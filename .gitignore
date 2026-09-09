@@ -1,0 +1,29 @@
+# 依赖与构建产物
+node_modules/
+dist/
+*.tgz
+
+# 本地配置（含真实凭据，禁止入库）
+.env
+.env.local
+mcp.json
+
+# 日志
+*.log
+
+# 本地探测/临时目录（含真实连接与凭据，禁止入库）
+probe-temp/
+*tmp*
+
+# 临时验证目录（测试后可删除）
+test-verification/
+
+# 测试与文档不入库（含环境标识/探测记录，本地保留供开发；克隆者按需自备）
+tests/
+docs/
+
+# 编辑器/工具生成目录（计划、配置等，不入库）
+.comate/
+.idea/
+.vscode/
+.dsh/

@@ -1,0 +1,28 @@
+{
+  "mcpServers": {
+    "saphana-modeler-mcp": {
+      "command": "node",
+      "args": [
+        "dist/index.js"
+      ],
+      "env": {
+        "HANA_HOST": "hana-host.example",
+        "HANA_INSTANCE": "00",
+        "HANA_PORT": "",
+        "HANA_USER": "YOUR_USERNAME",
+        "HANA_PASSWORD": "YOUR_PASSWORD",
+        "HANA_LOCALE": "zh_CN",
+        "HANA_DB_NAME": "SYSTEMDB",
+        "HANA_TLS": "true",
+        "HANA_SSL_VALIDATE": "true",
+        "HANA_TIMEZONE": "Asia/Shanghai",
+        "HANA_SCHEMA_ALLOW": "",
+        "HANA_WRITE_PACKAGES": "ZDEMO1,ZDEMO2.ZDEMO_SD",
+        "HANA_TOOL_GROUPS": "",
+        "HANA_TOOL_ALLOW": "",
+        "HANA_TOOL_DENY": "",
+        "LOG_LEVEL": "info"
+      }
+    }
+  }
+}

@@ -1,0 +1,53 @@
+{
+  "name": "saphana-modeler-mcp",
+  "version": "1.0.0",
+  "description": "SAP HANA Modeler MCP Server (TypeScript) - 经典 HANA 2.0 仓库建模能力（_SYS_REPO/_SYS_BI/_SYS_BIC）",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mininia/saphana-modeler-mcp.git"
+  },
+  "bin": {
+    "saphana-modeler-mcp": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20.12.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "test": "node --import tsx --test tests/unit/*.test.ts",
+    "test:watch": "node --import tsx --test --watch tests/unit/*.test.ts",
+    "smoke": "npm run build && node scripts/smoke-stdio.mjs",
+    "verify:system": "npm run build && node test-verification/verify-system.mjs",
+    "verify:p1-5": "npm run build && node test-verification/verify-p1-5.mjs",
+    "probe:repo": "node test-verification/probe-repo-read.mjs",
+    "probe:xfer": "node test-verification/probe-rest-check-xfer.mjs",
+    "verify:lifecycle": "node test-verification/verify-cv-lifecycle.mjs",
+    "verify:add-join": "node test-verification/verify-add-join.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/core": "^2.0.0",
+    "@modelcontextprotocol/node": "^2.0.0",
+    "@modelcontextprotocol/server": "^2.0.0",
+    "@sap/hana-client": "^2.26.26",
+    "fast-xml-parser": "^5.11.0",
+    "pino": "^10.3.1",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.3.0",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2"
+  },
+  "allowScripts": {
+    "@sap/hana-client@2.26.26": true
+  }
+}
