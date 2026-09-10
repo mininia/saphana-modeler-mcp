@@ -1,5 +1,7 @@
 # saphana-modeler-mcp
 
+> 🌐 中文 | [English](README.en.md)
+
 SAP HANA 经典 Modeler 能力的 MCP 服务器（TypeScript，Node >= 20.12）。面向本地部署 HANA 2.0
 （经典 `_SYS_REPO` 仓库建模），提供信息视图（计算视图/属性视图/分析视图）与仓库对象的
 **元数据浏览、数据预览、血缘查询与建模写操作**。
@@ -23,7 +25,19 @@ SAP HANA 经典 Modeler 能力的 MCP 服务器（TypeScript，Node >= 20.12）�
 
 ## 快速开始
 
+**方式一：npx 一键运行（无需克隆，推荐试用）**
+
 ```bash
+npx github:mininia/saphana-modeler-mcp   # 自动 clone + 构建 + 启动
+```
+
+需配合下方「MCP 客户端接入」的配置，把 `command` 换成 `npx`、`args` 换成 `["github:mininia/saphana-modeler-mcp"]` 即可。
+
+**方式二：克隆本地运行（开发/自定义）**
+
+```bash
+git clone https://github.com/mininia/saphana-modeler-mcp.git
+cd saphana-modeler-mcp
 npm install          # 首次安装后需 npm approve-scripts @sap/hana-client（预编译二进制）
 cp .env.example .env # 填写真实 HANA 连接
 npm run build
@@ -228,6 +242,28 @@ scripts/               通用冒烟脚本（smoke-stdio）；实机验收/探针
     "saphana-modeler-mcp": {
       "command": "node",
       "args": ["<仓库绝对路径>/dist/index.js"],
+      "env": {
+        "HANA_HOST": "hana-host.example",
+        "HANA_INSTANCE": "10",
+        "HANA_USER": "YOUR_USERNAME",
+        "HANA_PASSWORD": "YOUR_PASSWORD",
+        "HANA_DB_NAME": "SYSTEMDB",
+        "HANA_TLS": "false",
+        "HANA_WRITE_PACKAGES": "ZDEMO1"
+      }
+    }
+  }
+}
+```
+
+**或用 npx 一键拉取（免克隆）**：
+
+```jsonc
+{
+  "mcpServers": {
+    "saphana-modeler-mcp": {
+      "command": "npx",
+      "args": ["github:mininia/saphana-modeler-mcp"],
       "env": {
         "HANA_HOST": "hana-host.example",
         "HANA_INSTANCE": "10",
