@@ -198,7 +198,7 @@ MCP_HTTP_PORT=3000 MCP_HTTP_TOKEN='your-long-random-token' node dist/index.js
 | 通道 | 触发 | 机制 | 需要权限 |
 | --- | --- | --- | --- |
 | `direct`（整体预览） | 不传 `node` | `SELECT * FROM "_SYS_BIC"."包/视图名"` | `_SYS_BIC` 数据访问 |
-| `intermediate`（节点预览·默认） | 传 `node` | HANA 原生中间视图 `SYS.CREATE_INTERMEDIATE_CALCULATION_VIEW_DEV`（Studio 节点预览同款），CREATE 临时视图 → SELECT → 自动 DROP | `EXECUTE` on 上述过程 |
+| `intermediate`（节点预览·默认） | 传 `node` | HANA 原生中间视图 `SYS.CREATE_INTERMEDIATE_CALCULATION_VIEW_DEV`（Studio 节点预览同款）：视图名固定为 `<包/对象>/dp/<节点>`，已存在即复用不重建，查询后仅在本进程无占用且由本服务创建时才 DROP | `EXECUTE` on 上述过程 |
 | `derived`（节点预览·只读） | 传 `node` + `forceDerive=true`（显式启用） | 依据视图 XML 推导 SQL，纯只读 | `_SYS_REPO` 读 + 基表 SELECT |
 
 行数规则：无筛选默认 10 行，有筛选默认 100 行，显式 `limit` 上限 1000；`LIMIT n+1` 探测截断 → `truncated`。

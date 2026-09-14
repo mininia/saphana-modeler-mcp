@@ -1,10 +1,11 @@
 import type { HanaPool } from '../core/hana-client.js';
 import { HanaBusinessError } from '../core/errors.js';
+import { withKeyedLock } from '../core/keyed-mutex.js';
 import { assertSafeRuntimeName, quoteIdentifier, quoteLiteral, qualifyName } from '../core/sql.js';
 import { viewDefinitionCache } from '../model/view-cache.js';
 import type { ViewKind } from '../model/view-types.js';
 import { deriveNodeSql } from './preview.derive.js';
-import { diagnosePreview, type PreviewChannel } from './preview-diagnose.service.js';
+import { diagnosePreview, runtimeViewExists, type PreviewChannel } from './preview-diagnose.service.js';
 
 /**
  * hana_data_preview 数据预览。支持范围有限；
@@ -14,10 +15,18 @@ import { diagnosePreview, type PreviewChannel } from './preview-diagnose.service
  * - 默认（无 node）：对已激活视图整体预览 —— `SELECT * FROM "_SYS_BIC"."包/视图名"`，
  *   无需解析 XML；VIRTUAL 视图用 parameters 传输入参数（WITH PARAMETERS PLACEHOLDER）。
  * - 节点（有 node，默认）：调用 HANA 原生机制 `SYS.CREATE_INTERMEDIATE_CALCULATION_VIEW_DEV`
- *   （HANA Studio 节点预览同款）——HANA 为指定节点生成 SQL 虚拟视图，SELECT 后 DROP。
+ *   （HANA Studio 节点预览同款）——HANA 为指定节点生成 SQL 虚拟视图，用完按占用情况释放。
  *   类型/连接键/表达式由 HANA 自身计算，任意节点类型均支持。需 EXECUTE 权限；缺权限直接返回「不支持」。
  * - 节点（有 node + forceDerive=true，显式启用）：XML 推导只读模式（preview.derive.ts），
  *   支持类型受限（见文档），不自动启用。
+ *
+ * 中间视图命名与生命周期（确定性命名 + 复用 + 有条件释放）：
+ * - 视图名固定为 `<包路径/对象名>/dp/<节点名>`（见 intermediateViewName），人工可在 _SYS_BIC 中直接定位；
+ * - 创建前先查 SYS.VIEWS：已存在则**不重复创建**，直接复用（并发调用、上次残留、他人建的都走这条）；
+ * - 释放时先判断占用：本进程内还有调用在用、或视图非本服务创建 → 保留；无人占用才 DROP；
+ *   DROP 失败（本进程外的会话正在读）同样保留，交由下次调用复用。
+ *   注意：复用不校验视图新鲜度——CV 在视图创建后被重新激活时，同名视图仍是旧定义，
+ *   结果里以 `intermediate.reused` 如实回报，需要最新数据时先删掉该视图或改用 forceDerive。
  *
  * 行数规则：无筛选默认 10 行，有筛选默认 100 行；显式 limit 上限 1000。
  * 截断判定：多取 1 行探测是否还有更多（LIMIT n+1 → truncated）。
@@ -56,6 +65,20 @@ export interface PreviewResult {
   truncated: boolean;
   /** 实际执行的 SQL（调试/审计用） */
   sql: string;
+  /** 中间视图通道的视图信息（其余通道无此字段） */
+  intermediate?: IntermediateViewInfo;
+}
+
+/** 节点预览中间视图的命名与生命周期回报 */
+export interface IntermediateViewInfo {
+  /** 确定性视图名：`<包路径/对象名>/dp/<节点名>`（位于 _SYS_BIC） */
+  viewName: string;
+  /** true = 已存在同名视图，本次未执行创建（复用） */
+  reused: boolean;
+  /** true = 预览结束后已 DROP */
+  dropped: boolean;
+  /** dropped=false 时说明保留原因 */
+  keptBecause?: string;
 }
 
 const MAX_LIMIT = 1000;
@@ -66,9 +89,35 @@ const PARAM_NAME_RE = /^[A-Za-z0-9_.-]+$/;
 const INTERMEDIATE_VERSION = 0;
 /** 中间视图所在 schema */
 const INTERMEDIATE_SCHEMA = '_SYS_BIC';
+/** HANA 标识符长度上限（SQL Reference）；超限提前给可读错误，而非让 CREATE 抛晦涩语法错 */
+const MAX_IDENTIFIER_LEN = 127;
 
-/** 临时视图命名序号（进程内递增，避免并发/历史残留冲突） */
-let tempSeq = 0;
+/**
+ * 节点预览中间视图名：`<包路径/对象名>/dp/<节点名>`（确定性命名，与 _SYS_BIC 里 CV 运行时对象同名风格）。
+ * 确定性命名带来「可人工定位」与「可直接复用」，代价是名字与 CV+节点一一对应 —— 见文件头关于新鲜度的说明。
+ * 节点名按运行时名白名单校验（不做字符替换：替换会让不同节点名映射到同一视图，进而串数据）。
+ */
+function intermediateViewName(viewRef: string, node: string): string {
+  assertSafeRuntimeName(node, '节点名');
+  const name = `${viewRef}/dp/${node}`;
+  if (name.length > MAX_IDENTIFIER_LEN) {
+    throw new HanaBusinessError(
+      `节点预览视图名过长（${name.length} > ${MAX_IDENTIFIER_LEN} 字符）：${name}。` +
+        `可改用显式 forceDerive=true 的 XML 推导模式预览该节点`,
+    );
+  }
+  return name;
+}
+
+/** 中间视图占用/归属状态的操作锁 key（与写路径的 "包/对象" key 命名空间隔离） */
+function intermediateLockKey(viewName: string): string {
+  return `dp:${viewName}`;
+}
+
+/** 视图名 → 本进程内正在使用该中间视图的预览调用数 */
+const intermediateInUse = new Map<string, number>();
+/** 本服务创建过（因而有权清理）的中间视图名；预存在的他人对象不入册 → 释放时不动 */
+const intermediateOwned = new Set<string>();
 
 export async function previewData(
   pool: HanaPool,
@@ -184,8 +233,14 @@ async function withPermissionDiagnosis<T>(
 
 /**
  * 节点预览主路径：HANA 原生中间视图（Studio 节点预览同款机制）。
- * CALL CREATE_INTERMEDIATE_CALCULATION_VIEW_DEV(schema, view, node, temp_name, version=0)
- * → SELECT * FROM "_SYS_BIC"."temp_name" → 无论成败 finally 中 DROP 清理。
+ * CALL CREATE_INTERMEDIATE_CALCULATION_VIEW_DEV(schema, view, node, view_name, version=0)
+ * → SELECT * FROM "_SYS_BIC"."<包/对象/dp/节点>" → 按占用情况释放（见 release）。
+ *
+ * 取用与释放都在同一把 keyed lock 内完成（key=视图名），保证「创建 / 复用 / 占用计数 / 释放」
+ * 这一组操作对同一视图严格串行：
+ * - 两个并发调用不会同时判定「不存在」而重复 CREATE（后者会因对象已存在失败）；
+ * - 也不会出现「A 释放并 DROP 的瞬间 B 刚判定复用」——B 要么在 A 之前登记占用（A 遂不删），
+ *   要么在 A 删除之后进入（判定不存在 → 自行创建）。
  */
 async function previewNodeViaIntermediate(
   pool: HanaPool,
@@ -195,44 +250,93 @@ async function previewNodeViaIntermediate(
   limit: number,
 ): Promise<PreviewResult> {
   const node = opts.node!;
-  // 临时视图名：进程内序号 + 时间戳（36 进制）保证跨进程/重启唯一，避免历史残留同名冲突
-  const tempName = `TMP_MCP_PREVIEW_${node.replace(/[^A-Za-z0-9_]/g, '_')}_${++tempSeq}_${Date.now().toString(36)}`;
   const viewRef = `${packageId}/${objectName}`;
-  let created = false;
-  try {
-    await pool.execute(
-      `CALL SYS.CREATE_INTERMEDIATE_CALCULATION_VIEW_DEV(?, ?, ?, ?, ?)`,
-      [INTERMEDIATE_SCHEMA, viewRef, node, tempName, INTERMEDIATE_VERSION],
-    );
-    created = true;
-    const where = buildWhere(opts.filter);
-    const sql = `SELECT * FROM ${qualifyName(INTERMEDIATE_SCHEMA, tempName)}${where.clause} LIMIT ?`;
-    const rows = await pool.query<Record<string, unknown>>(sql, [...where.params, limit + 1]);
-    const truncated = rows.length > limit;
-    const sliced = truncated ? rows.slice(0, limit) : rows;
-    return {
-      object: { packageId, objectName, objectSuffix: opts.kind },
-      node,
-      via: 'intermediate',
-      columns: sliced[0] ? Object.keys(sliced[0]) : [],
-      rows: sliced,
-      limit,
-      truncated,
-      sql,
-    };
-  } finally {
-    if (created) {
-      try {
-        await pool.execute(`CALL SYS.DROP_INTERMEDIATE_CALCULATION_VIEW_DEV(?, ?, ?)`, [
-          INTERMEDIATE_SCHEMA,
-          tempName,
-          INTERMEDIATE_VERSION,
-        ]);
-      } catch {
-        /* 清理失败不掩盖原始错误（临时视图残留可由同名/序号机制规避） */
-      }
+  const viewName = intermediateViewName(viewRef, node);
+
+  // 取用：已存在（并发刚建的 / 上次残留 / 他人建的）则跳过创建，直接复用
+  let reused = false;
+  await withKeyedLock(intermediateLockKey(viewName), async () => {
+    if (await runtimeViewExists(pool, viewName)) {
+      reused = true;
+    } else {
+      await pool.execute(`CALL SYS.CREATE_INTERMEDIATE_CALCULATION_VIEW_DEV(?, ?, ?, ?, ?)`, [
+        INTERMEDIATE_SCHEMA,
+        viewRef,
+        node,
+        viewName,
+        INTERMEDIATE_VERSION,
+      ]);
+      intermediateOwned.add(viewName); // 本服务创建的才可清理（预存在的他人对象不在此列）
     }
+    intermediateInUse.set(viewName, (intermediateInUse.get(viewName) ?? 0) + 1);
+  });
+
+  let rows: Record<string, unknown>[];
+  let sql: string;
+  let release: { dropped: boolean; reason?: string };
+  try {
+    const where = buildWhere(opts.filter);
+    sql = `SELECT * FROM ${qualifyName(INTERMEDIATE_SCHEMA, viewName)}${where.clause} LIMIT ?`;
+    rows = await pool.query<Record<string, unknown>>(sql, [...where.params, limit + 1]);
+  } finally {
+    // 无论成败都解除占用（失败路径下由释放策略决定是否清理）
+    release = await releaseIntermediateView(pool, viewName);
   }
+  const truncated = rows.length > limit;
+  const sliced = truncated ? rows.slice(0, limit) : rows;
+  return {
+    object: { packageId, objectName, objectSuffix: opts.kind },
+    node,
+    via: 'intermediate',
+    columns: sliced[0] ? Object.keys(sliced[0]) : [],
+    rows: sliced,
+    limit,
+    truncated,
+    sql,
+    intermediate: {
+      viewName,
+      reused,
+      dropped: release.dropped,
+      ...(release.dropped ? {} : { keptBecause: release.reason }),
+    },
+  };
+}
+
+/**
+ * 释放中间视图：仅当「本进程已无调用占用」且「由本服务创建」时才 DROP。
+ * 保留的三种情形（均不报错、不影响本次预览结果）：
+ * - 本进程内还有并发调用在用（引用计数 > 0）
+ * - 视图非本服务创建（他人 / 上一次进程的残留）→ 误删他人对象风险，宁可留着
+ * - DROP 失败：本进程之外的会话（如 HANA Studio）正在读该视图而占用锁 → 交由下次调用复用
+ * 与取用共用同一把锁：保证不会在「刚判定无人占用」之后、DROP 之前被新调用复用。
+ */
+async function releaseIntermediateView(
+  pool: HanaPool,
+  viewName: string,
+): Promise<{ dropped: boolean; reason?: string }> {
+  return withKeyedLock(intermediateLockKey(viewName), async () => {
+    const remaining = (intermediateInUse.get(viewName) ?? 1) - 1;
+    if (remaining > 0) {
+      intermediateInUse.set(viewName, remaining);
+      return { dropped: false, reason: `仍有 ${remaining} 个预览调用在使用该视图` };
+    }
+    intermediateInUse.delete(viewName);
+    if (!intermediateOwned.has(viewName)) {
+      return { dropped: false, reason: '视图非本服务创建（他人或历史残留），不主动删除' };
+    }
+    try {
+      await pool.execute(`CALL SYS.DROP_INTERMEDIATE_CALCULATION_VIEW_DEV(?, ?, ?)`, [
+        INTERMEDIATE_SCHEMA,
+        viewName,
+        INTERMEDIATE_VERSION,
+      ]);
+      intermediateOwned.delete(viewName);
+      return { dropped: true };
+    } catch {
+      // 占用中（其他会话正在读）或权限不足：保留视图供下次复用（清理失败不得掩盖原始错误）
+      return { dropped: false, reason: '视图正被其他会话占用或 DROP 被拒绝，已保留供后续复用' };
+    }
+  });
 }
 
 /** 节点预览 fallback：XML 推导（无 SYS 过程 EXECUTE 权限时的只读替代） */

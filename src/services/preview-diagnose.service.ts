@@ -169,10 +169,10 @@ export async function diagnosePreview(
   }
 
   // 2. 运行时视图存在性（direct/intermediate 依赖 _SYS_BIC 运行时对象）
-  let runtimeViewExists: boolean | undefined;
+  let viewExists: boolean | undefined;
   if (opts.channel === 'direct' || opts.channel === 'intermediate') {
-    runtimeViewExists = await checkRuntimeViewExists(pool, packageId, objectName);
-    if (runtimeViewExists === false && activation.activated) {
+    viewExists = await runtimeViewExists(pool, `${packageId}/${objectName}`);
+    if (viewExists === false && activation.activated) {
       blockers.push(`运行时视图 "_SYS_BIC"."${packageId}/${objectName}" 不存在，但设计时对象已激活（激活可能失败或运行时未生成）`);
       hints.push('用 hana_view_validate(target=runtime) 复检运行时一致性');
     }
@@ -278,7 +278,7 @@ export async function diagnosePreview(
     object: { packageId, objectName, kind: opts.kind },
     channel: opts.channel,
     viewActivation: activation,
-    runtimeViewExists,
+    runtimeViewExists: viewExists,
     runtimeProbe,
     checks,
     baseTables,
@@ -322,12 +322,15 @@ async function checkViewActivation(
   }
 }
 
-/** 运行时视图 _SYS_BIC."包/视图" 是否存在 */
-async function checkRuntimeViewExists(pool: HanaPool, packageId: string, objectName: string): Promise<boolean> {
+/**
+ * _SYS_BIC 运行时视图是否存在（SYS.VIEWS 目录查询）。
+ * @param viewName 视图名：CV 运行时对象为 "包/对象"；节点预览中间视图为 "包/对象/dp/节点"
+ */
+export async function runtimeViewExists(pool: HanaPool, viewName: string): Promise<boolean> {
   try {
     const rows = await pool.query<{ C: number }>(
       `SELECT COUNT(*) AS C FROM SYS.VIEWS WHERE SCHEMA_NAME = '_SYS_BIC' AND VIEW_NAME = ?`,
-      [`${packageId}/${objectName}`],
+      [viewName],
     );
     return (rows[0]?.C ?? 0) > 0;
   } catch {

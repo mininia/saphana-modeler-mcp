@@ -21,8 +21,11 @@ export function registerPreviewTools(server: McpServer, ctx: ToolContext): void 
         '默认对视图整体预览（_SYS_BIC 直查）：无筛选默认返回前 10 行，有筛选默认返回前 100 行，' +
         'VIRTUAL 视图用 parameters 传输入参数（如 {"P_CURRENCY": "CNY"}）。' +
         '仅当用户明确要求看某视图中的某个节点时才传 node：调用 HANA 原生中间视图机制 ' +
-        'SYS.CREATE_INTERMEDIATE_CALCULATION_VIEW_DEV（HANA Studio 节点预览同款）让 HANA 为节点生成 SQL 虚拟视图并查询，' +
-        '用完自动 DROP；该通道任意节点类型均支持，但需要 EXECUTE 权限（缺权限直接返回不支持，不会自动回退）。' +
+        'SYS.CREATE_INTERMEDIATE_CALCULATION_VIEW_DEV（HANA Studio 节点预览同款）让 HANA 为节点生成 SQL 虚拟视图并查询。' +
+        '中间视图名固定为 "<包路径/对象名>/dp/<节点名>"（在 _SYS_BIC 内，人工可直接定位）：已存在同名视图时不再重复创建（直接复用）；' +
+        '查询结束后，若本进程已无调用占用且视图由本服务创建才自动 DROP，否则保留（结果里 intermediate 字段回报 reused/dropped）。' +
+        '注意复用不校验新鲜度：CV 重新激活后同名视图仍是旧定义，需要最新数据时先删掉该视图或改用 forceDerive。' +
+        '该通道任意节点类型均支持，但需要 EXECUTE 权限（缺权限直接返回不支持，不会自动回退）。' +
         '如需只读 XML 推导模式（支持 Projection/Join/Aggregation/Union/Rank，SqlScriptView/变量/复杂节点不支持），' +
         '可显式传 forceDerive=true。筛选条件（filter）以 AND 连接且值参数绑定；返回 via（direct/intermediate/derived）/columns/rows/truncated，' +
         '行数规则：limit 省略时按有无筛选默认 10/100，显式上限 1000。' +

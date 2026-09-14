@@ -199,7 +199,7 @@ On startup, if filter variables are configured, the log prints the enabled group
 | Channel | Trigger | Mechanism | Privileges required |
 | --- | --- | --- | --- |
 | `direct` (overall preview) | no `node` passed | `SELECT * FROM "_SYS_BIC"."package/view-name"` | `_SYS_BIC` data access |
-| `intermediate` (node preview · default) | `node` passed | HANA native intermediate view `SYS.CREATE_INTERMEDIATE_CALCULATION_VIEW_DEV` (same as Studio node preview): CREATE temp view → SELECT → auto DROP | `EXECUTE` on the above procedure |
+| `intermediate` (node preview · default) | `node` passed | HANA native intermediate view `SYS.CREATE_INTERMEDIATE_CALCULATION_VIEW_DEV` (same as Studio node preview): the view is always named `<pkg/object>/dp/<node>`, an existing one is reused instead of recreated, and after the query it is dropped only when no call in this process is using it and this server created it | `EXECUTE` on the above procedure |
 | `derived` (node preview · read-only) | `node` + `forceDerive=true` (explicit) | Derives SQL from the view XML, purely read-only | `_SYS_REPO` read + base-table SELECT |
 
 Row-count rules: 10 rows by default without filter, 100 with filter, explicit `limit` capped at 1000; `LIMIT n+1` probe for truncation → `truncated`.
