@@ -1,6 +1,7 @@
 import { ProtocolError, SdkError, SdkErrorCode, SdkHttpError } from '@modelcontextprotocol/server';
 import type { Envelope, HanaMessage } from '../types/hana.js';
 import { logger, redactSensitive } from './logger.js';
+import { currentClientId } from './request-context.js';
 
 export { ProtocolError, SdkError, SdkErrorCode, SdkHttpError };
 
@@ -53,24 +54,28 @@ export function wrapUnknownError(_e: unknown): SdkError {
  * - HANA 业务错误（HanaBusinessError）→ 信封 success:false + messages
  * - v2 MCP 错误（ProtocolError/SdkError）→ 透传抛出（协议层处理）
  * - 未知错误 → 包装为 SdkError 抛出
+ * 信封统一附带当前客户端身份（HTTP 模式；stdio 无身份上下文则不带该字段）。
  */
 export async function withErrorEnvelope<T>(fn: () => Promise<T>): Promise<Envelope> {
+  // 身份在请求上下文中读取（工具 handler 运行在 HTTP 请求的 AsyncLocalStorage 上下文内）
+  const clientId = currentClientId();
+  const withIdentity = (e: Envelope): Envelope => (clientId ? { ...e, clientId } : e);
   try {
     const data = await fn();
-    return { success: true, data, messages: [] };
+    return withIdentity({ success: true, data, messages: [] });
   } catch (e) {
     if (e instanceof HanaBusinessError) {
       const raw = e.code ? { code: e.code } : undefined;
       // 排障报告（如预览权限诊断）随错误透传给调用方，便于失败后定位阻塞点
       const rawWithDiagnosis = e.diagnosis != null ? { ...(raw ?? {}), diagnosis: e.diagnosis } : raw;
-      return {
+      return withIdentity({
         success: false,
         messages:
           e.messages.length > 0
             ? e.messages.map((m) => ({ ...m, text: redactSensitive(m.text) }))
             : [{ type: 'E', id: e.code, number: e.sqlState, text: redactSensitive(e.message) }],
         raw: rawWithDiagnosis,
-      };
+      });
     }
     if (e instanceof ProtocolError || e instanceof SdkError) {
       throw e;

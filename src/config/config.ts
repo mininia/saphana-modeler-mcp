@@ -117,6 +117,14 @@ const envSchema = z.object({
     .optional()
     .transform((s) => s?.trim()),
   /**
+   * 多客户端 Token → 身份映射（逗号分隔的 `name:token`）。
+   * 用于 HTTP 模式下把请求归属到具体客户端：envelope.clientId、审计日志与排障都据此归因
+   * （多客户端共享同一 HANA 技术账号，仓库侧的修改记录无法区分调用方，归属信息只有这里能给）。
+   * name 限 [A-Za-z0-9_.-]{1,32}；token ≥16 字符；name/token 重复或格式非法在启动时即失败。
+   * 可与 MCP_HTTP_TOKEN 并存（后者映射为身份 shared）。格式：alice:<token>,bob:<token>
+   */
+  MCP_HTTP_TOKENS: z.string().default('').transform((s) => s.trim()),
+  /**
    * 允许的 Host 头主机名（DNS rebinding 防护；逗号分隔，不含端口，IPv6 带方括号）。
    * 默认仅本机名；经对外主机名访问时须追加对应主机名。
    */
@@ -133,6 +141,64 @@ const envSchema = z.object({
     .default('localhost,127.0.0.1,[::1]')
     .transform((s) => s.split(',').map((x) => x.trim()).filter(Boolean)),
 });
+
+/** HTTP Token → 客户端身份映射条目（MCP_HTTP_TOKENS 解析结果） */
+export interface HttpClientIdentity {
+  /** 客户端身份名（进 envelope.clientId / 审计日志） */
+  clientId: string;
+  /** 该身份的 Bearer Token（仅驻内存，不落日志/不回显） */
+  token: string;
+}
+
+/** 仅配置 MCP_HTTP_TOKEN（无 per-client 区分）时的身份名：如实表达「共享凭据」 */
+export const SHARED_CLIENT_ID = 'shared';
+
+/** 客户端身份名合法字符集（防怪异名字进日志/审计） */
+const CLIENT_ID_RE = /^[A-Za-z0-9_.-]{1,32}$/;
+
+/**
+ * 解析 HTTP 客户端身份映射：MCP_HTTP_TOKENS 的 `name:token` 列表 + 可选单一 MCP_HTTP_TOKEN。
+ * fail-closed：名字/Token 重复、Token 过短、格式非法一律抛错（启动失败），不静默降级为「无身份」。
+ * 错误信息不含 Token 原文（配置错误会进日志，凭据不得回显）。
+ */
+export function parseHttpClients(raw: string, singleToken?: string): HttpClientIdentity[] {
+  const clients: HttpClientIdentity[] = [];
+  const names = new Set<string>();
+  const tokens = new Set<string>();
+  if (singleToken) {
+    clients.push({ clientId: SHARED_CLIENT_ID, token: singleToken });
+    names.add(SHARED_CLIENT_ID);
+    tokens.add(singleToken);
+  }
+  const entries = raw.split(',').map((s) => s.trim()).filter(Boolean);
+  entries.forEach((entry, idx) => {
+    const sep = entry.indexOf(':');
+    if (sep <= 0 || sep === entry.length - 1) {
+      // 不回显 entry 原文（可能含 Token）
+      throw new Error(`MCP_HTTP_TOKENS 第 ${idx + 1} 项格式非法：应为 name:token 形式`);
+    }
+    const clientId = entry.slice(0, sep).trim();
+    const token = entry.slice(sep + 1).trim();
+    if (!CLIENT_ID_RE.test(clientId)) {
+      throw new Error(
+        `MCP_HTTP_TOKENS 第 ${idx + 1} 项的客户端名非法：仅允许字母/数字/下划线/点/连字符且长度 ≤32`,
+      );
+    }
+    if (token.length < 16) {
+      throw new Error(`MCP_HTTP_TOKENS 中客户端 "${clientId}" 的 Token 长度须 ≥16 字符（防弱凭据）`);
+    }
+    if (names.has(clientId)) {
+      throw new Error(`MCP_HTTP_TOKENS 客户端名重复：${clientId}`);
+    }
+    if (tokens.has(token)) {
+      throw new Error(`MCP_HTTP_TOKENS 中客户端 "${clientId}" 的 Token 与另一条目重复（同一 Token 只能对应一个身份）`);
+    }
+    names.add(clientId);
+    tokens.add(token);
+    clients.push({ clientId, token });
+  });
+  return clients;
+}
 
 export interface HanaConfig {
   /** HANA 主机名/IP（真实值仅存在于本地 mcp.json/.env） */
@@ -175,11 +241,21 @@ export interface HanaConfig {
   /** Streamable HTTP 监听地址（默认 127.0.0.1，仅本机） */
   httpHost: string;
   /** Streamable HTTP Bearer Token（可选；设置后强制校验 Authorization 头） */
-  httpToken?: string;
+  httpTokens: HttpClientIdentity[];
   /** 允许的 Host 头主机名（DNS rebinding 防护，来自 MCP_HTTP_ALLOWED_HOSTS） */
   httpAllowedHosts: string[];
   /** 允许的 Origin 主机名（无 Origin 头放行，来自 MCP_HTTP_ALLOWED_ORIGINS） */
   httpAllowedOrigins: string[];
+  /**
+   * 连接目标/凭据各变量的实际来源标签（仅已设置项，不含值；来自 tryLoadDotEnv）。
+   * 例：{ HANA_USER: '进程环境变量', HANA_HOST: '.env（工作目录）' }
+   */
+  connectionSources: Partial<Record<string, string>>;
+  /**
+   * true = 连接目标与凭据来自多个来源（进程环境变量与 .env 逐变量混用）。
+   * 风险：某个变量的外部残留值会静默覆盖 .env 里的同名值，可能连到另一套环境 —— 入口处告警。
+   */
+  connectionSourceMixed: boolean;
 /** XS Classic 设计时 REST 直连端口（80<instance>）；未配置时运行时按实例号推导 */
     xsPort?: number;
     /** XS 设计时 REST 基础路径（默认 /sap/hana/xs/dt/base） */
@@ -199,31 +275,91 @@ function derivePort(instance: string, dbName?: string): number {
 }
 
 /**
+ * 连接目标与凭据：这组变量决定「连到哪个库、以谁的身份」，跨来源混用会导致静默误连
+ * （例：shell 里残留的 HANA_USER 覆盖 .env 里的用户名，其余变量仍来自 .env）。
+ * 仅这组参与「来源一致性」判定——日志级别/工具分组/HTTP 端口等调优项混用无此风险。
+ */
+const CONNECTION_KEYS = [
+  'HANA_HOST',
+  'HANA_INSTANCE',
+  'HANA_PORT',
+  'HANA_DB_NAME',
+  'HANA_USER',
+  'HANA_PASSWORD',
+] as const;
+
+type ConnectionKey = (typeof CONNECTION_KEYS)[number];
+
+/** 凭据三件套（缺一不可；齐备即完全跳过 .env） */
+const CREDENTIAL_KEYS: readonly ConnectionKey[] = ['HANA_HOST', 'HANA_USER', 'HANA_PASSWORD'];
+
+/** 来源标签：mcp.json env（客户端注入）/ shell / 容器注入都归此列 */
+const SOURCE_PROCESS_ENV = '进程环境变量';
+
+/** 值是否存在且非空（`HANA_PORT=` 这类空值视为未设置） */
+function hasValue(v: string | undefined): boolean {
+  return v !== undefined && v.trim() !== '';
+}
+
+/** .env 查找结果（只记录来源标签与文件，不记录任何值） */
+export interface DotEnvLoadResult {
+  /** 实际加载成功的 .env 文件标签（按尝试顺序） */
+  loadedFiles: string[];
+  /** 连接目标/凭据各变量的来源标签（仅含已设置且非空的键） */
+  sources: Partial<Record<ConnectionKey, string>>;
+}
+
+/**
  * 尝试加载 .env（Node 原生 process.loadEnvFile，无 dotenv 依赖）。
  * - 外部注入（mcp.json env / 真实环境变量）已提供 主机+用户+密码 三件套时跳过（外部配置优先，不覆盖）
  * - 否则按候选路径补齐：当前工作目录 .env → 项目根 .env
  *   （本模块位于 dist/config/config.js，需上两级才到项目根；MCP 客户端常以工作区为 cwd，凭据文件在项目根）
+ * - **逐变量生效**：loadEnvFile 不覆盖已存在的变量，因此「三件套只有一部分来自外部」时会出现
+ *   .env 与环境变量混用 —— 返回值记录每个变量的实际来源，由 loadConfig 判定并告警。
+ *
+ * 注意：HTTP 模式下没有 MCP 客户端拉起本进程，mcp.json 的 env 不会注入 ——
+ * 配置来源实际为 shell/容器环境变量 → .env 兜底（见 README「配置参数」）。
  */
-export function tryLoadDotEnv(env: NodeJS.ProcessEnv = process.env): void {
-  if (env.HANA_HOST && env.HANA_USER && env.HANA_PASSWORD) return;
+export function tryLoadDotEnv(env: NodeJS.ProcessEnv = process.env): DotEnvLoadResult {
+  const sources: Partial<Record<ConnectionKey, string>> = {};
+  for (const key of CONNECTION_KEYS) {
+    if (hasValue(env[key])) sources[key] = SOURCE_PROCESS_ENV;
+  }
+  // 三件套齐备 → 完全不读 .env（外部注入优先，不被邻近 .env 干扰）
+  if (CREDENTIAL_KEYS.every((k) => hasValue(env[k]))) {
+    return { loadedFiles: [], sources };
+  }
   const load = (process as NodeJS.Process & { loadEnvFile?: (p?: string) => void }).loadEnvFile;
-  if (typeof load !== 'function') return;
-  const candidates = [process.cwd()];
+  if (typeof load !== 'function') return { loadedFiles: [], sources };
+
+  const candidates: Array<{ dir: string; label: string }> = [
+    { dir: process.cwd(), label: '.env（工作目录）' },
+  ];
   try {
     // dist/config/config.js → 项目根（.env 所在目录），需上两级
-    candidates.push(fileURLToPath(new URL('../../', import.meta.url)));
+    candidates.push({ dir: fileURLToPath(new URL('../../', import.meta.url)), label: '.env（项目根）' });
   } catch {
     /* 推导失败则只试 cwd */
   }
-  for (const dir of candidates) {
+
+  const loadedFiles: string[] = [];
+  for (const { dir, label } of candidates) {
+    // 归因基线：本次加载前已有值的键属于更早的来源（外部注入或前一个 .env 文件）
+    const before = new Set<ConnectionKey>(CONNECTION_KEYS.filter((k) => hasValue(env[k])));
     const p = `${dir.replace(/[\\/]$/, '')}${process.platform === 'win32' ? '\\' : '/'}.env`;
     try {
       load(p);
-      if (env.HANA_PASSWORD) break; // 密码补齐即停
     } catch {
-      // 该路径无 .env，试下一个
+      continue; // 该路径无 .env，试下一个
     }
+    loadedFiles.push(label);
+    for (const key of CONNECTION_KEYS) {
+      if (!before.has(key) && hasValue(env[key])) sources[key] = label;
+    }
+    // 三件套齐备即停（避免继续合并下一个 .env 造成更多来源混用）
+    if (CREDENTIAL_KEYS.every((k) => hasValue(env[k]))) break;
   }
+  return { loadedFiles, sources };
 }
 
 /**
@@ -231,7 +367,7 @@ export function tryLoadDotEnv(env: NodeJS.ProcessEnv = process.env): void {
  * 缺失或非法抛 zod 校验错误（服务启动即失败，不给半配置运行的机会）。
  */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): HanaConfig {
-  tryLoadDotEnv();
+  const dotenv = tryLoadDotEnv(env);
   const parsed = envSchema.parse(env);
   
   // 解析端口：显式配置优先，否则按实例号推导
@@ -248,6 +384,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HanaConfig {
 
   // 凭据生命周期：取出密码后即从进程环境移除，避免常驻 process.env 被同机进程/子进程/调试器读取
   delete process.env.HANA_PASSWORD;
+
+  // 连接目标/凭据的来源归因：多于一个来源 = 混用（如 shell 残留的 HANA_USER + .env 其余项）
+  const connectionSourceMixed = new Set(Object.values(dotenv.sources)).size > 1;
 
   return {
     host: parsed.HANA_HOST,
@@ -270,8 +409,11 @@ xsPort: parsed.HANA_XS_PORT ? parseInt(parsed.HANA_XS_PORT, 10) : parseInt(`80${
     xsBasePath: parsed.HANA_XS_BASE_PATH,
     httpPort: parsed.MCP_HTTP_PORT,
     httpHost: parsed.MCP_HTTP_HOST,
-    httpToken: parsed.MCP_HTTP_TOKEN,
+    // Token → 身份映射（MCP_HTTP_TOKENS + 单一 MCP_HTTP_TOKEN 合并；非空即强制 Bearer 校验）
+    httpTokens: parseHttpClients(parsed.MCP_HTTP_TOKENS, parsed.MCP_HTTP_TOKEN),
     httpAllowedHosts: parsed.MCP_HTTP_ALLOWED_HOSTS,
     httpAllowedOrigins: parsed.MCP_HTTP_ALLOWED_ORIGINS,
+    connectionSources: dotenv.sources,
+    connectionSourceMixed,
   };
 }

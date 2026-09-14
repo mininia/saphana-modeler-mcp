@@ -1,5 +1,8 @@
 import type { HanaPool } from '../core/hana-client.js';
 import { HanaBusinessError } from '../core/errors.js';
+import { withKeyedLock } from '../core/keyed-mutex.js';
+import { logger } from '../core/logger.js';
+import { currentClientId } from '../core/request-context.js';
 import { assertSafeObjectName, assertSafeRuntimeName } from '../core/sql.js';
 import { XsRestClient, extractCheckResult, type FileMeta } from '../core/xs-rest.js';
 import type { HanaConfig } from '../config/config.js';
@@ -42,27 +45,43 @@ function isSafePackageName(packageId: string): boolean {
 }
 
 /**
- * 校验写入包名是否在配置的可写包范围内。
+ * 校验写入包名是否在配置的可写包范围内，并记录写操作审计日志。
  * - 白名单为空 → 不限制（fail-open，配置未填时的默认）
  * - 白名单非空 → 包名须等于某配置包，或以其为前缀（包名 = 配置包 或 包名以「配置包.」开头）
  *   例：配置 ["ZDEMO","ZDEMO.ZDEMO_SD"] → ZDEMO / ZDEMO.X / ZDEMO.ZDEMO_SD / ZDEMO.ZDEMO_SD.SUB 放行，
  *       ZDEMO.ZDEMO_MKC / ZDEMO 拒绝。
+ * 所有写路径（新建/更新/删除/激活/校验/导入/建包）都经本函数，故审计日志挂在此处：
+ * HTTP 模式下多个客户端共享同一 HANA 技术账号，仓库侧（_SYS_REPO 的 OWNER/ACTIVATED_BY）
+ * 只能看到该账号，归属信息只有进程侧能给。stdio 模式无身份上下文，日志不含 clientId 字段。
  */
-export function assertWritePackageAllowed(packageId: string): void {
+export function assertWritePackageAllowed(packageId: string, objectName?: string): void {
   if (!isSafePackageName(packageId)) {
     throw new HanaBusinessError(`包名 "${packageId}" 含非法字符，已拒绝`);
   }
-  if (WRITE_ALLOWED_PACKAGES.length === 0) return; // 未配置 = 不限制
-  const pkg = packageId.toUpperCase();
-  const allowed = WRITE_ALLOWED_PACKAGES.some(
-    (p) => pkg === p || pkg.startsWith(`${p}.`),
-  );
-  if (!allowed) {
-    throw new HanaBusinessError(
-      `写操作仅允许在配置的可写包内进行（当前请求包 "${packageId}" 被拒绝；已配置可写包：${WRITE_ALLOWED_PACKAGES.join(', ') || '(空)'}）。` +
-        `如需写入该包，请在 mcp.json 的 HANA_WRITE_PACKAGES 中追加该包前缀后重启服务`,
+  if (WRITE_ALLOWED_PACKAGES.length > 0) {
+    const pkg = packageId.toUpperCase();
+    const allowed = WRITE_ALLOWED_PACKAGES.some(
+      (p) => pkg === p || pkg.startsWith(`${p}.`),
     );
+    if (!allowed) {
+      throw new HanaBusinessError(
+        `写操作仅允许在配置的可写包内进行（当前请求包 "${packageId}" 被拒绝；已配置可写包：${WRITE_ALLOWED_PACKAGES.join(', ') || '(空)'}）。` +
+          `如需写入该包，请在其配置来源（stdio：mcp.json 的 env；HTTP：环境变量或 .env）中追加该包前缀后重启服务`,
+      );
+    }
   }
+  logger.info(
+    { clientId: currentClientId(), packageId, ...(objectName ? { objectName } : {}) },
+    '仓库写操作请求（审计：记录调用方与目标，结果见返回 envelope）',
+  );
+}
+
+/**
+ * 写临界区的锁 key：包 + 对象。
+ * 不同对象的写操作互不阻塞，同一对象上的 check-then-act 序列严格串行。
+ */
+function writeLockKey(packageId: string, objectName: string): string {
+  return `${packageId}/${objectName}`;
 }
 
 const u32le = (n: number): Buffer => {
@@ -304,10 +323,12 @@ export async function updateViaRest(
   objectName: string,
   xml: string,
   opts: { ifMatch?: string; activate?: boolean } = {},
+  client?: XsRestClient,
 ): Promise<FileMeta> {
-  const rest = makeRestClient(config);
-  const meta = await rest.fileMeta(packageId, `${objectName}.calculationview`);
-  const ifMatch = opts.ifMatch ?? meta.ETag;
+  const rest = client ?? makeRestClient(config);
+  // ifMatch 由调用方在请求入口捕获（「读时取」：窗口一直覆盖到 PUT，期间任何并发写入都使基线失效）。
+  // 仅当调用方未提供时才在此取当前 ETag —— 此时基线必然匹配，等于没有并发保护（保留分支仅为向后兼容）。
+  const ifMatch = opts.ifMatch ?? (await rest.fileMeta(packageId, `${objectName}.calculationview`)).ETag;
   return rest.writeFile(packageId, `${objectName}.calculationview`, xml, {
     activate: opts.activate ?? false,
     ifMatch,
@@ -390,8 +411,10 @@ export interface UpdateCalculationViewResult {
  * 更新 Calculation View 设计时定义（XS REST：PUT + If-Match ETag 乐观锁；冲突返回 isError+重读提示）。
  * 两种更新方式二选一（修改 CV 可零 XML）：
  * - input.xml：全量 XML 覆盖（原有方式，复杂改造用）；
- * - input.operations：声明式操作补丁——服务端读设计时当前内容（同步捕获 ETag 作乐观锁），逐条确定性变换
+ * - input.operations：声明式操作补丁——服务端读设计时当前内容，逐条确定性变换
  *   （view-edit，BW 方言同款），再走原有 PUT 更新路径；模型无需读取也不生成 XML。多条 operations 依序应用（可连续追加多个 join）。
+ * 并发：两种方式都在**请求入口**捕获当前 ETag 作基线（「读时取」），到 PUT 之间任何并发写入
+ * 都会使基线失效并以 412 显式暴露；调用方显式传 ifMatch 时以传入值为准（跨调用强一致场景）。
  */
 export async function updateCalculationView(
   config: HanaConfig,
@@ -400,32 +423,41 @@ export async function updateCalculationView(
   objectName: string,
   input: { xml?: string; operations?: AddJoinOperation[] },
   opts: { ifMatch?: string; activate?: boolean } = {},
+  client?: XsRestClient,
 ): Promise<UpdateCalculationViewResult> {
-  assertWritePackageAllowed(packageId);
+  assertWritePackageAllowed(packageId, objectName);
   assertSafeObjectName(objectName, '视图');
+  const hasOperations = input.operations !== undefined && input.operations.length > 0;
+  if (hasOperations && input.xml) throw new HanaBusinessError('xml 与 operations 二选一，请勿同时提供');
+  if (!hasOperations && !input.xml) {
+    throw new HanaBusinessError('需要提供 xml（全量 XML 更新）或 operations（声明式操作补丁）之一');
+  }
 
   const startedAt = Date.now();
+  // 写入全程复用同一 XS 会话（读基线 → 变换 → PUT）：省掉一次登录往返，也让读到的基线
+  // 与写出的 If-Match 出自同一会话视角
+  const rest = client ?? makeRestClient(config);
+  // 乐观锁基线：请求入口（最早时刻）取当前 ETag —— 读时取。
+  // 全量 xml 模式此前在「写入前」才取 ETag，基线必然匹配，等于没有并发保护；现在两种方式一致。
+  // 调用方显式传 ifMatch 时以传入值为准（跨调用强一致场景），此处仍读一次元数据作为存在性检查
+  // （对象不存在 → 立即失败，不会经 PUT 误建）。
+  // 注意：全量 xml 的内容由调用方给出，若其基于更早的一次读取，服务端无从得知 ——
+  // 返回 envelope 里的 412 是唯一的冲突信号，需要更强保证请显式传 ifMatch。
+  const baseMeta = await rest.fileMeta(packageId, `${objectName}.calculationview`);
+  const ifMatch = opts.ifMatch ?? baseMeta.ETag;
   let xml: string;
-  // 乐观锁 ETag：operations 模式在读取变换基线时同步捕获（读取到 PUT 之间任何并发写入都会使其失效，
-  // 冲突以 412 显式暴露）；xml 模式缺省仍由 updateViaRest 在写入时取当前 ETag
-  let ifMatch = opts.ifMatch;
   let operationsResult: UpdateCalculationViewResult['operationsResult'];
   let xmlVerification: FullXmlGuardResult | undefined;
-  if (input.operations && input.operations.length > 0) {
-    if (input.xml) throw new HanaBusinessError('xml 与 operations 二选一，请勿同时提供');
-    // 变换基线取设计时文件当前内容（与 ETag 同源同刻），而非已激活版本（ACTIVE_OBJECT）：
+  if (hasOperations) {
+    // 变换基线取设计时文件当前内容（与 ETag 同会话读取），而非已激活版本（ACTIVE_OBJECT）：
     // 存在未激活的挂起改动时，若以激活版为基线变换再覆盖设计时文件会静默丢失挂起工作。
-    // 先取 ETag 再读内容——基线与锁Token严格对应，读取到 PUT 之间的并发写入一律 412 冲突。
-    const rest = makeRestClient(config);
-    const baseMeta = await rest.fileMeta(packageId, `${objectName}.calculationview`);
-    ifMatch ??= baseMeta.ETag;
     const designTimeXml = await rest.fileContent(packageId, `${objectName}.calculationview`);
     if (!designTimeXml || designTimeXml.trim() === '') {
       throw new HanaBusinessError(`视图 ${packageId}/${objectName} 无设计时内容，无法应用 operations`);
     }
     const applied: AddJoinOperationResult[] = [];
     let currentXml = designTimeXml;
-    for (const op of input.operations) {
+    for (const op of input.operations!) {
       const r = await applyAddJoinOperation(pool, op, currentXml);
       applied.push(r.result);
       currentXml = r.xml;
@@ -436,13 +468,12 @@ export async function updateCalculationView(
     };
     xml = currentXml;
   } else {
-    if (!input.xml) throw new HanaBusinessError('需要提供 xml（全量 XML 更新）或 operations（声明式操作补丁）之一');
     // 全量通道护栏：解析性 + scenario id 一致性 + logicalModel 重接线（手工改 XML 两大高频事故，激活前拦下）
-    xmlVerification = guardFullXmlUpdate(input.xml, objectName);
-    xml = input.xml;
+    xmlVerification = guardFullXmlUpdate(input.xml!, objectName);
+    xml = input.xml!;
   }
 
-  const meta = await updateViaRest(config, packageId, objectName, xml, { ...opts, ifMatch });
+  const meta = await updateViaRest(config, packageId, objectName, xml, { ...opts, ifMatch }, rest);
   const activated = meta.Attributes?.SapBackPack?.Activated === true;
   const chk = extractCheckResult(meta);
   return {
@@ -462,7 +493,7 @@ export async function deleteCalculationView(
   packageId: string,
   objectName: string,
 ): Promise<{ object: { packageId: string; objectName: string; objectSuffix: 'calculationview' }; deleted: boolean }> {
-  assertWritePackageAllowed(packageId);
+  assertWritePackageAllowed(packageId, objectName);
   assertSafeObjectName(objectName, '视图');
   await deleteViaRest(config, packageId, objectName);
   return {
@@ -603,7 +634,8 @@ async function applyAddJoinOperation(
  * 1. 校验包（仅 ZDEMO）/对象名/源 schema
  * 2. 检查对象不存在
  * 3. 取源列 → 生成设计时 XML
- * 4. 按通道写入仓库（repo_rest 直通 REST；inactive_object 直写 INACTIVE_OBJECT）
+ * 4. 按通道写入仓库（repo_rest 直通 REST；inactive_object 直写 INACTIVE_OBJECT）—— 与存在性检查一起
+ *    构成串行临界区（见下）
  * 5.（可选）激活
  */
 export async function createCalculationView(
@@ -611,12 +643,13 @@ export async function createCalculationView(
   pool: HanaPool,
   input: CreateCalcViewInput,
 ): Promise<CreateCalcViewResult> {
-  assertWritePackageAllowed(input.packageId);
+  assertWritePackageAllowed(input.packageId, input.objectName);
   assertSafeObjectName(input.objectName, '视图');
 
   const { assertSchemaAllowed } = await import('../core/sql.js');
   assertSchemaAllowed(input.source.schema);
 
+  // 快速失败（权威检查在下方临界区内复核）：对象已存在时不必再取源列、生成 XML
   if (await objectExists(pool, input.packageId, input.objectName)) {
     throw new HanaBusinessError(
       `对象 ${input.packageId}/${input.objectName} 已存在，拒绝覆盖。请换一个对象名或先删除旧对象`,
@@ -653,28 +686,39 @@ export async function createCalculationView(
   }
 
   const transport = input.transport ?? 'xs_rest';
-  if (transport === 'xs_rest') {
-    // 官方 REST 写路径（PUT create-or-update）。实测：合法模型「写入即激活」，
-    // activated 为写入后的实测状态（非请求参数）；激活检查失败明细从响应体 CheckResult 透出。
-    const meta = await writeViaRest(config, input.packageId, input.objectName, xml, {
-      activate: input.activate ?? false,
-    });
-    result.wrote = true;
-    result.activated = meta.Attributes?.SapBackPack?.Activated === true;
-    const chk = extractCheckResult(meta);
-    if (chk && !chk.consistent) {
-      result.activationErrors = [chk.errorCode, chk.message].filter(Boolean).join(' ') || '激活检查未通过';
+  // 写临界区（keyed lock，key=包/对象）：存在性复核 + 写入必须原子。
+  // 仓库 PUT 是 create-or-update（服务端不会返回 409），两个并发同名 create 会双双通过入口检查，
+  // 后者静默覆盖前者；ETag 乐观锁覆盖不到这条路径，故进程内按对象互斥。
+  await withKeyedLock(writeLockKey(input.packageId, input.objectName), async () => {
+    if (await objectExists(pool, input.packageId, input.objectName)) {
+      throw new HanaBusinessError(
+        `对象 ${input.packageId}/${input.objectName} 已存在，拒绝覆盖` +
+          `（并发创建冲突：本次请求处理期间已有同名对象建成）。请换一个对象名或先删除旧对象`,
+      );
     }
-  } else if (transport === 'inactive_object') {
-    await writeViaInactiveObject(pool, input.packageId, input.objectName, xml);
-    result.wrote = true;
-    result.manualActivateHint =
-      `设计时对象已写入 _SYS_REPO.INACTIVE_OBJECT（${input.packageId}/${input.objectName}），` +
-      `请在 HANA Studio 中打开该对象并执行「激活」（直写内部表非官方支持，供 ZDEMO 验证用）`;
-  } else {
-    await writeViaRepoRest(pool, input.packageId, input.objectName, xml);
-    result.wrote = true;
-  }
+    if (transport === 'xs_rest') {
+      // 官方 REST 写路径（PUT create-or-update）。实测：合法模型「写入即激活」，
+      // activated 为写入后的实测状态（非请求参数）；激活检查失败明细从响应体 CheckResult 透出。
+      const meta = await writeViaRest(config, input.packageId, input.objectName, xml, {
+        activate: input.activate ?? false,
+      });
+      result.wrote = true;
+      result.activated = meta.Attributes?.SapBackPack?.Activated === true;
+      const chk = extractCheckResult(meta);
+      if (chk && !chk.consistent) {
+        result.activationErrors = [chk.errorCode, chk.message].filter(Boolean).join(' ') || '激活检查未通过';
+      }
+    } else if (transport === 'inactive_object') {
+      await writeViaInactiveObject(pool, input.packageId, input.objectName, xml);
+      result.wrote = true;
+      result.manualActivateHint =
+        `设计时对象已写入 _SYS_REPO.INACTIVE_OBJECT（${input.packageId}/${input.objectName}），` +
+        `请在 HANA Studio 中打开该对象并执行「激活」（直写内部表非官方支持，供 ZDEMO 验证用）`;
+    } else {
+      await writeViaRepoRest(pool, input.packageId, input.objectName, xml);
+      result.wrote = true;
+    }
+  });
 
   if (result.wrote && input.activate && transport !== 'xs_rest') {
     result.activated = await activateCalculationView(config, pool, input.packageId, input.objectName, 'repo_rest').then(
@@ -697,7 +741,7 @@ export async function activateCalculationView(
   objectName: string,
   transport: 'xs_rest' | 'repo_rest' = 'xs_rest',
 ): Promise<{ transport: string; meta?: FileMeta; repoResp?: RepoRestResponse }> {
-  assertWritePackageAllowed(packageId);
+  assertWritePackageAllowed(packageId, objectName);
   if (transport === 'xs_rest') {
     const meta = await activateViaRest(config, packageId, objectName);
     return { transport: 'xs_rest', meta };
@@ -857,32 +901,37 @@ export async function checkCalculationViewDesignTime(
   objectName: string,
   client?: XsRestClient,
 ): Promise<DesignCheckResult> {
-  assertWritePackageAllowed(packageId);
+  assertWritePackageAllowed(packageId, objectName);
   assertSafeObjectName(objectName, '视图');
   const rest = client ?? makeRestClient(config);
   const suffix = '.calculationview';
   const content = await rest.fileContent(packageId, `${objectName}${suffix}`);
   const tempObject = tempCheckName(objectName);
-  // 残留清理（上次校验异常中断可能遗留临时对象；best-effort）
-  try {
-    await rest.deleteFile(packageId, `${tempObject}${suffix}`);
-  } catch {
-    /* 不存在即忽略 */
-  }
-  let consistent: boolean;
-  let errors: string | undefined;
-  let errorCode: string | undefined;
-  try {
-    const r = await rest.checkFile(packageId, `${tempObject}${suffix}`, content);
-    consistent = r.consistent;
-    errors = r.message;
-    errorCode = r.errorCode;
-  } finally {
+  // 临界区（keyed lock，key=包/对象）：临时对象名由对象名确定性推导（<NAME>_CHKTMP），
+  // 同一对象的并发校验会互相删掉对方的临时对象 —— 把「清理残留 → 写入校验 → 删除副本」
+  // 整段按对象串行化（校验内容是本次调用开头读到的快照，不受串行化影响）。
+  return withKeyedLock(writeLockKey(packageId, objectName), async () => {
+    // 残留清理（上次校验异常中断可能遗留临时对象；best-effort）
     try {
       await rest.deleteFile(packageId, `${tempObject}${suffix}`);
     } catch {
-      /* 清理失败不掩盖校验结果 */
+      /* 不存在即忽略 */
     }
-  }
-  return { packageId, objectName, consistent, errors, errorCode, tempObject };
+    let consistent: boolean;
+    let errors: string | undefined;
+    let errorCode: string | undefined;
+    try {
+      const r = await rest.checkFile(packageId, `${tempObject}${suffix}`, content);
+      consistent = r.consistent;
+      errors = r.message;
+      errorCode = r.errorCode;
+    } finally {
+      try {
+        await rest.deleteFile(packageId, `${tempObject}${suffix}`);
+      } catch {
+        /* 清理失败不掩盖校验结果 */
+      }
+    }
+    return { packageId, objectName, consistent, errors, errorCode, tempObject };
+  });
 }

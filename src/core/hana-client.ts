@@ -2,7 +2,7 @@
 // （cjs-module-lexer 静态检测失败，namespace 只有 default）。统一用 default 导入：运行时即 module.exports。
 import hanaClient from '@sap/hana-client';
 import type { HanaConfig } from '../config/config.js';
-import { normalizeHanaError } from './errors.js';
+import { HanaBusinessError, normalizeHanaError } from './errors.js';
 
 type Connection = hanaClient.Connection;
 type ConnectionOptions = hanaClient.ConnectionOptions;
@@ -52,25 +52,49 @@ function disconnectAsync(conn: Connection): Promise<void> {
   });
 }
 
+/** 池内等待者（持有定时器与「已了结」标记，供超时退出与连接移交判定） */
+interface Waiter {
+  resolve: (conn: Connection) => void;
+  reject: (e: Error) => void;
+  /** true = 已超时退出或已被移交连接；release 据此跳过僵尸等待者，避免连接丢失 */
+  settled: boolean;
+  timer?: NodeJS.Timeout;
+}
+
+/** 连接池可调参数（默认值面向「一个 MCP 服务实例服务多个 HTTP 客户端」的场景） */
+export interface HanaPoolOptions {
+  /** 连接并发上限（默认 4） */
+  max?: number;
+  /** 池满时的排队上限（默认 64）：超出立即失败，防单客户端打满池后请求无限堆积 */
+  maxWaiters?: number;
+  /** 排队等待超时 ms（默认 30s）：到时仍未获得连接即失败，防单个慢查询把全部调用方无限期挂住 */
+  acquireTimeoutMs?: number;
+}
+
 /**
  * 简单 HANA 连接池（@sap/hana-client 原生驱动）：
  * - 懒连接：首次 acquire 才建连；连接失效时自动重建一次
- * - 池满时请求排队等待（MCP stdio 单进程场景足够）
+ * - 池满时请求排队等待，但有**队列上限与等待超时**（HTTP 多客户端下，无界排队会让一个客户端的
+ *   慢查询把其他客户端全部挂死；有界排队把「挂死」变成可解释的失败）
  * - 暴露 query/execute/withConnection 三个入口，service 层只用这几个
  */
 export class HanaPool {
   private readonly options: ConnectionOptions;
   private readonly max: number;
+  private readonly maxWaiters: number;
+  private readonly acquireTimeoutMs: number;
   private idle: Connection[] = [];
   private inUse = 0;
-  private readonly waiters: Array<(conn: Connection) => void> = [];
+  private readonly waiters: Waiter[] = [];
 
-  constructor(config: HanaConfig, opts: { max?: number } = {}) {
+  constructor(config: HanaConfig, opts: HanaPoolOptions = {}) {
     this.options = buildConnectionOptions(config);
     this.max = opts.max ?? 4;
+    this.maxWaiters = opts.maxWaiters ?? 64;
+    this.acquireTimeoutMs = opts.acquireTimeoutMs ?? 30_000;
   }
 
-  /** 获取一个可用连接（池满则排队） */
+  /** 获取一个可用连接（池满则排队；队列满或等待超时以 HanaBusinessError 失败） */
   async acquire(): Promise<Connection> {
     if (this.idle.length > 0) {
       const conn = this.idle.pop() as Connection;
@@ -86,22 +110,49 @@ export class HanaPool {
         throw e;
       }
     }
-    // 池满：排队等待释放
-    return new Promise<Connection>((resolve) => {
-      this.waiters.push(resolve);
+    // 池满：排队（有界 + 超时）
+    if (this.waiters.length >= this.maxWaiters) {
+      throw new HanaBusinessError(
+        `HANA 连接池繁忙：等待队列已满（${this.waiters.length} 个请求在排队，池上限 ${this.max} 个连接）。请降低并发或稍后重试`,
+      );
+    }
+    return new Promise<Connection>((resolve, reject) => {
+      const waiter: Waiter = { resolve, reject, settled: false };
+      waiter.timer = setTimeout(() => {
+        if (waiter.settled) return;
+        waiter.settled = true;
+        // 自我摘除，避免占用队列名额与后续无谓的移交尝试
+        const i = this.waiters.indexOf(waiter);
+        if (i >= 0) this.waiters.splice(i, 1);
+        reject(
+          new HanaBusinessError(
+            `HANA 连接池等待超时（${this.acquireTimeoutMs}ms）：${this.max} 个连接全部被占满（可能有长查询在跑）。请稍后重试或降低并发`,
+          ),
+        );
+      }, this.acquireTimeoutMs);
+      // 不因等待定时器而阻止进程退出（退出流程由 index.ts 的 exit 钩子收尾）
+      waiter.timer.unref?.();
+      this.waiters.push(waiter);
     });
   }
 
-  /** 归还连接（空闲队列，供后续复用） */
+  /** 归还连接（移交给下一个存活等待者，无等待者则入空闲队列） */
   release(conn: Connection): void {
     this.inUse--;
-    const next = this.waiters.shift();
-    if (next) {
+    for (;;) {
+      const next = this.waiters.shift();
+      if (!next) {
+        this.idle.push(conn);
+        return;
+      }
+      // 已超时退出的等待者：跳过并把连接继续传给下一位（否则连接就此丢失、池容量泄漏）
+      if (next.settled) continue;
+      next.settled = true;
+      if (next.timer) clearTimeout(next.timer);
       this.inUse++;
-      next(conn);
+      next.resolve(conn);
       return;
     }
-    this.idle.push(conn);
   }
 
   /** 执行查询并整体返回行（SELECT 语义；行数上限由调用方 SQL 保证） */
@@ -197,7 +248,7 @@ export class HanaPool {
   }
 
   /** 池状态（调试/测试用） */
-  stats(): { idle: number; inUse: number; max: number } {
-    return { idle: this.idle.length, inUse: this.inUse, max: this.max };
+  stats(): { idle: number; inUse: number; max: number; waiting: number } {
+    return { idle: this.idle.length, inUse: this.inUse, max: this.max, waiting: this.waiters.length };
   }
 }

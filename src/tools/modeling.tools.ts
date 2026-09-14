@@ -20,7 +20,8 @@ export function registerModelingTools(server: McpServer, ctx: ToolContext): void
       title: '新建 Calculation View（计算视图）',
       description:
         '在仓库中新建一个 Calculation View（计算视图）。当前仅支持最小形态：单个 Projection 节点 + 单个表/视图数据源（全列透传）。' +
-        '安全约束：写操作的可写包范围由 mcp.json 的 HANA_WRITE_PACKAGES 配置（空=全部可写；非空=仅配置包及其子包）；同名对象已存在时拒绝覆盖。' +
+        '安全约束：写操作的可写包范围由 mcp.json 的 HANA_WRITE_PACKAGES 配置（空=全部可写；非空=仅配置包及其子包）；同名对象已存在时拒绝覆盖' +
+        '（并发同名创建在服务端按对象串行化，后到者显式报并发冲突，不会静默覆盖前者）。' +
         '流程：校验包名/对象名 → 检查对象不存在 → 取源列 → 生成设计时 XML → 写入仓库（XS REST PUT）→（可选）显式激活。' +
         '实测边界（SPS08）：①激活要求视图至少 1 个度量 → 默认 SUM_NUMERIC（数值列聚合 sum），ALL_ATTRIBUTES（无度量）激活会被 40117 拒绝；' +
         '②本服务器对合法模型「写入即激活」，activate=false 不保证 inactive——返回的 activated 为写入后实测状态（激活失败的对象才是 inactive，错误明细在 activationErrors）。' +
@@ -186,8 +187,9 @@ reg(
           '② xml：传入完整新设计时 XML 全量覆盖（复杂改造用；可先用 hana_metadata_get_view(format=xml) 读取再改，最小 diff）。' +
           'xml 方式写入前有服务端护栏（XML 可解析、根 scenario id 与对象名一致、logicalModel 指向真实节点——手工改 XML 两大高频事故激活前拦下），' +
           '通过后返回 xmlVerification 摘要（输出节点/字段数）供免回读自检。' +
-          '两种方式都走 XS REST PUT + If-Match ETag 乐观锁：operations 模式在读取基线（设计时当前内容）时即捕获 ETag 全程持锁，' +
-          'xml 模式缺省在写入时取当前 ETag；显式传 ifMatch 不一致（并发冲突）返回 isError 并提示重读最新版本。' +
+          '两种方式都走 XS REST PUT + If-Match ETag 乐观锁：ETag 基线统一在**请求入口**捕获（读时取），' +
+          '到写入之间的任何并发写入都会使基线失效，冲突以 HTTP 412 显式返回（isError + 重读提示），不会静默覆盖他人改动；' +
+          '需要跨调用强一致（例如基于更早一次读取的内容）时显式传 ifMatch。' +
           '实测边界：本服务器对合法模型「写入即激活」，返回的 activated 为写入后实测状态；新内容编译失败时对象保持旧激活版本，明细在 activationErrors。' +
           '安全约束：写操作包范围由 HANA_WRITE_PACKAGES 配置。',
         inputSchema: z.object({

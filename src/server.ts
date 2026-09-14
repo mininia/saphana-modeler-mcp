@@ -25,7 +25,7 @@ export const SERVER_INSTRUCTIONS = `saphana-modeler-mcp：SAP HANA 经典 Modele
 
 数据预览（hana_data_preview）约定：支持范围有限，不支持即直接返回「不支持」，不做其他尝试。默认对已激活视图整体预览（_SYS_BIC 直查），无筛选默认 10 行、有筛选默认 100 行，VIRTUAL 视图用 parameters 传输入参数；仅当用户明确要求看某视图的某个节点时才传 node——走 HANA 原生中间视图机制（CREATE_INTERMEDIATE_CALCULATION_VIEW_DEV，Studio 同款，任意节点类型支持，查询后自动 DROP），需要 EXECUTE 权限，缺权限直接返回不支持；只读 XML 推导模式（forceDerive=true，Projection/Join/Aggregation/Union/Rank）需显式启用。权限类失败（缺 EXECUTE/SELECT、_SYS_BIC 对象不可见的 258/259）会自动附带权限诊断报告（envelope.raw.diagnosis），无需额外调用即可定位阻塞点；hana_data_preview_diagnose 可手动前置排查或区分「权限缺失」与「对象未激活」。
 
-统一返回 envelope：{ success, data?, messages[], raw? }。硬错误（参数非法/对象不存在）返回 isError 并附恢复提示。`;
+统一返回 envelope：{ success, data?, messages[], raw? }（HTTP 模式下额外带 clientId = 本次调用的客户端身份，见 MCP_HTTP_TOKENS）。硬错误（参数非法/对象不存在）返回 isError 并附恢复提示。`;
 
 /**
  * 创建 MCP Server（协议层）：McpServer（含 instructions）+ 工具注册（v2 config-object 范式）。

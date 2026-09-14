@@ -23,4 +23,10 @@ export interface Envelope {
   messages: HanaMessage[];
   /** 透传原始返回（如 HANA 原生错误对象），供调试 */
   raw?: unknown;
+  /**
+   * 本次调用的客户端身份（HTTP 模式由 MCP_HTTP_TOKENS 的 Token→身份映射得到；
+   * 未配置 Token 时为 anonymous）。stdio 模式无身份上下文，该字段缺省。
+   * 用途：多客户端共享同一 HANA 技术账号时，让调用方/审计侧知道「这次是谁发的」。
+   */
+  clientId?: string;
 }

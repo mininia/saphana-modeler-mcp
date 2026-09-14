@@ -50,7 +50,14 @@ MCP setup: copy `mcp.json.example` to `mcp.json` and fill in real connection det
 
 ## Configuration
 
-Connection info is only allowed from environment variables / `mcp.json` `env` / project-root `.env`. No defaults are provided — the server fails fast on startup if any required value is missing.
+Connection info is only allowed from environment variables / `mcp.json` `env` (**stdio mode only**) / a `.env` file. No defaults are provided — the server fails fast on startup if any required value is missing.
+
+| How it runs | Where configuration actually comes from |
+| --- | --- |
+| **stdio** (spawned by an MCP client) | The client's `mcp.json` `env` block is injected as child-process environment variables → equivalent to environment variables; once the credential triple (`HANA_HOST`+`HANA_USER`+`HANA_PASSWORD`) is complete, `.env` is **not read at all** |
+| **Streamable HTTP** (you run `npm start` / a container) | Nothing spawns the process on your behalf, so **`mcp.json` plays no part**; the source is the shell/container environment → `.env` as fallback |
+
+`.env` is looked up in the **working directory first, then the project root** (`dist/` two levels up), and it applies **per variable** — `process.loadEnvFile` never overwrites variables that already exist. So if only part of the credential triple comes from the external environment, the two sources get mixed (the classic case: a leftover `HANA_USER` in your shell silently wins over the one in `.env` while everything else comes from `.env`), which can connect you to a different environment. When the server detects connection targets/credentials coming from more than one source it logs a startup **warning** naming each variable's source — use it to clean up the stray variables.
 
 | Option | Required | Description | Example |
 | --- | --- | --- | --- |
@@ -74,7 +81,8 @@ Connection info is only allowed from environment variables / `mcp.json` `env` / 
 | `LOG_LEVEL` | optional | Log level, default `info` | `debug` |
 | `MCP_HTTP_PORT` | optional | Streamable HTTP port; when set the server starts in HTTP mode (endpoint `/mcp`), unset = stdio (default). `0` = random port | `3000` |
 | `MCP_HTTP_HOST` | optional | HTTP listen address, default `127.0.0.1` (loopback only, fail-closed); set explicitly (e.g. `0.0.0.0`) to expose | `127.0.0.1` |
-| `MCP_HTTP_TOKEN` | optional | HTTP bearer token (≥16 chars): when set, all requests must carry `Authorization: Bearer <token>` (timing-safe comparison); missing/mismatched → 401. Strongly recommended when exposing externally | — |
+| `MCP_HTTP_TOKEN` | optional | HTTP bearer token (≥16 chars): when set, all requests must carry `Authorization: Bearer <token>` (timing-safe comparison); missing/mismatched → 401. Strongly recommended when exposing externally. A single token cannot identify callers — every request is attributed to the identity `shared` | — |
+| `MCP_HTTP_TOKENS` | optional | **Multi-client token → identity map** (comma-separated `name:token`): each token maps to its own `clientId`, surfaced in `envelope.clientId` and the audit log (the only attribution source when clients share one HANA account). `name` is limited to `[A-Za-z0-9_.-]{1,32}`, `token` ≥16 chars; duplicates/invalid entries abort startup. May coexist with `MCP_HTTP_TOKEN` | `alice:<token>,bob:<token>` |
 | `MCP_HTTP_ALLOWED_HOSTS` | optional | Allowed `Host` header hostnames (DNS rebinding protection; comma-separated, no ports, IPv6 in brackets), defaults to loopback names only | `localhost,myhost.corp` |
 | `MCP_HTTP_ALLOWED_ORIGINS` | optional | Allowed `Origin` hostnames (comma-separated, no scheme/port; requests without an Origin header pass), defaults to loopback names only | `localhost` |
 
@@ -95,12 +103,24 @@ Two MCP transports are supported, switched by whether `MCP_HTTP_PORT` is set (al
 HTTP mode notes:
 
 - Endpoint `http://<host>:<port>/mcp` (this path only; others → 404); stateless per-request serving (both 2025/2026 protocol-version clients connect), shared connection pool
+- **Sessions & isolation**: there are no sessions — every request gets a fresh protocol instance, no `Mcp-Session-Id`, no session-scoped state, so there is no cross-session leakage or session-hijacking surface (and, correspondingly, no session-level quotas or cancellation). The isolation boundary is the server process: all clients share one connection pool, one tool-visibility config and one writable-package allowlist
 - **Secure defaults (fail-closed)**:
   - Binds `127.0.0.1` only; the Host/Origin allowlists default to loopback names (DNS rebinding protection). To expose externally you need all of: `MCP_HTTP_HOST=0.0.0.0` + `MCP_HTTP_ALLOWED_HOSTS` including the external hostname (plus `MCP_HTTP_ALLOWED_ORIGINS` for browser-like clients)
   - **Authentication**: set `MCP_HTTP_TOKEN` (≥16 chars) to enforce bearer-token validation on every request (missing/mismatched → 401); unset = the loopback binding is the access boundary, and external listening without a token logs a startup warning
   - Request body capped at 10MB (exceeding → 413); chunked uploads carry no Content-Length — let the reverse proxy enforce limits
-- No built-in OAuth or similar full auth system: when exposing to a network, set `MCP_HTTP_TOKEN` and place it behind a reverse proxy / VPN / firewall
-- Logs still go to stderr and never pollute the HTTP protocol channel; 401 logs never record the Authorization header value
+- **Client identity attribution**: `MCP_HTTP_TOKENS` maps each token to its own `clientId`, carried through the request context into the tool layer —
+  - every tool result envelope carries `clientId` (absent in stdio mode, so the envelope shape is unchanged there)
+  - every write leaves one audit line in the server log (`clientId` + package + object); stdio logs carry no `clientId`
+  - why it matters: the database identity is a single process-level technical account (`HANA_USER`), so `_SYS_REPO`'s `OWNER`/`ACTIVATED_BY` can only ever name that account — with multiple clients the repository side cannot tell callers apart
+  - with no token configured (loopback default) every request is attributed to `anonymous`
+- **Concurrency & locking** (the real limits when one instance serves multiple clients):
+  - Updates (`hana_view_update`): XS REST `If-Match` ETag optimistic locking, with the baseline captured at **request entry**; concurrent writes between the read and the PUT surface as an explicit 412 instead of silently overwriting
+  - Creates (`hana_view_create`) / design-time validation (`hana_view_validate` design mode): the existence check plus write, and the temporary copy's "clean up → write → delete" sequence, are serialized per object server-side (in-process keyed lock); the loser of a concurrent same-name create gets an explicit conflict error
+  - Connection pool: 4 connections max, queueing when saturated (queue cap 64, wait timeout 30s — overflow/timeout return a readable error instead of hanging indefinitely), so one client's slow query cannot stall the others
+  - View-definition cache: 60s TTL plus a 200-entry LRU cap, so multi-client fetching cannot grow memory without bound
+  - All of the above locks are **in-process**: multi-process/multi-instance deployments against the same HANA need external serialization (this server is designed as a single instance)
+- No built-in OAuth or similar full auth system: when exposing to a network, set `MCP_HTTP_TOKEN` / `MCP_HTTP_TOKENS` and place it behind a reverse proxy / VPN / firewall
+- Logs still go to stderr and never pollute the HTTP protocol channel; 401 logs never record the Authorization header value; token plaintext is neither kept in the comparison structures nor echoed into error messages
 
 ```bash
 MCP_HTTP_PORT=3000 MCP_HTTP_TOKEN='your-long-random-token' node dist/index.js
@@ -213,7 +233,9 @@ src/
   http.ts             Streamable HTTP transport: createMcpHandler per-request factory + node:http adapter + Host/Origin guards
   server.ts           McpServer (server-instructions domain context) + all tool registration
   config/             zod env-var validation (connection/TLS/timezone/allowlists/writable packages)
-  core/               HANA connection pool, SQL escaping & allowlist, error envelope, log redaction, XML utils, XS REST client
+  core/               HANA connection pool (bounded queue + wait timeout), SQL escaping & allowlist, error envelope,
+                      log redaction, per-request identity context (multi-client HTTP attribution), write critical-section
+                      keyed lock, XML utils, XS REST client
   model/              View TS types, XML bidirectional parsing, minimal-CV XML construction
   services/
     metadata.service        Read-only: package/object search/fields/lineage/table catalog
@@ -231,7 +253,7 @@ scripts/               General smoke script (smoke-stdio); real-machine verifica
 
 > `tests/` and `docs/` are not committed (they contain environment identifiers/probe records, kept locally for development); after cloning, prepare tests & docs as needed.
 
-Each tool returns a unified envelope `{ success, data?, messages[], raw? }`: hard errors (illegal params / object not found) come back via MCP `isError` with a recovery hint; HANA business failures (e.g. activation error details) go through `success:false`.
+Each tool returns a unified envelope `{ success, data?, messages[], raw? }` (in HTTP mode it also carries `clientId`, the caller identity resolved from `MCP_HTTP_TOKENS`): hard errors (illegal params / object not found) come back via MCP `isError` with a recovery hint; HANA business failures (e.g. activation error details) go through `success:false`.
 
 ## HANA Authorization Requirements
 

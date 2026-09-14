@@ -22,6 +22,15 @@ async function main(): Promise<void> {
   }
 
   const config = loadConfig();
+  // 连接目标/凭据跨来源混用（如 shell 残留 HANA_USER + .env 提供其余项）→ 可能连到另一套环境，必须显式告警。
+  // 只输出「哪个变量来自哪里」，不含任何值（连接信息/账号名一律不落日志）。
+  if (config.connectionSourceMixed) {
+    logger.warn(
+      { sources: config.connectionSources },
+      '连接目标与凭据来自多个来源（进程环境变量与 .env 混用）：已存在的环境变量不会被 .env 覆盖，' +
+        '请核对这些变量确实指向同一套环境（清掉多余的环境变量，或全部集中到三者之一）',
+    );
+  }
   // 接线 schema 白名单扩展（HANA_SCHEMA_ALLOW），使配置项真正生效
   configureExtraSchemas(config.schemaAllow);
   // 接线写操作包白名单（HANA_WRITE_PACKAGES）：空=不限制；非空=仅配置包及其子包可写

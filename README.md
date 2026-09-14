@@ -49,7 +49,14 @@ MCP 接入：将 `mcp.json.example` 复制为 `mcp.json` 并填入真实连接�
 
 ## 配置参数
 
-连接信息只允许来自环境变量 / `mcp.json` 的 `env` / 项目根 `.env`，不提供默认值，缺失时服务启动即失败。
+连接信息只允许来自环境变量 / `mcp.json` 的 `env`（**仅 stdio 模式生效**）/ `.env` 文件，不提供默认值，缺失时服务启动即失败。
+
+| 运行方式 | 配置实际来源 |
+| --- | --- |
+| **stdio**（MCP 客户端拉起进程） | 客户端 `mcp.json` 的 `env` 由客户端注入为子进程环境变量 → 等价于环境变量；凭据三件套（`HANA_HOST`+`HANA_USER`+`HANA_PASSWORD`）齐全时 **不再读 `.env`** |
+| **Streamable HTTP**（自行 `npm start` / 容器启动） | 没有客户端拉起进程，**`mcp.json` 不参与**；来源为 shell/容器环境变量 → 兜底 `.env` |
+
+`.env` 查找顺序为 **工作目录 → 项目根**（`dist/` 上两级），且**逐变量生效**——`process.loadEnvFile` 不覆盖已存在的环境变量。因此三件套只有一部分来自外部环境时会跨来源混用（典型：shell 里残留的 `HANA_USER` 覆盖 `.env` 中的用户名，其余仍取 `.env`），可能连接到另一套环境。服务检测到连接目标/凭据来自多个来源时，会在启动日志 **warn** 并列出每个变量的来源，请据此清理多余的环境变量。
 
 | 配置项 | 必填 | 说明 | 示例 |
 | --- | --- | --- | --- |
@@ -73,7 +80,8 @@ MCP 接入：将 `mcp.json.example` 复制为 `mcp.json` 并填入真实连接�
 | `LOG_LEVEL` | 可选 | 日志级别，默认 `info` | `debug` |
 | `MCP_HTTP_PORT` | 可选 | Streamable HTTP 端口；设置后以 HTTP 模式启动（端点 `/mcp`），未设置 = stdio（默认）。`0` = 随机端口 | `3000` |
 | `MCP_HTTP_HOST` | 可选 | HTTP 监听地址，默认 `127.0.0.1`（仅本机，fail-closed）；对外暴露需显式配置（如 `0.0.0.0`） | `127.0.0.1` |
-| `MCP_HTTP_TOKEN` | 可选 | HTTP Bearer Token（≥16 字符）：设置后所有请求须带 `Authorization: Bearer <token>`（timing-safe 比较），缺失/不匹配 → 401；对外暴露时强烈建议配置 | — |
+| `MCP_HTTP_TOKEN` | 可选 | HTTP Bearer Token（≥16 字符）：设置后所有请求须带 `Authorization: Bearer <token>`（timing-safe 比较），缺失/不匹配 → 401；对外暴露时强烈建议配置。单一 Token 无法区分调用方，所有请求归为身份 `shared` | — |
+| `MCP_HTTP_TOKENS` | 可选 | **多客户端 Token → 身份映射**（逗号分隔 `name:token`）：每个 Token 对应一个 `clientId`，进 `envelope.clientId` 与审计日志（多客户端共享同一 HANA 账号时的唯一归属来源）。`name` 限 `[A-Za-z0-9_.-]{1,32}`，`token` ≥16 字符；重复/非法则启动失败。可与 `MCP_HTTP_TOKEN` 并存 | `alice:<token>,bob:<token>` |
 | `MCP_HTTP_ALLOWED_HOSTS` | 可选 | 允许的 Host 头主机名（DNS rebinding 防护；逗号分隔，不含端口，IPv6 带方括号），默认仅本机名 | `localhost,myhost.corp` |
 | `MCP_HTTP_ALLOWED_ORIGINS` | 可选 | 允许的 Origin 主机名（逗号分隔，不含 scheme/端口；无 Origin 头的请求放行），默认仅本机名 | `localhost` |
 
@@ -94,12 +102,24 @@ MCP 接入：将 `mcp.json.example` 复制为 `mcp.json` 并填入真实连接�
 HTTP 模式要点：
 
 - 端点 `http://<host>:<port>/mcp`（仅此路径，其余 404）；无状态按请求服务（2025/2026 协议版本客户端均可接入），连接池共享
+- **会话与隔离**：本服务**无会话**——每个请求新建协议实例、无 `Mcp-Session-Id`、无会话级状态，因此不存在跨会话串扰与会话劫持面；相应地也没有会话级配额/取消。隔离粒度 = 单个服务进程：所有客户端共享同一连接池、同一工具可见性配置、同一可写包白名单
 - **安全默认（fail-closed）**：
   - 仅绑定 `127.0.0.1`，Host/Origin 白名单默认仅本机名（DNS rebinding 防护）。对外暴露需同时：`MCP_HTTP_HOST=0.0.0.0` + `MCP_HTTP_ALLOWED_HOSTS` 放行对外主机名（浏览器类客户端再放行 `MCP_HTTP_ALLOWED_ORIGINS`）
   - **认证**：设置 `MCP_HTTP_TOKEN`（≥16 字符）后所有请求强制 Bearer Token 校验（缺失/不匹配 → 401）；未设置时回环监听即为访问边界，对外监听且无 Token 会在启动日志告警
   - 请求体上限 10MB（超限 413）；chunked 流式上传无 Content-Length 头，请交由反向代理限长
-- 未内置 OAuth 等完整认证体系：暴露到网络时请配置 `MCP_HTTP_TOKEN` 并置于反向代理 / VPN / 防火墙之后
-- 日志仍走 stderr，不污染 HTTP 协议通道；401 日志不记录 Authorization 头内容
+- **客户端身份归因**：`MCP_HTTP_TOKENS` 把每个 Token 映射为独立 `clientId`，随请求上下文贯穿到工具层——
+  - 每次工具调用返回的 envelope 带 `clientId`（stdio 模式无此字段，形态与既有版本一致）
+  - 每个写操作在服务端日志留一条审计记录（`clientId` + 包 + 对象）；stdio 模式日志不含 `clientId`
+  - 为什么需要它：数据库身份是进程级单一技术账号（`HANA_USER`），`_SYS_REPO` 的 `OWNER`/`ACTIVATED_BY` 只能记到该账号，**多客户端下仓库侧无法区分调用方**
+  - 未配置任何 Token（回环默认边界）时所有请求归为 `anonymous`
+- **并发与锁**（多客户端共享一个实例时的实际边界）：
+  - 更新（`hana_view_update`）：XS REST 的 `If-Match` ETag 乐观锁，基线在**请求入口**捕获，到写入之间的并发改动以 412 显式冲突返回，不静默覆盖
+  - 新建（`hana_view_create`）/设计时校验（`hana_view_validate` design 模式）：存在性检查与写入、临时校验副本的「清理 → 写入 → 删除」在服务端按对象串行化（进程内 keyed lock），并发同名创建后者显式报冲突
+  - 连接池：上限 4 个连接，池满时排队（队列上限 64、等待超时 30s，超限/超时以可读错误返回而不是无限期挂住），避免单个客户端的慢查询拖住其他客户端
+  - 视图定义缓存：TTL 60s + 容量 200 条 LRU，防止多客户端拉取把内存撑大
+  - 上述锁均为**进程内**：多进程/多实例部署同一 HANA 时需外部串行化（本服务设计为单实例）
+- 未内置 OAuth 等完整认证体系：暴露到网络时请配置 `MCP_HTTP_TOKEN` / `MCP_HTTP_TOKENS` 并置于反向代理 / VPN / 防火墙之后
+- 日志仍走 stderr，不污染 HTTP 协议通道；401 日志不记录 Authorization 头内容；Token 原文不驻留于比对结构、不回显到错误信息
 
 ```bash
 MCP_HTTP_PORT=3000 MCP_HTTP_TOKEN='your-long-random-token' node dist/index.js
@@ -212,7 +232,8 @@ src/
   http.ts             Streamable HTTP 传输：createMcpHandler 按请求工厂 + node:http 适配 + Host/Origin 防护
   server.ts           McpServer（server instructions 领域上下文）+ 全部工具注册
   config/             zod 环境变量校验（连接/TLS/时区/白名单/可写包）
-  core/               HANA 连接池、SQL 转义与白名单、错误 envelope、日志脱敏、XML 工具、XS REST 客户端
+  core/               HANA 连接池（有界排队+等待超时）、SQL 转义与白名单、错误 envelope、日志脱敏、
+                      请求身份上下文（HTTP 多客户端归因）、写临界区 keyed lock、XML 工具、XS REST 客户端
   model/              视图 TS 类型、XML 双向解析、最小 CV 的 XML 构造
   services/
     metadata.service        只读：包/对象搜索/字段/血缘/表目录
@@ -230,7 +251,7 @@ scripts/               通用冒烟脚本（smoke-stdio）；实机验收/探针
 
 > `tests/` 与 `docs/` 不入库（含环境标识/探测记录，本地保留供开发）；克隆后按需自备测试与文档。
 
-每个工具统一返回信封 `{ success, data?, messages[], raw? }`：硬错误（参数非法/对象不存在）通过 MCP
+每个工具统一返回信封 `{ success, data?, messages[], raw? }`（HTTP 模式下另带 `clientId` = 由 `MCP_HTTP_TOKENS` 解析出的调用方身份）：硬错误（参数非法/对象不存在）通过 MCP
 `isError` 返回并附恢复提示；HANA 业务失败（如激活报错明细）走 `success:false`。
 
 ## HANA 授权要求

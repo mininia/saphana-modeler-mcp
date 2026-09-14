@@ -2,7 +2,8 @@
  * Streamable HTTP 冒烟测试：真实启动 dist/index.js（MCP_HTTP_PORT=0 随机端口），
  * 走完整 MCP streamable HTTP 握手（initialize → notifications/initialized → tools/list），
  * 并验证安全守卫链：Bearer Token（缺失/错误 → 401）、伪造 Host（→ 403）、
- * 非 /mcp 路径（→ 404）、超限 Content-Length（→ 413）、无状态回退（GET /mcp → 405）。
+ * 非 /mcp 路径（→ 404）、超限 Content-Length（→ 413）、无状态回退（GET /mcp → 405）、
+ * 多客户端 Token → 身份映射（不同 Token 归因到不同 clientId）。
  *
  * 不调用任何工具（工具全部触数据库），注入 dummy 配置仅用于通过 config 校验；
  * 实机验收脚本在本地 test-verification/（不入库）。
@@ -16,6 +17,9 @@ import { LATEST_PROTOCOL_VERSION } from '@modelcontextprotocol/server';
 
 // 测试专用 dummy token（长度须满足 config 校验 ≥16 字符；非真实凭据）
 const TOKEN = 'smoke-http-dummy-token-0123456789';
+// 多客户端身份映射（MCP_HTTP_TOKENS）：alpha / beta 各自独立身份
+const ALPHA_TOKEN = 'smoke-http-alpha-token-0123456789';
+const BETA_TOKEN = 'smoke-http-beta-token-0123456789';
 
 const child = spawn(process.execPath, ['dist/index.js'], {
   cwd: process.cwd(),
@@ -34,16 +38,27 @@ const child = spawn(process.execPath, ['dist/index.js'], {
     HANA_TIMEZONE: 'Asia/Shanghai',
     MCP_HTTP_PORT: '0',
     MCP_HTTP_TOKEN: TOKEN,
+    MCP_HTTP_TOKENS: `alpha:${ALPHA_TOKEN},beta:${BETA_TOKEN}`,
+    // 身份归因日志是 debug 级（每请求一条），冒烟测试需要它来验证 Token → 身份映射
+    LOG_LEVEL: 'debug',
   },
 });
 
 let port;
+/** 每请求一条的身份归属日志（clientId） */
+const observedClientIds = [];
+/** 启动日志里声明的身份映射表 */
+let startupClientIds = [];
 const stderrRl = createInterface({ input: child.stderr });
 stderrRl.on('line', (line) => {
   console.error(line);
   try {
     const j = JSON.parse(line);
     if (typeof j.httpPort === 'number' && j.httpPort > 0) port = j.httpPort;
+    if (Array.isArray(j.clientIds)) startupClientIds = j.clientIds;
+    if (typeof j.clientId === 'string' && typeof j.msg === 'string' && j.msg.includes('归属客户端身份')) {
+      observedClientIds.push(j.clientId);
+    }
   } catch {
     /* 非 JSON 行（tsx 转译等）忽略 */
   }
@@ -66,6 +81,14 @@ async function waitPort() {
 }
 
 let nextId = 1;
+
+/** 等待身份归属日志出现指定 clientId（最多 3s；日志与响应同批到达，通常立即可见） */
+async function waitForClientId(id) {
+  for (let i = 0; i < 30 && !observedClientIds.includes(id); i++) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return observedClientIds.includes(id);
+}
 
 /** 解析响应体：application/json 直接 parse；SSE 流取含 id 的最后一条 data 事件 */
 async function readMessage(res) {
@@ -210,6 +233,21 @@ try {
     headers: { authorization: `Bearer ${TOKEN}` },
   }).then((r) => r.status);
   console.log('[stateless] GET /mcp → HTTP', getStatus, getStatus === 405 ? '（无状态回退符合预期）' : '');
+
+  // 客户端身份映射：不同 Token → 不同 clientId（envelope.clientId 与审计日志的取值来源）
+  await rpc('tools/list', undefined, { authorization: `Bearer ${ALPHA_TOKEN}` });
+  await rpc('tools/list', undefined, { authorization: `Bearer ${BETA_TOKEN}` });
+  for (const id of ['alpha', 'beta']) {
+    if (!(await waitForClientId(id))) {
+      throw new Error(`未观测到客户端身份 ${id} 的请求归属日志（已观测：${observedClientIds.join(',') || '无'}）`);
+    }
+  }
+  for (const id of ['alpha', 'beta', 'shared']) {
+    if (!startupClientIds.includes(id)) {
+      throw new Error(`启动日志的身份映射缺少 ${id}（实际：${startupClientIds.join(',') || '无'}）`);
+    }
+  }
+  console.log('[identity] Token → 身份映射生效：', startupClientIds.join(', '));
 
   console.log('[smoke:http] PASS');
 } catch (e) {
