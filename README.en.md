@@ -7,7 +7,7 @@ An MCP server for SAP HANA classic Modeler capabilities (TypeScript, Node >= 20.
 modeling write operations** for information views (calculation views / attribute views / analytic views) and
 repository objects.
 
-Connect via the MCP stdio protocol to clients such as Claude / IDE: invoke tools to browse, validate, and
+Connect via the MCP protocol (both **stdio and Streamable HTTP** transports) to clients such as Claude / IDE: invoke tools to browse, validate, and
 (within configured writable packages) create calculation views — no HANA Studio required.
 
 ## Overview
@@ -72,12 +72,40 @@ Connection info is only allowed from environment variables / `mcp.json` `env` / 
 | `HANA_TOOL_ALLOW` | optional | Force-enabled tool name globs (registered even if their group is disabled; comma-separated, supports `*`) | `hana_view_validate` |
 | `HANA_TOOL_DENY` | optional | Force-disabled tool name globs (highest priority, overrides allow & groups; comma-separated, supports `*`) | `hana_data_preview*` |
 | `LOG_LEVEL` | optional | Log level, default `info` | `debug` |
-| `MCP_HTTP_PORT` | reserved | Streamable HTTP port (current mainline is stdio) | — |
+| `MCP_HTTP_PORT` | optional | Streamable HTTP port; when set the server starts in HTTP mode (endpoint `/mcp`), unset = stdio (default). `0` = random port | `3000` |
+| `MCP_HTTP_HOST` | optional | HTTP listen address, default `127.0.0.1` (loopback only, fail-closed); set explicitly (e.g. `0.0.0.0`) to expose | `127.0.0.1` |
+| `MCP_HTTP_TOKEN` | optional | HTTP bearer token (≥16 chars): when set, all requests must carry `Authorization: Bearer <token>` (timing-safe comparison); missing/mismatched → 401. Strongly recommended when exposing externally | — |
+| `MCP_HTTP_ALLOWED_HOSTS` | optional | Allowed `Host` header hostnames (DNS rebinding protection; comma-separated, no ports, IPv6 in brackets), defaults to loopback names only | `localhost,myhost.corp` |
+| `MCP_HTTP_ALLOWED_ORIGINS` | optional | Allowed `Origin` hostnames (comma-separated, no scheme/port; requests without an Origin header pass), defaults to loopback names only | `localhost` |
 
 Port auto-derivation rules:
 
 - SYSTEMDB / single container: `3<instance>13` (e.g. instance=10 → 31013)
 - Tenant database (MDC): `3<instance>15` (e.g. instance=10 → 31015)
+
+## Transports
+
+Two MCP transports are supported, switched by whether `MCP_HTTP_PORT` is set (all tools/config behave identically):
+
+| Transport | How to enable | Use case |
+| --- | --- | --- |
+| **stdio** (default) | leave `MCP_HTTP_PORT` unset | Local clients (Claude Desktop / Cursor / VS Code) that spawn the server as a child process |
+| **Streamable HTTP** | set `MCP_HTTP_PORT` (e.g. `3000`) and run `npm start` (or `node dist/index.js`) | Remote/containerized deployment, one shared server for multiple clients, MCP clients that connect via `url` |
+
+HTTP mode notes:
+
+- Endpoint `http://<host>:<port>/mcp` (this path only; others → 404); stateless per-request serving (both 2025/2026 protocol-version clients connect), shared connection pool
+- **Secure defaults (fail-closed)**:
+  - Binds `127.0.0.1` only; the Host/Origin allowlists default to loopback names (DNS rebinding protection). To expose externally you need all of: `MCP_HTTP_HOST=0.0.0.0` + `MCP_HTTP_ALLOWED_HOSTS` including the external hostname (plus `MCP_HTTP_ALLOWED_ORIGINS` for browser-like clients)
+  - **Authentication**: set `MCP_HTTP_TOKEN` (≥16 chars) to enforce bearer-token validation on every request (missing/mismatched → 401); unset = the loopback binding is the access boundary, and external listening without a token logs a startup warning
+  - Request body capped at 10MB (exceeding → 413); chunked uploads carry no Content-Length — let the reverse proxy enforce limits
+- No built-in OAuth or similar full auth system: when exposing to a network, set `MCP_HTTP_TOKEN` and place it behind a reverse proxy / VPN / firewall
+- Logs still go to stderr and never pollute the HTTP protocol channel; 401 logs never record the Authorization header value
+
+```bash
+MCP_HTTP_PORT=3000 MCP_HTTP_TOKEN='your-long-random-token' node dist/index.js
+# → ready (streamable HTTP transport, endpoint /mcp), listening on http://127.0.0.1:3000/mcp
+```
 
 ## Tool Groups & Visibility Control
 
@@ -171,6 +199,7 @@ You can also use `hana_data_preview_diagnose` to pre-check manually, focusing on
 | `npm start` | Run dist/index.js (stdio) |
 | `npm test` | Unit tests (node --test + tsx; test files kept locally, not in repo) |
 | `npm run smoke` | Build + stdio smoke test |
+| `npm run smoke:http` | Build + Streamable HTTP smoke test (handshake/tool registration/Host guard; no real HANA needed) |
 | `npm run typecheck` | Type-check only |
 | `npm run verify:system` | Build + real-HANA system-tool verification |
 | `npm run verify:p1-5` | Build + read-path/preview/field-logic black-box verification |
@@ -180,7 +209,8 @@ You can also use `hana_data_preview_diagnose` to pre-check manually, focusing on
 
 ```
 src/
-  index.ts            Entry: load config → connection pool → create MCP server → stdio
+  index.ts            Entry: load config → connection pool → stdio / Streamable HTTP transport branch
+  http.ts             Streamable HTTP transport: createMcpHandler per-request factory + node:http adapter + Host/Origin guards
   server.ts           McpServer (server-instructions domain context) + all tool registration
   config/             zod env-var validation (connection/TLS/timezone/allowlists/writable packages)
   core/               HANA connection pool, SQL escaping & allowlist, error envelope, log redaction, XML utils, XS REST client
@@ -277,6 +307,22 @@ Point to the local build artifact, stdio transport:
   }
 }
 ```
+
+**Streamable HTTP setup** (remote/shared deployment; start the server with `MCP_HTTP_PORT` set first — see "Transports"):
+
+```jsonc
+{
+  "mcpServers": {
+    "saphana-modeler-mcp": {
+      "url": "http://127.0.0.1:3000/mcp",
+      "headers": { "Authorization": "Bearer <MCP_HTTP_TOKEN value>" }
+    }
+  }
+}
+```
+
+> In HTTP mode, connection info and other env-var configuration lives on the **server side** (the shell / .env the server starts from); the client only fills in `url`.
+> When the server sets `MCP_HTTP_TOKEN`, the client carries the bearer token via `headers` (header support varies per client — check its own docs).
 
 ## License
 

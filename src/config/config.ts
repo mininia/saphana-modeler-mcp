@@ -96,8 +96,42 @@ const envSchema = z.object({
     HANA_XS_PORT: z.string().regex(/^[0-9]+$/, 'XS 端口必须是数字').optional(),
     /** XS 设计时 REST 基础路径（默认 /sap/hana/xs/dt/base） */
     HANA_XS_BASE_PATH: z.string().min(1).default('/sap/hana/xs/dt/base'),
-  /** 预留：Streamable HTTP transport 端口（当前 stdio 传输） */
-  MCP_HTTP_PORT: z.coerce.number().int().min(1).max(65535).optional(),
+  /**
+   * Streamable HTTP transport 端口。未设置 = stdio 传输（默认，向后兼容）；
+   * 设置后以 Streamable HTTP 模式监听（端点 /mcp）。0 = 随机端口（测试用）。
+   */
+  MCP_HTTP_PORT: z.coerce.number().int().min(0).max(65535).optional(),
+  /**
+   * Streamable HTTP 监听地址。默认 127.0.0.1（仅本机，fail-closed）；
+   * 对外暴露需显式配置（如 0.0.0.0），并同步放行 MCP_HTTP_ALLOWED_HOSTS/ORIGINS。
+   */
+  MCP_HTTP_HOST: z.string().min(1).default('127.0.0.1'),
+  /**
+   * Streamable HTTP Bearer Token（可选）。设置后所有请求须带 `Authorization: Bearer <token>`，
+   * 缺失/不匹配 → 401（sha256 摘要后 timingSafeEqual 比较，防时序侧信道）。
+   * HTTP 模式暴露到网络时的最低限度认证；默认未设置（回环监听即为访问边界）。≥16 字符防弱凭据。
+   */
+  MCP_HTTP_TOKEN: z
+    .string()
+    .min(16, 'MCP_HTTP_TOKEN 长度须 ≥16 字符（防弱凭据）')
+    .optional()
+    .transform((s) => s?.trim()),
+  /**
+   * 允许的 Host 头主机名（DNS rebinding 防护；逗号分隔，不含端口，IPv6 带方括号）。
+   * 默认仅本机名；经对外主机名访问时须追加对应主机名。
+   */
+  MCP_HTTP_ALLOWED_HOSTS: z
+    .string()
+    .default('localhost,127.0.0.1,[::1]')
+    .transform((s) => s.split(',').map((x) => x.trim()).filter(Boolean)),
+  /**
+   * 允许的 Origin 主机名（浏览器类客户端防护；逗号分隔，不含 scheme/端口）。
+   * 无 Origin 头的请求一律放行（非浏览器 MCP 客户端不发 Origin）。默认仅本机名。
+   */
+  MCP_HTTP_ALLOWED_ORIGINS: z
+    .string()
+    .default('localhost,127.0.0.1,[::1]')
+    .transform((s) => s.split(',').map((x) => x.trim()).filter(Boolean)),
 });
 
 export interface HanaConfig {
@@ -136,8 +170,16 @@ export interface HanaConfig {
   /** 强制禁用的工具名 glob 列表（最高优先级；来自 HANA_TOOL_DENY） */
   toolDeny: string[];
   logLevel: string;
-  /** 预留 HTTP 端口 */
+  /** Streamable HTTP 端口。undefined = stdio 传输（默认）；设置 = HTTP 模式监听（0 = 随机端口） */
   httpPort?: number;
+  /** Streamable HTTP 监听地址（默认 127.0.0.1，仅本机） */
+  httpHost: string;
+  /** Streamable HTTP Bearer Token（可选；设置后强制校验 Authorization 头） */
+  httpToken?: string;
+  /** 允许的 Host 头主机名（DNS rebinding 防护，来自 MCP_HTTP_ALLOWED_HOSTS） */
+  httpAllowedHosts: string[];
+  /** 允许的 Origin 主机名（无 Origin 头放行，来自 MCP_HTTP_ALLOWED_ORIGINS） */
+  httpAllowedOrigins: string[];
 /** XS Classic 设计时 REST 直连端口（80<instance>）；未配置时运行时按实例号推导 */
     xsPort?: number;
     /** XS 设计时 REST 基础路径（默认 /sap/hana/xs/dt/base） */
@@ -227,5 +269,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HanaConfig {
 xsPort: parsed.HANA_XS_PORT ? parseInt(parsed.HANA_XS_PORT, 10) : parseInt(`80${parsed.HANA_INSTANCE}`, 10),
     xsBasePath: parsed.HANA_XS_BASE_PATH,
     httpPort: parsed.MCP_HTTP_PORT,
+    httpHost: parsed.MCP_HTTP_HOST,
+    httpToken: parsed.MCP_HTTP_TOKEN,
+    httpAllowedHosts: parsed.MCP_HTTP_ALLOWED_HOSTS,
+    httpAllowedOrigins: parsed.MCP_HTTP_ALLOWED_ORIGINS,
   };
 }

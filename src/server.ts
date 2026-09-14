@@ -1,5 +1,5 @@
 import { McpServer } from '@modelcontextprotocol/server';
-import { buildToolFilter, logToolFilterSummary, registerAllTools, type ToolContext } from './tools/index.js';
+import { registerAllTools, type ToolContext } from './tools/index.js';
 
 /**
  * Server 级领域上下文（instructions）：
@@ -30,6 +30,8 @@ export const SERVER_INSTRUCTIONS = `saphana-modeler-mcp：SAP HANA 经典 Modele
 /**
  * 创建 MCP Server（协议层）：McpServer（含 instructions）+ 工具注册（v2 config-object 范式）。
  * pool 为懒连接；真实工具经 pool 访问 HANA。
+ * 注意：Streamable HTTP 模式下本函数作为按请求工厂被 createMcpHandler 反复调用（无状态服务），
+ * 只做纯构建 —— 一次性启动日志（工具过滤摘要等）由入口负责。
  */
 export function createServer(ctx: ToolContext): McpServer {
   const server = new McpServer(
@@ -37,6 +39,5 @@ export function createServer(ctx: ToolContext): McpServer {
     { instructions: SERVER_INSTRUCTIONS },
   );
   registerAllTools(server, ctx);
-  logToolFilterSummary(ctx.toolFilter);
   return server;
 }

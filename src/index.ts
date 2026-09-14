@@ -6,10 +6,11 @@ import { logger } from './core/logger.js';
 import { checkNodeVersion } from './core/node-version.js';
 import { configureExtraSchemas } from './core/sql.js';
 import { configureWritePackages } from './services/repository.service.js';
-import { buildToolFilter } from './tools/index.js';
+import { buildToolFilter, logToolFilterSummary, type ToolContext } from './tools/index.js';
+import { startHttpServer } from './http.js';
 import { createServer } from './server.js';
 
-/** 入口：Node 版本校验 → 加载配置 → 构建连接池（懒连接，不阻塞启动）→ stdio transport 启动 */
+/** 入口：Node 版本校验 → 加载配置 → 构建连接池（懒连接，不阻塞启动）→ stdio / Streamable HTTP transport 启动 */
 async function main(): Promise<void> {
   // 启动前置：Node 版本兼容校验（process.loadEnvFile 等特性依赖 >=20.12）
   const nodeVersion = checkNodeVersion();
@@ -29,17 +30,32 @@ async function main(): Promise<void> {
   const toolFilter = buildToolFilter(config);
   // 安全要求：连接信息/用户名/密码不得以任何形式出现，不落日志
   logger.info('saphana-modeler-mcp 配置加载完成（连接信息与凭据不落日志）');
+  // 一次性启动摘要：stdio 构建一次即用；HTTP 模式 server 按请求经工厂构建，摘要不能进工厂
+  logToolFilterSummary(toolFilter);
 
   const pool = new HanaPool(config);
-  const server = createServer({ pool, config, toolFilter });
+  const ctx: ToolContext = { pool, config, toolFilter };
+  let httpClose: (() => Promise<void>) | undefined;
 
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  logger.info('saphana-modeler-mcp 已就绪（stdio transport）');
+  if (config.httpPort != null) {
+    // Streamable HTTP 模式（端点 /mcp；server 按请求经工厂构建，连接池共享）
+    const { port, close } = await startHttpServer(ctx, config);
+    httpClose = close;
+    logger.info(
+      { httpHost: config.httpHost, httpPort: port },
+      'saphana-modeler-mcp 已就绪（streamable HTTP transport，端点 /mcp）',
+    );
+  } else {
+    const server = createServer(ctx);
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    logger.info('saphana-modeler-mcp 已就绪（stdio transport）');
+  }
 
-  // 进程退出时关闭空闲连接
+  // 进程退出时关闭空闲连接与 HTTP handler（尽力而为；exit 回调不可 await）
   process.on('exit', () => {
     void pool.closeAll();
+    void httpClose?.();
   });
 }
 

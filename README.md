@@ -6,7 +6,7 @@ SAP HANA 经典 Modeler 能力的 MCP 服务器（TypeScript，Node >= 20.12）�
 （经典 `_SYS_REPO` 仓库建模），提供信息视图（计算视图/属性视图/分析视图）与仓库对象的
 **元数据浏览、数据预览、血缘查询与建模写操作**。
 
-通过 MCP stdio 协议接入 Claude / IDE 等客户端：调用工具即可浏览、校验与（在配置的可写包内）创建计算视图，无需打开 HANA Studio。
+通过 MCP 协议接入 Claude / IDE 等客户端（**stdio / Streamable HTTP 双传输**）：调用工具即可浏览、校验与（在配置的可写包内）创建计算视图，无需打开 HANA Studio。
 
 ## 功能概览
 
@@ -71,12 +71,40 @@ MCP 接入：将 `mcp.json.example` 复制为 `mcp.json` 并填入真实连接�
 | `HANA_TOOL_ALLOW` | 可选 | 强制启用的工具名 glob（即便其分组未启用也注册；逗号分隔，支持 `*` 通配） | `hana_view_validate` |
 | `HANA_TOOL_DENY` | 可选 | 强制禁用的工具名 glob（优先级最高，覆盖 allow 与分组；逗号分隔，支持 `*` 通配） | `hana_data_preview*` |
 | `LOG_LEVEL` | 可选 | 日志级别，默认 `info` | `debug` |
-| `MCP_HTTP_PORT` | 预留 | streamable HTTP 端口（当前主线为 stdio） | — |
+| `MCP_HTTP_PORT` | 可选 | Streamable HTTP 端口；设置后以 HTTP 模式启动（端点 `/mcp`），未设置 = stdio（默认）。`0` = 随机端口 | `3000` |
+| `MCP_HTTP_HOST` | 可选 | HTTP 监听地址，默认 `127.0.0.1`（仅本机，fail-closed）；对外暴露需显式配置（如 `0.0.0.0`） | `127.0.0.1` |
+| `MCP_HTTP_TOKEN` | 可选 | HTTP Bearer Token（≥16 字符）：设置后所有请求须带 `Authorization: Bearer <token>`（timing-safe 比较），缺失/不匹配 → 401；对外暴露时强烈建议配置 | — |
+| `MCP_HTTP_ALLOWED_HOSTS` | 可选 | 允许的 Host 头主机名（DNS rebinding 防护；逗号分隔，不含端口，IPv6 带方括号），默认仅本机名 | `localhost,myhost.corp` |
+| `MCP_HTTP_ALLOWED_ORIGINS` | 可选 | 允许的 Origin 主机名（逗号分隔，不含 scheme/端口；无 Origin 头的请求放行），默认仅本机名 | `localhost` |
 
 端口自动推导规则：
 
 - SYSTEMDB / 单容器：`3<instance>13`（如 instance=10 → 31013）
 - 租户数据库（MDC）：`3<instance>15`（如 instance=10 → 31015）
+
+## 传输方式
+
+支持两种 MCP 传输，由 `MCP_HTTP_PORT` 是否设置切换（其余工具/配置完全一致）：
+
+| 传输 | 启用方式 | 适用场景 |
+| --- | --- | --- |
+| **stdio**（默认） | 不设置 `MCP_HTTP_PORT` | Claude Desktop / Cursor / VS Code 等本地客户端，随客户端进程拉起 |
+| **Streamable HTTP** | 设置 `MCP_HTTP_PORT`（如 `3000`）后 `npm start`（或 `node dist/index.js`） | 远程/容器化部署、多客户端共享一个服务实例、支持 `url` 接入的 MCP 客户端 |
+
+HTTP 模式要点：
+
+- 端点 `http://<host>:<port>/mcp`（仅此路径，其余 404）；无状态按请求服务（2025/2026 协议版本客户端均可接入），连接池共享
+- **安全默认（fail-closed）**：
+  - 仅绑定 `127.0.0.1`，Host/Origin 白名单默认仅本机名（DNS rebinding 防护）。对外暴露需同时：`MCP_HTTP_HOST=0.0.0.0` + `MCP_HTTP_ALLOWED_HOSTS` 放行对外主机名（浏览器类客户端再放行 `MCP_HTTP_ALLOWED_ORIGINS`）
+  - **认证**：设置 `MCP_HTTP_TOKEN`（≥16 字符）后所有请求强制 Bearer Token 校验（缺失/不匹配 → 401）；未设置时回环监听即为访问边界，对外监听且无 Token 会在启动日志告警
+  - 请求体上限 10MB（超限 413）；chunked 流式上传无 Content-Length 头，请交由反向代理限长
+- 未内置 OAuth 等完整认证体系：暴露到网络时请配置 `MCP_HTTP_TOKEN` 并置于反向代理 / VPN / 防火墙之后
+- 日志仍走 stderr，不污染 HTTP 协议通道；401 日志不记录 Authorization 头内容
+
+```bash
+MCP_HTTP_PORT=3000 MCP_HTTP_TOKEN='your-long-random-token' node dist/index.js
+# → 已就绪（streamable HTTP transport，端点 /mcp），监听 http://127.0.0.1:3000/mcp
+```
 
 ## 工具分组与可见性控制
 
@@ -170,6 +198,7 @@ MCP 接入：将 `mcp.json.example` 复制为 `mcp.json` 并填入真实连接�
 | `npm start` | 运行 dist/index.js（stdio） |
 | `npm test` | 单元测试（node --test + tsx；测试文件本地保留，未入库） |
 | `npm run smoke` | 构建 + stdio 冒烟测试 |
+| `npm run smoke:http` | 构建 + Streamable HTTP 冒烟测试（握手/工具注册/Host 防护，无需真实 HANA） |
 | `npm run typecheck` | 仅类型检查 |
 | `npm run verify:system` | 构建 + 真实 HANA 系统工具验收 |
 | `npm run verify:p1-5` | 构建 + 读路径/预览/字段逻辑黑盒验收 |
@@ -179,7 +208,8 @@ MCP 接入：将 `mcp.json.example` 复制为 `mcp.json` 并填入真实连接�
 
 ```
 src/
-  index.ts            入口：加载配置 → 连接池 → 创建 MCP server → stdio
+  index.ts            入口：加载配置 → 连接池 → stdio / Streamable HTTP transport 分支
+  http.ts             Streamable HTTP 传输：createMcpHandler 按请求工厂 + node:http 适配 + Host/Origin 防护
   server.ts           McpServer（server instructions 领域上下文）+ 全部工具注册
   config/             zod 环境变量校验（连接/TLS/时区/白名单/可写包）
   core/               HANA 连接池、SQL 转义与白名单、错误 envelope、日志脱敏、XML 工具、XS REST 客户端
@@ -277,6 +307,22 @@ scripts/               通用冒烟脚本（smoke-stdio）；实机验收/探针
   }
 }
 ```
+
+**Streamable HTTP 接入**（远程/共享部署；先在服务端设置 `MCP_HTTP_PORT` 启动，见「传输方式」）：
+
+```jsonc
+{
+  "mcpServers": {
+    "saphana-modeler-mcp": {
+      "url": "http://127.0.0.1:3000/mcp",
+      "headers": { "Authorization": "Bearer <MCP_HTTP_TOKEN 值>" }
+    }
+  }
+}
+```
+
+> HTTP 模式下连接信息等环境变量配置在**服务端**（服务启动的 shell / .env），客户端只填 `url`；
+> 服务端配置了 `MCP_HTTP_TOKEN` 时，客户端经 `headers` 携带 Bearer Token（各客户端对 headers 的支持以自身文档为准）。
 
 ## 许可
 
