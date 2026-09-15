@@ -1,6 +1,6 @@
 {
   "name": "saphana-modeler-mcp",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "SAP HANA Modeler MCP Server (TypeScript) - 经典 HANA 2.0 仓库建模能力（_SYS_REPO/_SYS_BI/_SYS_BIC）",
   "type": "module",
   "private": true,

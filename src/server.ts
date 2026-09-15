@@ -35,7 +35,7 @@ export const SERVER_INSTRUCTIONS = `saphana-modeler-mcp：SAP HANA 经典 Modele
  */
 export function createServer(ctx: ToolContext): McpServer {
   const server = new McpServer(
-    { name: 'saphana-modeler-mcp', version: '1.0.0' },
+    { name: 'saphana-modeler-mcp', version: '1.0.1' },
     { instructions: SERVER_INSTRUCTIONS },
   );
   registerAllTools(server, ctx);
