@@ -84,6 +84,7 @@ MCP 接入：将 `mcp.json.example` 复制为 `mcp.json` 并填入真实连接�
 | `MCP_HTTP_TOKENS` | 可选 | **多客户端 Token → 身份映射**（逗号分隔 `name:token`）：每个 Token 对应一个 `clientId`，进 `envelope.clientId` 与审计日志（多客户端共享同一 HANA 账号时的唯一归属来源）。`name` 限 `[A-Za-z0-9_.-]{1,32}`，`token` ≥16 字符；重复/非法则启动失败。可与 `MCP_HTTP_TOKEN` 并存 | `alice:<token>,bob:<token>` |
 | `MCP_HTTP_ALLOWED_HOSTS` | 可选 | 允许的 Host 头主机名（DNS rebinding 防护；逗号分隔，不含端口，IPv6 带方括号），默认仅本机名 | `localhost,myhost.corp` |
 | `MCP_HTTP_ALLOWED_ORIGINS` | 可选 | 允许的 Origin 主机名（逗号分隔，不含 scheme/端口；无 Origin 头的请求放行），默认仅本机名 | `localhost` |
+| `MCP_HTTP_ALLOW_ANONYMOUS` | 可选 | 显式承认「对外监听且不配置任何 Bearer Token」的风险（默认 `false`）。**非回环监听 + 无 Token 时默认拒绝启动**（该姿态下写边界/工具分组/schema 白名单全部形同虚设）；确实需要（如已置于带认证的反向代理之后）再显式置 `true` | `false` |
 
 端口自动推导规则：
 
@@ -105,7 +106,7 @@ HTTP 模式要点：
 - **会话与隔离**：本服务**无会话**——每个请求新建协议实例、无 `Mcp-Session-Id`、无会话级状态，因此不存在跨会话串扰与会话劫持面；相应地也没有会话级配额/取消。隔离粒度 = 单个服务进程：所有客户端共享同一连接池、同一工具可见性配置、同一可写包白名单
 - **安全默认（fail-closed）**：
   - 仅绑定 `127.0.0.1`，Host/Origin 白名单默认仅本机名（DNS rebinding 防护）。对外暴露需同时：`MCP_HTTP_HOST=0.0.0.0` + `MCP_HTTP_ALLOWED_HOSTS` 放行对外主机名（浏览器类客户端再放行 `MCP_HTTP_ALLOWED_ORIGINS`）
-  - **认证**：设置 `MCP_HTTP_TOKEN`（≥16 字符）后所有请求强制 Bearer Token 校验（缺失/不匹配 → 401）；未设置时回环监听即为访问边界，对外监听且无 Token 会在启动日志告警
+  - **认证**：设置 `MCP_HTTP_TOKEN`（≥16 字符）后所有请求强制 Bearer Token 校验（缺失/不匹配 → 401）；未设置时回环监听即为访问边界。**对外监听且无 Token 时默认拒绝启动**（配置自检的阻断级不变量，见下），确需如此须显式 `MCP_HTTP_ALLOW_ANONYMOUS=true`，届时启动日志每次都会告警
   - 请求体上限 10MB（超限 413）；chunked 流式上传无 Content-Length 头，请交由反向代理限长
 - **客户端身份归因**：`MCP_HTTP_TOKENS` 把每个 Token 映射为独立 `clientId`，随请求上下文贯穿到工具层——
   - 每次工具调用返回的 envelope 带 `clientId`（stdio 模式无此字段，形态与既有版本一致）
@@ -145,8 +146,12 @@ MCP_HTTP_PORT=3000 MCP_HTTP_TOKEN='your-long-random-token' node dist/index.js
 | 变量 | 语义 | 例 |
 | --- | --- | --- |
 | `HANA_TOOL_GROUPS` | 启用的分组（逗号分隔）；空=不限制 | `read` 仅暴露数据读取，关闭全部写工具 |
-| `HANA_TOOL_ALLOW` | 强制启用的工具名 glob（即便其分组未启用也注册；支持 `*`），用于分组开关外单独放行个别工具 | `hana_some_tool` |
-| `HANA_TOOL_DENY` | 强制禁用的工具名 glob（优先级最高；支持 `*`） | `hana_data_preview*` 关闭所有预览工具 |
+| `HANA_TOOL_ALLOW` | 强制启用的工具（即便其分组未启用也注册），支持**组名**与工具名 glob（`*`），用于分组开关外单独放行 | `hana_some_tool` / `write`（整组放行） |
+| `HANA_TOOL_DENY` | 强制禁用的工具（优先级最高），同样支持**组名**与 glob | `hana_data_preview*` 关闭所有预览工具；`write` 关闭整组写工具 |
+
+> **组名可直接用于 allow/deny**（`read` / `write` / `admin`），会展开为该组全部工具名——与 tableau-mcp 的
+> `INCLUDE_TOOLS`/`EXCLUDE_TOOLS` 组展开、dataworks-mcp 的 `TOOL_CATEGORIES` 同形。
+> 例：`HANA_TOOL_GROUPS=read,write` + `HANA_TOOL_DENY=write` ⇒ 等价于只读部署，且不必逐个写 `hana_view_*`。
 
 **典型部署形态：**
 
@@ -190,6 +195,62 @@ MCP_HTTP_PORT=3000 MCP_HTTP_TOKEN='your-long-random-token' node dist/index.js
 > `HANA_WRITE_PACKAGES` 配置控制——**空=不限制（全部可写）**；填写后仅允许配置包及其下级子包写操作
 > （例：`ZDEMO1,ZDEMO2.ZDEMO_SD` 允许 ZDEMO1、ZDEMO1.X、ZDEMO2.ZDEMO_SD、ZDEMO2.ZDEMO_SD.SUB，拒绝其他）。
 > 同名对象拒绝覆盖；update/delete 带 ETag 乐观锁。
+>
+> **写边界预检（启动即校验）**：服务启动时打印生效的可写包范围——配了则 info 列出白名单；未配
+> （=不限制）且写工具已对客户端暴露则 warn 显式告警。这样"以为配了边界、实际全库可写"不会拖到
+> 写操作才暴露。`HANA_WRITE_PACKAGES` 含非法包名（`ZDEMO.`、`ZDE MO`、`*` 等）在配置加载时即失败
+> 并给出修复提示，不再被静默保留成永不匹配的前缀（那会导致写操作全被拒或边界形同虚设）。
+> 另注意生效值取决于启动来源：以 mcp.json 启动的 stdio 服务以该文件 env 为准，凭据三件套齐备时
+> 仓库 `.env` 整个文件被跳过（服务不会去读它）——同一台机器上三处配置可能给出三个不同答案。
+>
+> **权限策略层（两个权限级功能）**：`src/config/preflight.ts` 是唯一的判定入口，按两个维度组织——
+>
+> | 维度 | 管什么 | 配置项 | 参考 |
+> |---|---|---|---|
+> | **能力级** | 哪些工具对外暴露 | `HANA_TOOL_GROUPS` / `ALLOW` / `DENY`（支持组名） | tableau 的 INCLUDE/EXCLUDE_TOOLS；dataworks 的 TOOL_CATEGORIES/NAMES |
+> | **资源级** | 能操作哪些资源 | `HANA_WRITE_PACKAGES`（可写包）/ `HANA_SCHEMA_ALLOW`（可读 schema） | tableau 的 BoundedContext；dataworks 交给平台 |
+> | （部署级） | 连接侧约束，非任务级 | `HANA_TLS` / `MCP_HTTP_*` | 两家均在 Config 构造期 fail-closed |
+>
+> 结构是**一个策略对象 + 一组判定器**：`resolvePolicy(source)` 从 env / mcp.json / 已加载 config 取出生效
+> 策略 → `checkCapability` / `checkResource` / `checkDeployment` 每维度一个纯函数（统一签名
+> `(policy, 请求) → Grant[]`，互不知道对方存在）→ `runPreflight`（任务闸门）或 `describePolicy`（策略自检）
+> 组合成 `Verdict { allowed, blocking[], warnings[] }`。规则本体在四个叶子模块
+> （`write-boundary` 写包 / `sql` schema / `groups` 工具 / `deployment` 姿态），判定器只做组合、不重写规则；
+> 新增一个权限维度 = 加一个 `check*`，不动其它维度。
+>
+> 三个调用方共用同一层：**服务启动自检**（`describePolicy`，阻断级即拒绝启动）、**工具层运行期闸门**
+> （`runPreflight`，拦在 handler 之前）、**CLI / 实机脚本**（`npm run preflight` 退出码判定；
+> 加 `--from <mcp.json>` 以客户端注入的那份配置为准，它与仓库 `.env` 不是同一个来源）。
+>
+> **拦截消息的边界（重要）**：返回给调用方的拦截消息一律以「被 MCP 安全策略拦截」开头，只陈述事实
+> （维度 / 规则码 / 请求内容 / 生效策略 / 配置来源），**不包含**"改哪一项配置即可放行"之类的指引——
+> 错误消息是给**不受信的一方**（通常是模型）看的，写进绕过方法等于把钥匙递出去。
+> 补救指引与豁免开关（如 `MCP_HTTP_ALLOW_ANONYMOUS`）只出现在**运维向**位置：服务启动自检与本文档。
+> 该边界由单测强制（拦截消息前缀 + 禁用词匹配），不是靠自觉。
+>
+> **运行期闸门（工具层，先规划后判定）**：所有写工具（`hana_view_*`、`hana_package_create`、`hana_repo_import`）
+> 经 `registerWriteTool` 注册，请求进入 handler **之前**分两步：
+> ① **预规划**（`src/write-plan.ts` + `src/tools/write-plans.ts`）——把这次调用最终会读写什么算清楚，
+> 产出 `WritePlan`（写哪些包 / 读哪些 schema / 跨包只读引用 / 无法静态确定的点）；
+> ② **判定**（预检层按生效权限配置）——不通过直接返回硬错误（`isError`），**不进 handler、不进 service**。
+>
+> 为什么不能只看参数：`hana_view_update` 的 `add_join`，**join 源在另一个包**，藏在 `operations` 里；
+> `hana_view_validate` 参数看着是"校验"，design 模式实际会**写入** `_CHKTMP` 临时对象；
+> `hana_repo_import` 的导入内容里可能引用别的包；`hana_view_delete` 的下游依赖会失效。
+> 这些都只有把请求解析一遍才知道，`WritePlan` 的 `steps` 与 `uncertain` 会一并进拦截报告，
+> 让调用方看清"本来会发生什么"再决定怎么改。
+>
+> 判定用服务已加载的配置（不重新解析 env），不存在"判定用的值 ≠ 运行用的值"。
+> 跨包只读引用当前**只报告不拦截**（权限配置里没有"可读包"这一项，加白名单会破坏既有的跨包 join 用法）。
+> service 层的 `assertWritePackageAllowed` 保留为纵深防御（脚本/内部调用不经过工具层），并复用同一判定规则。
+> 执行任务前可先自检：`npm run preflight -- <包名...> [--tool <工具名>] [--schema <schema>]`，
+> 退出码 `0`=可执行 / `1`=被拦截 / `2`=用法错误；本地模式加 `--from <mcp.json>` 以客户端注入的那份配置为准
+> （它与仓库 `.env` 不是同一个来源）。
+>
+> **部署级不变量（启动即拒绝）**：单项合法但组合起来构成安全暴露的配置，在启动自检中被拒绝而非只告警
+> （对照 tableau-mcp 在 Config 构造期 throw 的做法）。当前规则：① HTTP 非回环监听且无任何 Bearer Token →
+> **拒绝启动**（除非显式 `MCP_HTTP_ALLOW_ANONYMOUS=true`）；② `HANA_TLS=false` 明文连接、③ 加密但
+> `HANA_SSL_VALIDATE=false`（不防中间人）→ 告警放行，但每次启动都在日志中可见。
 
 ## 数据预览
 

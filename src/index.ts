@@ -7,6 +7,7 @@ import { checkNodeVersion } from './core/node-version.js';
 import { configureExtraSchemas } from './core/sql.js';
 import { configureWritePackages } from './services/repository.service.js';
 import { buildToolFilter, logToolFilterSummary, type ToolContext } from './tools/index.js';
+import { describePolicy, policyFromConfig } from './config/preflight.js';
 import { startHttpServer } from './http.js';
 import { createServer } from './server.js';
 
@@ -41,6 +42,21 @@ async function main(): Promise<void> {
   logger.info('saphana-modeler-mcp 配置加载完成（连接信息与凭据不落日志）');
   // 一次性启动摘要：stdio 构建一次即用；HTTP 模式 server 按请求经工厂构建，摘要不能进工厂
   logToolFilterSummary(toolFilter);
+  // 权限策略自检（能力级 / 资源级 / 部署级一并打出，含来源归因）。
+  // 阻断级结论（如对外监听且无任何认证）直接拒绝启动——那种姿态下能力级与资源级全部形同虚设。
+  // 注意：必须用**已加载的 config** 构造策略，不可用 { kind: 'env' } 重新解析 ——
+  // 那会在 loadConfig 删除 HANA_PASSWORD 之后再读一次 .env（重新写回凭据），并让判定值与运行值分叉。
+  const verdict = describePolicy({ kind: 'resolved', policy: policyFromConfig(config, toolFilter) });
+  if (verdict.blocking.length > 0) {
+    throw new Error(
+      `权限策略自检未通过（${verdict.blocking.map((g) => g.code).join(', ')}），拒绝启动：\n${verdict.text}`,
+    );
+  }
+  if (verdict.warnings.length > 0) {
+    logger.warn({ writePackages: verdict.policy.resource.writePackages }, verdict.text);
+  } else {
+    logger.info({ writePackages: verdict.policy.resource.writePackages }, verdict.text);
+  }
 
   const pool = new HanaPool(config);
   const ctx: ToolContext = { pool, config, toolFilter };

@@ -21,9 +21,19 @@ export function configureExtraSchemas(schemas: string[]): void {
   for (const s of schemas) extraSchemas.add(s.toUpperCase());
 }
 
-/** schema 是否在白名单内（含配置追加项） */
+/**
+ * schema 是否在「系统 schema + 给定追加项」内（**纯函数**，不读也不改进程状态）。
+ * 供预检层按任意配置来源（如某个 mcp.json）判定用，与运行时的 isSchemaAllowed 共用同一规则，
+ * 避免出现两套白名单判定。
+ */
+export function isSchemaAllowedWith(schema: string, extra: readonly string[]): boolean {
+  const s = schema.toUpperCase();
+  return SYSTEM_SCHEMAS.has(s) || extra.some((e) => e.toUpperCase() === s);
+}
+
+/** schema 是否在白名单内（含 configureExtraSchemas 配置的追加项） */
 export function isSchemaAllowed(schema: string): boolean {
-  return SYSTEM_SCHEMAS.has(schema.toUpperCase()) || extraSchemas.has(schema.toUpperCase());
+  return isSchemaAllowedWith(schema, [...extraSchemas]);
 }
 
 /** 校验 schema 名：不在白名单直接抛错（防注入与非授权 schema 探测） */

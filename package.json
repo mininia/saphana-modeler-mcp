@@ -28,12 +28,13 @@
     "test:watch": "node --import tsx --test --watch tests/unit/*.test.ts",
     "smoke": "npm run build && node scripts/smoke-stdio.mjs",
     "smoke:http": "npm run build && node scripts/smoke-http.mjs",
+    "preflight": "node scripts/preflight-write-packages.mjs",
     "verify:system": "npm run build && node test-verification/verify-system.mjs",
     "verify:p1-5": "npm run build && node test-verification/verify-p1-5.mjs",
     "probe:repo": "node test-verification/probe-repo-read.mjs",
     "probe:xfer": "node test-verification/probe-rest-check-xfer.mjs",
-    "verify:lifecycle": "node test-verification/verify-cv-lifecycle.mjs",
-    "verify:add-join": "node test-verification/verify-add-join.mjs"
+    "verify:lifecycle": "npm run build && node test-verification/verify-cv-lifecycle.mjs",
+    "verify:add-join": "npm run build && node test-verification/verify-add-join.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/core": "^2.0.0",

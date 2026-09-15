@@ -9,12 +9,14 @@ import {
   updateCalculationView,
 } from '../services/repository.service.js';
 import { getCheckActions, validateCalculationView } from '../services/validation.service.js';
-import { registerVisibleTool, type ToolContext } from './index.js';
+import { registerVisibleTool, registerWriteTool, type ToolContext } from './index.js';
 import type { Envelope } from '../types/hana.js';
 
 export function registerModelingTools(server: McpServer, ctx: ToolContext): void {
   const reg = registerVisibleTool(server, ctx);
-  reg(
+  // 写工具一律经预检闸门注册：判定不通过时在 handler 之前拦截，不进 service（见 tools/index.ts）
+  const regWrite = registerWriteTool(server, ctx);
+  regWrite(
     'hana_view_create',
     {
       title: '新建 Calculation View（计算视图）',
@@ -65,7 +67,7 @@ export function registerModelingTools(server: McpServer, ctx: ToolContext): void
     },
   );
 
-  reg(
+  regWrite(
     'hana_view_validate',
     {
       title: '校验计算视图一致性',
@@ -148,7 +150,7 @@ export function registerModelingTools(server: McpServer, ctx: ToolContext): void
       };
     },
   );
-reg(
+regWrite(
       'hana_view_activate',
       {
         title: '激活 Calculation View（设计时对象）',
@@ -173,7 +175,7 @@ reg(
       },
     );
 
-    reg(
+    regWrite(
       'hana_view_update',
       {
         title: '更新 Calculation View（声明式 operations 或全量 XML）',
@@ -246,7 +248,7 @@ reg(
       },
     );
 
-    reg(
+    regWrite(
       'hana_view_delete',
       {
         title: '删除 Calculation View（设计时对象）',

@@ -77,6 +77,36 @@ export interface ToolFilterConfig {
   denyPatterns: string[];
 }
 
+/** 分组名 → 该分组下的全部工具名（由 TOOL_GROUPS 反查，保持单一事实源） */
+export function toolsOfGroup(group: ToolGroup): string[] {
+  return Object.entries(TOOL_GROUPS)
+    .filter(([, g]) => g === group)
+    .map(([name]) => name);
+}
+
+/**
+ * 把 allow/deny 里的**组名**展开成该组的全部工具名。
+ *
+ * 对齐两家参考的做法：tableau-mcp 的 INCLUDE_TOOLS/EXCLUDE_TOOLS 支持组名
+ * （`isWebToolGroupName(v) ? webToolGroups[v] : []`），dataworks-mcp 直接按
+ * TOOL_CATEGORIES 过滤。此前我们只认工具名 glob，想关掉一整组只能逐个写
+ * `hana_view_*` 这类通配，既啰嗦又容易漏。
+ *
+ * 非组名的 token（工具名或 glob）原样保留。
+ */
+export function expandGroupTokens(tokens: string[]): string[] {
+  const out: string[] = [];
+  for (const t of tokens) {
+    const lower = t.toLowerCase();
+    if (ALL_TOOL_GROUPS.includes(lower as ToolGroup)) {
+      out.push(...toolsOfGroup(lower as ToolGroup));
+    } else {
+      out.push(t);
+    }
+  }
+  return out;
+}
+
 /** 逗号分隔 → 去空白 → 去空串 */
 function splitTrim(s: string): string[] {
   return s
@@ -102,7 +132,8 @@ export function matchGlob(name: string, patterns: string[]): boolean {
 /**
  * 解析环境变量为 ToolFilterConfig。
  * - 分组名大小写不敏感（统一转小写校验）；未知分组名抛错（fail-closed，启动即失败）。
- * - allow/deny 保留原样（工具名大小写敏感，均为 hana_* 小写）。
+ * - allow/deny 里的**组名**会展开成该组的全部工具名（见 expandGroupTokens），其余 token 原样保留
+ *   （工具名大小写敏感，均为 hana_* 小写）。
  */
 export function parseToolFilter(
   rawGroups: string,
@@ -120,8 +151,8 @@ export function parseToolFilter(
   }
   return {
     enabledGroups: new Set(groups as ToolGroup[]),
-    allowPatterns: splitTrim(rawAllow),
-    denyPatterns: splitTrim(rawDeny),
+    allowPatterns: expandGroupTokens(splitTrim(rawAllow)),
+    denyPatterns: expandGroupTokens(splitTrim(rawDeny)),
   };
 }
 

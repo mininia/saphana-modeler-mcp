@@ -1,5 +1,6 @@
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
+import { findInvalidWritePackages } from './write-boundary.js';
 
 /** 默认时区（IANA 名称），默认上海；可在 mcp.json env / .env 用 HANA_TIMEZONE 覆盖 */
 export const DEFAULT_TIMEZONE = 'Asia/Shanghai';
@@ -87,7 +88,24 @@ const envSchema = z.object({
    * 例：HANA_WRITE_PACKAGES="ZDEMO,ZDEMO.ZDEMO_SD" → 允许 ZDEMO、ZDEMO.X、ZDEMO.ZDEMO_SD、ZDEMO.ZDEMO_SD.SUB，
    * 拒绝 ZDEMO.ZDEMO_MKC（不在配置的包前缀下）。
    */
-  HANA_WRITE_PACKAGES: z.string().default('').transform((s) => s.split(',').map((x) => x.trim().toUpperCase()).filter(Boolean)),
+  HANA_WRITE_PACKAGES: z
+    .string()
+    .default('')
+    .transform((s) => {
+      const entries = s.split(',').map((x) => x.trim().toUpperCase()).filter(Boolean);
+      // 非法条目（"ZDEMO." / "ZDE MO" / "*" 等）会被静默保留成永不匹配的前缀：
+      // 表现为「所有写操作被拒」或「边界形同虚设」，两种都只会在写链路末端才暴露，
+      // 故在配置加载时即失败（fail-closed），并把修复方式写进错误消息。
+      const invalid = findInvalidWritePackages(entries);
+      if (invalid.length > 0) {
+        throw new Error(
+          `HANA_WRITE_PACKAGES 含非法包名：${invalid.join(', ')}。合法形式为点分段的仓库包路径` +
+            '（大写字母/数字/下划线/连字符，如 ZDEMO 或 ZDEMO.ZDEMO_SD）。' +
+            '如需不限制（所有包可写），请将该项整体留空，而不是填 * 等通配符',
+        );
+      }
+      return entries;
+    }),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
 /**
      * XS Classic 设计时 REST 端口（直连 HTTP）。
@@ -99,8 +117,13 @@ const envSchema = z.object({
   /**
    * Streamable HTTP transport 端口。未设置 = stdio 传输（默认，向后兼容）；
    * 设置后以 Streamable HTTP 模式监听（端点 /mcp）。0 = 随机端口（测试用）。
+   * 空串（`MCP_HTTP_PORT=`）按"未设置"处理——与 HANA_PORT 等同一约定，
+   * 也避免出现「配置解析成 0（= 进 HTTP 模式）而策略判定成 stdio」的分叉。
    */
-  MCP_HTTP_PORT: z.coerce.number().int().min(0).max(65535).optional(),
+  MCP_HTTP_PORT: z.preprocess(
+    (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
+    z.coerce.number().int().min(0).max(65535).optional(),
+  ),
   /**
    * Streamable HTTP 监听地址。默认 127.0.0.1（仅本机，fail-closed）；
    * 对外暴露需显式配置（如 0.0.0.0），并同步放行 MCP_HTTP_ALLOWED_HOSTS/ORIGINS。
@@ -140,6 +163,12 @@ const envSchema = z.object({
     .string()
     .default('localhost,127.0.0.1,[::1]')
     .transform((s) => s.split(',').map((x) => x.trim()).filter(Boolean)),
+  /**
+   * 显式承认「HTTP 对外监听且不配置任何 Bearer Token」的风险（默认 false = 拒绝启动）。
+   * 非回环监听 + 无 Token 时，任何可达者都能调用全部工具（含写操作）且无法归因，
+   * 故默认 fail-closed；确实需要（如已置于带认证的反向代理之后）再显式置 true。
+   */
+  MCP_HTTP_ALLOW_ANONYMOUS: boolSchema('false'),
 });
 
 /** HTTP Token → 客户端身份映射条目（MCP_HTTP_TOKENS 解析结果） */
@@ -246,6 +275,8 @@ export interface HanaConfig {
   httpAllowedHosts: string[];
   /** 允许的 Origin 主机名（无 Origin 头放行，来自 MCP_HTTP_ALLOWED_ORIGINS） */
   httpAllowedOrigins: string[];
+  /** 显式承认「对外监听且不认证」的风险（来自 MCP_HTTP_ALLOW_ANONYMOUS，默认 false） */
+  httpAllowAnonymous: boolean;
   /**
    * 连接目标/凭据各变量的实际来源标签（仅已设置项，不含值；来自 tryLoadDotEnv）。
    * 例：{ HANA_USER: '进程环境变量', HANA_HOST: '.env（工作目录）' }
@@ -413,6 +444,7 @@ xsPort: parsed.HANA_XS_PORT ? parseInt(parsed.HANA_XS_PORT, 10) : parseInt(`80${
     httpTokens: parseHttpClients(parsed.MCP_HTTP_TOKENS, parsed.MCP_HTTP_TOKEN),
     httpAllowedHosts: parsed.MCP_HTTP_ALLOWED_HOSTS,
     httpAllowedOrigins: parsed.MCP_HTTP_ALLOWED_ORIGINS,
+    httpAllowAnonymous: parsed.MCP_HTTP_ALLOW_ANONYMOUS,
     connectionSources: dotenv.sources,
     connectionSourceMixed,
   };

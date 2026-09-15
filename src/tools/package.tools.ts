@@ -9,7 +9,7 @@ import {
   importObjectViaRest,
   listChangesViaRest,
 } from '../services/repository.service.js';
-import { registerVisibleTool, type ToolContext } from './index.js';
+import { registerVisibleTool, registerWriteTool, type ToolContext } from './index.js';
 import type { Envelope } from '../types/hana.js';
 
 const VIEW_KIND = z.enum(['calculationview', 'attributeview', 'analyticview']);
@@ -17,6 +17,8 @@ const VIEW_KIND = z.enum(['calculationview', 'attributeview', 'analyticview']);
 /** 包/对象浏览工具：包树 + 包内对象清单（只读） */
 export function registerPackageTools(server: McpServer, ctx: ToolContext): void {
   const reg = registerVisibleTool(server, ctx);
+  // 写工具一律经预检闸门注册：判定不通过时在 handler 之前拦截，不进 service（见 tools/index.ts）
+  const regWrite = registerWriteTool(server, ctx);
   reg(
     'hana_package_list',
     {
@@ -68,7 +70,7 @@ export function registerPackageTools(server: McpServer, ctx: ToolContext): void 
     },
   );
 
-    reg(
+    regWrite(
       'hana_package_create',
       {
         title: '新建包（目录）',
@@ -116,7 +118,7 @@ export function registerPackageTools(server: McpServer, ctx: ToolContext): void 
       },
     );
 
-    reg(
+    regWrite(
       'hana_repo_import',
       {
         title: '导入设计时文件（Transfer API）',

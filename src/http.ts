@@ -7,6 +7,7 @@ import {
 import { hostHeaderValidation, originValidation, toNodeHandler } from '@modelcontextprotocol/node';
 import { createMcpHandler, type AuthInfo } from '@modelcontextprotocol/server';
 import type { HanaConfig, HttpClientIdentity } from './config/config.js';
+import { isLoopbackHost } from './config/deployment.js';
 import { logger } from './core/logger.js';
 import { runWithIdentity } from './core/request-context.js';
 import { createServer } from './server.js';
@@ -107,9 +108,6 @@ const bodySizeGuard: RequestGuard = (req, res) => {
   return false;
 };
 
-/** 回环地址判定（用于"对外监听但无 Token"的启动告警） */
-const isLoopbackHost = (host: string): boolean => ['127.0.0.1', '::1', 'localhost'].includes(host);
-
 /**
  * 启动 HTTP 监听。resolve 于 listen 成功后，携带实际端口（配置 0 = 随机端口，如冒烟测试）。
  * close() 供进程退出时收尾：先停新请求，再关闭 handler（中止在途请求）。
@@ -159,8 +157,12 @@ export async function startHttpServer(
       'saphana-modeler-mcp HTTP 已启用 Bearer Token 校验（每个 Token 映射到独立客户端身份）',
     );
   } else if (!isLoopbackHost(config.httpHost.trim())) {
+    // 走到这里说明已显式设置了 MCP_HTTP_ALLOW_ANONYMOUS=true（否则启动自检已拒绝启动）。
+    // 仍然每次启动都提醒：这是被显式承认的风险，不是被忽略的风险。
     logger.warn(
-      'saphana-modeler-mcp HTTP 对外监听但未设置 MCP_HTTP_TOKEN / MCP_HTTP_TOKENS：任何可达者均可调用全部工具（含写操作），且所有调用都归为身份 anonymous、无法归因，建议配置 Token 或置于反向代理/防火墙之后',
+      'saphana-modeler-mcp HTTP 对外监听且未设置 MCP_HTTP_TOKEN / MCP_HTTP_TOKENS' +
+        '（已由 MCP_HTTP_ALLOW_ANONYMOUS 显式放行）：任何可达者均可调用全部工具（含写操作），' +
+        '且所有调用都归为身份 anonymous、无法归因。请确认前置的反向代理/防火墙已完成认证',
     );
   }
 

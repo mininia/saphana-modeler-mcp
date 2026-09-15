@@ -4,6 +4,7 @@ import { withKeyedLock } from '../core/keyed-mutex.js';
 import { logger } from '../core/logger.js';
 import { currentClientId } from '../core/request-context.js';
 import { assertSafeObjectName, assertSafeRuntimeName } from '../core/sql.js';
+import { isPackageAllowed } from '../config/write-boundary.js';
 import { XsRestClient, extractCheckResult, type FileMeta } from '../core/xs-rest.js';
 import type { HanaConfig } from '../config/config.js';
 import { buildMinCalcViewXml } from '../model/view-builder.js';
@@ -58,17 +59,13 @@ export function assertWritePackageAllowed(packageId: string, objectName?: string
   if (!isSafePackageName(packageId)) {
     throw new HanaBusinessError(`包名 "${packageId}" 含非法字符，已拒绝`);
   }
-  if (WRITE_ALLOWED_PACKAGES.length > 0) {
-    const pkg = packageId.toUpperCase();
-    const allowed = WRITE_ALLOWED_PACKAGES.some(
-      (p) => pkg === p || pkg.startsWith(`${p}.`),
+  if (!isPackageAllowed(packageId, WRITE_ALLOWED_PACKAGES)) {
+    // 纵深防御（脚本/内部调用不经过工具层闸门）。消息只陈述拦截事实，**不给**绕过方法：
+    // 本消息会随 envelope 返回给调用方（通常是模型），写明"改哪项配置可放行"等于教它绕过。
+    throw new HanaBusinessError(
+      `被 MCP 安全策略拦截：目标包 "${packageId}" 不在服务端配置的可写包范围内` +
+        `（生效范围：${WRITE_ALLOWED_PACKAGES.join(', ') || '(空)'}）。请求未执行。`,
     );
-    if (!allowed) {
-      throw new HanaBusinessError(
-        `写操作仅允许在配置的可写包内进行（当前请求包 "${packageId}" 被拒绝；已配置可写包：${WRITE_ALLOWED_PACKAGES.join(', ') || '(空)'}）。` +
-          `如需写入该包，请在其配置来源（stdio：mcp.json 的 env；HTTP：环境变量或 .env）中追加该包前缀后重启服务`,
-      );
-    }
   }
   logger.info(
     { clientId: currentClientId(), packageId, ...(objectName ? { objectName } : {}) },
