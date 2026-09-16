@@ -1,7 +1,7 @@
 import type { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
-import { withErrorEnvelope } from '../core/errors.js';
-import { previewData, type PreviewFilter } from '../services/preview.service.js';
+import { mcpErrorText, withErrorEnvelope } from '../core/errors.js';
+import { inspectTable, previewData, type PreviewFilter } from '../services/preview.service.js';
 import { diagnosePreview } from '../services/preview-diagnose.service.js';
 import { registerVisibleTool, type ToolContext } from './index.js';
 import type { Envelope } from '../types/hana.js';
@@ -15,9 +15,17 @@ export function registerPreviewTools(server: McpServer, ctx: ToolContext): void 
   reg(
     'hana_data_preview',
     {
-      title: '数据预览',
+      title: '数据预览 / 基表勘察',
       description:
-        '对已激活视图做数据预览（支持范围有限，不支持时直接返回「不支持」，不做其他尝试）。' +
+        '两种目标（二选一）：\n' +
+        '① **基表/视图勘察**（给 schema + table，跨表建模前**先做这一步**）：直接对源表采样并逐列画像——' +
+        '去重值样例、长度区间（uniformLength/minLength/maxLength）、含前导零的值样例（zeroPaddedSamples）、采样 NULL 数。' +
+        '用来在建模前把三件事核清楚，避免"激活成功但 0 行"的隐性返工：' +
+        '(a) 数据在哪张表（BW 变更日志表 vs 活动数据表 / 分区，换 table 再查一次即可对比行数）；' +
+        '(b) 关联键的补零格式（两侧长度是否一致，不一致会静默丢结果）；' +
+        '(c) 号码列语义（如某编号在 /BIC/Z* 客户字段而非 *NUM 标准字段）。' +
+        '统计**只基于采样行**（sampleRows，默认 200）——不跑 COUNT(*) 这类全表操作，大表上代价可控。' +
+        '② **视图预览**（给 packageId + objectName，原行为）：对已激活视图做数据预览（支持范围有限，不支持时直接返回「不支持」，不做其他尝试）。' +
         '默认对视图整体预览（_SYS_BIC 直查）：无筛选默认返回前 10 行，有筛选默认返回前 100 行，' +
         'VIRTUAL 视图用 parameters 传输入参数（如 {"P_CURRENCY": "CNY"}）。' +
         '仅当用户明确要求看某视图中的某个节点时才传 node：调用 HANA 原生中间视图机制 ' +
@@ -32,11 +40,17 @@ export function registerPreviewTools(server: McpServer, ctx: ToolContext): void 
         '权限类失败（缺 EXECUTE/SELECT、_SYS_BIC 对象不可见的 258/259）会自动附带权限诊断报告（envelope.raw.diagnosis），' +
         '无需额外调用即可看到阻塞点与授权建议；手动前置排查用 hana_data_preview_diagnose',
       inputSchema: z.object({
-        packageId: z.string().regex(/^[A-Za-z0-9_.\-]+$/).describe('包名，层级用 . 分隔，如 ZDEMO.ZDEMO_MGF'),
-        objectName: z.string().regex(/^[A-Za-z0-9_.\-]+$/).describe('视图对象名，如 ZDEMO02_CV008'),
-        kind: VIEW_KIND.optional().describe('视图类型；省略时自动匹配三种类型'),
+        schema: z.string().optional().describe('勘察模式：表/视图所在 schema（须在白名单内，如 SAPABAP1）；与 table 成对提供'),
+        table: z.string().optional().describe('勘察模式：表或视图名，如 /BIC/AZDEMO001 或某视图名'),
+        columns: z.array(z.string()).max(200).optional()
+          .describe('勘察模式：要画像的列；缺省=按元数据取（最多 50 列）。跨表关联前建议显式给出两个 key 列'),
+        sampleRows: z.number().int().min(1).max(2000).default(200)
+          .describe('勘察模式：采样行数（统计口径，非全表统计），默认 200'),
+        packageId: z.string().regex(/^[A-Za-z0-9_.\-]+$/).optional().describe('预览模式：包名，层级用 . 分隔，如 ZDEMO.ZDEMO_MGF'),
+        objectName: z.string().regex(/^[A-Za-z0-9_.\-]+$/).optional().describe('预览模式：视图对象名，如 ZDEMO02_CV008'),
+        kind: VIEW_KIND.optional().describe('预览模式：视图类型；省略时自动匹配三种类型'),
         node: z.string().regex(/^[A-Za-z0-9_]+$/).min(1).max(200).optional().describe(
-          '要预览的节点 ID（如 Projection_1 / Join_1 / Aggregation_1）；省略 = 视图整体预览。仅当用户明确要求看某节点时传入',
+          '预览模式：要预览的节点 ID（如 Projection_1 / Join_1 / Aggregation_1）；省略 = 视图整体预览。仅当用户明确要求看某节点时传入',
         ),
         filter: z.array(z.object({
           column: z.string().min(1).max(128).describe('筛选列名（大小写敏感，如 CUST_ID）'),
@@ -51,8 +65,37 @@ export function registerPreviewTools(server: McpServer, ctx: ToolContext): void 
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
     async (params) => {
+      // 勘察与预览是两种目标：**视图目标优先**（packageId+objectName 齐全即走预览，
+      // 否则 {schema, packageId, objectName} 这类混用会被误路由到勘察并报"需要 table"）。
+      // 两者都缺时再按部分参数给可恢复提示，不静默降级。
+      if (!(params.packageId && params.objectName) && (params.schema || params.table)) {
+        if (!params.schema || !params.table) {
+          return mcpErrorText(
+            '勘察模式需要同时提供 schema 与 table。',
+            '视图预览请改传 packageId + objectName；两者不要混用',
+          );
+        }
+        const envelope: Envelope = await withErrorEnvelope(() =>
+          inspectTable(ctx.pool, {
+            schema: params.schema!,
+            table: params.table!,
+            columns: params.columns,
+            sampleRows: params.sampleRows,
+            filter: params.filter as PreviewFilter[] | undefined,
+          }),
+        );
+        return {
+          content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }],
+          structuredContent: envelope,
+        };
+      }
+      if (!params.packageId || !params.objectName) {
+        return mcpErrorText(
+          '需要指定目标：视图预览传 packageId + objectName；基表勘察传 schema + table。',
+        );
+      }
       const envelope: Envelope = await withErrorEnvelope(() =>
-        previewData(ctx.pool, params.packageId, params.objectName, {
+        previewData(ctx.pool, params.packageId!, params.objectName!, {
           kind: params.kind,
           node: params.node,
           filter: params.filter as PreviewFilter[] | undefined,

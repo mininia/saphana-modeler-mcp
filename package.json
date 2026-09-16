@@ -34,7 +34,8 @@
     "probe:repo": "node test-verification/probe-repo-read.mjs",
     "probe:xfer": "node test-verification/probe-rest-check-xfer.mjs",
     "verify:lifecycle": "npm run build && node test-verification/verify-cv-lifecycle.mjs",
-    "verify:add-join": "npm run build && node test-verification/verify-add-join.mjs"
+    "verify:add-join": "npm run build && node test-verification/verify-add-join.mjs",
+    "verify:sql-mode": "npm run build && node test-verification/verify-sql-mode.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/core": "^2.0.0",

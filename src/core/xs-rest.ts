@@ -87,12 +87,20 @@ export interface WriteCheckResult {
   error_msg?: string;
   errorCode?: number | string;
   errorMsg?: string;
+  /** 其余字段（如各 SPS 版本附带的 DDL/明细字段）原样保留：错误详情不猜字段名，整块透传 */
+  [key: string]: unknown;
 }
 
-/** 从写响应体提取激活检查结果（无则 undefined） */
-export function extractCheckResult(body: unknown): { consistent: boolean; message?: string; errorCode?: string } | undefined {
-  const cr = (body as { CheckResult?: WriteCheckResult } | null | undefined)?.CheckResult;
-  if (!cr) return undefined;
+/** 从写响应体提取激活检查结果（无则 undefined）；raw 保留原始 CheckResult 供调用方原样透出 */
+export function extractCheckResult(
+  body: unknown,
+): { consistent: boolean; message?: string; errorCode?: string; raw: WriteCheckResult } | undefined {
+  const cr = (body as { CheckResult?: WriteCheckResult | string } | null | undefined)?.CheckResult;
+  if (cr === undefined || cr === null) return undefined;
+  // CheckResult 也可能是裸文本（非对象）：仍按「激活检查未通过」回报，不静默丢信号
+  if (typeof cr !== 'object') {
+    return { consistent: false, message: String(cr), raw: { error_msg: String(cr) } };
+  }
   const activated = cr.Operations?.Activate === true;
   const code = cr.error_code ?? cr.errorCode;
   const msg = cr.error_msg ?? cr.errorMsg;
@@ -100,7 +108,78 @@ export function extractCheckResult(body: unknown): { consistent: boolean; messag
     consistent: activated,
     message: activated ? undefined : (msg ? String(msg) : '激活检查未通过'),
     errorCode: code !== undefined ? String(code) : undefined,
+    raw: cr,
   };
+}
+
+/**
+ * 错误明细长度上限（字符）。
+ * 激活失败的明细里含 Type/Procedure DDL 全文（实测数 KB），截断会让调用方必须再调一次校验才能拿全——
+ * 故上限设得足够宽；仅在极端响应体下兜底，且截断处显式标注，不静默丢内容。
+ */
+export const MAX_ERROR_DETAIL_CHARS = 8000;
+
+/** 截断兜底（超限时显式标注，不静默丢内容） */
+function capDetail(text: string): string {
+  return text.length > MAX_ERROR_DETAIL_CHARS
+    ? `${text.slice(0, MAX_ERROR_DETAIL_CHARS)}\n…（错误明细超过 ${MAX_ERROR_DETAIL_CHARS} 字符已截断；请求体不做日志，如需剩余部分请重跑该对象的设计时校验）`
+    : text;
+}
+
+/**
+ * 从 XS 错误响应体提取**完整**错误明细。
+ * 字段名跨 SPS 版本不统一（error_msg / message / Message / error / CheckResult.error_msg 等），
+ * 故按优先级逐个尝试；都取不到才退回响应体原文。截断上限见 MAX_ERROR_DETAIL_CHARS——
+ * 上限设小了（如 300 字符）调用方就必须再调一次 validate 才能拿全 Type/Procedure DDL。
+ */
+export function extractErrorDetail(body: string): string {
+  const j = safeJson<Record<string, unknown>>(body);
+  if (!j) return capDetail(body.replace(/\s+/g, ' ').trim());
+  const cr = (j['CheckResult'] ?? {}) as Record<string, unknown>;
+  const candidates = [
+    j['error_msg'],
+    j['errorMessage'],
+    j['error_msg_detail'],
+    j['message'],
+    j['Message'],
+    j['error'],
+    cr['error_msg'],
+    cr['errorMsg'],
+    cr['message'],
+  ];
+  for (const c of candidates) {
+    if (typeof c === 'string' && c.trim() !== '') return capDetail(c);
+  }
+  const code = j['error_code'] ?? j['errorCode'] ?? cr['error_code'] ?? cr['errorCode'];
+  if (code !== undefined) {
+    // 有错误码但无消息字段：至少把码与响应体一并给出，别让调用方只看到状态码
+    return capDetail(`错误码 ${String(code)}：${JSON.stringify(j).slice(0, MAX_ERROR_DETAIL_CHARS)}`);
+  }
+  return capDetail(JSON.stringify(j).slice(0, MAX_ERROR_DETAIL_CHARS));
+}
+
+/**
+ * 写路径失败错误（携带服务端原始响应，供上层一次调用把详情给全）。
+ * - httpStatus：原始状态码（如 555 = 激活失败）
+ * - checkResult：响应体里的 CheckResult 原文（含 Write/Activate 与错误字段）
+ * - body：完整响应体（已按上限截断，截断处有标注）
+ */
+export class XsWriteError extends HanaBusinessError {
+  constructor(
+    message: string,
+    public readonly httpStatus: number,
+    public readonly checkResult?: WriteCheckResult,
+    public readonly body?: string,
+    code?: string,
+  ) {
+    // 原始载荷挂到 rawDetail → envelope.raw.errorDetail：调用方一次拿到 HTTP 状态 + CheckResult + 响应体
+    super(message, code, undefined, [], undefined, {
+      httpStatus,
+      ...(checkResult ? { checkResult } : {}),
+      ...(body ? { body } : {}),
+    });
+    this.name = 'XsWriteError';
+  }
 }
 
 /** XS REST 空会话/令牌异常分类：写前置必须登录，否则给清晰提示 */
@@ -245,15 +324,9 @@ export class XsRestClient {
     return resp;
   }
 
-  /** 错误信息提取：优先 JSON 错误体，否则状态码 */
+  /** 错误信息提取：优先 HANA 错误字段（完整不截断），否则响应体原文 */
   private describeError(resp: XsResponse, action: string): string {
-    const j = safeJson<Record<string, unknown>>(resp.body);
-    const detail =
-      j && typeof j['message'] === 'string'
-        ? String(j['message'])
-        : j && typeof j['error'] === 'string'
-          ? String(j['error'])
-          : resp.body.replace(/\s+/g, ' ').slice(0, 300);
+    const detail = extractErrorDetail(resp.body);
     return `XS ${action} 失败（HTTP ${resp.status}）：${detail || '无错误详情'}`;
   }
 
@@ -416,8 +489,30 @@ export class XsRestClient {
         '412',
       );
     }
-    this.assertOk(resp, `写文件 ${path}`, true);
-    return safeJson<FileMeta & { CheckResult?: WriteCheckResult }>(resp.body) ?? ({} as FileMeta);
+    const parsed = safeJson<FileMeta & { CheckResult?: WriteCheckResult }>(resp.body);
+    // 附带原始 HTTP 状态（非标准字段，仅服务端内部消费）：activationDetailOf 用它区分
+    // 555（写成功/激活失败）与 202（Check 未通过），故此处必须写入真实状态，不能缺省
+    if (parsed) parsed['_httpStatus'] = resp.status;
+    if (resp.status < 200 || resp.status >= 300) {
+      const cr = parsed?.CheckResult;
+      // 激活失败（HTTP 555）：CheckResult.Operations.Write=true 表示**文件已写入**，只有激活没通过。
+      // 这不是"写失败"——按非致命结果原样返回，调用方一次即可拿到 activated=false + 完整 CheckResult
+      // （CheckResult 必须原样带出：丢掉它，调用方就得再调一次设计时校验才能看到 DDL 全文）。
+      if (resp.status === 555 && cr?.Operations?.Write === true) {
+        logger.warn(
+          { path, httpStatus: resp.status, errorCode: cr.error_code ?? cr.errorCode },
+          'XS 写入成功但激活失败：按非致命结果返回（错误明细随响应体透出，调用方无需二次校验）',
+        );
+        return parsed as FileMeta & { CheckResult?: WriteCheckResult };
+      }
+      throw new XsWriteError(
+        this.describeError(resp, `写文件 ${path}`),
+        resp.status,
+        cr,
+        capDetail(resp.body),
+      );
+    }
+    return parsed ?? ({} as FileMeta);
   }
 
   /**
@@ -453,7 +548,8 @@ export class XsRestClient {
     const cr = j?.CheckResult;
     const activated = cr?.Operations?.Activate === true;
     const code = cr?.error_code ?? cr?.errorCode;
-    const msg = cr?.error_msg ?? cr?.errorMsg ?? (activated ? undefined : j?.Message);
+    // 消息优先取结构化字段；取不到就退回完整响应体文本（含 Type/Procedure DDL 明细），不截断
+    const msg = cr?.error_msg ?? cr?.errorMsg ?? j?.Message ?? (activated ? undefined : extractErrorDetail(resp.body));
     return {
       consistent: activated,
       message: activated ? undefined : (msg ? String(msg) : `校验未通过（HTTP ${resp.status}）`),

@@ -3,12 +3,12 @@ import { HanaBusinessError } from '../core/errors.js';
 import { withKeyedLock } from '../core/keyed-mutex.js';
 import { logger } from '../core/logger.js';
 import { currentClientId } from '../core/request-context.js';
-import { assertSafeObjectName, assertSafeRuntimeName } from '../core/sql.js';
+import { assertSafeObjectName, assertSafeRuntimeName, assertSchemaAllowed, qualifyName } from '../core/sql.js';
 import { isPackageAllowed } from '../config/write-boundary.js';
-import { XsRestClient, extractCheckResult, type FileMeta } from '../core/xs-rest.js';
+import { XsRestClient, extractCheckResult, type FileMeta, type WriteCheckResult } from '../core/xs-rest.js';
 import type { HanaConfig } from '../config/config.js';
-import { buildMinCalcViewXml } from '../model/view-builder.js';
-import { addJoinToViewXml, chooseDefaultJoinFields, getJoinTargetAttrs, guardFullXmlUpdate, type FullXmlGuardResult } from '../model/view-edit.js';
+import { buildMinCalcViewXml, buildScriptedCalcViewXml, type ScriptedCalcViewSpec } from '../model/view-builder.js';
+import { addJoinToViewXml, chooseDefaultJoinFields, getJoinTargetAttrs, guardFullXmlUpdate, setScriptInViewXml, type FullXmlGuardResult, type SetScriptSpec } from '../model/view-edit.js';
 import { getViewDefinition } from './metadata.service.js';
 
 /**
@@ -182,25 +182,101 @@ export interface CreateCalcViewInput {
   /** 对象名（不含包名，如 ZDEMO_CV_TEST001） */
   objectName: string;
   description?: string;
-  /** 源：表/视图（schema 经白名单）+ 列（缺省自动取全列） */
-  source: {
+  /**
+   * 视图形态：
+   * - projection（默认）：图形化最小形态 = 单 Projection 节点 + 单个表/视图数据源（source 必填）；
+   * - sql：SQL 模式 = 单个 SqlScriptView 节点 + <definition> SQL（scripted 必填，source 不使用）。
+   */
+  mode?: 'projection' | 'sql';
+  /** 源：表/视图（schema 经白名单）+ 列（缺省自动取全列）；mode=projection 时必填 */
+  source?: {
     schema: string;
     name: string;
     /** 显式指定映射列（仅需 columnName，dataTypeName 用于度量判定；缺省取表全列） */
     columns?: Array<{ columnName: string; dataTypeName?: string }>;
     measureMode?: 'SUM_NUMERIC' | 'ALL_ATTRIBUTES';
   };
+  /** SQL 模式：SQL 脚本 + 输出列清单（mode=sql 时必填；对象名/描述取自本次创建的入参） */
+  scripted?: Omit<ScriptedCalcViewSpec, 'objectName' | 'description'>;
   /** 激活开关：true=写后立即尝试激活；false/缺省=仅写设计时对象 */
   activate?: boolean;
-  /** 传输通道：repo_rest（默认）/ inactive_object（兜底直写，需特权账号） */
   /**
-     * 传输通道：
-     * - repo_rest（默认）：SYS.REPOSITORY_REST 裸 repoV2 JSON（读侧稳定；写侧在部分环境会 40106）
-     * - xs_rest：XS Classic 设计时 REST API（Orion，官方写路径，推荐用于写/激活）
-     * - inactive_object：直写 _SYS_REPO.INACTIVE_OBJECT 兜底（需特权账号）
-     */
-    transport?: 'repo_rest' | 'xs_rest' | 'inactive_object';
+   * 传输通道：
+   * - repo_rest（默认）：SYS.REPOSITORY_REST 裸 repoV2 JSON（读侧稳定；写侧在部分环境会 40106）
+   * - xs_rest：XS Classic 设计时 REST API（Orion，官方写路径，推荐用于写/激活）
+   * - inactive_object：直写 _SYS_REPO.INACTIVE_OBJECT 兜底（需特权账号）
+   */
+  transport?: 'repo_rest' | 'xs_rest' | 'inactive_object';
+  /** 激活成功后探测的行数上限（0=不探测，默认 10）：让「0 行」当场可见，而不是留到人工预览才发现 */
+  probeRows?: number;
 }
+
+/**
+ * 激活未通过时的完整明细（一次调用给全：HTTP 状态 + CheckResult 原文 + 完整错误文本）。
+ * 存在理由：激活失败的完整明细（含 Type/Procedure DDL）一次给全——否则调用方得「失败 → 再调一次
+ * hana_view_validate」才能拿全，每轮固定多一次往返。
+ */
+export interface ActivationDetail {
+  /** 服务端 HTTP 状态（555=激活失败；202/200 为 Check 未通过） */
+  httpStatus?: number;
+  /** CheckResult 原文（含 Operations.Write/Activate 与各 SPS 附带的明细字段，字段名不猜、整块透传） */
+  checkResult?: WriteCheckResult;
+  /** 错误码（如 40117 / 34011） */
+  errorCode?: string;
+  /** 完整错误文本（未截断；含 Type/Procedure DDL 明细） */
+  message?: string;
+  /** 原始响应体（仅在错误路径且未被 CheckResult 覆盖时有值） */
+  body?: string;
+}
+
+/** 由写响应体的 CheckResult 提取「激活未通过」的完整明细（激活通过则 undefined） */
+function activationDetailOf(meta: FileMeta & { CheckResult?: WriteCheckResult }): ActivationDetail | undefined {
+  const chk = extractCheckResult(meta);
+  if (!chk || chk.consistent) return undefined;
+  // httpStatus 来自 writeFile 附带的原始状态（555=写成功/激活失败，202=Check 未通过）：
+  // 调用方据此区分这两类失败，必须透传真实状态值，不能写死默认值或缺省
+  const httpStatus = typeof meta['_httpStatus'] === 'number' ? (meta['_httpStatus'] as number) : undefined;
+  return {
+    checkResult: chk.raw,
+    ...(httpStatus !== undefined ? { httpStatus } : {}),
+    ...(chk.errorCode ? { errorCode: chk.errorCode } : {}),
+    ...(chk.message ? { message: chk.message } : {}),
+  };
+}
+
+/** 去掉仅供进程内判定用的内部字段（`_httpStatus`），不回显给调用方 */
+function stripInternalMeta(meta: FileMeta & { CheckResult?: WriteCheckResult }): FileMeta {
+  const { _httpStatus, ...rest } = meta as FileMeta & { _httpStatus?: number };
+  void _httpStatus;
+  return rest as FileMeta;
+}
+
+/** 激活失败的一行摘要（首行 + 错误码）：完整文本在 activationDetail.message，避免同一长文本回显两遍 */
+function activationSummary(detail: ActivationDetail, fallback = '激活检查未通过'): string {
+  const firstLine = (detail.message ?? '').split('\n')[0].trim();
+  return [detail.errorCode, firstLine].filter(Boolean).join(' ') || fallback;
+}
+
+/** 激活后行探测结果：让「激活成功但 0 行」当场可见，而不是靠人工再预览一次 */
+export interface RowProbe {
+  /** 实际取回的行数（≤ probeRows） */
+  sampledRows: number;
+  /** true = 命中 probeRows 上限，还有更多行 */
+  truncated: boolean;
+  columns: string[];
+  rows: Record<string, unknown>[];
+  /** 0 行时的排查提示（键值补零 / 号码列语义 / 数据所在表与分区） */
+  emptyHint?: string;
+  /** 探测失败原因（未激活、无 SELECT 权限等）；探测失败不影响写入结果 */
+  error?: string;
+}
+
+/** 0 行提示：直接给出"下一步查什么"，避免把「激活成功」误当成「逻辑正确」 */
+const EMPTY_ROWS_HINT =
+  '视图可执行但返回 0 行——这不等于逻辑正确。排查顺序：' +
+  '① 用 hana_data_preview 的基表勘察模式（schema+table）核对源表**实际值**与行数，确认数据在哪个表/分区（ADSO 变更日志表 vs 活动数据表）；' +
+  '② 核对关联键的**补零/前导零格式**（BW 体系 ID 常见 15 位零填充 vs 不补零，两侧长度不一致会静默丢结果）；' +
+  '③ 核对**号码列语义**是否选错（如单据编号可能在 /BIC/Z* 客户字段而非 *NUM 标准字段）。';
 
 /** 新建视图结果 */
 export interface CreateCalcViewResult {
@@ -208,13 +284,100 @@ export interface CreateCalcViewResult {
   xml: string;
   wrote: boolean;
   activated?: boolean;
+  /** 激活未通过的一行摘要（首行 + 错误码）；完整明细见 activationDetail */
   activationErrors?: unknown;
+  /** 激活未通过的完整明细（含 DDL 全文）：无需再调 hana_view_validate 即可定位 */
+  activationDetail?: ActivationDetail;
   /** 度量数量（本环境激活要求 ≥1 个度量；0 时 activationNote 说明） */
   measureCount: number;
   /** measureCount=0 时的实测边界提示（激活会被 40117 "No measures defined" 拒绝） */
   activationNote?: string;
   /** inactive_object 通道专用：需要用户在 Studio 手工激活的提示 */
   manualActivateHint?: string;
+  /** 视图形态：projection（图形化最小形态）/ sql（SQL 模式，单 SqlScriptView） */
+  mode?: 'projection' | 'sql';
+  /** 激活后的行探测（probeRows>0 且对象已激活时才有） */
+  rowProbe?: RowProbe;
+}
+
+/** 行探测默认/上限（工具层 zod 默认值与服务层共用同一常量，避免多处各写一遍） */
+export const DEFAULT_PROBE_ROWS = 10;
+export const MAX_PROBE_ROWS = 100;
+
+/**
+ * 激活后的行探测：对刚写入/激活的视图取前 N 行，让「0 行」当场可见。
+ * - 只走运行时对象（_SYS_BIC.<包>/<对象>）；视图未激活时不做猜测，直接回报原因
+ * - LIMIT probeRows+1 探测是否被截断（不跑 COUNT(*)：大视图上代价不可控）
+ * - 任何失败都只进 rowProbe.error，不影响写入结果本身（探测是附加信息，不是前置条件）
+ */
+export async function probeRuntimeRows(
+  pool: HanaPool,
+  packageId: string,
+  objectName: string,
+  probeRows: number,
+): Promise<RowProbe> {
+  const empty: RowProbe = { sampledRows: 0, truncated: false, columns: [], rows: [] };
+  const limit = Math.min(Math.max(Math.trunc(probeRows), 1), MAX_PROBE_ROWS);
+  try {
+    const rows = await pool.query<Record<string, unknown>>(
+      `SELECT * FROM ${qualifyName('_SYS_BIC', `${packageId}/${objectName}`)} LIMIT ?`,
+      [limit + 1],
+    );
+    const truncated = rows.length > limit;
+    const sliced = truncated ? rows.slice(0, limit) : rows;
+    return {
+      sampledRows: sliced.length,
+      truncated,
+      columns: sliced[0] ? Object.keys(sliced[0]) : [],
+      rows: sliced,
+      ...(sliced.length === 0 ? { emptyHint: EMPTY_ROWS_HINT } : {}),
+    };
+  } catch (e) {
+    return {
+      ...empty,
+      error:
+        `行探测失败（不影响写入结果）：${e instanceof Error ? e.message : String(e)}。` +
+        '对象可能未激活，或当前用户缺少 _SYS_BIC 下该对象的 SELECT 权限（可用 hana_data_preview 复核）',
+    };
+  }
+}
+
+/**
+ * 行探测的唯一守卫：仅当「对象确实激活」且「probeRows > 0」时探测，否则返回 undefined。
+ * create 与 update 共用同一守卫：各写一份时，改默认值/加守卫要同时找多处，漏一处即行为不一致。
+ */
+async function probeIfActivated(
+  pool: HanaPool,
+  packageId: string,
+  objectName: string,
+  activated: boolean,
+  probeRows?: number,
+): Promise<RowProbe | undefined> {
+  const rows = probeRows ?? DEFAULT_PROBE_ROWS;
+  if (!activated || rows <= 0) return undefined;
+  return probeRuntimeRows(pool, packageId, objectName, rows);
+}
+
+/**
+ * SQL 模式的读取范围校验（读边界的最后一道）。
+ * 脚本里**限定 schema** 的引用由工具层写计划扫描判定；**未限定**表名（`FROM MARA`）按当前用户的
+ * 默认 schema 解析——扫描器无从得知，故这里查出 CURRENT_SCHEMA 再判它是否在允许范围内。
+ * 没有这一步时 `SELECT * FROM MARA` 这类写法会完全绕过 HANA_SCHEMA_ALLOW。
+ */
+async function assertScriptReadScopes(pool: HanaPool, script: string): Promise<void> {
+  const { hasUnqualifiedTableRef } = await import('../write-plan.js');
+  if (!hasUnqualifiedTableRef(script)) return;
+  const rows = await pool.query<{ CURRENT_SCHEMA: string }>('SELECT CURRENT_SCHEMA FROM DUMMY');
+  const schema = rows[0]?.CURRENT_SCHEMA ?? '';
+  if (schema === '') return; // 取不到默认 schema 时不误拦（写包边界与限定名扫描仍在）
+  try {
+    assertSchemaAllowed(schema);
+  } catch {
+    throw new HanaBusinessError(
+      `脚本含未限定 schema 的表名，按当前用户默认 schema "${schema}" 解析，而它不在服务端允许读取的范围内。` +
+        '请把表名写成全限定名（SCHEMA."表"），或由部署方调整可读 schema 配置',
+    );
+  }
 }
 
 /** 检查对象是否已存在（ACTIVE_OBJECT 或 INACTIVE_OBJECT） */
@@ -237,7 +400,7 @@ async function objectExists(
 /** 生成数据源定义所需的列信息（缺省从表元数据取全列） */
 async function resolveColumns(
   pool: HanaPool,
-  source: CreateCalcViewInput['source'],
+  source: NonNullable<CreateCalcViewInput['source']>,
 ): Promise<Array<{ columnName: string; dataTypeName?: string }>> {
   if (source.columns && source.columns.length > 0) return source.columns;
   const { getTableColumns } = await import('./metadata.service.js');
@@ -350,7 +513,7 @@ export async function createPackageViaRest(config: HanaConfig, packageId: string
   const leafName = segments[segments.length - 1];
   return rest.createPackage(packageId, leafName, description);
 }
-/** view_update 的声明式操作补丁（op=add_join：给当前视图追加一个 join） */
+/** view_update 的声明式操作补丁（op=add_join：给当前视图追加一个 join；op=set_script：替换 SQL 模式脚本） */
 export interface AddJoinOperation {
   op: 'add_join';
   /** join 源视图（仓库对象；BW query 视图/普通 CV/AV 均可，只读即可） */
@@ -363,6 +526,13 @@ export interface AddJoinOperation {
   /** 要透出到输出的源视图字段；缺省=源视图全部可见属性 − join 条件字段 − 左侧已有字段 */
   fields?: string[];
 }
+
+/** op=set_script：替换 SQL 模式视图（SqlScriptView）的脚本与输出列（模型零 XML） */
+export interface SetScriptOperation extends SetScriptSpec {
+  op: 'set_script';
+}
+
+export type ViewUpdateOperation = AddJoinOperation | SetScriptOperation;
 
 /** 单条 add_join 操作的应用明细 */
 export interface AddJoinOperationResult {
@@ -385,6 +555,21 @@ export interface AddJoinOperationResult {
   fieldSelectionNote?: string;
 }
 
+/** 单条 set_script 操作的应用明细 */
+export interface SetScriptOperationResult {
+  op: 'set_script';
+  /** 被替换脚本的节点 id（SqlScript_1） */
+  scriptNodeId: string;
+  /** 重建后的输出属性/度量数 */
+  attributeCount: number;
+  measureCount: number;
+  /** 脚本字符数（替换前 → 后） */
+  scriptBytes: { before: number; after: number };
+}
+
+/** 任一 operation 的应用明细（按 op 判别） */
+export type AppliedOperationResult = AddJoinOperationResult | SetScriptOperationResult;
+
 export interface UpdateCalculationViewResult {
   object: { packageId: string; objectName: string; objectSuffix: 'calculationview' };
   updated: boolean;
@@ -392,14 +577,18 @@ export interface UpdateCalculationViewResult {
   activated: boolean;
   /** 写入时激活检查失败明细（存在即新内容未激活成功） */
   activationErrors?: string;
+  /** 激活未通过的完整明细（含 DDL 全文）：无需再调 hana_view_validate 即可定位 */
+  activationDetail?: ActivationDetail;
   meta?: FileMeta;
   /** operations 模式：操作应用明细（xml 全量模式无此字段） */
   operationsResult?: {
-    applied: AddJoinOperationResult[];
+    applied: AppliedOperationResult[];
     xmlBytes: { before: number; after: number };
   };
   /** xml 全量模式：护栏校验摘要（operations 模式无此字段），供模型免回读自检 */
   xmlVerification?: FullXmlGuardResult;
+  /** 激活后的行探测（probeRows>0 且对象已激活时才有）——与 create 回执同形 */
+  rowProbe?: RowProbe;
   /** 端到端耗时（operations 模式含当前/源定义读取与确定性变换；xml 模式无意义故不返回） */
   elapsedMs?: number;
 }
@@ -418,8 +607,8 @@ export async function updateCalculationView(
   pool: HanaPool,
   packageId: string,
   objectName: string,
-  input: { xml?: string; operations?: AddJoinOperation[] },
-  opts: { ifMatch?: string; activate?: boolean } = {},
+  input: { xml?: string; operations?: ViewUpdateOperation[] },
+  opts: { ifMatch?: string; activate?: boolean; probeRows?: number } = {},
   client?: XsRestClient,
 ): Promise<UpdateCalculationViewResult> {
   assertWritePackageAllowed(packageId, objectName);
@@ -452,12 +641,26 @@ export async function updateCalculationView(
     if (!designTimeXml || designTimeXml.trim() === '') {
       throw new HanaBusinessError(`视图 ${packageId}/${objectName} 无设计时内容，无法应用 operations`);
     }
-    const applied: AddJoinOperationResult[] = [];
+    const applied: AppliedOperationResult[] = [];
     let currentXml = designTimeXml;
     for (const op of input.operations!) {
-      const r = await applyAddJoinOperation(pool, op, currentXml);
-      applied.push(r.result);
-      currentXml = r.xml;
+      // 按 op 分派：add_join 读源视图定义后接线；set_script 只改当前视图自身（无跨包读取）
+      if (op.op === 'set_script') {
+        await assertScriptReadScopes(pool, op.script);
+        const r = setScriptInViewXml(currentXml, op);
+        applied.push({
+          op: 'set_script',
+          scriptNodeId: r.scriptNodeId,
+          attributeCount: r.attributeCount,
+          measureCount: r.measureCount,
+          scriptBytes: r.scriptBytes,
+        });
+        currentXml = r.xml;
+      } else {
+        const r = await applyAddJoinOperation(pool, op, currentXml);
+        applied.push(r.result);
+        currentXml = r.xml;
+      }
     }
     operationsResult = {
       applied,
@@ -472,15 +675,18 @@ export async function updateCalculationView(
 
   const meta = await updateViaRest(config, packageId, objectName, xml, { ...opts, ifMatch }, rest);
   const activated = meta.Attributes?.SapBackPack?.Activated === true;
-  const chk = extractCheckResult(meta);
+  const detail = activationDetailOf(meta);
+  // 行探测：对象确实激活后才探（同 create，让"激活成功但 0 行"当场可见）
+  const rowProbe = await probeIfActivated(pool, packageId, objectName, activated, opts.probeRows);
   return {
     object: { packageId, objectName, objectSuffix: 'calculationview' },
     updated: true,
     activated,
-    ...(chk && !chk.consistent ? { activationErrors: [chk.errorCode, chk.message].filter(Boolean).join(' ') } : {}),
-    meta,
+    ...(detail ? { activationErrors: activationSummary(detail), activationDetail: detail } : {}),
+    meta: stripInternalMeta(meta),
     ...(operationsResult ? { operationsResult, elapsedMs: Date.now() - startedAt } : {}),
     ...(xmlVerification ? { xmlVerification } : {}),
+    ...(rowProbe ? { rowProbe } : {}),
   };
 }
 
@@ -643,8 +849,7 @@ export async function createCalculationView(
   assertWritePackageAllowed(input.packageId, input.objectName);
   assertSafeObjectName(input.objectName, '视图');
 
-  const { assertSchemaAllowed } = await import('../core/sql.js');
-  assertSchemaAllowed(input.source.schema);
+  const mode = input.mode ?? 'projection';
 
   // 快速失败（权威检查在下方临界区内复核）：对象已存在时不必再取源列、生成 XML
   if (await objectExists(pool, input.packageId, input.objectName)) {
@@ -653,33 +858,56 @@ export async function createCalculationView(
     );
   }
 
-  const columns = await resolveColumns(pool, input.source);
-  const measureMode = input.source.measureMode ?? 'ALL_ATTRIBUTES';
-  const xml = buildMinCalcViewXml({
-    objectName: input.objectName,
-    description: input.description,
-    schema: input.source.schema,
-    table: input.source.name,
-    columns: columns.map((c) => ({ columnName: c.columnName, dataTypeName: c.dataTypeName })),
-    measureMode,
-  });
+  let xml: string;
+  let measureCount: number;
+  if (mode === 'sql') {
+    // SQL 模式：单 SqlScriptView + <definition> SQL，输出列由调用方声明（datatype 必填）
+    if (!input.scripted) {
+      throw new HanaBusinessError('mode=sql 需要提供 scripted（script + columns），或改用 mode=projection');
+    }
+    await assertScriptReadScopes(pool, input.scripted.script);
+    xml = buildScriptedCalcViewXml({
+      ...input.scripted,
+      objectName: input.objectName,
+      description: input.description,
+    });
+    measureCount = input.scripted.columns.filter((c) => c.isMeasure === true).length;
+  } else {
+    if (!input.source) {
+      throw new HanaBusinessError('mode=projection 需要提供 source（schema + name），或改用 mode=sql');
+    }
+    assertSchemaAllowed(input.source.schema);
+    const columns = await resolveColumns(pool, input.source);
+    const measureMode = input.source.measureMode ?? 'ALL_ATTRIBUTES';
+    xml = buildMinCalcViewXml({
+      objectName: input.objectName,
+      description: input.description,
+      schema: input.source.schema,
+      table: input.source.name,
+      columns: columns.map((c) => ({ columnName: c.columnName, dataTypeName: c.dataTypeName })),
+      measureMode,
+    });
 
-  // 度量计数（与 builder 的 SUM_NUMERIC 判定一致：数值类型进 baseMeasures）
-  const NUMERIC = new Set(['TINYINT', 'SMALLINT', 'INTEGER', 'INT', 'BIGINT', 'DECIMAL', 'SMALLDECIMAL', 'REAL', 'DOUBLE', 'FLOAT', 'SECONDDATE', 'DATE', 'TIME', 'TIMESTAMP', 'LONGDATE']);
-  const measureCount = measureMode === 'SUM_NUMERIC'
-    ? columns.filter((c) => NUMERIC.has((c.dataTypeName ?? '').toUpperCase())).length
-    : 0;
+    // 度量计数（与 builder 的 SUM_NUMERIC 判定一致：数值类型进 baseMeasures）
+    const NUMERIC = new Set(['TINYINT', 'SMALLINT', 'INTEGER', 'INT', 'BIGINT', 'DECIMAL', 'SMALLDECIMAL', 'REAL', 'DOUBLE', 'FLOAT', 'SECONDDATE', 'DATE', 'TIME', 'TIMESTAMP', 'LONGDATE']);
+    measureCount = measureMode === 'SUM_NUMERIC'
+      ? columns.filter((c) => NUMERIC.has((c.dataTypeName ?? '').toUpperCase())).length
+      : 0;
+  }
 
   const result: CreateCalcViewResult = {
     object: { packageId: input.packageId, objectName: input.objectName, objectSuffix: 'calculationview' },
     xml,
     wrote: false,
     measureCount,
+    mode,
   };
   if (measureCount === 0) {
     result.activationNote =
       '本环境（SPS08 实测）激活要求视图至少包含 1 个度量（40117 "No measures defined"）。' +
-      '当前视图无度量，仅可保存设计时对象；建议用 measureMode=SUM_NUMERIC（需源表含数值列）重建';
+      (mode === 'sql'
+        ? '当前 SQL 模式视图无度量列：把至少一个数值输出列的 columns[].isMeasure 置为 true，否则只能保存设计时对象'
+        : '当前视图无度量，仅可保存设计时对象；建议用 measureMode=SUM_NUMERIC（需源表含数值列）重建');
   }
 
   const transport = input.transport ?? 'xs_rest';
@@ -696,14 +924,17 @@ export async function createCalculationView(
     if (transport === 'xs_rest') {
       // 官方 REST 写路径（PUT create-or-update）。实测：合法模型「写入即激活」，
       // activated 为写入后的实测状态（非请求参数）；激活检查失败明细从响应体 CheckResult 透出。
+      // 激活失败（HTTP 555 + Write:true）时 writeFile 按非致命结果返回——文件已写入、只是没激活，
+      // 这里照常回报 activated=false + 完整明细，调用方一次调用即可定位。
       const meta = await writeViaRest(config, input.packageId, input.objectName, xml, {
         activate: input.activate ?? false,
       });
       result.wrote = true;
       result.activated = meta.Attributes?.SapBackPack?.Activated === true;
-      const chk = extractCheckResult(meta);
-      if (chk && !chk.consistent) {
-        result.activationErrors = [chk.errorCode, chk.message].filter(Boolean).join(' ') || '激活检查未通过';
+      const detail = activationDetailOf(meta);
+      if (detail) {
+        result.activationErrors = activationSummary(detail);
+        result.activationDetail = detail;
       }
     } else if (transport === 'inactive_object') {
       await writeViaInactiveObject(pool, input.packageId, input.objectName, xml);
@@ -727,6 +958,10 @@ export async function createCalculationView(
     );
   }
 
+  // 行探测：对象确实激活后才探，避免在未激活对象上做无意义查询
+  const rowProbe = await probeIfActivated(pool, input.packageId, input.objectName, result.activated === true, input.probeRows);
+  if (rowProbe) result.rowProbe = rowProbe;
+
   return result;
 }
 
@@ -741,6 +976,22 @@ export async function activateCalculationView(
   assertWritePackageAllowed(packageId, objectName);
   if (transport === 'xs_rest') {
     const meta = await activateViaRest(config, packageId, objectName);
+    // 显式激活的语义就是「必须激活成功」：writeFile 对 555（写成功/激活失败）按非致命返回，
+    // 这里必须把失败重新显性化——否则调用方拿到 success:true 却面对一个未激活的对象
+    // （工具描述承诺「失败会透传编译错误明细（不误报成功）」）。
+    if (meta.Attributes?.SapBackPack?.Activated !== true) {
+      const detail = activationDetailOf(meta);
+      const errDetail = detail?.message ?? describeActivationFailure(meta);
+      throw new HanaBusinessError(
+        `激活失败：${packageId}/${objectName} 写入成功但未激活。${errDetail}`,
+        detail?.errorCode,
+        undefined,
+        [],
+        undefined,
+        // 原始载荷与 create/update 路径同形（envelope.raw.errorDetail）
+        { httpStatus: meta['_httpStatus'], ...(detail ?? {}) },
+      );
+    }
     return { transport: 'xs_rest', meta };
   }
   const resp = await repositoryRest(pool, {
@@ -751,6 +1002,13 @@ export async function activateCalculationView(
   });
   assertNoRepoRestError(resp, 'activate');
   return { transport: 'repo_rest', repoResp: resp };
+}
+
+/** 激活检查未通过但响应体没有 CheckResult 时的兜底说明 */
+function describeActivationFailure(meta: FileMeta & { CheckResult?: WriteCheckResult }): string {
+  return meta.CheckResult
+    ? '激活检查未通过（响应体 CheckResult 明细见 raw.errorDetail）'
+    : '服务端未返回 Activated=true（未见 CheckResult 明细；可用 hana_view_validate 复核）';
 }
 
 /* ── Transfer API（xfer）：导出备份 / 导入恢复────────── */

@@ -20,6 +20,11 @@ export class HanaBusinessError extends Error {
     public readonly messages: HanaMessage[] = [],
     /** 排障报告（如预览权限诊断）；由失败路径自动附加，envelope.raw.diagnosis 透传给调用方 */
     public readonly diagnosis?: unknown,
+    /**
+     * 服务端原始错误载荷（如 XS 写失败的 CheckResult + 响应体）。
+     * 与 diagnosis 同为「失败后无需二次调用即可定位」的附加信息，envelope.raw.errorDetail 透传。
+     */
+    public readonly rawDetail?: unknown,
   ) {
     super(message);
     this.name = 'HanaBusinessError';
@@ -66,8 +71,13 @@ export async function withErrorEnvelope<T>(fn: () => Promise<T>): Promise<Envelo
   } catch (e) {
     if (e instanceof HanaBusinessError) {
       const raw = e.code ? { code: e.code } : undefined;
-      // 排障报告（如预览权限诊断）随错误透传给调用方，便于失败后定位阻塞点
-      const rawWithDiagnosis = e.diagnosis != null ? { ...(raw ?? {}), diagnosis: e.diagnosis } : raw;
+      // 排障报告（如预览权限诊断）与服务端原始错误载荷（如 XS CheckResult）随错误透传给调用方，
+      // 便于失败后一次定位阻塞点——避免"失败 → 再调一次校验才看到 DDL 全文"的固定 +1 轮。
+      const extra = {
+        ...(e.diagnosis != null ? { diagnosis: e.diagnosis } : {}),
+        ...(e.rawDetail != null ? { errorDetail: e.rawDetail } : {}),
+      };
+      const rawWithDiagnosis = Object.keys(extra).length > 0 ? { ...(raw ?? {}), ...extra } : raw;
       return withIdentity({
         success: false,
         messages:

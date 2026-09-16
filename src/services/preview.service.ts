@@ -1,7 +1,7 @@
 import type { HanaPool } from '../core/hana-client.js';
 import { HanaBusinessError } from '../core/errors.js';
 import { withKeyedLock } from '../core/keyed-mutex.js';
-import { assertSafeRuntimeName, quoteIdentifier, quoteLiteral, qualifyName } from '../core/sql.js';
+import { assertSafeRuntimeName, assertSchemaAllowed, quoteIdentifier, quoteLiteral, qualifyName } from '../core/sql.js';
 import { viewDefinitionCache } from '../model/view-cache.js';
 import type { ViewKind } from '../model/view-types.js';
 import { deriveNodeSql } from './preview.derive.js';
@@ -48,6 +48,59 @@ export interface PreviewOptions {
   limit?: number;
   /** 强制走 XML 推导（跳过中间视图主路径），默认自动 */
   forceDerive?: boolean;
+}
+
+/** 基表勘察输入：schema + table（+ 可选列清单 / 采样行数） */
+export interface TableInspectOptions {
+  schema: string;
+  table: string;
+  /** 要勘察的列；缺省=按元数据取（上限 50 列） */
+  columns?: string[];
+  /** 采样行数（进入统计与样例的行数上限），默认 200，最大 2000 */
+  sampleRows?: number;
+  /** 筛选条件（与视图预览同语义，AND 连接、参数绑定） */
+  filter?: PreviewFilter[];
+}
+
+/**
+ * 单列勘察结果：**基于采样行**（不跑 COUNT(DISTINCT) 这类全表扫描——BW 大表上代价不可控）。
+ * 目标是把「关联键到底长什么样」一次说清：值样例 + 长度区间 + 是否含前导零。
+ */
+export interface TableColumnProfile {
+  name: string;
+  dataType?: string;
+  length?: number;
+  /** 采样行中的 NULL 数 */
+  nullCount: number;
+  /** 采样行中的去重值数 */
+  distinctInSample: number;
+  /** 长度区间（采样行；仅字符型有意义） */
+  minLength?: number;
+  maxLength?: number;
+  /** true=采样内所有非空值长度一致（补零差异排查的关键信号） */
+  uniformLength?: boolean;
+  /** 去重后的值样例（最多 10 个，超长值截断显示） */
+  samples: string[];
+  /** 含前导零的值样例（BW 体系 ID 补零差异的头号信号；无则缺省） */
+  zeroPaddedSamples?: string[];
+}
+
+export interface TableInspectResult {
+  table: { schema: string; table: string };
+  /** 本次实际采样的行数（≤ sampleRows 且 ≤ 实际行数） */
+  sampledRows: number;
+  /** true = 采样达到 sampleRows 上限（表可能还有更多行） */
+  truncated: boolean;
+  /** 采样是否为空（表为空 / 筛选后为空 / 无 SELECT 权限时给出 error） */
+  empty: boolean;
+  /** 0 行时的排查提示 */
+  emptyHint?: string;
+  columns: TableColumnProfile[];
+  /** 样例行（前若干行，便于直接看真实值形态） */
+  rows: Record<string, unknown>[];
+  sql: string;
+  /** 采样方式说明（统计口径，避免把采样值当成全表结论） */
+  samplingNote: string;
 }
 
 export interface PreviewResult {
@@ -427,4 +480,129 @@ function buildParameters(parameters: Record<string, string>): string {
       return `'PLACEHOLDER' = (${quoteLiteral(`$$${k}$$`)}, ${quoteLiteral(v)})`;
     })
     .join(', ');
+}
+
+/* ── 基表勘察 ─────────────────────────────────────────────────────────
+ * 为什么需要：跨表建模前必须核对「源表实际值长什么样」——数据在哪张表/哪个分区、关联键是否补零、
+ * 号码列到底在哪一列。没有这条通道，就只能「建临时透传视图 → 激活 → 预览 → 删除」：
+ * 每核对一次是 4 次写操作，而且「0 行」要等激活之后才发现。
+ *
+ * 统计口径：**只基于采样行**（默认 200 行）。不跑 COUNT(*)/COUNT(DISTINCT) 这类全表操作——
+ * BW 大表上代价不可控，而"值形态"（补零、长度、号码列）看采样就够。
+ * schema 走白名单（HANA_SCHEMA_ALLOW），列名/表名走运行时名校验，值一律参数绑定。
+ */
+
+/** 值样例最多返回个数 */
+const PROFILE_SAMPLE_VALUES = 10;
+/** 样例值显示长度上限（超长列值截断，避免把宽表整行塞进上下文） */
+const PROFILE_VALUE_CHARS = 80;
+/** 勘察默认采样行数 / 上限 */
+const INSPECT_DEFAULT_ROWS = 200;
+const INSPECT_MAX_ROWS = 2000;
+
+/** 值 → 展示字符串（null 单独处理；超长截断并标注） */
+function displayValue(v: unknown): string {
+  if (v === null || v === undefined) return 'NULL';
+  const s = typeof v === 'string' ? v : typeof v === 'object' ? JSON.stringify(v) : String(v);
+  return s.length > PROFILE_VALUE_CHARS ? `${s.slice(0, PROFILE_VALUE_CHARS)}…(${s.length} 字符)` : s;
+}
+
+/** 单列统计（纯函数；输入为采样行） */
+function profileColumn(name: string, values: unknown[], meta?: { dataType?: string; length?: number }): TableColumnProfile {
+  const nonNull = values.filter((v) => v !== null && v !== undefined);
+  const nullCount = values.length - nonNull.length;
+  const distinct = new Map<string, unknown>();
+  for (const v of nonNull) {
+    const key = typeof v === 'string' ? v : String(v);
+    if (!distinct.has(key)) distinct.set(key, v);
+  }
+  // 长度统计只取**字符串值**：数值列上 String(5).length 之类的长度没有业务含义，
+  // 却会被当成"补零不一致"的信号（README/指令里 minLength/maxLength 就是给字符型键用的）
+  const stringValues = nonNull.filter((v) => typeof v === 'string') as string[];
+  const lengths = stringValues.map((v) => v.length);
+  const minLength = lengths.length > 0 ? Math.min(...lengths) : undefined;
+  const maxLength = lengths.length > 0 ? Math.max(...lengths) : undefined;
+  const zeroPadded = nonNull.filter((v) => typeof v === 'string' && /^0\d/.test(v)).map(displayValue);
+  return {
+    name,
+    ...(meta?.dataType ? { dataType: meta.dataType } : {}),
+    ...(meta?.length !== undefined ? { length: meta.length } : {}),
+    nullCount,
+    distinctInSample: distinct.size,
+    ...(minLength !== undefined ? { minLength, maxLength, uniformLength: minLength === maxLength } : {}),
+    samples: [...distinct.values()].slice(0, PROFILE_SAMPLE_VALUES).map(displayValue),
+    ...(zeroPadded.length > 0 ? { zeroPaddedSamples: [...new Set(zeroPadded)].slice(0, 5) } : {}),
+  };
+}
+
+/**
+ * 基表/视图勘察：采样 N 行 + 逐列统计（去重值样例、长度区间、前导零样例）。
+ * 与视图预览共用筛选语义（filter 为 AND 连接、值参数绑定）。
+ */
+export async function inspectTable(
+  pool: HanaPool,
+  opts: TableInspectOptions,
+): Promise<TableInspectResult> {
+  // 这些断言来自 core/sql（抛裸 Error），而 withErrorEnvelope 只把 HanaBusinessError 转成结构化信封——
+  // 不在这里包一层的话，调用方只会看到「内部错误，详情见服务端日志」（实测）。
+  try {
+    assertSchemaAllowed(opts.schema);
+    assertSafeRuntimeName(opts.table, '表/视图');
+  } catch (e) {
+    throw new HanaBusinessError(e instanceof Error ? e.message : String(e));
+  }
+  const sampleRows = Math.min(Math.max(opts.sampleRows ?? INSPECT_DEFAULT_ROWS, 1), INSPECT_MAX_ROWS);
+  const { clause, params } = buildWhere(opts.filter);
+
+  // 列清单：显式给出则校验后用；缺省按元数据取（有上限，避免宽表把上下文塞满）。
+  // 取不到列时 getTableColumns 会抛「未找到表…（或当前用户无权限）」——比在这里重写一条更精确，直接透传。
+  // 元数据里的类型/长度一并留下：画像里的 dataType/length 就是给「NUMC(10) vs CHAR(18)」这类判断用的。
+  const metaByName = new Map<string, { dataType?: string; length?: number }>();
+  let columnNames = opts.columns?.map((c) => c.trim());
+  for (const c of columnNames ?? []) {
+    try {
+      assertSafeRuntimeName(c, '列名');
+    } catch (e) {
+      throw new HanaBusinessError(e instanceof Error ? e.message : String(e));
+    }
+  }
+  try {
+    const { getTableColumns } = await import('./metadata.service.js');
+    const cols = await getTableColumns(pool, opts.schema, opts.table, { limit: 50 });
+    for (const c of cols) metaByName.set(c.columnName, { dataType: c.dataTypeName, length: c.length ?? undefined });
+    if (!columnNames || columnNames.length === 0) columnNames = cols.map((c) => c.columnName);
+  } catch (e) {
+    // 显式给了列清单时元数据失败不致命（仍可采样）；缺省取列时失败必须上抛（否则无从采起）
+    if (!columnNames || columnNames.length === 0) throw e;
+  }
+
+  const target = `${quoteIdentifier(opts.schema)}.${quoteIdentifier(opts.table)}`;
+  const selectList = columnNames.map((c) => quoteIdentifier(c)).join(', ');
+  const sql = `SELECT ${selectList} FROM ${target}${clause} LIMIT ?`;
+  const rows = await pool.query<Record<string, unknown>>(sql, [...params, sampleRows + 1]);
+  const truncated = rows.length > sampleRows;
+  const sliced = truncated ? rows.slice(0, sampleRows) : rows;
+
+  const profiles = columnNames.map((name) => profileColumn(name, sliced.map((r) => r[name]), metaByName.get(name)));
+
+  return {
+    table: { schema: opts.schema, table: opts.table },
+    sampledRows: sliced.length,
+    truncated,
+    empty: sliced.length === 0,
+    ...(sliced.length === 0
+      ? {
+          emptyHint:
+            '该表（在当前筛选下）没有数据。BW 场景常见原因：数据在**另一张表**——变更日志表（...1 结尾）vs 活动数据表（...2 结尾）、' +
+            '或数据在另一个分区/年份段；请对候选表逐一勘察行数对比（本工具支持直接换 table 再查）',
+        }
+      : {}),
+    columns: profiles,
+    // 样例行只回前 10 行：够看值形态，又不至于把宽表刷屏
+    rows: sliced.slice(0, 10),
+    sql,
+    samplingNote:
+      `统计基于前 ${sliced.length} 行采样（sampleRows=${sampleRows}${truncated ? '，已截断、表还有更多行' : ''}）；` +
+      'distinctInSample / minLength / maxLength 均为**采样口径**，不代表全表精确值',
+  };
 }

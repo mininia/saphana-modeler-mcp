@@ -22,6 +22,9 @@ test-verification/
 tests/
 docs/
 
+# 环境方言模板样本不入库（含真实对象名/列名，属环境资产而非通用代码）
+templates/
+
 # 编辑器/工具生成目录（计划、配置等，不入库）
 .claude/
 .comate/

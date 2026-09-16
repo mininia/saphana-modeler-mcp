@@ -1,4 +1,4 @@
-import { scanXmlPackageRefs, type WritePlan } from '../write-plan.js';
+import { scanSqlSchemaRefs, scanXmlPackageRefs, type WritePlan } from '../write-plan.js';
 
 /**
  * 写工具预规划器（单一事实源）：工具名 → 入参 → WritePlan。
@@ -24,26 +24,51 @@ function add(list: string[], ...items: (string | undefined)[]): void {
   }
 }
 
-/** op=add_join 的声明式补丁（结构见 hana_view_update 的 operations schema） */
-interface AddJoinOp {
+/** 声明式操作补丁的入参形状（结构见 hana_view_update 的 operations schema：add_join / set_script） */
+interface DeclarativeOp {
   op?: unknown;
   sourcePackageId?: unknown;
   sourceObjectName?: unknown;
+  /** op=set_script 的 SQL 正文 */
+  script?: unknown;
 }
 
-/** hana_view_create：写入目标包；读取源 schema；激活会生成 _SYS_BIC 运行时视图 */
+/** hana_view_create：写入目标包；读取源 schema（或扫描 SQL 模式脚本里的 schema 引用）；激活会生成 _SYS_BIC 运行时视图 */
 function planViewCreate(args: Record<string, unknown>): WritePlan {
   const p = emptyPlan('hana_view_create');
   const pkg = asStr(args.packageId);
   const object = asStr(args.objectName) ?? '(未指定对象名)';
   const schema = asStr(args.sourceSchema);
   const source = asStr(args.sourceName);
+  const script = asStr(args.script);
+  // 与服务层同一判定：mode 缺省即 projection（此时 script 会被忽略，计划也不该按 SQL 模式描述）
+  const isSqlMode = args.mode === 'sql';
   add(p.writePackages, pkg);
   add(p.readSchemas, schema);
-  p.steps.push(`在包 ${pkg ?? '(未指定)'} 新建设计时 Calculation View ${object}`);
-  if (schema && source) p.steps.push(`读取源 ${schema}.${source} 的列定义（按类型区分属性/度量）`);
+  p.steps.push(
+    isSqlMode
+      ? `在包 ${pkg ?? '(未指定)'} 新建 SQL 模式设计时 Calculation View ${object}（单 SqlScriptView + <definition>）`
+      : `在包 ${pkg ?? '(未指定)'} 新建设计时 Calculation View ${object}`,
+  );
+  if (isSqlMode) {
+    if (script) {
+      const refs = scanSqlSchemaRefs(script);
+      add(p.readSchemas, ...refs);
+      p.steps.push(`按脚本中出现的 schema 限定名核对读取范围（共 ${refs.length} 个候选，来自 FROM/JOIN 表位置）`);
+      p.uncertain.push(
+        'SQL 模式：脚本内 schema 引用按 FROM/JOIN 表位置扫描（含引号/小写写法），' +
+          '未限定 schema 的表名（按当前用户默认 schema 解析）与动态 SQL 不在本计划内',
+      );
+    }
+    p.steps.push('按本环境方言生成设计时 XML（SCRIPT_BASED + definition + viewAttribute datatype）');
+  } else if (schema && source) {
+    p.steps.push(`读取源 ${schema}.${source} 的列定义（按类型区分属性/度量）`);
+  }
   p.steps.push('生成并写入设计时 XML（XS REST PUT）');
   if (args.activate === true) p.steps.push('写入后尝试激活 → 生成 _SYS_BIC 运行时列视图');
+  if (typeof args.probeRows === 'number' && args.probeRows > 0) {
+    p.steps.push(`激活后回探测前 ${args.probeRows} 行（只读 _SYS_BIC 运行时对象）`);
+  }
   return p;
 }
 
@@ -58,12 +83,18 @@ function planViewUpdate(args: Record<string, unknown>): WritePlan {
   add(p.writePackages, pkg);
   p.steps.push(`读取 ${pkg ?? '?'}/${object} 的当前定义（同时取 ETag 作并发基线）`);
 
-  const ops = Array.isArray(args.operations) ? (args.operations as AddJoinOp[]) : [];
+  const ops = Array.isArray(args.operations) ? (args.operations as DeclarativeOp[]) : [];
   ops.forEach((op, i) => {
     const sp = asStr(op?.sourcePackageId);
     const so = asStr(op?.sourceObjectName);
     const kind = String(op?.op ?? '?');
-    if (sp) {
+    if (kind === 'set_script') {
+      // 替换脚本：只改当前视图自身（无跨包读取），但脚本内的 schema 限定名属于读取范围
+      const script = asStr(op?.script);
+      if (script) add(p.readSchemas, ...scanSqlSchemaRefs(script));
+      p.steps.push(`应用操作 ${i + 1}（set_script）：替换 SQL 模式视图的脚本与输出列（重建 definition/viewAttributes/logicalModel 输出）`);
+      p.uncertain.push(`操作 ${i + 1}（set_script）：脚本内的 schema 引用按启发式扫描，未限定 schema 的表名不在本计划内`);
+    } else if (sp) {
       add(p.readPackages, sp);
       p.steps.push(`应用操作 ${i + 1}（${kind}）：join 源 ${sp}/${so ?? '?'} —— 跨包只读引用`);
     } else {
