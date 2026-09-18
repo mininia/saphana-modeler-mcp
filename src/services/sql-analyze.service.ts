@@ -72,6 +72,8 @@ const VERBOSE_COLUMNS = [
 const CACHE_COLUMNS = [
   'PLAN_ID',
   'USER_NAME',
+  // 条目编译时的 session schema：未限定表名当初就是按它解析的，判读取范围要用它而不是调用方的
+  'SCHEMA_NAME',
   'STATEMENT_STRING',
   'EXECUTION_COUNT',
   'TOTAL_EXECUTION_TIME',
@@ -181,6 +183,8 @@ export interface SqlAnalyzeResult {
 interface PlanCacheRow {
   PLAN_ID: number | null;
   USER_NAME?: string | null;
+  /** 编译该计划时的 session schema（`FROM T` 的解析基准） */
+  SCHEMA_NAME?: string | null;
   STATEMENT_STRING: string | null;
   EXECUTION_COUNT?: number | null;
   TOTAL_EXECUTION_TIME?: number | null;
@@ -226,9 +230,11 @@ export async function analyzeSql(pool: HanaPool, opts: SqlAnalyzeOptions): Promi
       const cleaned = await cleanup();
       return withCleanupNote(result, statementName, cleaned);
     } catch (e) {
-      // 失败路径同样可能已经写入计划行（EXPLAIN 成功、回读失败）：尽力清理，但不掩盖原始错误
-      await cleanup();
-      throw e;
+      // 失败路径同样可能已经写入计划行（EXPLAIN 成功、回读失败）：尽力清理，但不掩盖原始错误。
+      // 清理**也**失败时必须让调用方知道——否则错误信息里既没有语句名、也没有"有行残留"这件事，
+      // 补救线索直接丢失（成功路径本来就会回报这些）
+      const cleaned = await cleanup();
+      throw withCleanupDiagnosis(e, statementName, cleaned);
     }
   });
 }
@@ -263,15 +269,34 @@ function withCleanupNote(
   return {
     ...result,
     planRowsCleaned: cleaned,
-    ...(cleaned
-      ? {}
-      : {
-          notes: [
-            ...result.notes,
-            `本次写入的计划行未清理（可能当前用户无 DELETE 权限）：SYS.EXPLAIN_PLAN_TABLE 中 STATEMENT_NAME='${statementName}' 的行需手工清理`,
-          ],
-        }),
+    ...(cleaned ? {} : { notes: [...result.notes, cleanupHint(statementName)] }),
   };
+}
+
+/**
+ * 失败路径：清理没成功时，把补救线索并入**错误诊断**（经 withErrorEnvelope 进 envelope.raw.diagnosis）。
+ * 与成功路径的 note 同一份措辞，保证"失败也不丢核心信息"。
+ * 非 HanaBusinessError（协议层错误等）原样抛出——那类错误不该被包装成业务错误。
+ */
+function withCleanupDiagnosis(e: unknown, statementName: string, cleaned: boolean): unknown {
+  if (cleaned || !(e instanceof HanaBusinessError)) return e;
+  const prev = (e.diagnosis ?? {}) as Record<string, unknown>;
+  return new HanaBusinessError(
+    e.message,
+    e.code,
+    e.sqlState,
+    e.messages,
+    { ...prev, planRowsCleaned: false, statementName, cleanupHint: cleanupHint(statementName) },
+    e.rawDetail,
+  );
+}
+
+/** 计划行残留时的统一提示（成功路径进 notes，失败路径进 diagnosis） */
+function cleanupHint(statementName: string): string {
+  return (
+    `本次写入的计划行未能清理（当前用户可能没有 SYS.EXPLAIN_PLAN_TABLE 的 DELETE 权限）：` +
+    `该表中 STATEMENT_NAME='${statementName}' 的行需手工清理`
+  );
 }
 
 /** 模式一：按语句文本编译解释，**不执行** */
@@ -321,10 +346,22 @@ async function analyzeCacheEntry(
   }
   const entry = rows[0];
   const statement = entry.STATEMENT_STRING ?? '';
-  await assertEntryAnalyzable(statement, args.session.schema);
+  // 未限定表名按**条目自己的** schema 判，而不是调用方的 CURRENT_SCHEMA：
+  // 计划缓存的条目是全局的（PLAN_ID 定位、与"谁来解释"无关），条目里就存着编译时的
+  // session schema（M_SQL_PLAN_CACHE.SCHEMA_NAME）——那才是 `FROM T` 当初的解析基准。
+  // 用调用方的 schema 去判别人的语句，两个方向都会错：误拒（作者 schema 合规、我们不合规）
+  // 与误放（反过来）。取不到该列时不误拦（与 read-scope.service 的既有约定一致），但如实说明。
+  const entrySchema = (entry.SCHEMA_NAME ?? '').trim();
+  const notes: string[] = [];
+  if (entrySchema === '') {
+    notes.push(
+      '条目未记录编译时的 schema（M_SQL_PLAN_CACHE.SCHEMA_NAME 为空）：本次不对未限定表名做读取范围判定；' +
+        '限定名引用仍按白名单校验',
+    );
+  }
+  await assertEntryAnalyzable(statement, entrySchema, args.planId);
 
   await runExplain(pool, conn, args.statementName, { planId: args.planId });
-  const notes: string[] = [];
   if (rows.length > 1) {
     notes.push(`PLAN_ID 命中 ${rows.length} 条记录（多 host 部署常见），按执行次数最多的一条解释`);
   }
@@ -482,8 +519,9 @@ async function readSessionInfo(pool: HanaPool, conn: HanaConnection): Promise<Se
 /** 读取范围（服务层纵深防御：内部调用不经过工具层预检） */
 async function assertReadScopes(
   sql: string,
-  currentSchema: string,
+  defaultSchema: string,
   noun: string,
+  schemaLabel = '当前用户默认 schema',
 ): Promise<void> {
   for (const schema of scanSqlSchemaRefs(sql)) {
     try {
@@ -491,28 +529,51 @@ async function assertReadScopes(
     } catch {
       throw new HanaBusinessError(
         `${noun}引用的 schema "${schema}" 不在服务端允许读取的范围内，已拒绝分析`,
+        undefined,
+        undefined,
+        [],
+        { statementHead: statementHead(sql) },
       );
     }
   }
-  // 未限定表名按当前用户默认 schema 判定（与 SQL 模式视图共用同一份规则）
-  await assertSqlReadScopes(sql, async () => currentSchema, noun);
+  // 未限定表名按默认 schema 判定（与 SQL 模式视图共用同一份规则）
+  await assertSqlReadScopes(sql, async () => defaultSchema, noun, schemaLabel);
 }
 
 /** plan_id 模式：条目文本同样要过分类器与读取范围（否则解释就等于绕过全部边界） */
-async function assertEntryAnalyzable(statement: string, currentSchema: string): Promise<void> {
+async function assertEntryAnalyzable(
+  statement: string,
+  defaultSchema: string,
+  planId: number,
+): Promise<void> {
   // 计划缓存里绝大多数条目本就是参数化语句（`… WHERE A = ?`），而解释缓存条目**不需要参数值**，
   // 所以这里必须放行占位符——否则 plan_id 模式对最典型的那类条目完全不可用
   const info = parseSqlStatement(statement, { allowPlaceholders: true });
   if (info.problems.length > 0) {
     throw new HanaBusinessError(
-      `计划缓存条目不是可分析的查询语句：${info.problems[0].message}`,
+      `计划缓存条目（PLAN_ID=${planId}）不是可分析的查询语句：${info.problems[0].message}`,
       undefined,
       undefined,
       [],
-      { hint: '本工具只分析 SELECT/WITH 查询；要分析别的语句请自行在数据库端进行' },
+      {
+        planId,
+        statementHead: statementHead(statement),
+        hint: `${info.problems[0].hint}；本工具只分析 SELECT/WITH 查询，要分析别的语句请自行在数据库端进行`,
+      },
     );
   }
-  await assertReadScopes(statement, currentSchema, '计划缓存条目里的语句');
+  await assertReadScopes(
+    statement,
+    defaultSchema,
+    `计划缓存条目（PLAN_ID=${planId}）里的语句`,
+    '该条目编译时的 schema',
+  );
+}
+
+/** 语句开头摘要（进错误信息，让调用方不必再查一次就知道是哪条） */
+function statementHead(statement: string, max = 120): string {
+  const oneLine = statement.replace(/\s+/g, ' ').trim();
+  return oneLine.length > max ? `${oneLine.slice(0, max)}…` : oneLine;
 }
 
 async function runExplain(

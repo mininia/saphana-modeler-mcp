@@ -32,11 +32,14 @@ export type CurrentSchemaReader = () => Promise<string>;
  * @param sql 待校验语句（原样文本即可：判据是剥离字面量/注释后的表位置）
  * @param readCurrentSchema 取当前用户默认 schema
  * @param noun 报错里的主语（"脚本" / "语句"），影响可读性不影响判定
+ * @param schemaLabel 该 schema 的**来源说明**——SQL 分析工具是在判"别人缓存条目编译时的 schema"，
+ *                    沿用"当前用户默认 schema"会给出错误的事实描述
  */
 export async function assertSqlReadScopes(
   sql: string,
   readCurrentSchema: CurrentSchemaReader,
   noun = '脚本',
+  schemaLabel = '当前用户默认 schema',
 ): Promise<void> {
   if (!hasUnqualifiedTableRef(sql)) return;
   const schema = (await readCurrentSchema()) || '';
@@ -45,7 +48,7 @@ export async function assertSqlReadScopes(
     assertSchemaAllowed(schema);
   } catch {
     throw new HanaBusinessError(
-      `${noun}含未限定 schema 的表名，按当前用户默认 schema "${schema}" 解析，而它不在服务端允许读取的范围内。` +
+      `${noun}含未限定 schema 的表名，按${schemaLabel} "${schema}" 解析，而它不在服务端允许读取的范围内。` +
         '请把表名写成全限定名（SCHEMA."表"），或由部署方调整可读 schema 配置',
     );
   }
