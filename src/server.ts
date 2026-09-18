@@ -40,7 +40,7 @@ SQL 分析（hana_sql_analyze）约定：**默认输出是一段可读的分析�
  */
 export function createServer(ctx: ToolContext): McpServer {
   const server = new McpServer(
-    { name: 'saphana-modeler-mcp', version: '1.0.1' },
+    { name: 'saphana-modeler-mcp', version: '1.0.2' },
     { instructions: SERVER_INSTRUCTIONS },
   );
   registerAllTools(server, ctx);
