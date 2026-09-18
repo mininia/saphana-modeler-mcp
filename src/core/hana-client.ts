@@ -8,6 +8,14 @@ type Connection = hanaClient.Connection;
 type ConnectionOptions = hanaClient.ConnectionOptions;
 type HanaParameterList = hanaClient.HanaParameterList;
 
+/**
+ * 已持有连接与结果集类型（供服务层声明签名用）。
+ * 服务层不应直接 import 驱动：驱动交互集中在本模块，这里只把类型转出去。
+ */
+export type HanaConnection = hanaClient.Connection;
+export type HanaStatement = hanaClient.Statement;
+export type HanaResultSet = hanaClient.ResultSet;
+
 /** 连接参数（security：真实凭据仅来自 config，不落日志） */
 function buildConnectionOptions(config: HanaConfig): ConnectionOptions {
   return {
@@ -76,7 +84,7 @@ export interface HanaPoolOptions {
  * - 懒连接：首次 acquire 才建连；连接失效时自动重建一次
  * - 池满时请求排队等待，但有**队列上限与等待超时**（HTTP 多客户端下，无界排队会让一个客户端的
  *   慢查询把其他客户端全部挂死；有界排队把「挂死」变成可解释的失败）
- * - 暴露 query/execute/withConnection 三个入口，service 层只用这几个
+ * - 暴露 query/execute/withConnection/execOn 入口，service 层只用这几个
  */
 export class HanaPool {
   private readonly options: ConnectionOptions;
@@ -163,6 +171,24 @@ export class HanaPool {
   /** 执行 DDL/DML（返回驱动结果对象，如 execReturnType） */
   async execute(sql: string, params?: HanaParameterList): Promise<unknown> {
     return this.withConnection((conn) => execAsync(conn, sql, params));
+  }
+
+  /**
+   * 在**已持有的连接**上执行一条语句（配合 withConnection 使用）。
+   *
+   * 为什么需要它：有些操作要在一段连贯的会话里完成多步（例如 SQL 执行计划：EXPLAIN 写入后**立即**
+   * 按语句名回读、用完再按名删除）。query/execute 各自 acquire 一条连接，多步之间可能被别的请求
+   * 插入，也可能落到不同连接上，语义就不连贯了。
+   *
+   * ⚠️ 持有 conn 期间**只能**走本方法，不可再调 query/execute：那会二次 acquire
+   * （并发下互相等池位直至 acquireTimeout 失败）。
+   */
+  async execOn<T = Record<string, unknown>>(
+    conn: Connection,
+    sql: string,
+    params?: HanaParameterList,
+  ): Promise<T> {
+    return execAsync<T>(conn, sql, params);
   }
 
   /**

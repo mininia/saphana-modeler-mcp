@@ -1,4 +1,4 @@
-import { scanSqlSchemaRefs, scanXmlPackageRefs, type WritePlan } from '../write-plan.js';
+import { scanSqlSchemaRefs, scanXmlPackageRefs, hasUnqualifiedTableRef, type WritePlan } from '../write-plan.js';
 
 /**
  * 写工具预规划器（单一事实源）：工具名 → 入参 → WritePlan。
@@ -184,6 +184,43 @@ function planRepoImport(args: Record<string, unknown>): WritePlan {
   return p;
 }
 
+/**
+ * hana_sql_analyze：**不写任何仓库包**（工具不碰仓库），但会读语句里出现的 schema——
+ * 与 SQL 模式视图同一套扫描。plan_id 模式拿不到语句文本（文本在服务端取到），
+ * 读取范围静态不可判定，如实标注；服务层取到条目后会跑同一套规则再拦一次。
+ */
+function planSqlAnalyze(args: Record<string, unknown>): WritePlan {
+  const p = emptyPlan('hana_sql_analyze');
+  const sql = asStr(args.sql);
+  const planId = args.planId;
+
+  if (typeof planId === 'number') {
+    p.steps.push(`解释计划缓存条目 PLAN_ID=${planId}（只编译不执行）`);
+    p.uncertain.push(
+      'plan_id 模式不解析语句文本：读取范围取决于该缓存条目本身，静态无法判定' +
+        '（服务层取到条目文本后按同一套 schema 规则拦截）',
+    );
+  } else if (sql) {
+    const refs = scanSqlSchemaRefs(sql);
+    add(p.readSchemas, ...refs);
+    p.steps.push(
+      args.analyze === true
+        ? '先实际执行该语句（30s 超时 + 最多取 100 行 + **不返回数据行**），再按文本关联计划缓存条目解释其重编译计划'
+        : '编译（**不执行**）该语句',
+    );
+    p.steps.push(`按语句中出现的 schema 限定名核对读取范围（共 ${refs.length} 个候选，来自 FROM/JOIN 表位置）`);
+    if (hasUnqualifiedTableRef(sql)) {
+      p.uncertain.push('语句含未限定 schema 的表名（按当前用户默认 schema 解析，由服务层查 CURRENT_SCHEMA 后判定）');
+    }
+    p.uncertain.push('schema 引用按 FROM/JOIN 表位置启发式扫描；动态 SQL 与表函数内部访问不在本计划内');
+  }
+  // 该表**不是**只读的：EXPLAIN 会把本次的算子行写进去，且全库可读（实测），故收尾必须按名删除
+  p.steps.push('执行 EXPLAIN PLAN → 向 SYS.EXPLAIN_PLAN_TABLE 写入本次算子行（该表全库可读）');
+  p.steps.push('按唯一 STATEMENT_NAME 回读本次计划');
+  p.steps.push('回读后按同一唯一名删除本次写入的计划行');
+  return p;
+}
+
 /** 未登记专用规划器的工具：按入参约定提取，并显式标注"未规划内部实际触碰" */
 function planFallback(toolName: string, args: Record<string, unknown>): WritePlan {
   const p = emptyPlan(toolName);
@@ -204,6 +241,7 @@ const PLANNERS: Record<string, (args: Record<string, unknown>) => WritePlan> = {
   hana_view_validate: planViewValidate,
   hana_package_create: planPackageCreate,
   hana_repo_import: planRepoImport,
+  hana_sql_analyze: planSqlAnalyze,
 };
 
 /** 已登记专用规划器的工具（测试据此断言"写工具都登记了"） */

@@ -10,6 +10,7 @@ import type { HanaConfig } from '../config/config.js';
 import { buildMinCalcViewXml, buildScriptedCalcViewXml, type ScriptedCalcViewSpec } from '../model/view-builder.js';
 import { addJoinToViewXml, chooseDefaultJoinFields, getJoinTargetAttrs, guardFullXmlUpdate, setScriptInViewXml, type FullXmlGuardResult, type SetScriptSpec } from '../model/view-edit.js';
 import { getViewDefinition } from './metadata.service.js';
+import { assertSqlReadScopes } from './read-scope.service.js';
 
 /**
  * 仓库写服务：
@@ -363,21 +364,18 @@ async function probeIfActivated(
  * 脚本里**限定 schema** 的引用由工具层写计划扫描判定；**未限定**表名（`FROM MARA`）按当前用户的
  * 默认 schema 解析——扫描器无从得知，故这里查出 CURRENT_SCHEMA 再判它是否在允许范围内。
  * 没有这一步时 `SELECT * FROM MARA` 这类写法会完全绕过 HANA_SCHEMA_ALLOW。
+ *
+ * 判定规则已提取到 read-scope.service（SQL 分析工具要在**已持有连接**上做同一件事），此处只注入读法。
  */
 async function assertScriptReadScopes(pool: HanaPool, script: string): Promise<void> {
-  const { hasUnqualifiedTableRef } = await import('../write-plan.js');
-  if (!hasUnqualifiedTableRef(script)) return;
-  const rows = await pool.query<{ CURRENT_SCHEMA: string }>('SELECT CURRENT_SCHEMA FROM DUMMY');
-  const schema = rows[0]?.CURRENT_SCHEMA ?? '';
-  if (schema === '') return; // 取不到默认 schema 时不误拦（写包边界与限定名扫描仍在）
-  try {
-    assertSchemaAllowed(schema);
-  } catch {
-    throw new HanaBusinessError(
-      `脚本含未限定 schema 的表名，按当前用户默认 schema "${schema}" 解析，而它不在服务端允许读取的范围内。` +
-        '请把表名写成全限定名（SCHEMA."表"），或由部署方调整可读 schema 配置',
-    );
-  }
+  return assertSqlReadScopes(
+    script,
+    async () => {
+      const rows = await pool.query<{ CURRENT_SCHEMA: string }>('SELECT CURRENT_SCHEMA FROM DUMMY');
+      return rows[0]?.CURRENT_SCHEMA ?? '';
+    },
+    '脚本',
+  );
 }
 
 /** 检查对象是否已存在（ACTIVE_OBJECT 或 INACTIVE_OBJECT） */

@@ -19,6 +19,7 @@ SAP HANA 经典 Modeler 能力的 MCP 服务器（TypeScript，Node >= 20.12）�
 | 数据预览 | 已激活视图数据预览（整体/节点/推导三通道，支持筛选与输入参数）+ 预览权限诊断 | `hana_data_preview`、`hana_data_preview_diagnose` |
 | 建模写操作 | 新建/激活/更新/删除计算视图、设计时+运行时校验、校验动作查询 | `hana_view_create`、`hana_view_activate`、`hana_view_update`、`hana_view_delete`、`hana_view_validate`、`hana_view_check_actions` |
 | 仓库传输 | 包导出备份（zip）、设计时文件导入、变更列表 | `hana_repo_export`、`hana_repo_import`、`hana_repo_changelist` |
+| SQL 分析 | SQL 分析结论（默认）：扫描/规模/连接/引擎切换/结构异常的**逐条发现 + 建议 + 统计**；可选实际执行后分析；原始执行计划需 `raw=true` | `hana_sql_analyze` |
 
 > 视图对象的完整定义读取（json/xml）由 `hana_metadata_get_view` 提供；字段级查看用 `hana_metadata_list_fields` / `hana_metadata_get_field_logic`。
 > 修改计算视图优先用 `hana_view_update` 的 operations 声明式模式（零 XML）；复杂改造用全量 XML 通道（先用 `hana_metadata_get_view(format=xml)` 读取，最小修改后回传）。
@@ -129,7 +130,7 @@ MCP_HTTP_PORT=3000 MCP_HTTP_TOKEN='your-long-random-token' node dist/index.js
 
 ## 工具分组与可见性控制
 
-23 个工具按功能划分为三组，可经 mcp.json / .env 的环境变量控制哪些工具对 MCP 客户端可见（不注册即不出现在 `tools/list`、不可被调用）。配置全空 = 全部启用（向后兼容默认）。
+24 个工具按功能划分为三组，可经 mcp.json / .env 的环境变量控制哪些工具对 MCP 客户端可见（不注册即不出现在 `tools/list`、不可被调用）。配置全空 = 全部启用（向后兼容默认）。
 
 ### 三类分组
 
@@ -137,9 +138,11 @@ MCP_HTTP_PORT=3000 MCP_HTTP_TOKEN='your-long-random-token' node dist/index.js
 | --- | --- | --- |
 | **read** 数据读取 | 只读访问 HANA 数据/元数据/系统信息/审计/导出，不改动仓库 | `hana_system_get_info`、`hana_check_privileges`、`hana_package_list`、`hana_package_list_objects`、`hana_metadata_get_view`、`hana_metadata_search_objects`、`hana_metadata_list_fields`、`hana_metadata_get_field_logic`、`hana_metadata_where_used`、`hana_table_list`、`hana_table_columns`、`hana_data_preview`、`hana_data_preview_diagnose`、`hana_view_check_actions`、`hana_repo_export`、`hana_repo_changelist` |
 | **write** 写操作 | 改动仓库设计时对象/包（create/activate/update/delete/import/设计时校验） | `hana_package_create`、`hana_repo_import`、`hana_view_create`、`hana_view_activate`、`hana_view_update`、`hana_view_delete`、`hana_view_validate` |
-| **admin** 管理操作 | 生命周期/审计/权限管理类（当前为空占位，预留给 `hana_privilege_create` 等后续工具） | （暂无） |
+| **admin** 管理操作 | 高权限/管理类：生命周期/审计/权限管理，以及**接受任意 SQL** 的高权限分析 | `hana_sql_analyze` |
 
 > `hana_view_validate` 的 `design` 模式会短暂写入临时校验对象 `_CHKTMP`，故整工具归 `write`；不按 design/runtime 模式做混合划分，只读部署（`HANA_TOOL_GROUPS=read`）不暴露此工具。
+>
+> `hana_sql_analyze` 归 `admin`（不是 `write`）：它**不写业务数据、不碰仓库**，归最严一组是**暴露面控制**——接受任意 SQL 文本（`analyze=true` 时还会真实执行），且 `planId` 模式需要 `OPTIMIZER ADMIN` 权限。**只启用 read/write 的部署看不到它**（`HANA_TOOL_GROUPS=read,write` 不含 admin）。
 
 ### 三个配置变量（优先级：`HANA_TOOL_DENY` > `HANA_TOOL_ALLOW` > `HANA_TOOL_GROUPS`）
 
@@ -163,7 +166,7 @@ MCP_HTTP_PORT=3000 MCP_HTTP_TOKEN='your-long-random-token' node dist/index.js
 
 ## 工具速查
 
-共 23 个工具，全部带 annotations（`readOnlyHint` / `destructiveHint` / `idempotentHint`）以便 host 自动审批与危险操作确认。
+共 24 个工具，全部带 annotations（`readOnlyHint` / `destructiveHint` / `idempotentHint`）以便 host 自动审批与危险操作确认。
 
 | 工具 | 类型 | 说明 |
 | --- | --- | --- |
@@ -190,6 +193,10 @@ MCP_HTTP_PORT=3000 MCP_HTTP_TOKEN='your-long-random-token' node dist/index.js
 | `hana_repo_export` | 备份 | 导出包为 zip（XS REST Transfer API；saveTo 落盘或返回 base64） |
 | `hana_repo_import` | 写 | 导入设计时文件（Transfer API 目录目标+分片上传，落库 inactive，目标须在可写包范围，导入后回读状态） |
 | `hana_repo_changelist` | 只读 | 仓库变更列表审计（GET /base/change，需系统启用 Change Tracking） |
+| `hana_sql_analyze` | 分析 | SQL 分析：**默认返回可读结论**（一句话结论 + 逐条发现[风险/关注/信息，带依据与建议] + 统计），**默认不给原始计划**（`raw=true` 才返回算子行与文本树）；`sql`=只编译不执行；`planId`=分析计划缓存条目并附运行时统计（需 OPTIMIZER ADMIN）；`sql`+`analyze=true`=先实际执行再分析（30s 超时、最多取 100 行、**不返回数据行**） |
+
+> **PlanViz 未实现（预留扩展点）**：逐算子的实际执行细节（inclusive/exclusive 耗时、实际行数、时间线）只有 PlanViz 的 Executed Plan 提供，需要服务端开启 plan trace 并把 XML 落盘再取回，属运维面能力，本期不做。
+> 预留方式是：`source` 为可扩展枚举（后续可加 `planviz` 而不破坏既有取值）、服务入口带 options 形状、本行文档记录路径与前置条件。**不写空实现/僵尸分支**——不可用的路径宁可不出现。
 
 > **写操作安全边界**：写工具（create/activate/update/delete/package_create/import）的可写包范围由
 > `HANA_WRITE_PACKAGES` 配置控制——**空=不限制（全部可写）**；填写后仅允许配置包及其下级子包写操作
@@ -229,6 +236,7 @@ MCP_HTTP_PORT=3000 MCP_HTTP_TOKEN='your-long-random-token' node dist/index.js
 > 该边界由单测强制（拦截消息前缀 + 禁用词匹配），不是靠自觉。
 >
 > **运行期闸门（工具层，先规划后判定）**：所有写工具（`hana_view_*`、`hana_package_create`、`hana_repo_import`）
+> 与 `hana_sql_analyze`（归 admin 组，但闸门按组无关的「规划→判定」逻辑同样适用）
 > 经 `registerWriteTool` 注册，请求进入 handler **之前**分两步：
 > ① **预规划**（`src/write-plan.ts` + `src/tools/write-plans.ts`）——把这次调用最终会读写什么算清楚，
 > 产出 `WritePlan`（写哪些包 / 读哪些 schema / 跨包只读引用 / 无法静态确定的点）；
@@ -305,7 +313,10 @@ src/
                              + 写包白名单（HANA_WRITE_PACKAGES）
     validation.service      运行时视图一致性校验
     system.service          系统信息与权限检查
-  tools/               MCP 工具薄壳（system/package/metadata/preview/modeling）
+    sql-analyze.service     SQL 分析（执行计划）主流程：同连接内 EXPLAIN → 按唯一名回读 → 用完即清
+    sql-analyze.rules      上述的纯规则层：语句分类/白名单/分析结论（默认输出）与算子渲染
+    read-scope.service      未限定表名的读取范围校验（SQL 模式视图与 SQL 分析共用一份判定）
+  tools/               MCP 工具薄壳（system/package/metadata/preview/modeling/sql-analyze）
   types/               统一返回信封 Envelope 等
 scripts/               通用冒烟脚本（smoke-stdio）；实机验收/探针脚本在本地 test-verification/（不入库）
 ```

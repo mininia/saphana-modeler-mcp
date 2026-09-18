@@ -6,7 +6,7 @@
  * 三类分组：
  * - read  数据读取：只读访问 HANA 数据/元数据/系统信息/审计/导出（GET 类，不改动仓库）
  * - write 写操作：改动仓库设计时对象/包（create/activate/update/delete/import/设计时校验）
- * - admin 管理操作：生命周期/审计/权限管理类（当前为空占位，预留给 hana_privilege_create 等后续工具）
+ * - admin 管理操作：高权限/管理类（生命周期/审计/权限管理，以及接受任意 SQL 的高权限分析）
  *
  * 可见性由 mcp.json / .env 的三个变量控制（详见 README「工具分组与可见性控制」）：
  * - HANA_TOOL_GROUPS  启用的分组（逗号分隔）；空=全启用（默认，向后兼容）
@@ -63,8 +63,11 @@ export const TOOL_GROUPS: Record<string, ToolGroup> = {
   hana_view_delete: 'write',
   hana_view_validate: 'write',
 
-  // —— 管理操作（admin，占位）——
-  // 预留：hana_privilege_create 等管理类工具登记于此
+  // —— 管理操作（admin）——
+  // hana_sql_analyze：接受任意 SQL 文本（analyze=true 时**真实执行**），且 plan_id 模式需要
+  // OPTIMIZER ADMIN。它不写业务数据、不碰仓库——归 admin 是**暴露面控制**（最严的一组），
+  // 不是因为它有副作用。预留：hana_privilege_create 等管理类工具继续登记于此。
+  hana_sql_analyze: 'admin',
 };
 
 /** 工具过滤配置（来自环境变量，启动时解析一次） */

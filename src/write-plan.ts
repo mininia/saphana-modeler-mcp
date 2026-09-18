@@ -74,22 +74,101 @@ export function scanXmlPackageRefs(xml: string): string[] {
  */
 export function hasUnqualifiedTableRef(sql: string): boolean {
   const text = stripSqlLiteralsAndComments(sql);
+  const ctes = collectCteNames(text);
   const anchor = /\b(FROM|JOIN)\b/gi;
   let m: RegExpExecArray | null;
   while ((m = anchor.exec(text)) !== null) {
-    const rest = text.slice(m.index + m[0].length);
-    // 只看紧邻的那个标识符：后面跟 `.` 说明是限定名（已由 scanSqlSchemaRefs 处理）
-    const ident = /^\s*("?)([A-Za-z_][A-Za-z0-9_$#]*)\1\s*(\.)?/.exec(rest);
-    if (ident && !ident[3]) return true;
+    if (regionHasUnqualifiedName(tableNameRegion(text, m.index + m[0].length), ctes)) return true;
     anchor.lastIndex = m.index + m[0].length;
   }
   return false;
 }
 
+/**
+ * 表名区里的**每一张表**都要看，不能只看紧邻锚点的那一个：
+ * `SELECT * FROM SYS.DUMMY, MARA` 里 MARA 才是未限定的那张，只看第一个会漏（评审实测）——
+ * 而漏判的后果是"默认 schema 不在允许范围内"这类越界读取直接放行。
+ * 按**顶层逗号**分片（括号内的逗号属于函数调用参数，不分片），每片只看头一个标识符。
+ */
+function regionHasUnqualifiedName(region: string, ctes: Set<string>): boolean {
+  for (const part of splitTopLevel(region)) {
+    const head = /^\s*(?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_$#]*))\s*([.(]?)/.exec(part);
+    if (!head) continue;
+    const quoted = head[1] !== undefined;
+    const name = quoted ? head[1] : head[2];
+    const follow = head[3];
+    if (follow === '.' || follow === '(') continue; // 限定名（另有扫描）/ 函数调用
+    if (quoted) return true;
+    const upper = name.toUpperCase();
+    // DUMMY 是 SYS 下的伪表（恒 1 行）；CTE 名与保留字都不是表引用
+    if (upper === 'DUMMY' || SQL_NON_SCHEMA.has(upper) || ctes.has(upper)) continue;
+    return true;
+  }
+  return false;
+}
+
+/** 收集 `WITH <名> AS (` 定义的 CTE 名——它们出现在 FROM 位置时不是表引用 */
+function collectCteNames(text: string): Set<string> {
+  const names = new Set<string>();
+  const re = /\b([A-Za-z_][A-Za-z0-9_$#]*)\s+AS\s*\(/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) names.add(m[1].toUpperCase());
+  return names;
+}
+
+/** 按顶层逗号分片（括号深度 > 0 的逗号属于函数参数，不分片） */
+function splitTopLevel(region: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < region.length; i++) {
+    const ch = region[i];
+    if (ch === '(') depth++;
+    else if (ch === ')') {
+      if (depth > 0) depth--;
+    } else if (ch === ',' && depth === 0) {
+      parts.push(region.slice(start, i));
+      start = i + 1;
+    }
+  }
+  parts.push(region.slice(start));
+  return parts;
+}
+
+/**
+ * 表名区 = FROM/JOIN 锚点之后，到**顶层**子句边界为止。
+ *
+ * 为什么要跟踪括号深度而不是见到 `(`/`)` 就切：表函数与派生表的表名都在括号里——
+ * `APPLY_FILTER("SAPSR3"."MARA", $$X=1$$)`、`CE_COLUMN_TABLE("S"."T")`、`(SELECT * FROM C.T)`，
+ * 早切会让它们整体逃过扫描（评审实测：这是读边界被绕过的一类写法）。顶层边界仍然是
+ * ON/WHERE/GROUP/… 与语句结尾；顶层的 `=` 也切（旧行为，保留）。
+ */
+function tableNameRegion(text: string, start: number): string {
+  let depth = 0;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '(') { depth++; continue; }
+    if (ch === ')') {
+      if (depth === 0) return text.slice(start, i);
+      depth--;
+      continue;
+    }
+    if (depth === 0 && ch === '=') return text.slice(start, i);
+    if (depth === 0 && /[A-Za-z_]/.test(ch)) {
+      CLAUSE_KEYWORD.lastIndex = i;
+      if (CLAUSE_KEYWORD.test(text)) return text.slice(start, i);
+    }
+  }
+  return text.slice(start);
+}
+
+/** 表名区的顶层子句边界关键字（粘性匹配：只在当前位置判定，避免把 `ONYX` 当 `ON`） */
+const CLAUSE_KEYWORD = /\b(?:ON|WHERE|GROUP|ORDER|HAVING|UNION|EXCEPT|INTERSECT|AS)\b/iy;
+
 /** SQL 里不会作为 schema 出现的保留字（表位置上的兜底过滤） */
 const SQL_NON_SCHEMA = new Set([
   'SELECT', 'FROM', 'WHERE', 'GROUP', 'ORDER', 'HAVING', 'INTO', 'VALUES', 'UNION', 'EXCEPT',
-  'INTERSECT', 'LATERAL', 'DUMMY', 'PUBLIC', 'CURRENT_USER', 'SESSION_USER',
+  'INTERSECT', 'LATERAL', 'DUMMY', 'CURRENT_USER', 'SESSION_USER',
 ]);
 
 /**
@@ -98,8 +177,11 @@ const SQL_NON_SCHEMA = new Set([
  * 用**单遍状态机**而不是连续 replace：正则顺序敏感——先剥 `--` 行注释会把 `'a--b'` 里的
  * 字面量后半行一并吃掉（实测：`SELECT 'a--b' AS X ... FROM SAPSR3.T` 会扫不出 SAPSR3，
  * 读边界因此静默放行）。状态机同时正确处理引号内的 `--`、注释里的引号与 `''` 转义。
+ *
+ * 导出给 SQL 分析工具复用：语句分类（首 token）与分号校验都必须跑在剥离后的文本上，
+ * 否则 `SELECT 'a;b' FROM T` 会被误判成多语句。**不要再写第二份剥离实现**。
  */
-function stripSqlLiteralsAndComments(sql: string): string {
+export function stripSqlLiteralsAndComments(sql: string): string {
   let out = '';
   let i = 0;
   while (i < sql.length) {
@@ -115,8 +197,25 @@ function stripSqlLiteralsAndComments(sql: string): string {
       out += "''";
       continue;
     }
+    // 双引号标识符必须**原样保留**（扫描器要读它），但它的内容要按标识符处理：
+    // 里面的单引号 / $$ / -- 都不是字面量或注释的起始。缺这一段时
+    // `SELECT "a'b" AS X, B.* FROM "SAPSR3"."MARA" B` 会被那个孤立的单引号吞掉后半句，
+    // 两个扫描器都看不到 FROM，读边界静默放行（评审实测）。
+    if (c === '"') {
+      const start = i;
+      i++;
+      while (i < sql.length) {
+        if (sql[i] === '"' && sql[i + 1] === '"') i += 2; // "" 转义
+        else if (sql[i] === '"') { i++; break; }
+        else i++;
+      }
+      out += sql.slice(start, i);
+      continue;
+    }
     if (c === '-' && next === '-') {
-      while (i < sql.length && sql[i] !== '\n') i++;
+      // 行注释终止于 LF 或 CR（只认 LF 时，CR 结尾的一行会把后续语句一起吞成"注释"，
+      // 多语句判定随之失效，但送去执行的是原文 —— 评审实测的洞）
+      while (i < sql.length && sql[i] !== '\n' && sql[i] !== '\r') i++;
       out += ' ';
       continue;
     }
@@ -162,16 +261,15 @@ export function scanSqlSchemaRefs(sql: string): string[] {
   const anchor = /\b(FROM|JOIN)\b/gi;
   let m: RegExpExecArray | null;
   while ((m = anchor.exec(text)) !== null) {
-    // 表名区 = 锚点之后到子句边界（`(`、`)`、`=`、ON/WHERE/GROUP/… 或语句结束）
-    const rest = text.slice(m.index + m[0].length);
-    const boundary = rest.search(CLAUSE_BOUNDARY);
-    const region = boundary >= 0 ? rest.slice(0, boundary) : rest;
-    // 区内所有「限定名.」都算：第一张表 + 逗号列表里的后续表
-    const qualified = /("?)([A-Za-z_][A-Za-z0-9_$#]*)\1\s*\./g;
+    // 表名区 = 锚点之后到**顶层**子句边界（表函数/派生表里在括号内的表名同样要扫，见 tableNameRegion）
+    const region = tableNameRegion(text, m.index + m[0].length);
+    // 区内所有「限定名.」都算：第一张表 + 逗号列表里的后续表。
+    // 引号分支不限定字符集——`"Z-DEMO"."PAYROLL"` 这类合法引号名旧版扫不到 = 读边界被绕过（评审实测）
+    const qualified = /"([^"]+)"\s*\.|([A-Za-z_][A-Za-z0-9_$#]*)\s*\./g;
     let q: RegExpExecArray | null;
     while ((q = qualified.exec(region)) !== null) {
-      const quoted = q[1] === '"';
-      const name = quoted ? q[2] : q[2].toUpperCase();
+      const quoted = q[1] !== undefined;
+      const name = quoted ? q[1] : q[2].toUpperCase();
       if (!quoted && SQL_NON_SCHEMA.has(name)) continue;
       out.add(name);
     }

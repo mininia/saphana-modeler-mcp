@@ -21,6 +21,7 @@ Connect via the MCP protocol (both **stdio and Streamable HTTP** transports) to 
 | Data preview | Activated-view data preview (overall / node / derived — three channels, with filtering & input parameters) + preview privilege diagnosis | `hana_data_preview`, `hana_data_preview_diagnose` |
 | Modeling write | Create/activate/update/delete calculation views, design-time + runtime validation, validation action query | `hana_view_create`, `hana_view_activate`, `hana_view_update`, `hana_view_delete`, `hana_view_validate`, `hana_view_check_actions` |
 | Repository transport | Package export backup (zip), design-time file import, change list | `hana_repo_export`, `hana_repo_import`, `hana_repo_changelist` |
+| SQL analysis | SQL analysis conclusion (default): per-item findings + advice + statistics on scans/sizes/joins/engine switches/structure; optional execute-then-analyze; raw plan only via `raw=true` | `hana_sql_analyze` |
 
 > Full definition read (json/xml) of view objects is provided by `hana_metadata_get_view`; field-level inspection uses `hana_metadata_list_fields` / `hana_metadata_get_field_logic`.
 > Prefer the declarative `operations` mode of `hana_view_update` for modifying calculation views (zero XML); for complex rework use the full-XML channel (read with `hana_metadata_get_view(format=xml)` first, make minimal edits, then post back).
@@ -130,7 +131,7 @@ MCP_HTTP_PORT=3000 MCP_HTTP_TOKEN='your-long-random-token' node dist/index.js
 
 ## Tool Groups & Visibility Control
 
-23 tools are divided into three functional groups. You can control which tools are visible to the MCP client
+24 tools are divided into three functional groups. You can control which tools are visible to the MCP client
 (via `mcp.json` / `.env` environment variables) — unregistered tools never appear in `tools/list` and cannot be
 invoked. All-empty config = all enabled (backwards-compatible default).
 
@@ -140,9 +141,11 @@ invoked. All-empty config = all enabled (backwards-compatible default).
 | --- | --- | --- |
 | **read** (data read) | Read-only access to HANA data/metadata/system info/audit/export — no repository changes | `hana_system_get_info`, `hana_check_privileges`, `hana_package_list`, `hana_package_list_objects`, `hana_metadata_get_view`, `hana_metadata_search_objects`, `hana_metadata_list_fields`, `hana_metadata_get_field_logic`, `hana_metadata_where_used`, `hana_table_list`, `hana_table_columns`, `hana_data_preview`, `hana_data_preview_diagnose`, `hana_view_check_actions`, `hana_repo_export`, `hana_repo_changelist` |
 | **write** (write ops) | Modifies design-time repository objects/packages (create/activate/update/delete/import/design-time validate) | `hana_package_create`, `hana_repo_import`, `hana_view_create`, `hana_view_activate`, `hana_view_update`, `hana_view_delete`, `hana_view_validate` |
-| **admin** (admin ops) | Lifecycle/audit/privilege management (currently an empty placeholder, reserved for `hana_privilege_create` etc.) | (none yet) |
+| **admin** (admin ops) | High-privilege / management: lifecycle, audit, privilege management, and **arbitrary-SQL** analysis | `hana_sql_analyze` |
 
 > The `design` mode of `hana_view_validate` briefly writes a temporary validation object `_CHKTMP`, so the whole tool is classified as `write`; there is no mixed split by design/runtime mode — a read-only deployment (`HANA_TOOL_GROUPS=read`) does not expose this tool.
+>
+> `hana_sql_analyze` is `admin` (not `write`): it **writes no business data and never touches the repository** — the strictest group is a **capability-exposure control**, because it accepts arbitrary SQL text (`analyze=true` really executes it) and its `planId` mode needs the `OPTIMIZER ADMIN` privilege. **Deployments enabling only read/write cannot see it** (`HANA_TOOL_GROUPS=read,write` excludes admin).
 
 ### Three config variables (priority: `HANA_TOOL_DENY` > `HANA_TOOL_ALLOW` > `HANA_TOOL_GROUPS`)
 
@@ -162,7 +165,7 @@ On startup, if filter variables are configured, the log prints the enabled group
 
 ## Tool Reference
 
-23 tools in total, all carrying annotations (`readOnlyHint` / `destructiveHint` / `idempotentHint`) so hosts can auto-approve and confirm dangerous operations.
+24 tools in total, all carrying annotations (`readOnlyHint` / `destructiveHint` / `idempotentHint`) so hosts can auto-approve and confirm dangerous operations.
 
 | Tool | Type | Description |
 | --- | --- | --- |
@@ -189,6 +192,10 @@ On startup, if filter variables are configured, the log prints the enabled group
 | `hana_repo_export` | backup | Export a package as zip (XS REST Transfer API; saveTo to disk or return base64) |
 | `hana_repo_import` | write | Import design-time files (Transfer API directory target + chunked upload, stored inactive, target must be within writable package scope, re-read status after import) |
 | `hana_repo_changelist` | read-only | Repository change-list audit (GET /base/change; requires Change Tracking enabled) |
+| `hana_sql_analyze` | analyze | SQL analysis: **returns a readable conclusion by default** (one-line summary + per-item findings [risk/warn/info, each with evidence and advice] + statistics); **no raw plan unless `raw=true`**; `sql` = compile only; `planId` = explain a plan-cache entry with runtime stats (needs OPTIMIZER ADMIN); `sql` + `analyze=true` = execute first, then analyze (30 s timeout, at most 100 rows, **no data rows returned**) |
+
+> **PlanViz is not implemented (reserved extension point)**: per-operator actual execution detail (inclusive/exclusive time, actual row counts, timeline) is only available from PlanViz's Executed Plan, which requires server-side plan tracing to be enabled and the XML trace to be retrieved — an operational concern, out of scope for now.
+> The extension is reserved via: `source` being an extensible enum (a future `planviz` value breaks nothing), the service entry taking an options object, and this note recording the path and its prerequisites. **No stub implementations or dead branches** — an unavailable path is better left absent.
 
 > **Write-operation safety boundary**: the writable-package scope for write tools (create/activate/update/delete/package_create/import) is controlled by `HANA_WRITE_PACKAGES` — **empty = no restriction (all writable)**; when set, only configured packages and their sub-packages are writable (e.g. `ZDEMO1,ZDEMO2.ZDEMO_SD` allows ZDEMO1, ZDEMO1.X, ZDEMO2.ZDEMO_SD, ZDEMO2.ZDEMO_SD.SUB, rejects others).
 > Same-name objects are rejected from overwrite; update/delete carry ETag optimistic locking.
@@ -198,7 +205,7 @@ On startup, if filter variables are configured, the log prints the enabled group
 >
 > **Preflight layering**: each rule leaf owns one thing — `src/config/write-boundary.ts` (writable package prefixes), `src/tools/groups.ts` (tool visibility), `src/core/sql.ts` (schema allowlist), `src/config/deployment.ts` (deployment posture and invariants); the preflight layer `src/config/preflight.ts` resolves the effective config from one source and evaluates each capability (`runPreflight` is the task gate, `describeEffectiveBoundary` the config summary); callers are the server startup self-check, the `npm run preflight` CLI and the live verification scripts.
 >
-> **Runtime gate (tool layer — plan first, then judge)**: every write tool (`hana_view_*`, `hana_package_create`, `hana_repo_import`) is registered through `registerWriteTool`; before the request enters the handler it goes through two steps: (1) **planning** (`src/write-plan.ts` + `src/tools/write-plans.ts`) computes what the call will actually read and write into a `WritePlan` (packages written / schemas read / cross-package read references / points that cannot be determined statically); (2) **judging** against the effective permission config by the preflight layer — on failure it returns a hard error (`isError`) and **never reaches the handler or the service**.
+> **Runtime gate (tool layer — plan first, then judge)**: every write tool (`hana_view_*`, `hana_package_create`, `hana_repo_import`) and `hana_sql_analyze` (classified as admin, but the plan-then-judge gate is group-agnostic) is registered through `registerWriteTool`; before the request enters the handler it goes through two steps: (1) **planning** (`src/write-plan.ts` + `src/tools/write-plans.ts`) computes what the call will actually read and write into a `WritePlan` (packages written / schemas read / cross-package read references / points that cannot be determined statically); (2) **judging** against the effective permission config by the preflight layer — on failure it returns a hard error (`isError`) and **never reaches the handler or the service**.
 >
 > Why arguments alone are not enough: with `hana_view_update`'s `add_join` the **join source lives in another package**, hidden inside `operations`; `hana_view_validate` looks like "validation" but its design mode actually **writes** a `_CHKTMP` temp object; `hana_repo_import` content may reference other packages; deleting a view invalidates downstream dependents. Only by parsing the request do these become visible — the plan's `steps` and `uncertain` fields go into the interception report so the caller sees what *would* have happened before deciding how to fix it.
 >
@@ -260,7 +267,10 @@ src/
                              + writable-package allowlist (HANA_WRITE_PACKAGES)
     validation.service      Runtime view consistency check
     system.service          System info & privilege check
-  tools/               MCP tool thin shells (system/package/metadata/preview/modeling)
+    sql-analyze.service     SQL analysis (execution plan) main flow: EXPLAIN → read back by unique name → clean up, all on one connection
+    sql-analyze.rules       Pure rule layer for the above: statement classification/allowlist/readable conclusion (default output) + operator rendering
+    read-scope.service      Unqualified-table read-scope check (shared by SQL-mode views and SQL analysis)
+  tools/               MCP tool thin shells (system/package/metadata/preview/modeling/sql-analyze)
   types/               Unified return envelope Envelope etc.
 scripts/               General smoke script (smoke-stdio); real-machine verification/probe scripts are in local test-verification/ (not in repo)
 ```

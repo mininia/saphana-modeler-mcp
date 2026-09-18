@@ -104,6 +104,11 @@ try {
       'hana_package_create', 'hana_repo_import', 'hana_view_create', 'hana_view_activate',
       'hana_view_update', 'hana_view_delete', 'hana_view_validate',
     ]);
+    // admin 组工具（高权限/管理类）。不登记的话下面的 group 推断会把它当 admin 蒙对，
+    // 但断言循环覆盖不到它 —— 等于静默失去这部分的过滤自检。
+    const ADMIN_TOOLS = new Set([
+      'hana_sql_analyze',
+    ]);
     const matchGlob = (name, patterns) => patterns.some((p) =>
       p.includes('*')
         ? new RegExp('^' + p.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$').test(name)
@@ -114,11 +119,12 @@ try {
       if (matchGlob(name, allowPatterns)) return true;
       const isRead = READ_TOOLS.has(name);
       const isWrite = WRITE_TOOLS.has(name);
+      // 不在 read/write 集合内的一律按 admin（与 src/tools/groups.ts 的映射一致）
       const group = isRead ? 'read' : isWrite ? 'write' : 'admin';
       return groups.includes(group);
     };
-    // 校验可见集合与预期一致（仅对已知 read/write 工具断言）
-    for (const name of [...READ_TOOLS, ...WRITE_TOOLS]) {
+    // 校验可见集合与预期一致（仅对已登记在集合里的工具断言）
+    for (const name of [...READ_TOOLS, ...WRITE_TOOLS, ...ADMIN_TOOLS]) {
       const expected = shouldSee(name);
       const actual = names.includes(name);
       if (expected !== actual) {
@@ -143,13 +149,19 @@ try {
   if (missing.length > 0 && !filterConfigured) {
     throw new Error(`工具未注册: ${missing.join(', ')}（若配置了 HANA_TOOL_GROUPS 限制，请确认这些工具所属分组已启用）`);
   }
-  // annotations 应在 tools/list 中透出；优先取只读工具样本，配置过滤只剩占位工具时退而取其任意工具
-  const sampleTool =
+  // annotations 应在 tools/list 中透出。优先取只读工具样本；只启用 write/admin 的部署里
+  // 没有任何只读工具，此时退为断言"工具确实带 annotations"——否则 HANA_TOOL_GROUPS=write/admin
+  // 会因为找不到只读样本而失败，看起来像工具没注册（评审指出：这与可见性无关）
+  const readonlySample =
     tools.tools.find((t) => t.name === 'hana_metadata_get_field_logic') ??
     tools.tools.find((t) => t.annotations?.readOnlyHint);
+  const sampleTool = readonlySample ?? tools.tools.find((t) => t.annotations);
   console.log('[annotations]', JSON.stringify(sampleTool?.annotations ?? '(未透出)'));
-  if (!sampleTool?.annotations?.readOnlyHint) {
-    throw new Error('annotations 未按约定透出（readOnlyHint 缺失）');
+  if (!sampleTool?.annotations) {
+    throw new Error('annotations 未按约定透出（tools/list 里没有任何工具带 annotations）');
+  }
+  if (readonlySample && !readonlySample.annotations?.readOnlyHint) {
+    throw new Error(`annotations 未按约定透出（${readonlySample.name} 缺 readOnlyHint）`);
   }
   console.log('[smoke] PASS');
 } catch (e) {

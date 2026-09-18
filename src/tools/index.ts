@@ -20,6 +20,7 @@ import { registerPackageTools } from './package.tools.js';
 import { registerMetadataTools } from './metadata.tools.js';
 import { registerPreviewTools } from './preview.tools.js';
 import { registerModelingTools } from './modeling.tools.js';
+import { registerSqlAnalyzeTools } from './sql-analyze.tools.js';
 import type { HanaPool } from '../core/hana-client.js';
 import type { HanaConfig } from '../config/config.js';
 
@@ -174,9 +175,10 @@ export function registerAllTools(server: McpServer, ctx: ToolContext): void {
   registerMetadataTools(server, ctx);
   registerPreviewTools(server, ctx);
   registerModelingTools(server, ctx);
+  registerSqlAnalyzeTools(server, ctx);
 
   // 过滤后零工具可见时注册一个占位只读工具，避免 SDK 不声明 tools 能力导致 tools/list 返回 method not found。
-  // 仅在配置了过滤变量时可能出现（全空默认=全部注册，至少 23 个）。
+  // 仅在配置了过滤变量时可能出现（全空默认=全部注册，至少 24 个）。
   const filter = ctx.toolFilter;
   const anyVisible = Object.keys(TOOL_GROUPS).some((name) => shouldRegisterTool(name, filter));
   if (!anyVisible) {
