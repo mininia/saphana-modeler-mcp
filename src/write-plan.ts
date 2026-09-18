@@ -262,18 +262,49 @@ export function scanSqlSchemaRefs(sql: string): string[] {
   let m: RegExpExecArray | null;
   while ((m = anchor.exec(text)) !== null) {
     // 表名区 = 锚点之后到**顶层**子句边界（表函数/派生表里在括号内的表名同样要扫，见 tableNameRegion）
-    const region = tableNameRegion(text, m.index + m[0].length);
-    // 区内所有「限定名.」都算：第一张表 + 逗号列表里的后续表。
-    // 引号分支不限定字符集——`"Z-DEMO"."PAYROLL"` 这类合法引号名旧版扫不到 = 读边界被绕过（评审实测）
-    const qualified = /"([^"]+)"\s*\.|([A-Za-z_][A-Za-z0-9_$#]*)\s*\./g;
-    let q: RegExpExecArray | null;
-    while ((q = qualified.exec(region)) !== null) {
-      const quoted = q[1] !== undefined;
-      const name = quoted ? q[1] : q[2].toUpperCase();
-      if (!quoted && SQL_NON_SCHEMA.has(name)) continue;
-      out.add(name);
-    }
+    collectQualifiedRefs(tableNameRegion(text, m.index + m[0].length), out);
     anchor.lastIndex = m.index + m[0].length;
   }
   return [...out];
+}
+
+/**
+ * 扫表名区里的限定名（`SCHEMA.表` / `"SCHEMA"."表"`）。
+ *
+ * 必须按**标识符 token** 走，不能拿"名字后面跟点"的正则在整个区里找：
+ * 引号标识符的内容里可以有任意字符，包括点——`"_SYS_BIC"."PKG/VIEW"`（HANA 运行时视图名的常见形态）
+ * 会被正则当成 `_SYS_BIC` 与 `PKG` 两个限定名，凭空多出一个越界的假 schema（实测被策略层拦下）。
+ * 所以：引号内的字符只按"引号标识符"整体处理，只有紧跟其后的 `.` 才算限定符。
+ */
+function collectQualifiedRefs(region: string, out: Set<string>): void {
+  let i = 0;
+  // 多段名里只有**第一段**是 schema：`SCHEMA1.T1.COL` / `"S"."A--B"."C"` 的后续段不算 schema，
+  // 否则会多扫出假 schema（如把列名当 schema），把合法调用挡在预检外
+  const isFirstSegment = (pos: number): boolean => !/\.\s*$/.test(region.slice(0, pos));
+  while (i < region.length) {
+    const ch = region[i];
+    if (ch === '"') {
+      const start = i + 1;
+      let j = start;
+      while (j < region.length) {
+        if (region[j] === '"' && region[j + 1] === '"') j += 2; // "" 转义
+        else if (region[j] === '"') break;
+        else j++;
+      }
+      const name = region.slice(start, j);
+      const next = j + 1; // 跳过收尾引号
+      if (name !== '' && /^\s*\./.test(region.slice(next)) && isFirstSegment(i)) out.add(name);
+      i = next;
+      continue;
+    }
+    if (/[A-Za-z_]/.test(ch)) {
+      let j = i;
+      while (j < region.length && /[A-Za-z0-9_$#]/.test(region[j])) j++;
+      const upper = region.slice(i, j).toUpperCase();
+      if (/^\s*\./.test(region.slice(j)) && !SQL_NON_SCHEMA.has(upper) && isFirstSegment(i)) out.add(upper);
+      i = j;
+      continue;
+    }
+    i++;
+  }
 }
