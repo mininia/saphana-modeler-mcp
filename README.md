@@ -8,6 +8,15 @@ SAP HANA 经典 Modeler 能力的 MCP 服务器（TypeScript，Node >= 20.12）�
 
 通过 MCP 协议接入 Claude / IDE 等客户端（**stdio / Streamable HTTP 双传输**）：调用工具即可浏览、校验与（在配置的可写包内）创建计算视图，无需打开 HANA Studio。
 
+## 项目目标
+
+**让 AI 独立完成 SAP HANA 的开发。**
+
+不是给它一个 SQL 窗口，而是让它像建模工程师那样工作：看懂仓库里已有什么、对象之间怎么关联，
+判断该改什么、怎么改，动手改，再自己确认改对了——**语义能被理解，动作能被完成，边界可控**。
+
+今天覆盖经典仓库建模与执行计划分析；朝着这个目标，还会有 CDS/HDI、权限角色、数据传输与运维动作。
+
 ## 功能概览
 
 | 分类 | 能力 | 工具 |
@@ -19,7 +28,7 @@ SAP HANA 经典 Modeler 能力的 MCP 服务器（TypeScript，Node >= 20.12）�
 | 数据预览 | 已激活视图数据预览（整体/节点/推导三通道，支持筛选与输入参数）+ 预览权限诊断 | `hana_data_preview`、`hana_data_preview_diagnose` |
 | 建模写操作 | 新建/激活/更新/删除计算视图、设计时+运行时校验、校验动作查询 | `hana_view_create`、`hana_view_activate`、`hana_view_update`、`hana_view_delete`、`hana_view_validate`、`hana_view_check_actions` |
 | 仓库传输 | 包导出备份（zip）、设计时文件导入、变更列表 | `hana_repo_export`、`hana_repo_import`、`hana_repo_changelist` |
-| SQL 分析 | SQL 分析结论（默认）：扫描/规模/连接/引擎切换/结构异常的**逐条发现 + 建议 + 统计**；可选实际执行后分析；原始执行计划需 `raw=true` | `hana_sql_analyze` |
+| SQL 分析 | SQL 分析结论（默认）：扫描/规模/连接/引擎切换/结构异常的**逐条发现 + 建议 + 统计**；`analyze=true` 走 PlanViz 拿**逐算子实测**六栏（瓶颈/实际行数/时间轴/并行度）；原始执行计划需 `raw=true` | `hana_sql_analyze` |
 
 > 视图对象的完整定义读取（json/xml）由 `hana_metadata_get_view` 提供；字段级查看用 `hana_metadata_list_fields` / `hana_metadata_get_field_logic`。
 > 修改计算视图优先用 `hana_view_update` 的 operations 声明式模式（零 XML）；复杂改造用全量 XML 通道（先用 `hana_metadata_get_view(format=xml)` 读取，最小修改后回传）。
@@ -193,10 +202,23 @@ MCP_HTTP_PORT=3000 MCP_HTTP_TOKEN='your-long-random-token' node dist/index.js
 | `hana_repo_export` | 备份 | 导出包为 zip（XS REST Transfer API；saveTo 落盘或返回 base64） |
 | `hana_repo_import` | 写 | 导入设计时文件（Transfer API 目录目标+分片上传，落库 inactive，目标须在可写包范围，导入后回读状态） |
 | `hana_repo_changelist` | 只读 | 仓库变更列表审计（GET /base/change，需系统启用 Change Tracking） |
-| `hana_sql_analyze` | 分析 | SQL 分析：**默认返回可读结论**（一句话结论 + 逐条发现[风险/关注/信息，带依据与建议] + 统计），**默认不给原始计划**（`raw=true` 才返回算子行与文本树）；`sql`=只编译不执行；`planId`=分析计划缓存条目并附运行时统计（需 OPTIMIZER ADMIN）；`sql`+`analyze=true`=先实际执行再分析（30s 超时、最多取 100 行、**不返回数据行**） |
+| `hana_sql_analyze` | 分析 | SQL 分析：**默认返回可读结论**（一句话结论 + 逐条发现[风险/关注/信息，带依据与建议] + 统计），**默认不给原始计划**（`raw=true` 才返回算子行与文本树）；`sql`=只编译不执行（估计计划）；`planId`=分析计划缓存条目并附运行时统计（需 OPTIMIZER ADMIN）；`sql`+`analyze=true`=先真执行，**默认走 PlanViz 通道**拿与官方 Executed Plan(F8) 同款的**逐算子实测**（`panels` 六栏 + 实测结论；通道不可用时降级为估计计划 + 语句级统计，notes 说明）。执行受硬护栏：30s 超时、最多取 100 行、**不返回数据行** |
 
-> **PlanViz 未实现（预留扩展点）**：逐算子的实际执行细节（inclusive/exclusive 耗时、实际行数、时间线）只有 PlanViz 的 Executed Plan 提供，需要服务端开启 plan trace 并把 XML 落盘再取回，属运维面能力，本期不做。
-> 预留方式是：`source` 为可扩展枚举（后续可加 `planviz` 而不破坏既有取值）、服务入口带 options 形状、本行文档记录路径与前置条件。**不写空实现/僵尸分支**——不可用的路径宁可不出现。
+
+> **PlanViz 通道实测记录：估计计划与执行计划都已打通（普通连接、无需额外权限）**
+> 官方流程里的 Executed Plan（控制台 Execute Plan / F8）给的是**逐算子实测**数据——`Exclusive`/`Inclusive` 耗时、实际输出行数、`Timestamps` 时间轴、表访问次数与线程并行度；这些 EXPLAIN PLAN 拿不到，只存在于 `.plv`（PlanViz XML）里。
+> **「planviz 会话」不是私有握手，就是一条普通系统过程调用**：`CALL SYS.PLANVIZ_ACTION(103, '')`（或 `110`）返回 `{"PLANVIZ_VERSION":"0.9.2.2"}`，普通连接即可建立（老客户端走 `SET 'PLANVIZ' = 'ON'`，它只开引擎侧、且不会进计划缓存，所以靠观察计划缓存看不到这一步；关闭用 `PLANVIZ_ACTION(900, '')`）。动作码表取自 HANA Studio 客户端本体（`com.sap.ndb.planviz.protocol.base.PlanVizAction`，55 项）。
+> **完整取数流程（实测跑通，产物与手工导出的 `.plv` 同 schema）**：
+> ① `PLANVIZ_ACTION(103,'')` 建会话 →
+> ② `PLANVIZ_ACTION(201, '<SQL>')` 编译，返回 `queryId`（形如 `<连接号>_<hash>`，即 Statement ID）→
+> ③ 执行：把 **`EXECUTE PLANVIZ STATEMENT ID '<queryId>'`** 当语句发出去（这一步就是"实际执行"，返回结果集本身）→
+> ④ 取计划：`PLANVIZ_ACTION(402|401|301, '<queryId>')` 返回 `XML_PLAN` 字符流 —— **`Type="Executed"`，逐算子实测**（实测样例：15 算子、51 KB，15 组 `ExecutionTime`/`Timestamps`/`MemoryUsage`，4 线程，时间轴跨度 42.7 ms）；不执行则同一步返回 `Type="Estimated"`。
+> ⚠ **`EXECUTE PLANVIZ STATEMENT ID` 的 id 必须是 ② 的原样返回值**——不要自己拼 `ID_` 前缀或 `_1` 后缀；拼错会让 HANA **直接打掉连接**（`89006 recv failed`，已复现两次）。
+> 独立的 **plan trace 文件通道**（服务端 trace 文件，与 F8 无关）在本环境仍不可用：`GET_TRACE_CONFIG(191)` 返回 `-4`；`PLAN_TRACE_ON(100)`、`GET_TRACE_IN_PLAN_CACHE(405)`、`GET_ENCRYPTED_PLAN(306)` 报 *Not supported*；`PLAN_TRACE_ON_WITH_INI(180)`、`GET_PLAN_TRACE(403)`、`GET_QUERY_LIST_FOR_PLAN_TRACE(480)`、`LOAD_PLAN_TRACE_METADATA(481)`、`GET_A_PLV_FROM_PLAN_TRACE(482)` 一律 `258 insufficient privilege`；`SYS.GET_PLANVIZ_EXECUTED_PLAN(...)` 同样恒返回 258。`SET 'PLANVIZ'='ON'` 支路依赖的 `M_DEV_PLAN_SEARCH_SPACE`（HANA 1.0 时代的 `FOR PLAN EXPORT` 机制）在 2.00.085 上不存在。
+> **本工具已接入（模式③）**：`sql` + `analyze=true` 走这条通道，产出 `panels` 六栏（Plan Graph / Physical Plan / Execution Time / Timeline / Table Access / Logical Plan）与逐算子实测结论；通道不可用时**自动降级**为估计计划 + 语句级统计（`source=sqlExecuted`）并在 notes 写明原因。
+> 模式①（只编译）与②（计划缓存条目）仍走 `EXPLAIN PLAN`——那是"不执行"的语义，用不到实测。⚠ 注意 `EXPLAIN PLAN` 对系统监控视图（`SYS.M_*`、`M_CONNECTIONS` 等）会返回 `258`，而**同一条语句走 PlanViz 通道可以正常出计划**：要分析这类语句用 `analyze=true`。
+> `.plv` 结构实测：`<?Version 35?>` + `<Plan Type="Executed" PlanType="QoExec">`，含 `<ExecutionTime><Exclusive|Inclusive|Start|End|Timestamps>`、`<Schema|ObjectName|TableType>`、`<ExecutedOutputCardinality>`、`<InnerPlans>` 逻辑/物理内层计划。解析要点（踩过的坑）：`<Relation>` **物理嵌套**（子算子包在父的 `<Child>` 块里）、实测行数记在**父算子的 `<Child>` 块**上、`<InnerPlans>` 嵌在算子内部而子计划本体又作为平级 `<Plan>` 片段挂在外面、整体耗时要用**时间轴跨度**而非根算子含子耗时（惰性物化与并行分支发生在根算子的计时窗口之外）。
+
 
 > **写操作安全边界**：写工具（create/activate/update/delete/package_create/import）的可写包范围由
 > `HANA_WRITE_PACKAGES` 配置控制——**空=不限制（全部可写）**；填写后仅允许配置包及其下级子包写操作

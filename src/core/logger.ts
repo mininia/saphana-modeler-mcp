@@ -14,7 +14,7 @@ const SENSITIVE_PATTERNS: Array<[RegExp, string]> = [
   [/(HANA_PASSWORD|PASSWORD|PASSWD|PWD)=([^&\s;]+)/gi, '$1=****'],
   [/(uid|user|username)\s*[:=]\s*([^,;\s]+)/gi, '$1: ****'],
   [/(Authorization|api[_-]?key|secret|token)\s*[:=]\s*[^&\r\n,;]*/gi, '$1: ****'],
-  // 连接目标 IP（HANA 驱动连接错误消息格式，如 "Connection to '10.1.2.3:31041' failed"）：
+  // 连接目标 IP（HANA 驱动连接错误消息格式，如 "Connection to '192.0.2.10:30015' failed"）：
   // 掩码主机 IP，保留端口，防止内网拓扑进入日志/错误（不匹配 ISO 时间戳，避免误伤）
   [/\b((?:\d{1,3}\.){3}\d{1,3}):(\d{2,5})\b/g, '****:$2'],
 ];

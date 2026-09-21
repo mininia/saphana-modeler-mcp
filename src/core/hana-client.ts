@@ -81,10 +81,17 @@ export interface HanaPoolOptions {
 
 /**
  * 简单 HANA 连接池（@sap/hana-client 原生驱动）：
- * - 懒连接：首次 acquire 才建连；连接失效时自动重建一次
+ * - 懒连接：首次 acquire 才建连
  * - 池满时请求排队等待，但有**队列上限与等待超时**（HTTP 多客户端下，无界排队会让一个客户端的
  *   慢查询把其他客户端全部挂死；有界排队把「挂死」变成可解释的失败）
  * - 暴露 query/execute/withConnection/execOn 入口，service 层只用这几个
+ *
+ * ⚠ **本池不做连接存活检查**（acquire 直接从空闲队列取、release 无条件放回）：连接在服务端被
+ * 掐断后仍会被下一位取到，其第一条语句失败、连接又被放回，如此循环到进程重启。
+ * 原先这里写着"连接失效时自动重建一次"，但实现里从来没有这段逻辑——已按实际情况更正。
+ * 已知能造成这种连接的一条路径是 PlanViz 通道（`EXECUTE PLANVIZ STATEMENT ID` 传错 id 会被
+ * HANA 直接断开，见 README 的通道记录）；该 id 现在会先过 `QUERY_ID_RE` 形状校验才拼进语句，
+ * 但**根因未除**：真正要修的是在 release/acquire 时判定连接可用性并丢弃失效连接。
  */
 export class HanaPool {
   private readonly options: ConnectionOptions;

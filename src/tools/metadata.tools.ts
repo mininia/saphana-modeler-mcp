@@ -183,7 +183,7 @@ export function registerMetadataTools(server: McpServer, ctx: ToolContext): void
         '表不存在或当前用户无权限时返回 isError 并提示用 hana_table_list 确认可访问的表',
       inputSchema: z.object({
         schema: z.string().describe('schema 名，如 SAPABAP1 / _SYS_BIC'),
-        table: z.string().describe('表名，如 /BIC/AYELC070011'),
+        table: z.string().describe('表名，如 /BIC/AZDEMO001'),
         limit: z.number().int().min(1).max(500).default(200).describe('返回列数上限，默认 200，最大 500'),
       }),
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },

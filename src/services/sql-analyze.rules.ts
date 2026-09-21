@@ -205,6 +205,17 @@ export function generateStatementName(): string {
 }
 
 /**
+ * 降级路径专用的语句名：由主名字**派生**（固定后缀），不重新随机。
+ *
+ * 为什么派生而不是再生成一个随机名：写计划行用哪个名字、回读就得用哪个名字、清理也得删得掉。
+ * 派生名让这三处只凭主名字就能推导出来——早先用随机新名的那版，`finish` 仍按主名字回读 → 0 行硬失败，
+ * 写进去的行成了孤儿永远清不掉（真机实测：计划表里躺着 3 行删不掉的 MCP_* 行）。
+ */
+export function fallbackStatementName(primary: string): string {
+  return `${primary}_FB`;
+}
+
+/**
  * 拼 EXPLAIN PLAN 语句。
  *
  * ⚠️ 本工具**唯一**的注入面：EXPLAIN 是工具语句，statement_name 与 plan_id 都**不能参数绑定**，

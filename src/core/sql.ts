@@ -11,7 +11,7 @@ const SYSTEM_SCHEMAS = new Set(['_SYS_BIC', '_SYS_BI', '_SYS_REPO', 'SYS', '_SYS
 /** 设计时对象名（包/视图）允许的字符集：字母/数字/_/$/#/./-，禁止引号与分号 */
 const SAFE_NAME_RE = /^[A-Za-z0-9_$#.\-]+$/;
 
-/** 运行时对象名（表/视图，允许 /，如 /BIC/AYELC070011）：字母/数字/_/$/#/./-/，禁止引号与分号 */
+/** 运行时对象名（表/视图，允许 /，如 /BIC/AZDEMO001）：字母/数字/_/$/#/./-/，禁止引号与分号 */
 const SAFE_RUNTIME_NAME_RE = /^[A-Za-z0-9_$#.\/\-]+$/;
 
 /** 追加配置允许的 schema（来自 HANA_SCHEMA_ALLOW），大小写不敏感 */

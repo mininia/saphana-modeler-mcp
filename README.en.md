@@ -10,6 +10,17 @@ repository objects.
 Connect via the MCP protocol (both **stdio and Streamable HTTP** transports) to clients such as Claude / IDE: invoke tools to browse, validate, and
 (within configured writable packages) create calculation views — no HANA Studio required.
 
+## Project goal
+
+**Let AI complete SAP HANA development on its own.**
+
+Not by handing it a SQL window, but by letting it work the way a modeling engineer does: understand what already
+exists and how the objects relate, decide what to change and how, make the change, then confirm it worked —
+**semantics it can understand, actions it can complete, boundaries that stay in control**.
+
+Today it covers classic repository modeling and execution-plan analysis; CDS/HDI, privileges and roles, data
+transfer and operations actions are where this is heading.
+
 ## Overview
 
 | Category | Capability | Tools |
@@ -21,7 +32,7 @@ Connect via the MCP protocol (both **stdio and Streamable HTTP** transports) to 
 | Data preview | Activated-view data preview (overall / node / derived — three channels, with filtering & input parameters) + preview privilege diagnosis | `hana_data_preview`, `hana_data_preview_diagnose` |
 | Modeling write | Create/activate/update/delete calculation views, design-time + runtime validation, validation action query | `hana_view_create`, `hana_view_activate`, `hana_view_update`, `hana_view_delete`, `hana_view_validate`, `hana_view_check_actions` |
 | Repository transport | Package export backup (zip), design-time file import, change list | `hana_repo_export`, `hana_repo_import`, `hana_repo_changelist` |
-| SQL analysis | SQL analysis conclusion (default): per-item findings + advice + statistics on scans/sizes/joins/engine switches/structure; optional execute-then-analyze; raw plan only via `raw=true` | `hana_sql_analyze` |
+| SQL analysis | SQL analysis conclusion (default): per-item findings + advice + statistics on scans/sizes/joins/engine switches/structure; `analyze=true` goes through the PlanViz channel for **per-operator measured** six panels (bottleneck / actual rows / timeline / parallelism); raw plan only via `raw=true` | `hana_sql_analyze` |
 
 > Full definition read (json/xml) of view objects is provided by `hana_metadata_get_view`; field-level inspection uses `hana_metadata_list_fields` / `hana_metadata_get_field_logic`.
 > Prefer the declarative `operations` mode of `hana_view_update` for modifying calculation views (zero XML); for complex rework use the full-XML channel (read with `hana_metadata_get_view(format=xml)` first, make minimal edits, then post back).
@@ -192,10 +203,23 @@ On startup, if filter variables are configured, the log prints the enabled group
 | `hana_repo_export` | backup | Export a package as zip (XS REST Transfer API; saveTo to disk or return base64) |
 | `hana_repo_import` | write | Import design-time files (Transfer API directory target + chunked upload, stored inactive, target must be within writable package scope, re-read status after import) |
 | `hana_repo_changelist` | read-only | Repository change-list audit (GET /base/change; requires Change Tracking enabled) |
-| `hana_sql_analyze` | analyze | SQL analysis: **returns a readable conclusion by default** (one-line summary + per-item findings [risk/warn/info, each with evidence and advice] + statistics); **no raw plan unless `raw=true`**; `sql` = compile only; `planId` = explain a plan-cache entry with runtime stats (needs OPTIMIZER ADMIN); `sql` + `analyze=true` = execute first, then analyze (30 s timeout, at most 100 rows, **no data rows returned**) |
+| `hana_sql_analyze` | analyze | SQL analysis: **returns a readable conclusion by default** (one-line summary + per-item findings [risk/warn/info, each with evidence and advice] + statistics); **no raw plan unless `raw=true`**; `sql` = compile only; `planId` = explain a plan-cache entry with runtime stats (needs OPTIMIZER ADMIN); `sql` + `analyze=true` = really executes, then by default goes through the **PlanViz channel** for the same **per-operator measurements** as the official Executed Plan (F8) — the `panels` six panels (Plan Graph / Physical Plan / Execution Time / Timeline / Table Access / Logical Plan) plus measured findings; if the channel is unavailable it falls back to an estimated plan + statement-level statistics and explains why in `notes` (`source=sqlExecuted` marks the fallback). Guards either way: 30 s timeout, at most 100 rows, **no data rows returned**) |
 
-> **PlanViz is not implemented (reserved extension point)**: per-operator actual execution detail (inclusive/exclusive time, actual row counts, timeline) is only available from PlanViz's Executed Plan, which requires server-side plan tracing to be enabled and the XML trace to be retrieved — an operational concern, out of scope for now.
-> The extension is reserved via: `source` being an extensible enum (a future `planviz` value breaks nothing), the service entry taking an options object, and this note recording the path and its prerequisites. **No stub implementations or dead branches** — an unavailable path is better left absent.
+> **PlanViz channel, as measured: both the estimated and the executed plan are reachable (ordinary connection, no extra privileges)**
+> The Executed Plan in the official flow (Execute Plan / F8) carries **per-operator measured** data — `Exclusive`/`Inclusive` time, actual row counts, `Timestamps` timeline, table-access counts and thread parallelism. EXPLAIN PLAN cannot produce any of it; it only exists in a `.plv` (PlanViz XML) file.
+> **A "planviz session" is not a private handshake but a plain system-procedure call**: `CALL SYS.PLANVIZ_ACTION(103, '')` (or `110`) returns `{"PLANVIZ_VERSION":"0.9.2.2"}` and works from an ordinary connection (older clients use `SET 'PLANVIZ' = 'ON'`, which only flips the engine-side flag and never enters the plan cache — which is why watching the plan cache misses it; `PLANVIZ_ACTION(900, '')` closes it). The action code table comes from the HANA Studio client itself (`com.sap.ndb.planviz.protocol.base.PlanVizAction`, 55 entries).
+> **The full retrieval flow (verified end to end; the artifact matches a hand-exported `.plv` schema)**:
+> ① `PLANVIZ_ACTION(103,'')` opens the session →
+> ② `PLANVIZ_ACTION(201, '<SQL>')` compiles and returns `queryId` (shaped `<connectionId>_<hash>`, i.e. the Statement ID) →
+> ③ execute by sending **`EXECUTE PLANVIZ STATEMENT ID '<queryId>'`** as a statement (this *is* the real execution; it returns the result set) →
+> ④ fetch the plan with `PLANVIZ_ACTION(402|401|301, '<queryId>')`, which returns `XML_PLAN` as a character stream — **`Type="Executed"` with per-operator measurements** (sample: 15 operators, 51 KB, 15 `ExecutionTime`/`Timestamps`/`MemoryUsage` blocks, 4 threads, 42.7 ms timeline span); skip step ③ and the same call returns `Type="Estimated"`.
+> ⚠ **The id in `EXECUTE PLANVIZ STATEMENT ID` must be the verbatim value returned by step ②** — do not invent an `ID_` prefix or `_1` suffix; a malformed id makes HANA **drop the connection outright** (`89006 recv failed`, reproduced twice).
+> The separate **plan-trace file channel** (server-side trace files, unrelated to F8) remains unavailable here: `GET_TRACE_CONFIG(191)` returns `-4`; `PLAN_TRACE_ON(100)`, `GET_TRACE_IN_PLAN_CACHE(405)` and `GET_ENCRYPTED_PLAN(306)` report *Not supported*; `PLAN_TRACE_ON_WITH_INI(180)`, `GET_PLAN_TRACE(403)`, `GET_QUERY_LIST_FOR_PLAN_TRACE(480)`, `LOAD_PLAN_TRACE_METADATA(481)` and `GET_A_PLV_FROM_PLAN_TRACE(482)` all return `258 insufficient privilege`; `SYS.GET_PLANVIZ_EXECUTED_PLAN(...)` likewise returns 258. The `SET 'PLANVIZ'='ON'` branch depends on `M_DEV_PLAN_SEARCH_SPACE` (the HANA 1.0-era `FOR PLAN EXPORT` mechanism), which does not exist on 2.00.085.
+> `.plv` schema as measured: `<?Version 35?>` + `<Plan Type="Executed" PlanType="QoExec">`, containing `<ExecutionTime><Exclusive|Inclusive|Start|End|Timestamps>`, `<Schema|ObjectName|TableType>`, `<ExecutedOutputCardinality>` and `<InnerPlans>` logical/physical inner plans.
+> **Wired in (mode ③)**: `sql` + `analyze=true` uses this channel and returns the `panels` six panels plus per-operator measured findings; when the channel is unavailable it **falls back** to an estimated plan + statement-level statistics (`source=sqlExecuted`) and says why in `notes`.
+> Modes ① (compile only) and ② (plan-cache entry) still use `EXPLAIN PLAN` — those are "do not execute" semantics and have no measurements to gain. ⚠ `EXPLAIN PLAN` returns `258` for system monitoring views (`SYS.M_*`, `M_CONNECTIONS`, …), while **the same statement goes through the PlanViz channel fine**: use `analyze=true` for those.
+> `.plv` schema as measured: `<?Version 35?>` + `<Plan Type="Executed" PlanType="QoExec">`, containing `<ExecutionTime><Exclusive|Inclusive|Start|End|Timestamps>`, `<Schema|ObjectName|TableType>`, `<ExecutedOutputCardinality>` and `<InnerPlans>` logical/physical inner plans. Parsing pitfalls (all hit for real): `<Relation>` is **physically nested** (a child sits inside its parent's `<Child>` block); actual row counts are recorded on the **parent's `<Child>` block**; `<InnerPlans>` is nested inside an operator while the sub-plan itself also appears as a sibling `<Plan>` fragment; and the overall duration must come from the **timeline span**, not the root operator's inclusive time (lazy materialization and parallel branches happen outside the root's timing window).
+
 
 > **Write-operation safety boundary**: the writable-package scope for write tools (create/activate/update/delete/package_create/import) is controlled by `HANA_WRITE_PACKAGES` — **empty = no restriction (all writable)**; when set, only configured packages and their sub-packages are writable (e.g. `ZDEMO1,ZDEMO2.ZDEMO_SD` allows ZDEMO1, ZDEMO1.X, ZDEMO2.ZDEMO_SD, ZDEMO2.ZDEMO_SD.SUB, rejects others).
 > Same-name objects are rejected from overwrite; update/delete carry ETag optimistic locking.
