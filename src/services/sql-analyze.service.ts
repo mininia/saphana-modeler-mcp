@@ -4,13 +4,24 @@ import { assertSchemaAllowed } from '../core/sql.js';
 import { scanSqlSchemaRefs } from '../write-plan.js';
 import { assertSqlReadScopes } from './read-scope.service.js';
 import {
+  PLANVIZ_ACTION,
+  QUERY_ID_RE,
+  analyzePlanVizPlan,
+  buildPlanVizPanels,
+  parsePlanVizXml,
+  type PlanVizPanels,
+  type PlanVizPlan,
+} from './planviz.rules.js';
+import {
+  ANALYZE_CONTROL_TIMEOUT_MS,
+  ANALYZE_EXECUTION_TIMEOUT_MS,
   ANALYZE_MAX_ROWS,
-  ANALYZE_TIMEOUT_MS,
   DEFAULT_OPERATOR_LIMIT,
   HARD_OPERATOR_CAP,
   MAX_OPERATOR_LIMIT,
   analyzePlan,
   buildExplainStatement,
+  fallbackStatementName,
   generateStatementName,
   parseSqlStatement,
   renderPlan,
@@ -139,6 +150,7 @@ export interface ExecutionStats {
   rowsFetched: number;
   /** 取行上限（达到即停止拉取并关闭结果集） */
   maxRows: number;
+  /** 本次执行实际生效的语句超时（**只覆盖执行**；PlanViz 控制面调用另有 30s 上限） */
   timeoutMs: number;
   serverProcessingTime?: number;
   serverCpuTime?: number;
@@ -146,8 +158,22 @@ export interface ExecutionStats {
 }
 
 export interface SqlAnalyzeResult {
-  /** sql=按语句文本编译解释；planCacheEntry=解释计划缓存条目；sqlExecuted=先执行再分析 */
-  source: 'sql' | 'planCacheEntry' | 'sqlExecuted';
+  /**
+   * 计划来源：
+   * - sql=按语句文本编译解释（对应官方 Visualize Plan 的估计计划）
+   * - planCacheEntry=解释计划缓存条目（官方「SQL Plan Cache → Visualize Plan」同款）
+   * - sqlExecuted=先执行、再解释缓存条目（仍是估计值 + 语句级运行时统计）
+   * - plv=**预留**：走 PlanViz 通道取计划（官方 Executed Plan 的落点，逐算子实测耗时/时间轴）。
+   *   实测（HANA 2.00.085）**已打通全流程，普通连接、无需 trace 权限**：
+   *   `CALL SYS.PLANVIZ_ACTION(103|110,'')` 建 planviz 会话（老客户端走 `SET 'PLANVIZ'='ON'`）→
+   *   `PLANVIZ_ACTION(201, sql)` 编译并返回 queryId（`<连接号>_<hash>`，即 Statement ID）→
+   *   执行 = 把 `EXECUTE PLANVIZ STATEMENT ID '<上一步原样返回的 queryId>'` 当语句发出去 →
+   *   `PLANVIZ_ACTION(402|401|301, queryId)` 取回 `XML_PLAN`，此时为 `Type="Executed"` 逐算子实测；
+   *   不做第三步则同一步返回 `Type="Estimated"`。
+   *   **id 必须原样传递**——自行拼 `ID_` 前缀/`_1` 后缀会让 HANA 直接打掉连接（89006）。
+   *   本期仍未接入，只保留取值位（服务端 trace 文件通道是另一回事，本环境 258/未开启）。
+   */
+  source: 'sql' | 'planCacheEntry' | 'sqlExecuted' | 'plv';
   /** 服务端生成的唯一语句名（回读凭它过滤） */
   statementName: string;
   /** 调用方给的输出标签（原样回显） */
@@ -156,10 +182,19 @@ export interface SqlAnalyzeResult {
   statement: string;
   /** 写入这个计划的连接号（计划表**全库可读**，此值用于"只读自己这次写的行"的第二道过滤） */
   connectionId: number | null;
-  /** 回读是否按 CONNECTION_ID 过滤（false=退化为仅按语句名过滤，如实回报） */
-  connectionFiltered: boolean;
+  /**
+   * 回读是否按 CONNECTION_ID 过滤（false=退化为仅按语句名过滤，如实回报）。
+   * **仅 EXPLAIN 路径有意义**（那条路径才读 SYS.EXPLAIN_PLAN_TABLE）；PlanViz 路径不读该表，故不回报。
+   */
+  connectionFiltered?: boolean;
   /** **默认输出**：可读的分析结论（一句话结论 + 逐条发现 + 统计） */
   conclusion: PlanConclusion;
+  /**
+   * 六栏结构化数据（对齐官方 PlanViz 界面的六块：Plan Graph / Physical Plan / Execution Time /
+   * Timeline / Table Access / Logical Plan）。**仅 PlanViz 通道（source='plv'）提供**——
+   * EXPLAIN 路径给不出实测耗时与时间轴，硬凑一个残缺版本反而误导。文本树在 raw=true 时才有。
+   */
+  panels?: PlanVizPanels;
   /** 原始执行计划（仅 raw=true 时返回）：紧凑算子行 */
   operators?: PlanOperator[];
   /** 原始执行计划（仅 raw=true 时返回）：按层级缩进的文本树 */
@@ -219,7 +254,10 @@ export async function analyzeSql(pool: HanaPool, opts: SqlAnalyzeOptions): Promi
   return pool.withConnection(async (conn): Promise<SqlAnalyzeResult> => {
     const session = await readSessionInfo(pool, conn);
     const base = { statementName, session, verbose, raw, limit, ...(label !== undefined ? { label } : {}) };
-    const cleanup = () => cleanupPlanRows(pool, conn, statementName);
+    // 本次可能写进计划表的**所有**名字：主名 + 降级路径用的派生名。清理与残留提示都按这一份走，
+    // 否则按提示去查主名是 0 行、真正残留的派生名行无人知晓
+    const planNames = [statementName, fallbackStatementName(statementName)];
+    const cleanup = () => cleanupPlanRows(pool, conn, planNames);
     try {
       const result =
         opts.planId !== undefined
@@ -228,13 +266,13 @@ export async function analyzeSql(pool: HanaPool, opts: SqlAnalyzeOptions): Promi
             ? await analyzeByExecution(pool, conn, { ...base, sql: String(opts.sql) })
             : await analyzeText(pool, conn, { ...base, sql: String(opts.sql) });
       const cleaned = await cleanup();
-      return withCleanupNote(result, statementName, cleaned);
+      return withCleanupNote(result, planNames, cleaned);
     } catch (e) {
       // 失败路径同样可能已经写入计划行（EXPLAIN 成功、回读失败）：尽力清理，但不掩盖原始错误。
       // 清理**也**失败时必须让调用方知道——否则错误信息里既没有语句名、也没有"有行残留"这件事，
       // 补救线索直接丢失（成功路径本来就会回报这些）
       const cleaned = await cleanup();
-      throw withCleanupDiagnosis(e, statementName, cleaned);
+      throw withCleanupDiagnosis(e, planNames, cleaned);
     }
   });
 }
@@ -251,25 +289,31 @@ export async function analyzeSql(pool: HanaPool, opts: SqlAnalyzeOptions): Promi
 async function cleanupPlanRows(
   pool: HanaPool,
   conn: HanaConnection,
-  statementName: string,
+  statementNames: string[],
 ): Promise<boolean> {
-  try {
-    await pool.execOn(conn, `DELETE FROM ${PLAN_TABLE} WHERE STATEMENT_NAME = ?`, [statementName]);
-    return true;
-  } catch {
-    return false;
+  let allCleaned = true;
+  // 逐个名字各自 try：一次调用要清的名字不止一个（降级路径用派生名写行，见 fallbackStatementName），
+  // 共用一次 try 会让第一个名字失败就跳过其余——真正写了行的那个（派生名）反而没被删，
+  // 提示里也只报主名，按提示去查是 0 行，孤儿行无人知晓。这正是当初要消灭的情况。
+  for (const name of statementNames) {
+    try {
+      await pool.execOn(conn, `DELETE FROM ${PLAN_TABLE} WHERE STATEMENT_NAME = ?`, [name]);
+    } catch {
+      allCleaned = false;
+    }
   }
+  return allCleaned;
 }
 
 function withCleanupNote(
   result: SqlAnalyzeResult,
-  statementName: string,
+  statementNames: string[],
   cleaned: boolean,
 ): SqlAnalyzeResult {
   return {
     ...result,
     planRowsCleaned: cleaned,
-    ...(cleaned ? {} : { notes: [...result.notes, cleanupHint(statementName)] }),
+    ...(cleaned ? {} : { notes: [...result.notes, cleanupHint(statementNames)] }),
   };
 }
 
@@ -278,7 +322,7 @@ function withCleanupNote(
  * 与成功路径的 note 同一份措辞，保证"失败也不丢核心信息"。
  * 非 HanaBusinessError（协议层错误等）原样抛出——那类错误不该被包装成业务错误。
  */
-function withCleanupDiagnosis(e: unknown, statementName: string, cleaned: boolean): unknown {
+function withCleanupDiagnosis(e: unknown, statementNames: string[], cleaned: boolean): unknown {
   if (cleaned || !(e instanceof HanaBusinessError)) return e;
   const prev = (e.diagnosis ?? {}) as Record<string, unknown>;
   return new HanaBusinessError(
@@ -286,16 +330,17 @@ function withCleanupDiagnosis(e: unknown, statementName: string, cleaned: boolea
     e.code,
     e.sqlState,
     e.messages,
-    { ...prev, planRowsCleaned: false, statementName, cleanupHint: cleanupHint(statementName) },
+    { ...prev, planRowsCleaned: false, statementNames, cleanupHint: cleanupHint(statementNames) },
     e.rawDetail,
   );
 }
 
-/** 计划行残留时的统一提示（成功路径进 notes，失败路径进 diagnosis） */
-function cleanupHint(statementName: string): string {
+/** 计划行残留时的统一提示（成功路径进 notes，失败路径进 diagnosis）——**列出全部可能残留的名字** */
+function cleanupHint(statementNames: string[]): string {
+  const list = statementNames.map((n) => `'${n}'`).join(' 或 ');
   return (
-    `本次写入的计划行未能清理（当前用户可能没有 SYS.EXPLAIN_PLAN_TABLE 的 DELETE 权限）：` +
-    `该表中 STATEMENT_NAME='${statementName}' 的行需手工清理`
+    '本次写入的计划行未能清理（当前用户可能没有 SYS.EXPLAIN_PLAN_TABLE 的 DELETE 权限）：' +
+    `该表中 STATEMENT_NAME 为 ${list} 的行需手工清理（降级路径写的是带 _FB 后缀的那个名字）`
   );
 }
 
@@ -377,13 +422,14 @@ async function analyzeCacheEntry(
 /**
  * 模式三：**先实际执行再分析**（可选，默认关闭）。
  *
- * 为什么必须"执行"才能拿到运行时统计：EXPLAIN 只给估计值，实际数据只在计划缓存/PlanViz 里
- * （SAP 文档原话：Actual execution information is only available in the Plan Visualizer）。
- * 执行后再按**完全相同的语句文本**关联缓存条目，得到的还是**重编译（参数感知）**计划——
- * 这正是文档推荐的做法。
+ * 取计划有两条路，**优先走 PlanViz 通道**（官方 Executed Plan / F8 的同一条路）：
+ * - PlanViz 通道拿得到**逐算子实测**：独占/含子耗时、实际行数、时间轴、线程数、表访问次数；
+ * - 拿不到时（旧版本不支持 `EXECUTE PLANVIZ STATEMENT ID`、或会话被占等）**降级**到
+ *   "执行后按语句文本关联计划缓存条目"的老路——那条路只有**语句级**聚合统计，计划仍是估计值。
+ * 降级是静默可解释的：notes 里说明为什么退、退到了哪。
  *
- * 护栏（服务层常量，不做成参数）：语句超时 30s、最多取 100 行即关闭结果集、只允许 SELECT、
- * 执行前先过读取范围。**不返回数据行**。
+ * 护栏（服务层常量，不做成参数）：语句超时 5 min、最多取 100 行即关闭结果集、只允许 SELECT、
+ * 执行前先过读取范围。**不返回数据行**。两道执行路径都套同一套护栏。
  */
 async function analyzeByExecution(
   pool: HanaPool,
@@ -391,13 +437,27 @@ async function analyzeByExecution(
   args: BaseArgs & { sql: string },
 ): Promise<SqlAnalyzeResult> {
   await assertReadScopes(args.sql, args.session.schema, '语句');
-  const execution = await executeGuarded(conn, args.sql);
+
+  const planViz = await tryPlanVizExecution(pool, conn, args);
+  if (planViz.ok) return planViz.result;
+
+  // 第③步已经真执行过就不再执行第二遍：一次调用跑两遍语句意味着墙钟翻倍、库上负载翻倍，
+  // 而 PlanViz 失败正是在"语句已经跑完"之后才暴露的（取计划/解析那几步）
+  const execution = planViz.executed ?? (await executeGuarded(conn, args.sql));
 
   // 按"完全相同的文本"关联计划缓存条目：文本一致才能拿到同一个（重编译）计划。
   // 用 LIKE + ESCAPE 而非等值（STATEMENT_STRING 是 LOB，等值比较会报 NLocator 错误，实测）。
   // 查询本身失败也不该让整次调用失败——语句**已经执行成功**了，与"找不到条目"是同一种降级。
   let entry: PlanCacheRow | undefined;
   const notes: string[] = [];
+  // 上面 PlanViz 通道没走通：把原因如实带出来（否则调用方只会看到"没有实测数据"而不知为什么）
+  notes.push(
+    planViz.executed !== undefined
+      ? `PlanViz 通道在**语句已执行之后**失败（${planViz.reason}）：不会重复执行该语句，以下改用` +
+          '「按语句文本关联计划缓存条目」的降级路径——计划仍是 EXPLAIN 的**估计值**、只有**语句级**聚合统计'
+      : `PlanViz 通道不可用（${planViz.reason}），已改用「执行后按语句文本关联计划缓存条目」的降级路径：` +
+          '计划仍是 EXPLAIN 的**估计值**、只有**语句级**聚合统计，没有逐算子实测耗时与时间轴',
+  );
   try {
     const rows = await pool.execOn<PlanCacheRow[]>(
       conn,
@@ -412,18 +472,27 @@ async function analyzeByExecution(
     );
   }
 
+  // 回读必须按「真正写进计划表的那个名字」做，而不是调用初始生成的名字：
+  // 降级路径会换一个新名字写入（防同名追加混行），拿旧名字回读必然 0 行（实测：报“回读不到任何算子行”，
+  // 而写入的行成了孤儿永远清不掉）。名字由主名字派生，收尾与清理都能只凭主名字推导。
+  let planName = args.statementName;
+
   let runtime: RuntimeStats | undefined;
   if (entry && typeof entry.PLAN_ID === 'number') {
     try {
       await runExplain(pool, conn, args.statementName, { planId: entry.PLAN_ID });
       runtime = toRuntime(entry);
-      notes.unshift('计划来自实际执行后的计划缓存条目（参数感知的重编译计划）');
+      notes.unshift(
+        '计划来自执行后的计划缓存条目（参数感知的**重编译**计划；仍是编译期**估计**值，' +
+          '逐算子实测耗时不在 EXPLAIN 的返回里——那属于 Executed Plan/PlanViz 的范畴，本工具未提供）',
+      );
     } catch (e) {
       // 解释缓存条目要 OPTIMIZER ADMIN：语句已经执行成功，不该因这一步整体失败 → 退回解释文本。
       // ⚠️ 必须换一个**新的语句名**：同名是追加而非替换，复用名字会把两条计划的算子混在一起
       // （根算子变 2 个、扫描数翻倍，结论静默出错）——正是唯一命名要防的事。
       notes.push(`按计划缓存条目解释失败（${(e as Error).message}），已退回编译期计划；运行时统计不可用`);
-      await runExplain(pool, conn, generateStatementName(), { sql: args.sql });
+      planName = fallbackStatementName(args.statementName);
+      await runExplain(pool, conn, planName, { sql: args.sql });
       notes.push('退回路径使用独立的计划标识，不与失败那次混行');
     }
   } else if (!entry) {
@@ -436,9 +505,209 @@ async function analyzeByExecution(
   return finish(pool, conn, args, {
     source: 'sqlExecuted',
     statement: args.sql,
+    planName,
     execution,
     ...(runtime ? { runtime } : {}),
     notes,
+  });
+}
+
+// ── PlanViz 通道（官方 Executed Plan / F8 的同一条路）────────────────
+
+/** `{CALL PLANVIZ_ACTION(?,?)}`：与 HANA Studio 客户端逐字节相同（反编译自 PlanVizProtocol） */
+const PLANVIZ_CALL = '{CALL PLANVIZ_ACTION(?,?)}';
+
+/**
+ * 走 PlanViz 通道取**逐算子实测**计划。四步（每步都是实测出来的，见 README 的通道记录）：
+ *   ① `PLANVIZ_ACTION(103,'')` 建 planviz 会话
+ *   ② `PLANVIZ_ACTION(201, sql)` 编译，拿 Statement ID（queryId）
+ *   ③ `EXECUTE PLANVIZ STATEMENT ID '<queryId>'` —— **这一步就是真执行**，返回结果集本身
+ *   ④ `PLANVIZ_ACTION(402, queryId)` 取回计划 XML（此时 `Type="Executed"`，带逐算子实测）
+ *
+ * fail-soft：任何一步失败都返回 undefined，由调用方降级到 EXPLAIN 路径；**失败原因绝不吞掉**，
+ * 经 notes 如实回报。会话若已建立，无论成败都关掉（PLANVIZ_OFF），避免把连接留在 planviz 态。
+ */
+/**
+ * PlanViz 通道的尝试结果。**不用模块级变量传失败原因**：服务在 HTTP 模式下是多客户端并发的，
+ * 共享可变状态会把别的请求的失败原因串到本次的 notes 里。
+ *
+ * `executed` 用于避免**重复执行**：PlanViz 的第③步已经真跑过语句了，若之后取计划才失败，
+ * 降级路径不能再执行第二遍（墙钟翻倍、库上负载翻倍），而要把已测到的执行统计带出去。
+ */
+type PlanVizAttempt =
+  | { ok: true; result: SqlAnalyzeResult }
+  | { ok: false; reason: string; executed?: ExecutionStats };
+
+async function tryPlanVizExecution(
+  pool: HanaPool,
+  conn: HanaConnection,
+  args: BaseArgs & { sql: string },
+): Promise<PlanVizAttempt> {
+  let sessionOn = false;
+  let executed: ExecutionStats | undefined;
+  try {
+    await planVizCall(pool, conn, PLANVIZ_ACTION.ON, '');
+    sessionOn = true;
+    const queryId = await planVizPrepare(pool, conn, args.sql);
+    // ③ 执行走同一套护栏（执行超时 5 min / 总共只取 100 行 / 不返回数据行）——实测该 engine 语句
+    //    支持 setTimeout 与流式 execQuery，且**提前 close 之后计划照样能取到**（Type 仍是 Executed）
+    executed = await executeGuarded(conn, `EXECUTE PLANVIZ STATEMENT ID '${queryId}'`);
+    const xml = await planVizFetchPlan(pool, conn, queryId);
+    const plan = parsePlanVizXml(xml);
+    const panels = buildPlanVizPanels(plan, { tree: args.raw });
+    const conclusion = analyzePlanVizPlan(plan, { statement: args.sql, measured: plan.measured });
+    const notes = [
+      `计划来自 PlanViz 通道（官方 Executed Plan 同款）：Type="${plan.type}"，` +
+        `${plan.operators.length} 个算子（主计划 ${plan.primaryOperators.length}）` +
+        `${plan.subPlanCount > 0 ? `，含 ${plan.subPlanCount} 个子计划片段` : ''}；` +
+        '本模式的算子耗时/实际行数/时间轴都是**实测值**',
+    ];
+    if (!plan.measured) {
+      notes.push('该计划没有逐算子实测数据（服务端未回传 ExecutionTime）：耗时结论不可用，只有结构与行数');
+    }
+    if (plan.subPlanCount > 0) {
+      notes.push(
+        `计划里还带 ${plan.subPlanCount} 个子计划（下推到其它引擎的片段/逻辑内层计划），` +
+          '六栏数据覆盖**全部**算子（子计划里的热点往往才是真瓶颈）',
+      );
+    }
+    return {
+      ok: true,
+      result: {
+        source: 'plv',
+        statementName: args.statementName,
+        ...(args.label !== undefined ? { label: args.label } : {}),
+        statement: args.sql,
+        connectionId: args.session.connectionId,
+        // 这条路径**不读** SYS.EXPLAIN_PLAN_TABLE，没有"按连接号过滤回读"这回事 → 不回报该字段，
+        // 而不是回一个 true 让调用方以为它被校验过
+        conclusion,
+        panels,
+        ...(args.raw
+          ? { planText: panels.planGraph.tree, operators: toPlanOperators(plan, args.limit) }
+          : {}),
+        operatorCount: plan.operators.length,
+        // limit 与 EXPLAIN 路径同口径：raw 时的算子行要截断，并如实标注
+        truncated: plan.operators.length > args.limit,
+        // 主计划的根才是"这条语句的根"；全部算子里的根包含各子计划片段的根（实测 1063 个算子里有 422 个）
+        rootCount: plan.primaryRootIds.length,
+        orphanCount: plan.orphanCount,
+        execution: executed,
+        notes,
+      },
+    };
+  } catch (e) {
+    // 降级：不是"错误"，只是这条路走不通（旧版本不支持 / 权限 / 会话忙）——让调用方继续走 EXPLAIN。
+    // 若第③步已经执行成功，把执行统计带出去，降级路径**不会再执行第二遍**
+    return { ok: false, reason: (e as Error).message, ...(executed !== undefined ? { executed } : {}) };
+  } finally {
+    if (sessionOn) {
+      try {
+        await planVizCall(pool, conn, PLANVIZ_ACTION.OFF, '');
+      } catch {
+        /* 关会话失败不该影响已拿到的结果 */
+      }
+    }
+  }
+}
+
+/** 调一次 PLANVIZ_ACTION；返回结果集行（空结果集也合法，如 PLANVIZ_OFF） */
+async function planVizCall(
+  pool: HanaPool,
+  conn: HanaConnection,
+  code: number,
+  data: string,
+): Promise<Array<Record<string, unknown>>> {
+  const stmt = conn.prepare(PLANVIZ_CALL);
+  return new Promise<Array<Record<string, unknown>>>((resolve, reject) => {
+    const onDone = (err: Error | null, rows?: Array<Record<string, unknown>>): void => {
+      if (err) reject(normalizeHanaError(err));
+      else resolve(rows ?? []);
+    };
+    try {
+      // 控制面调用同样设超时（30s，**不跟执行一起放宽**）：取计划（402 可能回传 10MB 级 XML）
+      // 挂住时若不设，这条连接会一直占着池位（池上限 4），几个这样的请求就能让全部工具调用排队超时
+      stmt.setTimeout(ANALYZE_CONTROL_TIMEOUT_MS);
+      stmt.exec([code, data], onDone);
+    } catch (e) {
+      reject(normalizeHanaError(e));
+    }
+  }).finally(() => {
+    try {
+      stmt.drop?.();
+    } catch {
+      /* 释放语句失败无关结果 */
+    }
+  }) as Promise<Array<Record<string, unknown>>>;
+}
+
+/** 编译语句并取 Statement ID。**形状校验后在拼执行语句前拦住**（id 来自服务端，仍不信任它） */
+async function planVizPrepare(pool: HanaPool, conn: HanaConnection, sql: string): Promise<string> {
+  const rows = await planVizCall(pool, conn, PLANVIZ_ACTION.PREPARE, sql);
+  const raw = rows[0]?.DATA ?? (rows[0] ? Object.values(rows[0])[0] : undefined);
+  const queryId = typeof raw === 'string' ? raw : String(raw ?? '');
+  if (!QUERY_ID_RE.test(queryId)) {
+    throw new HanaBusinessError(
+      `PlanViz 未返回可用的 Statement ID（收到 ${JSON.stringify(raw ?? null)}）`,
+      undefined,
+      undefined,
+      [],
+      { hint: '该服务端版本的 PlanViz 协议可能不受支持' },
+    );
+  }
+  return queryId;
+}
+
+/** 取计划 XML（402 = 客户端 getTrace() 用的那条，实测与 301/401 等价） */
+async function planVizFetchPlan(pool: HanaPool, conn: HanaConnection, queryId: string): Promise<string> {
+  const rows = await planVizCall(pool, conn, PLANVIZ_ACTION.GET_TABLE_INFORMATION_TRACE, queryId);
+  const raw = rows[0]?.XML_PLAN ?? (rows[0] ? Object.values(rows[0])[0] : undefined);
+  const xml = typeof raw === 'string' ? raw : Buffer.isBuffer(raw) ? raw.toString('utf8') : '';
+  if (xml.trim() === '') {
+    throw new HanaBusinessError('PlanViz 通道未返回计划内容', undefined, undefined, [], {
+      hint: '该语句可能没有产生计划（例如被优化器整段消解）',
+    });
+  }
+  return xml;
+}
+
+/**
+ * PlanViz 算子 → 既有 PlanOperator 形状（raw=true 时与 EXPLAIN 版输出同形，调用方不必区分来源）。
+ *
+ * 只映射**语义一致**的字段：`cost` 在 EXPLAIN 版是优化器代价（无量纲，来自 SUBTREE_COST），
+ * 这里若塞含子耗时（微秒）会让同一个字段名在两条通道下不可比——耗时放 `details` 里说清楚。
+ */
+function toPlanOperators(plan: PlanVizPlan, limit: number): PlanOperator[] {
+  const slice = plan.operators.slice(0, limit);
+  const index = new Map(slice.map((o, i) => [o.id, i + 1]));
+  // 父算子：`<Child ID>` 是唯一权威关系；先在**全量**里找父，再落到截断后的编号上（落在外面就是 null）
+  const parentOf = new Map<string, string>();
+  for (const p of plan.operators) {
+    for (const c of p.childIds) if (!parentOf.has(c)) parentOf.set(c, p.id);
+  }
+  return slice.map((o, i) => {
+    const parentId = parentOf.get(o.id);
+    const detail = [
+      o.exclusiveUs !== undefined ? `独占 ${o.exclusiveUs}us` : undefined,
+      o.inclusiveUs !== undefined ? `含子 ${o.inclusiveUs}us` : undefined,
+      o.userCpuUs !== undefined ? `UserCPU ${o.userCpuUs}us` : undefined,
+      o.actualCardinality !== undefined ? `实际 ${o.actualCardinality} 行` : undefined,
+    ].filter((x): x is string => x !== undefined).join('；');
+    return {
+      operatorId: i + 1,
+      parentId: parentId !== undefined ? (index.get(parentId) ?? null) : null,
+      level: o.level,
+      position: i,
+      operator: o.operator,
+      ...(o.engine !== undefined ? { engine: o.engine } : {}),
+      ...(o.schema !== undefined ? { schema: o.schema } : {}),
+      ...(o.object !== undefined ? { table: o.object } : {}),
+      ...(o.objectType !== undefined ? { tableType: o.objectType } : {}),
+      ...(o.actualCardinality !== undefined || o.estimatedCardinality !== undefined
+        ? { outputSize: o.actualCardinality ?? o.estimatedCardinality }
+        : {}),
+      ...(detail !== '' ? { details: detail } : {}),
+    };
   });
 }
 
@@ -459,16 +728,19 @@ async function finish(
   extra: {
     source: SqlAnalyzeResult['source'];
     statement: string;
+    /** 计划行**实际写入**的名字；缺省=args.statementName（降级路径会换名，回读必须跟着走） */
+    planName?: string;
     runtime?: RuntimeStats;
     execution?: ExecutionStats;
     cacheRows?: number;
     notes: string[];
   },
 ): Promise<SqlAnalyzeResult> {
+  const planName = extra.planName ?? args.statementName;
   const { rows, totalRows, connectionFiltered } = await readPlanBack(
     pool,
     conn,
-    args.statementName,
+    planName,
     args.session.connectionId,
     args.raw && args.verbose,
     args.limit,
@@ -486,7 +758,7 @@ async function finish(
   });
   return {
     source: extra.source,
-    statementName: args.statementName,
+    statementName: planName,
     ...(args.label !== undefined ? { label: args.label } : {}),
     statement: extra.statement,
     connectionId: args.session.connectionId,
@@ -680,7 +952,7 @@ async function executeGuarded(conn: HanaConnection, sql: string): Promise<Execut
     // 不放在 try 里会被当成"未知错误"包装掉（调用方只看到"内部错误，详情见服务端日志"），
     // 与本工具"失败一次给全"的约定相反。
     stmt = conn.prepare(sql);
-    stmt.setTimeout(ANALYZE_TIMEOUT_MS);
+    stmt.setTimeout(ANALYZE_EXECUTION_TIMEOUT_MS);
     rs = await new Promise<HanaResultSet>((resolve, reject) => {
       // 参数显式标注：execQuery 有一个 `options: {[key: string]: any}` 重载，函数实参同时也匹配它，
       // 不标注就推断不出回调参数类型
@@ -714,7 +986,7 @@ async function executeGuarded(conn: HanaConnection, sql: string): Promise<Execut
       wallClockMs: Date.now() - startedAt,
       rowsFetched,
       maxRows: ANALYZE_MAX_ROWS,
-      timeoutMs: ANALYZE_TIMEOUT_MS,
+      timeoutMs: ANALYZE_EXECUTION_TIMEOUT_MS,
       ...withDefined('serverProcessingTime', stat(() => rs!.getServerProcessingTime())),
       ...withDefined('serverCpuTime', stat(() => rs!.getServerCPUTime())),
       ...withDefined('serverMemoryUsage', stat(() => rs!.getServerMemoryUsage())),

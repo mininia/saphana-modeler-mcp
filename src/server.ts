@@ -28,7 +28,7 @@ export const SERVER_INSTRUCTIONS = `saphana-modeler-mcp：SAP HANA 经典 Modele
 
 数据预览（hana_data_preview 的视图预览模式）约定：支持范围有限，不支持即直接返回「不支持」，不做其他尝试。默认对已激活视图整体预览（_SYS_BIC 直查），无筛选默认 10 行、有筛选默认 100 行，VIRTUAL 视图用 parameters 传输入参数；仅当用户明确要求看某视图的某个节点时才传 node——走 HANA 原生中间视图机制（CREATE_INTERMEDIATE_CALCULATION_VIEW_DEV，Studio 同款，任意节点类型支持；中间视图名固定为「包/对象/dp/节点」，已存在即复用，查询后仅在本进程无占用且由本服务创建时才 DROP），需要 EXECUTE 权限，缺权限直接返回不支持；只读 XML 推导模式（forceDerive=true，Projection/Join/Aggregation/Union/Rank）需显式启用。权限类失败（缺 EXECUTE/SELECT、_SYS_BIC 对象不可见的 258/259）会自动附带权限诊断报告（envelope.raw.diagnosis），无需额外调用即可定位阻塞点；hana_data_preview_diagnose 可手动前置排查或区分「权限缺失」与「对象未激活」。
 
-SQL 分析（hana_sql_analyze）约定：**默认输出是一段可读的分析结论**（conclusion：一句话结论 + 逐条发现[risk/warn/info，每条带依据与建议] + 统计[引擎/表与规模/扫描次数/连接次数/预计输出行数]，并附 conclusion.text 整段文本），**默认不返回原始执行计划**——要算子明细才传 raw=true（verbose=true 再加算子细节）。结论覆盖：全表扫描与表规模（大表、占位估计值）、是否缺过滤条件、跨执行引擎切换、嵌套循环连接、计划结构异常；planId/analyze 模式另带运行时统计（次数/平均耗时/内存）。三种取数方式（sql 与 planId 二选一）：sql（只编译不执行）；planId（分析计划缓存里已执行过的语句，编号取自 SYS.M_SQL_PLAN_CACHE.PLAN_ID，需 OPTIMIZER ADMIN）；sql + analyze=true（**先实际执行再分析**——EXPLAIN 只有估计值，实测数据只存在于执行之后；执行受硬护栏：只允许 SELECT、30 秒超时、最多取 100 行即关闭结果集、**不返回数据行**；执行后按相同语句文本关联计划缓存条目，故拿到的是重编译（参数感知）计划）。语句内 schema 须落在服务端允许范围内（未限定表名按当前用户默认 schema 判定）；只接受单条 SELECT/WITH：多语句、绑定占位符（? 或 :name）、DML/DDL/过程调用一律拒绝。该工具归 **admin** 组，只启用 read/write 的部署看不到它。
+SQL 分析（hana_sql_analyze）约定：**默认输出是一段可读的分析结论**（conclusion：一句话结论 + 逐条发现[risk/warn/info，每条带依据与建议] + 统计[引擎/表与规模/扫描次数/连接次数/预计输出行数]，并附 conclusion.text 整段文本），**默认不返回原始执行计划**——要算子明细才传 raw=true（verbose=true 再加算子细节）。结论覆盖：全表扫描与表规模（大表、占位估计值）、是否缺过滤条件、跨执行引擎切换、嵌套循环连接、计划结构异常；planId/analyze 模式另带运行时统计（次数/平均耗时/内存）。三种取数方式（sql 与 planId 二选一）：sql（只编译不执行）；planId（分析计划缓存里已执行过的语句，编号取自 SYS.M_SQL_PLAN_CACHE.PLAN_ID，需 OPTIMIZER ADMIN）；sql + analyze=true（先真执行，**默认走 PlanViz 通道**——与官方 Executed Plan/F8 同一条路：产出 panels 六栏[Plan Graph/Physical Plan/Execution Time/Timeline/Table Access/Logical Plan]，含逐算子独占与含子耗时、实际输出行数、时间轴跨度与线程数、表访问次数，结论据实测给出瓶颈算子或瓶颈对象、实际与估计行数的偏离、真实并行度、大中间结果物化；通道不可用时降级为「执行后按语句文本关联计划缓存条目」，**此时才是** EXPLAIN 估计值 + 语句级聚合统计，notes 会写明降级原因，source 相应为 sqlExecuted；执行受硬护栏：只允许 SELECT、单次执行最多 5 分钟（PlanViz 控制面调用 30 秒）、最多取 100 行即关闭结果集、**不返回数据行**）。语句内 schema 须落在服务端允许范围内（未限定表名按当前用户默认 schema 判定）；只接受单条 SELECT/WITH：多语句、绑定占位符（? 或 :name）、DML/DDL/过程调用一律拒绝。该工具归 **admin** 组，只启用 read/write 的部署看不到它。
 
 统一返回 envelope：{ success, data?, messages[], raw? }（HTTP 模式下额外带 clientId = 本次调用的客户端身份，见 MCP_HTTP_TOKENS）。硬错误（参数非法/对象不存在）返回 isError 并附恢复提示。`;
 
@@ -40,7 +40,7 @@ SQL 分析（hana_sql_analyze）约定：**默认输出是一段可读的分析�
  */
 export function createServer(ctx: ToolContext): McpServer {
   const server = new McpServer(
-    { name: 'saphana-modeler-mcp', version: '1.0.2' },
+    { name: 'saphana-modeler-mcp', version: '1.1.1' },
     { instructions: SERVER_INSTRUCTIONS },
   );
   registerAllTools(server, ctx);

@@ -52,6 +52,14 @@ export const TOOL_GROUPS: Record<string, ToolGroup> = {
   hana_repo_export: 'read',
   hana_repo_changelist: 'read',
 
+  // 稳定性诊断四件套：仅 SELECT 系统视图（SYS.M_* / _SYS_STATISTICS.*），零副作用。
+  // 归 read 而非 admin：它们不接受任意 SQL、不写任何东西，与 hana_sql_analyze 的暴露面不同。
+  // 需要收敛时用 HANA_TOOL_DENY="hana_system_health,hana_system_activity,hana_table_storage,hana_system_trend"。
+  hana_system_health: 'read',
+  hana_system_activity: 'read',
+  hana_table_storage: 'read',
+  hana_system_trend: 'read',
+
   // —— 写操作（write）——
   // hana_view_validate 的 design 模式会短暂写入临时校验对象 _CHKTMP，故整工具归 write；
   // 不按 design/runtime 模式做混合划分，只读部署不暴露此工具。

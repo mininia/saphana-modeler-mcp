@@ -1,6 +1,6 @@
 {
   "name": "saphana-modeler-mcp",
-  "version": "1.0.2",
+  "version": "1.1.1",
   "description": "SAP HANA Modeler MCP Server (TypeScript) - 经典 HANA 2.0 仓库建模能力（_SYS_REPO/_SYS_BI/_SYS_BIC）",
   "type": "module",
   "private": true,
@@ -33,9 +33,11 @@
     "verify:p1-5": "npm run build && node test-verification/verify-p1-5.mjs",
     "probe:repo": "node test-verification/probe-repo-read.mjs",
     "probe:xfer": "node test-verification/probe-rest-check-xfer.mjs",
+    "probe:health": "node test-verification/probe-health-views.mjs",
     "verify:lifecycle": "npm run build && node test-verification/verify-cv-lifecycle.mjs",
     "verify:add-join": "npm run build && node test-verification/verify-add-join.mjs",
-    "verify:sql-mode": "npm run build && node test-verification/verify-sql-mode.mjs"
+    "verify:sql-mode": "npm run build && node test-verification/verify-sql-mode.mjs",
+    "verify:health": "npm run build && node test-verification/verify-health.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/core": "^2.0.0",

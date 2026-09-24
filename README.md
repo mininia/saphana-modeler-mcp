@@ -8,21 +8,30 @@ SAP HANA 经典 Modeler 能力的 MCP 服务器（TypeScript，Node >= 20.12）�
 
 通过 MCP 协议接入 Claude / IDE 等客户端（**stdio / Streamable HTTP 双传输**）：调用工具即可浏览、校验与（在配置的可写包内）创建计算视图，无需打开 HANA Studio。
 
+## 项目目标
+
+**让 AI 独立完成 SAP HANA 的开发。**
+
+不是给它一个 SQL 窗口，而是让它像建模工程师那样工作：看懂仓库里已有什么、对象之间怎么关联，
+判断该改什么、怎么改，动手改，再自己确认改对了——**语义能被理解，动作能被完成，边界可控**。
+
+当前目标是覆盖经典仓库建模与执行计划分析；未来计划有权限角色、数据传输与运维动作等内容。
+
 ## 功能概览
 
 | 分类 | 能力 | 工具 |
 | --- | --- | --- |
 | 系统 | 版本信息、用户权限与建模能力自检 | `hana_system_get_info`、`hana_check_privileges` |
+| 稳定性诊断 | 实例体检（**读数层**：内存%/磁盘与卷 IO/备份距今/内存分配失败率… + **结论层**：磁盘/服务/备份/内存/CPU/告警/阻塞/长事务/复制/配置/弃用特性/加密**十二项**，**三态**：正常/异常/看不见）、会话与阻塞深潜（谁堵谁）、表存储画像（内存/磁盘/碎片/热度/分区/列级/索引级）、历史趋势（过去 N 天的 CPU/内存/磁盘/网络） | `hana_system_health`、`hana_system_activity`、`hana_table_storage`、`hana_system_trend` |
 | 包 | 包清单/包树、包内对象（含激活状态）、新建包 | `hana_package_list`、`hana_package_list_objects`、`hana_package_create` |
 | 元数据 | 完整定义读取、对象搜索、字段清单、单字段逻辑溯源、血缘 | `hana_metadata_get_view`、`hana_metadata_search_objects`、`hana_metadata_list_fields`、`hana_metadata_get_field_logic`、`hana_metadata_where_used` |
 | 表目录 | 可访问表清单、表列结构 | `hana_table_list`、`hana_table_columns` |
 | 数据预览 | 已激活视图数据预览（整体/节点/推导三通道，支持筛选与输入参数）+ 预览权限诊断 | `hana_data_preview`、`hana_data_preview_diagnose` |
 | 建模写操作 | 新建/激活/更新/删除计算视图、设计时+运行时校验、校验动作查询 | `hana_view_create`、`hana_view_activate`、`hana_view_update`、`hana_view_delete`、`hana_view_validate`、`hana_view_check_actions` |
 | 仓库传输 | 包导出备份（zip）、设计时文件导入、变更列表 | `hana_repo_export`、`hana_repo_import`、`hana_repo_changelist` |
-| SQL 分析 | SQL 分析结论（默认）：扫描/规模/连接/引擎切换/结构异常的**逐条发现 + 建议 + 统计**；可选实际执行后分析；原始执行计划需 `raw=true` | `hana_sql_analyze` |
+| SQL 分析 | SQL 分析结论（默认）：扫描/规模/连接/引擎切换/结构异常的**逐条发现 + 建议 + 统计**；`analyze=true` 走 PlanViz 拿**逐算子实测**六栏（瓶颈/实际行数/时间轴/并行度）；原始执行计划需 `raw=true` | `hana_sql_analyze` |
 
 > 视图对象的完整定义读取（json/xml）由 `hana_metadata_get_view` 提供；字段级查看用 `hana_metadata_list_fields` / `hana_metadata_get_field_logic`。
-> 修改计算视图优先用 `hana_view_update` 的 operations 声明式模式（零 XML）；复杂改造用全量 XML 通道（先用 `hana_metadata_get_view(format=xml)` 读取，最小修改后回传）。
 
 ## 快速开始
 
@@ -87,11 +96,6 @@ MCP 接入：将 `mcp.json.example` 复制为 `mcp.json` 并填入真实连接�
 | `MCP_HTTP_ALLOWED_ORIGINS` | 可选 | 允许的 Origin 主机名（逗号分隔，不含 scheme/端口；无 Origin 头的请求放行），默认仅本机名 | `localhost` |
 | `MCP_HTTP_ALLOW_ANONYMOUS` | 可选 | 显式承认「对外监听且不配置任何 Bearer Token」的风险（默认 `false`）。**非回环监听 + 无 Token 时默认拒绝启动**（该姿态下写边界/工具分组/schema 白名单全部形同虚设）；确实需要（如已置于带认证的反向代理之后）再显式置 `true` | `false` |
 
-端口自动推导规则：
-
-- SYSTEMDB / 单容器：`3<instance>13`（如 instance=10 → 31013）
-- 租户数据库（MDC）：`3<instance>15`（如 instance=10 → 31015）
-
 ## 传输方式
 
 支持两种 MCP 传输，由 `MCP_HTTP_PORT` 是否设置切换（其余工具/配置完全一致）：
@@ -117,7 +121,7 @@ HTTP 模式要点：
 - **并发与锁**（多客户端共享一个实例时的实际边界）：
   - 更新（`hana_view_update`）：XS REST 的 `If-Match` ETag 乐观锁，基线在**请求入口**捕获，到写入之间的并发改动以 412 显式冲突返回，不静默覆盖
   - 新建（`hana_view_create`）/设计时校验（`hana_view_validate` design 模式）：存在性检查与写入、临时校验副本的「清理 → 写入 → 删除」在服务端按对象串行化（进程内 keyed lock），并发同名创建后者显式报冲突
-  - 连接池：上限 4 个连接，池满时排队（队列上限 64、等待超时 30s，超限/超时以可读错误返回而不是无限期挂住），避免单个客户端的慢查询拖住其他客户端
+  - 连接池：上限 4 个连接，池满时排队（队列上限 64、等待超时 30s，超限/超时以可读错误返回而不是无限期挂住），避免单个客户端的慢查询拖住其他客户端（⚠ `hana_sql_analyze` 的 `analyze=true` 单次最多执行 5 分钟，期间占住一个池位：并发跑大语句时，其他调用可能等不到连接）
   - 视图定义缓存：TTL 60s + 容量 200 条 LRU，防止多客户端拉取把内存撑大
   - 上述锁均为**进程内**：多进程/多实例部署同一 HANA 时需外部串行化（本服务设计为单实例）
 - 未内置 OAuth 等完整认证体系：暴露到网络时请配置 `MCP_HTTP_TOKEN` / `MCP_HTTP_TOKENS` 并置于反向代理 / VPN / 防火墙之后
@@ -136,7 +140,7 @@ MCP_HTTP_PORT=3000 MCP_HTTP_TOKEN='your-long-random-token' node dist/index.js
 
 | 分组 | 说明 | 工具 |
 | --- | --- | --- |
-| **read** 数据读取 | 只读访问 HANA 数据/元数据/系统信息/审计/导出，不改动仓库 | `hana_system_get_info`、`hana_check_privileges`、`hana_package_list`、`hana_package_list_objects`、`hana_metadata_get_view`、`hana_metadata_search_objects`、`hana_metadata_list_fields`、`hana_metadata_get_field_logic`、`hana_metadata_where_used`、`hana_table_list`、`hana_table_columns`、`hana_data_preview`、`hana_data_preview_diagnose`、`hana_view_check_actions`、`hana_repo_export`、`hana_repo_changelist` |
+| **read** 数据读取 | 只读访问 HANA 数据/元数据/系统信息/审计/导出，不改动仓库 | `hana_system_get_info`、`hana_check_privileges`、`hana_package_list`、`hana_package_list_objects`、`hana_metadata_get_view`、`hana_metadata_search_objects`、`hana_metadata_list_fields`、`hana_metadata_get_field_logic`、`hana_metadata_where_used`、`hana_table_list`、`hana_table_columns`、`hana_data_preview`、`hana_data_preview_diagnose`、`hana_view_check_actions`、`hana_repo_export`、`hana_repo_changelist`、`hana_system_health`、`hana_system_activity`、`hana_table_storage`、`hana_system_trend` |
 | **write** 写操作 | 改动仓库设计时对象/包（create/activate/update/delete/import/设计时校验） | `hana_package_create`、`hana_repo_import`、`hana_view_create`、`hana_view_activate`、`hana_view_update`、`hana_view_delete`、`hana_view_validate` |
 | **admin** 管理操作 | 高权限/管理类：生命周期/审计/权限管理，以及**接受任意 SQL** 的高权限分析 | `hana_sql_analyze` |
 
@@ -166,7 +170,7 @@ MCP_HTTP_PORT=3000 MCP_HTTP_TOKEN='your-long-random-token' node dist/index.js
 
 ## 工具速查
 
-共 24 个工具，全部带 annotations（`readOnlyHint` / `destructiveHint` / `idempotentHint`）以便 host 自动审批与危险操作确认。
+共 28 个工具，全部带 annotations（`readOnlyHint` / `destructiveHint` / `idempotentHint`）以便 host 自动审批与危险操作确认。
 
 | 工具 | 类型 | 说明 |
 | --- | --- | --- |
@@ -193,10 +197,12 @@ MCP_HTTP_PORT=3000 MCP_HTTP_TOKEN='your-long-random-token' node dist/index.js
 | `hana_repo_export` | 备份 | 导出包为 zip（XS REST Transfer API；saveTo 落盘或返回 base64） |
 | `hana_repo_import` | 写 | 导入设计时文件（Transfer API 目录目标+分片上传，落库 inactive，目标须在可写包范围，导入后回读状态） |
 | `hana_repo_changelist` | 只读 | 仓库变更列表审计（GET /base/change，需系统启用 Change Tracking） |
-| `hana_sql_analyze` | 分析 | SQL 分析：**默认返回可读结论**（一句话结论 + 逐条发现[风险/关注/信息，带依据与建议] + 统计），**默认不给原始计划**（`raw=true` 才返回算子行与文本树）；`sql`=只编译不执行；`planId`=分析计划缓存条目并附运行时统计（需 OPTIMIZER ADMIN）；`sql`+`analyze=true`=先实际执行再分析（30s 超时、最多取 100 行、**不返回数据行**） |
+| `hana_sql_analyze` | 分析 | SQL 分析：**默认返回可读结论**（一句话结论 + 逐条发现[风险/关注/信息，带依据与建议] + 统计），**默认不给原始计划**（`raw=true` 才返回算子行与文本树）；`sql`=只编译不执行（估计计划）；`planId`=分析计划缓存条目并附运行时统计（需 OPTIMIZER ADMIN）；`sql`+`analyze=true`=先真执行，**默认走 PlanViz 通道**拿与官方 Executed Plan(F8) 同款的**逐算子实测**（`panels` 六栏 + 实测结论；通道不可用时降级为估计计划 + 语句级统计，notes 说明）。执行受硬护栏：只允许 SELECT、单次执行最多 5 分钟、最多取 100 行、**不返回数据行** |
+| `hana_system_health` | 只读 | 稳定性体检，返回**读数 + 结论**两层。`metrics` 给具体占用（实例内存已用/配额/峰值及百分比、主机物理内存、**数据库与主机驻留内存**、**主机与数据库 CPU**、各挂载点使用率、**各用途卷大小 Data/Log/Trace**、**卷 IO 失败读写/阻塞写/软异常**、**内存对象层：不可换出内存/分配失败率/命中率/收缩失败/可回收性梯度**、备份距今天数、阻塞/长事务/告警数、参数违规与待重启数、在用弃用特性数、加密状态…），**无论判定正常与否都会给**——问"当前内存多少"直接读这里；`findings` 给整体 verdict + 逐项级别/结论/证据/建议。**12 项检查**：磁盘（容量 + IO 两个正交口径）/服务/备份/内存（主机+实例+内存对象层）/CPU/告警/阻塞/长事务/复制/**配置**（违反限制/改了未重启/非默认层覆盖，**不做"参数该设成多少"的比对**）/ **弃用特性**（升级前风险，非当前故障）/ **加密**（恒为 info——是否要求加密是合规决策，只进读数不参与判定）。**三态**：ok / 异常 / `unknown`（看不见）—— 监视视图按权限行级过滤，权限不足时静默返回空集，本工具绝不把它当"正常"；每项要么给读数、要么给一条带成因的 `unknown`，**不得静默消失**。容量单位统一 **GiB**，与 HANA Cockpit 一致 |
+| `hana_system_activity` | 只读 | 会话与阻塞深潜：被阻塞事务（含**谁堵谁**的连接画像）、长事务（含 undo/版本/持锁，用于判断是否阻碍 MVCC 回收）、长语句。`sections` 选段落、`minDurationSec` 设时长下限 |
+| `hana_table_storage` | 只读 | 表存储画像，每行带**内存占用 / 磁盘占用 / 分区数 / 碎片率 / 读写次数 / 上次 merge / BW 分类**。**7 种口径**：`memory` 内存 TOP / `disk` 磁盘 TOP（`M_TABLE_PERSISTENCE_STATISTICS.DISK_SIZE`）/ `fragmentation` delta 占比 TOP / `hotness` 读写 TOP / `partition` 分区数 TOP。`schema`/`table` 是**过滤器**，给 `table` 即返回该表的完整画像；`partition` + `schema` + `table` 还会**额外**返回逐分区明细。`partition` 模式**默认只看 BW 活动数据表**（`subtype` 可切换 QUEUE/CHANGE_LOG/PSA/…/ALL）——同一 BW 对象在 HANA 上是一组物理表（活动表/入站队列/变更日志/PSA），表名只差后缀。按 (schema, table) 聚合后再排序——该视图一行是一个分区。另有两种**下钻口径**（单元不是"表"）：`column` 列级内存 TOP（`M_CS_ALL_COLUMNS`，带压缩类型/行数/不同值数/索引类型/最后访问时间；**刻意不返回 `COMPRESSION_RATIO_IN_PERCENTAGE`**——实测该列在本版本会出现 361890% 这种不可能的值）、`index` 索引内存 TOP（`M_CS_INDEXES`，带**该索引占所属表内存的百分比**，实测 73%~83%——只看表内存会把真实成本少算近一半）。体量单位 **MiB**（与 Cockpit 同为 1024 进制） |
+| `hana_system_trend` | 只读 | 历史趋势，回答"**这周比上周差了吗**"——前面三个工具都是"此刻的快照"，没有一个能回答变化。数据源 `_SYS_STATISTICS.HOST_LOAD_HISTORY_HOST`（一份同时带 CPU/内存/磁盘/网络/swap，不必跨视图对齐时间轴）。`hours` 回溯窗口、`bucketMinutes` 桶宽、`metrics` 选指标组（cpu/memory/disk/network/swap），每桶给 **min/max/avg** 与采样点数。**实测结构**：约 **10 秒一个采样点**、36 万行跨约 42 天；**`SERVER_TIMESTAMP` 是快照写入时刻，`TIME` 才是采样时刻**（同一 SERVER_TIMESTAMP 下有 358 行不同 TIME——用前者做时间轴会把一小时压成一个点），本工具用 `TIME`；`INDEX` 是行唯一键不是服务维度。**保留期有限**：窗口超出时 `retention.coversWindow=false` 且 caveats 说明只回溯到何时——**未覆盖的那段不等于"正常"，只是没有数据**。刻意不给"上升就是坏"的结论，只给首尾桶变化率 |
 
-> **PlanViz 未实现（预留扩展点）**：逐算子的实际执行细节（inclusive/exclusive 耗时、实际行数、时间线）只有 PlanViz 的 Executed Plan 提供，需要服务端开启 plan trace 并把 XML 落盘再取回，属运维面能力，本期不做。
-> 预留方式是：`source` 为可扩展枚举（后续可加 `planviz` 而不破坏既有取值）、服务入口带 options 形状、本行文档记录路径与前置条件。**不写空实现/僵尸分支**——不可用的路径宁可不出现。
 
 > **写操作安全边界**：写工具（create/activate/update/delete/package_create/import）的可写包范围由
 > `HANA_WRITE_PACKAGES` 配置控制——**空=不限制（全部可写）**；填写后仅允许配置包及其下级子包写操作
@@ -292,6 +298,8 @@ MCP_HTTP_PORT=3000 MCP_HTTP_TOKEN='your-long-random-token' node dist/index.js
 | `npm run verify:system` | 构建 + 真实 HANA 系统工具验收 |
 | `npm run verify:p1-5` | 构建 + 读路径/预览/字段逻辑黑盒验收 |
 | `npm run verify:lifecycle` | 构建 + 写路径全生命周期验收（create→validate→activate→preview→update冲突→delete→import；脚本在本地 `test-verification/`，不入库） |
+| `npm run verify:health` | 构建 + 稳定性诊断四件套验收（**192 项断言**）。含多条回归护栏：防止误用 `M_DISK_USAGE` 的 `FILE_SIZE` 口径导致整机误报；防止卷文件用量（预分配写满属常态）被当成磁盘告警；防止 `COMPRESSION_RATIO_IN_PERCENTAGE` 与 `HASH_COLLISION_COUNT` 这两个**实测不可用**的列被透出；防止趋势时间轴误用 `SERVER_TIMESTAMP`（会把一小时压成一个点）；以及「每一项要么给读数、要么给一条带成因的 unknown」这条纪律 |
+| `npm run probe:health` | 只读探针：枚举监视视图的可用性/列名/取值域（换环境后先跑它，勿按文档猜） |
 
 ## 架构简介
 
@@ -348,6 +356,24 @@ scripts/               通用冒烟脚本（smoke-stdio）；实机验收/探针
 - XS 会话（`http://<host>:80<instance>/sap/hana/xs/formLogin`）：用户须可登录 XS Classic
   （`PUBLIC` + 应用特权 `sap.hana.xs.admin.roles::RuntimeConfOperator` 所含会话能力；实测以 `hana_check_privileges` 排查）
 - 写目标包：`REPO.EDIT_NATIVE_OBJECTS` + 包的 owner 或 package 级写特权
+
+**稳定性诊断（`hana_system_health` / `hana_system_activity` / `hana_table_storage` / `hana_system_trend`）**
+
+- **无需额外权限即可用**：`SYS.M_SERVICES`、`M_DATABASES`、`M_CS_TABLES`、`M_TABLES`、
+  `M_SQL_PLAN_CACHE` 等实例内视图，任何用户都能查（表画像与部分体检项因此始终可用）。
+- **`CATALOG READ`（或含它的 `MONITORING` 角色）**：解锁**基础设施类**监视视图 ——
+  `M_DISKS`/`M_DISK_USAGE`、`M_HOST_RESOURCE_UTILIZATION`、`M_BACKUP_CATALOG`、
+  `M_SERVICE_REPLICATION`、`M_MEMORY_OBJECTS`，以及他人会话的完整可见性。
+  这些视图**权限不足时不报错、只返回空集**，因此缺权限时体检会把对应项标为 `unknown`（而非"正常"）。
+- **`_SYS_STATISTICS` 的 SELECT**：告警项（`STATISTICS_CURRENT_ALERTS`）与**整个趋势工具**需要它；
+  缺权限时报 258，同样标记为 `unknown`。**趋势的保留期实测约 42 天**（可配置），窗口超出时如实说明只回溯到何时。
+- **配置类读数**（`hana_system_health` 的 `config` 项）需要 `INIFILE ADMIN` 或等效授权才能读全
+  `M_CONFIGURATION_PARAMETER_VALUES`；读不全时不一定报错，故该项的非默认层覆盖数会偏小。
+- **内存对象层读数**（`M_MEMORY_OBJECTS` / `M_MEMORY_OBJECT_DISPOSITIONS`）与**卷 IO 读数**
+  （`M_VOLUME_IO_TOTAL_STATISTICS` / `M_VOLUME_FILES`）同属基础设施类：缺权限时**只影响该层读数**，
+  会在 metrics 里留一条「无法判定」，但不会把主机/实例内存与容量的结论一起带偏。
+- 权限是否到位可用 `hana_system_health` 返回的 `visibility`（`unfiltered` 布尔值与已持有权限清单）
+  或 `hana_check_privileges` 直接确认。
 
 权限不足时先用 `hana_check_privileges` 排查；预览失败用 `hana_data_preview_diagnose` 定位是分析权限还是上游不可达。
 
@@ -416,6 +442,10 @@ scripts/               通用冒烟脚本（smoke-stdio）；实机验收/探针
 
 > HTTP 模式下连接信息等环境变量配置在**服务端**（服务启动的 shell / .env），客户端只填 `url`；
 > 服务端配置了 `MCP_HTTP_TOKEN` 时，客户端经 `headers` 携带 Bearer Token（各客户端对 headers 的支持以自身文档为准）。
+
+> **工具调用超时要自行调大（`hana_sql_analyze` 的 `analyze=true`）**：该模式会**真执行**语句，服务端给执行留的上限是 **5 分钟**（最坏再加约 2.5 分钟的排队与控制面调用）。多数客户端会远早于此掐断调用——例如 Claude Code 默认 **60 秒**——大 CV 会在客户端先被中止，服务端那条语句却还在跑，结果拿不到。请把客户端的单次工具调用超时调到 **600000 ms（10 分钟）**：
+> - **按 server 配**：在 `mcp.json` 该 server 条目下加 `"timeout": 600000`（毫秒，覆盖 `MCP_TOOL_TIMEOUT`；小于 1000 的值被忽略）
+> - **全局配**：在**启动客户端**的环境里设 `MCP_TOOL_TIMEOUT=600000`
 
 ## 许可
 

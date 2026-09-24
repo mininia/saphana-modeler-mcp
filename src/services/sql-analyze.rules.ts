@@ -36,7 +36,21 @@ export const HARD_OPERATOR_CAP = 5000;
  * 实际执行任意 SELECT 必须有硬边界，参数化只会把"跑飞"变成"可配置地跑飞"。
  */
 export const ANALYZE_MAX_ROWS = 100;
-export const ANALYZE_TIMEOUT_MS = 30_000;
+
+/**
+ * **实际执行**（analyze=true 真跑那条语句）的超时。
+ * 大 CV 本身就要 2–3 min，30s 会把合法分析直接掐断；5 min 覆盖得住这类语句，
+ * 同时把"整个调用"的墙钟压在一处：执行 5 min + 控制面各 30s ≈ 7.5 min 最坏，
+ * 调用方只要留够这个数就一定是我们先返回，而不是被对方掐断。再长的语句该去查为什么慢。
+ */
+export const ANALYZE_EXECUTION_TIMEOUT_MS = 300_000;
+
+/**
+ * **控制面调用**（PlanViz 的建会话/编译/取计划 XML/关会话）的超时。
+ * 都是元数据级操作，30s 足够；**不跟着执行一起放宽**——这类调用一挂住，池位（上限 4）就被占着，
+ * 放宽它等于把"一次卡死拖垮全部工具调用"的时间窗放大 20 倍。
+ */
+export const ANALYZE_CONTROL_TIMEOUT_MS = 30_000;
 
 /** statement_name 列上限 256，生成名留足余量 */
 export const MAX_LABEL_LENGTH = 64;
@@ -202,6 +216,17 @@ export function validateLabel(v: unknown): RequestProblem | undefined {
  */
 export function generateStatementName(): string {
   return `MCP_${Date.now().toString(36).toUpperCase()}_${randomBytes(4).toString('hex').toUpperCase()}`;
+}
+
+/**
+ * 降级路径专用的语句名：由主名字**派生**（固定后缀），不重新随机。
+ *
+ * 为什么派生而不是再生成一个随机名：写计划行用哪个名字、回读就得用哪个名字、清理也得删得掉。
+ * 派生名让这三处只凭主名字就能推导出来——早先用随机新名的那版，`finish` 仍按主名字回读 → 0 行硬失败，
+ * 写进去的行成了孤儿永远清不掉（真机实测：计划表里躺着 3 行删不掉的 MCP_* 行）。
+ */
+export function fallbackStatementName(primary: string): string {
+  return `${primary}_FB`;
 }
 
 /**

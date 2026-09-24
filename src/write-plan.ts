@@ -97,7 +97,14 @@ function regionHasUnqualifiedName(region: string, ctes: Set<string>): boolean {
     const quoted = head[1] !== undefined;
     const name = quoted ? head[1] : head[2];
     const follow = head[3];
-    if (follow === '.' || follow === '(') continue; // 限定名（另有扫描）/ 函数调用
+    if (follow === '.') continue; // 限定名（另有扫描）
+    if (follow === '(') {
+      // 表函数：**参数里也能有表名**，必须递归进去看（`APPLY_FILTER(MARA, $$X$$)` 里的 MARA
+      // 若不看就等于没做"未限定表名"判定，而这类语句在 analyze=true 下会被真实执行）
+      const open = part.indexOf('(', part.indexOf(name) + name.length);
+      if (open >= 0 && regionHasUnqualifiedName(part.slice(open + 1), ctes)) return true;
+      continue;
+    }
     if (quoted) return true;
     const upper = name.toUpperCase();
     // DUMMY 是 SYS 下的伪表（恒 1 行）；CTE 名与保留字都不是表引用
@@ -135,13 +142,76 @@ function splitTopLevel(region: string): string[] {
   return parts;
 }
 
+/** 跳过一段配对括号，返回右括号之后的位置；不配对返回 -1 */
+function skipBalanced(text: string, open: number): number {
+  let depth = 0;
+  for (let i = open; i < text.length; i++) {
+    if (text[i] === '(') depth++;
+    else if (text[i] === ')') {
+      depth--;
+      if (depth === 0) return i + 1;
+    }
+  }
+  return -1;
+}
+
+/** `(` 前紧邻标识符（或引号标识符的收尾）= 表函数调用；否则 `(` 属于派生表/子查询 */
+function isCallParen(before: string): boolean {
+  return /[A-Za-z0-9_$#"]$/.test(before.replace(/\s+$/, ''));
+}
+
+/**
+ * 把**派生表/子查询**的括号内容抹成空白（保持偏移不变）。
+ *
+ * 为什么必须抹：`SELECT V.A FROM (SELECT T.A FROM SYS.TAB T) V` 里 `T.A` 的 `T` 是派生表的别名，
+ * 不是 schema——不抹会被当成 schema 收集，而任何白名单都不可能有 `T`，于是**合法语句被误拒**
+ * （实测：main 上返回 `['SYS']`，加括号扫描后变成 `['T','SYS']`）。
+ * 派生表内部的表名不会因此漏掉：它自己的 `FROM` 会被锚点单独扫到（`SYS.TAB` 就在内层）。
+ * **函数调用的参数不抹**——表函数的参数里可以有表名，而那里没有 FROM 锚点兜底。
+ */
+function maskDerivedTables(region: string): string {
+  let out = '';
+  let i = 0;
+  while (i < region.length) {
+    if (region[i] === '(' && !isCallParen(out)) {
+      const end = skipBalanced(region, i);
+      if (end > 0) {
+        out += ' '.repeat(end - i);
+        i = end;
+        continue;
+      }
+    }
+    out += region[i];
+    i++;
+  }
+  return out;
+}
+
+/**
+ * 跳过 `AS` 之后的别名（标识符或引号标识符）。**不能把 `AS` 当成表名区的终点**：
+ * `SELECT * FROM SYS.DUMMY AS D, SECRET.T2` 里第一个 AS 之后就截断，逗号列表里后面的表
+ * 对扫描器完全不可见（实测 refs 只有 `['SYS']`，SECRET 逃过白名单判定）。
+ * 只跳过别名本身，后面的表继续可见；别名里的点（`AS "a.b"`）也不会被当成 schema。
+ */
+function skipAlias(text: string, from: number): number {
+  let i = from;
+  while (i < text.length && /\s/.test(text[i])) i++;
+  if (text[i] === '"') {
+    i++;
+    while (i < text.length && text[i] !== '"') i++;
+    return text[i] === '"' ? i + 1 : i;
+  }
+  while (i < text.length && /[A-Za-z0-9_$#]/.test(text[i])) i++;
+  return i;
+}
+
 /**
  * 表名区 = FROM/JOIN 锚点之后，到**顶层**子句边界为止。
  *
  * 为什么要跟踪括号深度而不是见到 `(`/`)` 就切：表函数与派生表的表名都在括号里——
  * `APPLY_FILTER("SAPSR3"."MARA", $$X=1$$)`、`CE_COLUMN_TABLE("S"."T")`、`(SELECT * FROM C.T)`，
  * 早切会让它们整体逃过扫描（评审实测：这是读边界被绕过的一类写法）。顶层边界仍然是
- * ON/WHERE/GROUP/… 与语句结尾；顶层的 `=` 也切（旧行为，保留）。
+ * ON/WHERE/GROUP/… 与语句结尾；顶层的 `=` 也切（旧行为，保留）；`AS` 只跳别名不截断（见 skipAlias）。
  */
 function tableNameRegion(text: string, start: number): string {
   let depth = 0;
@@ -156,7 +226,13 @@ function tableNameRegion(text: string, start: number): string {
     if (depth === 0 && ch === '=') return text.slice(start, i);
     if (depth === 0 && /[A-Za-z_]/.test(ch)) {
       CLAUSE_KEYWORD.lastIndex = i;
-      if (CLAUSE_KEYWORD.test(text)) return text.slice(start, i);
+      if (CLAUSE_KEYWORD.test(text)) {
+        if (/^AS(?![A-Za-z0-9_$#])/i.test(text.slice(i))) {
+          // AS 不是终点：跳过它和紧跟的别名，继续扫同一张表名区里后面的表
+          return text.slice(start, i) + ' ' + tableNameRegion(text, skipAlias(text, i + 2));
+        }
+        return text.slice(start, i);
+      }
     }
   }
   return text.slice(start);
@@ -261,8 +337,10 @@ export function scanSqlSchemaRefs(sql: string): string[] {
   const anchor = /\b(FROM|JOIN)\b/gi;
   let m: RegExpExecArray | null;
   while ((m = anchor.exec(text)) !== null) {
-    // 表名区 = 锚点之后到**顶层**子句边界（表函数/派生表里在括号内的表名同样要扫，见 tableNameRegion）
-    collectQualifiedRefs(tableNameRegion(text, m.index + m[0].length), out);
+    // 表名区 = 锚点之后到**顶层**子句边界（表函数里括号内的表名同样要扫，见 tableNameRegion）；
+    // 派生表/子查询的括号内容先抹掉——那里的 `T.A` 是别名限定列不是 schema，抹掉前会误拒合法语句
+    // （它内部的表由自己的 FROM 锚点扫到，不会漏）
+    collectQualifiedRefs(maskDerivedTables(tableNameRegion(text, m.index + m[0].length)), out);
     anchor.lastIndex = m.index + m[0].length;
   }
   return [...out];
@@ -276,11 +354,32 @@ export function scanSqlSchemaRefs(sql: string): string[] {
  * 会被正则当成 `_SYS_BIC` 与 `PKG` 两个限定名，凭空多出一个越界的假 schema（实测被策略层拦下）。
  * 所以：引号内的字符只按"引号标识符"整体处理，只有紧跟其后的 `.` 才算限定符。
  */
+/** 前一个非空白字符（越界返回 undefined） */
+function prevNonSpace(region: string, pos: number): string | undefined {
+  let k = pos - 1;
+  while (k >= 0 && /\s/.test(region[k])) k--;
+  return k >= 0 ? region[k] : undefined;
+}
+
+/** 后一个非空白字符（越界返回 undefined） */
+function nextNonSpace(region: string, pos: number): string | undefined {
+  let k = pos;
+  while (k < region.length && /\s/.test(region[k])) k++;
+  return k < region.length ? region[k] : undefined;
+}
+
 function collectQualifiedRefs(region: string, out: Set<string>): void {
   let i = 0;
   // 多段名里只有**第一段**是 schema：`SCHEMA1.T1.COL` / `"S"."A--B"."C"` 的后续段不算 schema，
-  // 否则会多扫出假 schema（如把列名当 schema），把合法调用挡在预检外
-  const isFirstSegment = (pos: number): boolean => !/\.\s*$/.test(region.slice(0, pos));
+  // 否则会多扫出假 schema（如把列名当 schema），把合法调用挡在预检外。
+  //
+  // 两个判断都只看**紧邻的一个非空白字符**，所以用 prevNonSpace/nextNonSpace 前后扫，**不做切片**：
+  // 早先写成 `!/\.\s*$/.test(region.slice(0, pos))` 与 `/^\s*\./.test(region.slice(j))`，每个标识符
+  // 拷贝两次整段文本 → 整趟扫描是 O(标识符数 × 区域长度)。实测（本机）：限定名 1000/2000/4000/8000
+  // 个 → 6.9/20.2/76.1/329.0 ms（每翻倍约 4×），10 万字符的语句单次 303 ms，而 hana_sql_analyze
+  // 每次调用要跑两遍 → 约 0.6 s 的**同步**计算，HTTP 模式下会把整个进程的并发请求一起卡住。
+  // 表名区扫描范围扩大（函数参数、AS 之后的表）后这个平方项才变得显眼，故改为零分配的前后扫。
+  const isFirstSegment = (pos: number): boolean => prevNonSpace(region, pos) !== '.';
   while (i < region.length) {
     const ch = region[i];
     if (ch === '"') {
@@ -293,7 +392,7 @@ function collectQualifiedRefs(region: string, out: Set<string>): void {
       }
       const name = region.slice(start, j);
       const next = j + 1; // 跳过收尾引号
-      if (name !== '' && /^\s*\./.test(region.slice(next)) && isFirstSegment(i)) out.add(name);
+      if (name !== '' && nextNonSpace(region, next) === '.' && isFirstSegment(i)) out.add(name);
       i = next;
       continue;
     }
@@ -301,7 +400,7 @@ function collectQualifiedRefs(region: string, out: Set<string>): void {
       let j = i;
       while (j < region.length && /[A-Za-z0-9_$#]/.test(region[j])) j++;
       const upper = region.slice(i, j).toUpperCase();
-      if (/^\s*\./.test(region.slice(j)) && !SQL_NON_SCHEMA.has(upper) && isFirstSegment(i)) out.add(upper);
+      if (nextNonSpace(region, j) === '.' && !SQL_NON_SCHEMA.has(upper) && isFirstSegment(i)) out.add(upper);
       i = j;
       continue;
     }

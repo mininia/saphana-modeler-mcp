@@ -10,6 +10,17 @@ repository objects.
 Connect via the MCP protocol (both **stdio and Streamable HTTP** transports) to clients such as Claude / IDE: invoke tools to browse, validate, and
 (within configured writable packages) create calculation views — no HANA Studio required.
 
+## Project goal
+
+**Let AI complete SAP HANA development on its own.**
+
+Not by handing it a SQL window, but by letting it work the way a modeling engineer does: understand what already
+exists and how the objects relate, decide what to change and how, make the change, then confirm it worked —
+**semantics it can understand, actions it can complete, boundaries that stay in control**.
+
+The current goal is classic repository modeling and execution-plan analysis; privileges and roles, data transfer and
+operations actions are among the plans for the future.
+
 ## Overview
 
 | Category | Capability | Tools |
@@ -21,10 +32,10 @@ Connect via the MCP protocol (both **stdio and Streamable HTTP** transports) to 
 | Data preview | Activated-view data preview (overall / node / derived — three channels, with filtering & input parameters) + preview privilege diagnosis | `hana_data_preview`, `hana_data_preview_diagnose` |
 | Modeling write | Create/activate/update/delete calculation views, design-time + runtime validation, validation action query | `hana_view_create`, `hana_view_activate`, `hana_view_update`, `hana_view_delete`, `hana_view_validate`, `hana_view_check_actions` |
 | Repository transport | Package export backup (zip), design-time file import, change list | `hana_repo_export`, `hana_repo_import`, `hana_repo_changelist` |
-| SQL analysis | SQL analysis conclusion (default): per-item findings + advice + statistics on scans/sizes/joins/engine switches/structure; optional execute-then-analyze; raw plan only via `raw=true` | `hana_sql_analyze` |
+| SQL analysis | SQL analysis conclusion (default): per-item findings + advice + statistics on scans/sizes/joins/engine switches/structure; `analyze=true` goes through the PlanViz channel for **per-operator measured** six panels (bottleneck / actual rows / timeline / parallelism); raw plan only via `raw=true` | `hana_sql_analyze` |
+| Stability diagnostics | Instance health check (**readings layer**: memory %, disk & volume IO, backup age, memory allocation failure rate … + **conclusions layer**: twelve checks — disk / services / backup / memory / CPU / alerts / blocked / long transactions / replication / config / deprecated features / encryption; **three states**: ok / abnormal / invisible), session & blocking deep dive, table storage profile (memory / disk / fragmentation / hotness / partition / column / index), historical trend (CPU / memory / disk / network over the past N hours) | `hana_system_health`, `hana_system_activity`, `hana_table_storage`, `hana_system_trend` |
 
 > Full definition read (json/xml) of view objects is provided by `hana_metadata_get_view`; field-level inspection uses `hana_metadata_list_fields` / `hana_metadata_get_field_logic`.
-> Prefer the declarative `operations` mode of `hana_view_update` for modifying calculation views (zero XML); for complex rework use the full-XML channel (read with `hana_metadata_get_view(format=xml)` first, make minimal edits, then post back).
 
 ## Quick Start
 
@@ -88,11 +99,6 @@ Connection info is only allowed from environment variables / `mcp.json` `env` (*
 | `MCP_HTTP_ALLOWED_ORIGINS` | optional | Allowed `Origin` hostnames (comma-separated, no scheme/port; requests without an Origin header pass), defaults to loopback names only | `localhost` |
 | `MCP_HTTP_ALLOW_ANONYMOUS` | optional | Explicitly accepts the risk of "listening externally with no Bearer token" (default `false`). **A non-loopback bind with no token is refused at startup** (in that posture the write boundary, tool groups and schema allowlist are all moot); set it to `true` only when something in front already authenticates (e.g. a reverse proxy) | `false` |
 
-Port auto-derivation rules:
-
-- SYSTEMDB / single container: `3<instance>13` (e.g. instance=10 → 31013)
-- Tenant database (MDC): `3<instance>15` (e.g. instance=10 → 31015)
-
 ## Transports
 
 Two MCP transports are supported, switched by whether `MCP_HTTP_PORT` is set (all tools/config behave identically):
@@ -118,7 +124,7 @@ HTTP mode notes:
 - **Concurrency & locking** (the real limits when one instance serves multiple clients):
   - Updates (`hana_view_update`): XS REST `If-Match` ETag optimistic locking, with the baseline captured at **request entry**; concurrent writes between the read and the PUT surface as an explicit 412 instead of silently overwriting
   - Creates (`hana_view_create`) / design-time validation (`hana_view_validate` design mode): the existence check plus write, and the temporary copy's "clean up → write → delete" sequence, are serialized per object server-side (in-process keyed lock); the loser of a concurrent same-name create gets an explicit conflict error
-  - Connection pool: 4 connections max, queueing when saturated (queue cap 64, wait timeout 30s — overflow/timeout return a readable error instead of hanging indefinitely), so one client's slow query cannot stall the others
+  - Connection pool: 4 connections max, queueing when saturated (queue cap 64, wait timeout 30s — overflow/timeout return a readable error instead of hanging indefinitely), so one client's slow query cannot stall the others (⚠ a single `hana_sql_analyze` run with `analyze=true` may execute for up to 5 minutes and hold a pool slot the whole time: with several big statements in flight, other calls may never get a connection)
   - View-definition cache: 60s TTL plus a 200-entry LRU cap, so multi-client fetching cannot grow memory without bound
   - All of the above locks are **in-process**: multi-process/multi-instance deployments against the same HANA need external serialization (this server is designed as a single instance)
 - No built-in OAuth or similar full auth system: when exposing to a network, set `MCP_HTTP_TOKEN` / `MCP_HTTP_TOKENS` and place it behind a reverse proxy / VPN / firewall
@@ -131,7 +137,7 @@ MCP_HTTP_PORT=3000 MCP_HTTP_TOKEN='your-long-random-token' node dist/index.js
 
 ## Tool Groups & Visibility Control
 
-24 tools are divided into three functional groups. You can control which tools are visible to the MCP client
+28 tools are divided into three functional groups. You can control which tools are visible to the MCP client
 (via `mcp.json` / `.env` environment variables) — unregistered tools never appear in `tools/list` and cannot be
 invoked. All-empty config = all enabled (backwards-compatible default).
 
@@ -139,7 +145,7 @@ invoked. All-empty config = all enabled (backwards-compatible default).
 
 | Group | Description | Tools |
 | --- | --- | --- |
-| **read** (data read) | Read-only access to HANA data/metadata/system info/audit/export — no repository changes | `hana_system_get_info`, `hana_check_privileges`, `hana_package_list`, `hana_package_list_objects`, `hana_metadata_get_view`, `hana_metadata_search_objects`, `hana_metadata_list_fields`, `hana_metadata_get_field_logic`, `hana_metadata_where_used`, `hana_table_list`, `hana_table_columns`, `hana_data_preview`, `hana_data_preview_diagnose`, `hana_view_check_actions`, `hana_repo_export`, `hana_repo_changelist` |
+| **read** (data read) | Read-only access to HANA data/metadata/system info/audit/export — no repository changes | `hana_system_get_info`, `hana_check_privileges`, `hana_package_list`, `hana_package_list_objects`, `hana_metadata_get_view`, `hana_metadata_search_objects`, `hana_metadata_list_fields`, `hana_metadata_get_field_logic`, `hana_metadata_where_used`, `hana_table_list`, `hana_table_columns`, `hana_data_preview`, `hana_data_preview_diagnose`, `hana_view_check_actions`, `hana_repo_export`, `hana_repo_changelist`, `hana_system_health`, `hana_system_activity`, `hana_table_storage`, `hana_system_trend` |
 | **write** (write ops) | Modifies design-time repository objects/packages (create/activate/update/delete/import/design-time validate) | `hana_package_create`, `hana_repo_import`, `hana_view_create`, `hana_view_activate`, `hana_view_update`, `hana_view_delete`, `hana_view_validate` |
 | **admin** (admin ops) | High-privilege / management: lifecycle, audit, privilege management, and **arbitrary-SQL** analysis | `hana_sql_analyze` |
 
@@ -192,10 +198,12 @@ On startup, if filter variables are configured, the log prints the enabled group
 | `hana_repo_export` | backup | Export a package as zip (XS REST Transfer API; saveTo to disk or return base64) |
 | `hana_repo_import` | write | Import design-time files (Transfer API directory target + chunked upload, stored inactive, target must be within writable package scope, re-read status after import) |
 | `hana_repo_changelist` | read-only | Repository change-list audit (GET /base/change; requires Change Tracking enabled) |
-| `hana_sql_analyze` | analyze | SQL analysis: **returns a readable conclusion by default** (one-line summary + per-item findings [risk/warn/info, each with evidence and advice] + statistics); **no raw plan unless `raw=true`**; `sql` = compile only; `planId` = explain a plan-cache entry with runtime stats (needs OPTIMIZER ADMIN); `sql` + `analyze=true` = execute first, then analyze (30 s timeout, at most 100 rows, **no data rows returned**) |
+| `hana_sql_analyze` | analyze | SQL analysis: **returns a readable conclusion by default** (one-line summary + per-item findings [risk/warn/info, each with evidence and advice] + statistics); **no raw plan unless `raw=true`**; `sql` = compile only; `planId` = explain a plan-cache entry with runtime stats (needs OPTIMIZER ADMIN); `sql` + `analyze=true` = really executes, then by default goes through the **PlanViz channel** for the same **per-operator measurements** as the official Executed Plan (F8) — the `panels` six panels (Plan Graph / Physical Plan / Execution Time / Timeline / Table Access / Logical Plan) plus measured findings; if the channel is unavailable it falls back to an estimated plan + statement-level statistics and explains why in `notes` (`source=sqlExecuted` marks the fallback). Guards either way: a single execution is capped at 5 minutes, at most 100 rows, **no data rows returned**) |
+| `hana_system_health` | read-only | Stability health check, returning **readings + conclusions** two layers. `metrics` gives concrete usage (instance memory used/quota/peak and %, host physical memory, database and host resident memory, host and database CPU, per-mount usage, per-purpose volume size, **volume IO failed reads/writes, blocked writes, soft errors**, **memory-object layer: non-swappable memory, allocation failure rate, hit rate, failed shrinks, reclaimability gradient**, backup age, blocked/long-transaction/alert counts, config violations and restart-pending counts, deprecated features in use, encryption status …) — **given whether or not the verdict is ok**, so "what is memory at right now" is answered here. `findings` gives the overall verdict plus per-item level/conclusion/evidence/advice. **Twelve checks**: disk (capacity and IO as two orthogonal readings) / services / backup / memory (host + instance + memory-object layer) / CPU / alerts / blocked / long transactions / replication / **config** (violated restrictions, changed-but-not-restarted, non-default layer overrides — **no "what the value should be" comparison**) / **deprecated features** (upgrade risk, not a current fault) / **encryption** (always info-level — whether encryption is required is a compliance decision, so it stays a reading and never affects the verdict). **Three states**: ok / abnormal / `unknown` (invisible) — monitoring views are row-filtered by privilege and silently return empty sets, which this tool never reads as "fine"; every item either yields a reading or an `unknown` carrying its cause, and **none may silently disappear**. Capacity units are **GiB**, matching HANA Cockpit |
+| `hana_system_activity` | read-only | Session and blocking deep dive: blocked transactions (including the **who-blocks-whom** connection picture), long-running uncommitted transactions (with undo/version/lock evidence, to tell an idle transaction from a lock-holding one), long-running statements. `sections` picks sections, `minDurationSec` sets the duration floor |
+| `hana_table_storage` | read-only | Table storage profile; each row carries **memory / disk / partitions / fragmentation / read-write counts / last merge / BW classification**. **Seven modes**: `memory`, `disk` (`M_TABLE_PERSISTENCE_STATISTICS.DISK_SIZE`), `fragmentation`, `hotness`, `partition`, plus two **drill-down** modes whose unit is not a table — `column` (column-level memory top with compression type, row count, distinct count, index type, last access; **deliberately not returning `COMPRESSION_RATIO_IN_PERCENTAGE`**, which on this revision produces impossible values such as 361890%) and `index` (index memory top with **the index's share of its table's memory**, measured at 73–83% — table memory alone understates the real cost by nearly half). `schema`/`table` are **filters**; `partition` + `schema` + `table` additionally returns per-partition detail. `partition` **defaults to BW active data tables only** (`subtype` switches) because one BW object is a group of physical tables distinguished only by name suffix. Results are aggregated by (schema, table) before sorting — one view row is one partition. Volume units are **MiB** |
+| `hana_system_trend` | read-only | Historical trend, answering "**is this week worse than last week**" — the other three are snapshots of *now* and cannot answer change. Source `_SYS_STATISTICS.HOST_LOAD_HISTORY_HOST` (one view carrying CPU/memory/disk/network/swap, so no cross-view time-axis alignment). `hours` window, `bucketMinutes` bucket width, `metrics` selects groups (cpu/memory/disk/network/swap); each bucket gives **min/max/avg** plus sample count. **Measured structure**: roughly **one sample every 10 seconds**, 362k rows spanning ~42 days; **`SERVER_TIMESTAMP` is when the snapshot was written, `TIME` is when the sample was taken** (358 distinct TIMEs share one SERVER_TIMESTAMP — using the former collapses an hour into a single point), and this tool uses `TIME`; `INDEX` is a row key, not a service dimension. **Retention is finite**: when the window exceeds it, `retention.coversWindow=false` and caveats state how far back the data actually goes — **the uncovered part is not "fine", it is simply missing**. It deliberately avoids "rising means bad", reporting only first-to-last bucket change |
 
-> **PlanViz is not implemented (reserved extension point)**: per-operator actual execution detail (inclusive/exclusive time, actual row counts, timeline) is only available from PlanViz's Executed Plan, which requires server-side plan tracing to be enabled and the XML trace to be retrieved — an operational concern, out of scope for now.
-> The extension is reserved via: `source` being an extensible enum (a future `planviz` value breaks nothing), the service entry taking an options object, and this note recording the path and its prerequisites. **No stub implementations or dead branches** — an unavailable path is better left absent.
 
 > **Write-operation safety boundary**: the writable-package scope for write tools (create/activate/update/delete/package_create/import) is controlled by `HANA_WRITE_PACKAGES` — **empty = no restriction (all writable)**; when set, only configured packages and their sub-packages are writable (e.g. `ZDEMO1,ZDEMO2.ZDEMO_SD` allows ZDEMO1, ZDEMO1.X, ZDEMO2.ZDEMO_SD, ZDEMO2.ZDEMO_SD.SUB, rejects others).
 > Same-name objects are rejected from overwrite; update/delete carry ETag optimistic locking.
@@ -245,6 +253,8 @@ You can also use `hana_data_preview_diagnose` to pre-check manually, focusing on
 | `npm run verify:system` | Build + real-HANA system-tool verification |
 | `npm run verify:p1-5` | Build + read-path/preview/field-logic black-box verification |
 | `npm run verify:lifecycle` | Build + write-path full-lifecycle verification (create→validate→activate→preview→update-conflict→delete→import; scripts in local `test-verification/`, not in repo) |
+| `npm run verify:health` | Build + stability-diagnostics verification (**192 assertions**), including regression guards against using the `M_DISK_USAGE` `FILE_SIZE` account for capacity (whole-machine false alarms), against treating volume-file usage (pre-allocated and often full) as a disk alarm, against exposing `COMPRESSION_RATIO_IN_PERCENTAGE` and `HASH_COLLISION_COUNT` (both unusable on this revision), against using `SERVER_TIMESTAMP` as the trend time axis, and for the rule that every item yields either a reading or an `unknown` with its cause |
+| `npm run probe:health` | Read-only probe enumerating monitoring-view availability / column names / value domains (run it first on a new environment — do not guess from documentation) |
 
 ## Architecture
 
@@ -301,6 +311,14 @@ The connecting user needs corresponding privileges on the following objects (che
 - XS session (`http://<host>:80<instance>/sap/hana/xs/formLogin`): the user must be able to log in to XS Classic
   (`PUBLIC` + the session capability contained in application privilege `sap.hana.xs.admin.roles::RuntimeConfOperator`; verify with `hana_check_privileges`)
 - Write-target package: `REPO.EDIT_NATIVE_OBJECTS` + owner of the package or package-level write privilege
+
+**Stability diagnostics (`hana_system_health` / `hana_system_activity` / `hana_table_storage` / `hana_system_trend`)**
+
+- **No extra privileges needed**: instance-scope views (`SYS.M_SERVICES`, `M_CS_TABLES`, `M_TABLES`, `M_SQL_PLAN_CACHE`, …) are readable by any user, so the table profile and part of the health check always work.
+- **`CATALOG READ`** (or a `MONITORING` role containing it) unlocks the **infrastructure-class** monitoring views — `M_DISKS`/`M_DISK_USAGE`, `M_HOST_RESOURCE_UTILIZATION`, `M_BACKUP_CATALOG`, `M_SERVICE_REPLICATION`, `M_MEMORY_OBJECTS`, `M_VOLUME_IO_TOTAL_STATISTICS`, `M_ENCRYPTION_OVERVIEW`, … These views **do not error when privileges are missing — they return empty sets**, so the health check marks the corresponding item `unknown` rather than "fine".
+- **`SELECT` on `_SYS_STATISTICS`**: needed by the alerts check (`STATISTICS_CURRENT_ALERTS`) and by the **whole trend tool**; without it the call reports 258 and is likewise marked `unknown`. **Measured retention is about 42 days** (configurable) — when the window exceeds it the report states how far back the data goes.
+- **Config readings** (the `config` item of `hana_system_health`) need `INIFILE ADMIN` or equivalent to read all of `M_CONFIGURATION_PARAMETER_VALUES`; a partial read does not necessarily error, so the non-default-layer override count may be understated.
+- **Memory-object and volume-IO readings** (`M_MEMORY_OBJECTS`, `M_MEMORY_OBJECT_DISPOSITIONS`, `M_VOLUME_IO_TOTAL_STATISTICS`, `M_VOLUME_FILES`) are likewise infrastructure-class: missing privileges affect **only that layer's readings**, leaving a "cannot be determined" entry in `metrics` without skewing the host/instance memory and capacity conclusions.
 
 When privileges are insufficient, troubleshoot with `hana_check_privileges` first; for preview failures use `hana_data_preview_diagnose` to determine whether it's an analytic-privilege issue or upstream inaccessibility.
 
@@ -369,6 +387,10 @@ Point to the local build artifact, stdio transport:
 
 > In HTTP mode, connection info and other env-var configuration lives on the **server side** (the shell / .env the server starts from); the client only fills in `url`.
 > When the server sets `MCP_HTTP_TOKEN`, the client carries the bearer token via `headers` (header support varies per client — check its own docs).
+
+> **Raise the client's tool-call timeout (`hana_sql_analyze` with `analyze=true`)**: this mode **really executes** the statement, and the server allows it up to **5 minutes** (plus roughly 2.5 minutes of queueing and control calls in the worst case). Most clients cut a tool call off far earlier — Claude Code defaults to **60 seconds** — so a big calculation view gets killed client-side while the server-side statement keeps running, and you never see the result. Set the client's per-call timeout to **600000 ms (10 minutes)**:
+> - **Per server**: add `"timeout": 600000` to that server's entry in `mcp.json` (milliseconds; overrides `MCP_TOOL_TIMEOUT`; values below 1000 are ignored)
+> - **Globally**: set `MCP_TOOL_TIMEOUT=600000` in the environment that **starts the client**
 
 ## License
 

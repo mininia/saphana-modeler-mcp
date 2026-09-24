@@ -205,7 +205,7 @@ function planSqlAnalyze(args: Record<string, unknown>): WritePlan {
     add(p.readSchemas, ...refs);
     p.steps.push(
       args.analyze === true
-        ? '先实际执行该语句（30s 超时 + 最多取 100 行 + **不返回数据行**），再按文本关联计划缓存条目解释其重编译计划'
+        ? '先实际执行该语句（单次执行最多 5 分钟 + 最多取 100 行 + **不返回数据行**），再按文本关联计划缓存条目解释其重编译计划'
         : '编译（**不执行**）该语句',
     );
     p.steps.push(`按语句中出现的 schema 限定名核对读取范围（共 ${refs.length} 个候选，来自 FROM/JOIN 表位置）`);
