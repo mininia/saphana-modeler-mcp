@@ -1,9 +1,5 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
-import {
-  createServer as createHttpServer,
-  type IncomingMessage,
-  type ServerResponse,
-} from 'node:http';
+import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { hostHeaderValidation, originValidation, toNodeHandler } from '@modelcontextprotocol/node';
 import { createMcpHandler, type AuthInfo } from '@modelcontextprotocol/server';
 import type { HanaConfig, HttpClientIdentity } from './config/config.js';
@@ -44,20 +40,20 @@ type RequestGuard = (req: IncomingMessage, res: ServerResponse) => boolean;
 type AuthedRequest = IncomingMessage & { auth?: AuthInfo };
 
 /** 仅放行 MCP_HTTP_PATH（忽略 querystring） */
-const pathGuard: RequestGuard = (req, res) => {
+function pathGuard(req: IncomingMessage, res: ServerResponse): boolean {
   const path = (req.url ?? '/').split('?')[0];
   if (path === MCP_HTTP_PATH) return true;
   res.writeHead(404, { 'content-type': 'application/json' });
   res.end(JSON.stringify({ error: `not found; the MCP endpoint is ${MCP_HTTP_PATH}` }));
   return false;
-};
+}
 
 /**
  * Bearer Token 校验（可选）：未配置任何 Token 时恒放行（回环默认边界）；配置后强制校验。
  * 命中的身份写入 req.auth —— SDK 约定位置（toNodeHandler 会把 req.auth 透传为 handler 的
  * authInfo），请求入口据此进入身份上下文，使工具层/日志/envelope 可归因到具体客户端。
  */
-const bearerTokenGuard = (clients: HttpClientIdentity[]): RequestGuard => {
+function bearerTokenGuard(clients: HttpClientIdentity[]): RequestGuard {
   if (clients.length === 0) return () => true;
   // sha256 摘要定长后 timingSafeEqual，防时序侧信道；摘要不回泄 token；token 原文不驻留在比对结构中
   const digests = clients.map((c) => ({
@@ -97,16 +93,16 @@ const bearerTokenGuard = (clients: HttpClientIdentity[]): RequestGuard => {
     );
     return false;
   };
-};
+}
 
 /** Content-Length 超限拒绝（413）；流式（chunked）请求无该头，交由代理层限长（README 已注明） */
-const bodySizeGuard: RequestGuard = (req, res) => {
+function bodySizeGuard(req: IncomingMessage, res: ServerResponse): boolean {
   const declared = Number(req.headers['content-length'] ?? 0);
   if (!Number.isFinite(declared) || declared <= MCP_HTTP_MAX_BODY_BYTES) return true;
   res.writeHead(413, { 'content-type': 'application/json' });
   res.end(JSON.stringify({ error: 'payload too large' }));
   return false;
-};
+}
 
 /**
  * 启动 HTTP 监听。resolve 于 listen 成功后，携带实际端口（配置 0 = 随机端口，如冒烟测试）。

@@ -1,10 +1,10 @@
 import type { HanaPool } from '../core/hana-client.js';
 import { HanaBusinessError } from '../core/errors.js';
-import { assertSafeRuntimeName, assertSchemaAllowed } from '../core/sql.js';
+import { clampLimit } from '../core/num.js';
+import { assertSafeRuntimeName, assertSchemaAllowed, quoteIdentifier } from '../core/sql.js';
 import { parseViewDefinition } from '../model/view-xml.js';
 import type {
   ViewCalculatedAttribute,
-  ViewDataSource,
   ViewDefinition,
   ViewKind,
   ViewNode,
@@ -20,16 +20,67 @@ import type {
  * - 表列：SYS.TABLE_COLUMNS（SYS.COLUMNS 对该环境用户 258 不可用）
  */
 
-/** 视图类型 → ACTIVE_OBJECT.OBJECT_SUFFIX 映射（导出供视图解析缓存复用） */
+/**
+ * 视图类型 → ACTIVE_OBJECT.OBJECT_SUFFIX 映射（导出供视图解析缓存复用）。
+ *
+ * 保留理由（刻意不删）：当前三项虽是**全等映射**，但它在本模块承担「合法取值集合」职责 ——
+ * `Object.values(VIEW_SUFFIXES)` 是「不指定 kind 时匹配全部三种类型」的唯一事实源；
+ * 且 view-cache / preview-diagnose 两个模块按同一 key 取值（跨文件契约，改动会波及它们）。
+ * 若改成直接拼 ViewKind 字面量，上述枚举点会散成多处手写数组。
+ */
 export const VIEW_SUFFIXES: Record<ViewKind, string> = {
   calculationview: 'calculationview',
   attributeview: 'attributeview',
   analyticview: 'analyticview',
 };
 
+/** kind 指定时只取该类型的 suffix，省略时三种全匹配（getViewDefinition/whereUsed/searchObjects/listPackageObjects 共用） */
+function suffixesOf(kind?: ViewKind): string[] {
+  return kind ? [VIEW_SUFFIXES[kind]] : Object.values(VIEW_SUFFIXES);
+}
+
+/** `IN (?,?,…)` 占位符串：长度由 suffixes 决定，值一律走参数绑定（三处手拼曾各写一遍） */
+function suffixInClause(suffixes: readonly string[]): string {
+  return `(${suffixes.map(() => '?').join(',')})`;
+}
+
+/**
+ * 「命中总数 + 本次上限 + 截断标记」的通用分页外壳。
+ * K 为条目数组的对外字段名（objects/packages 等）：历史契约字段名不同，不能统一改名，
+ * 故这里只统一分页三件套与条目类型的拼装方式（见 runPaged）。
+ */
+export type PagedResult<T, K extends string = 'items'> = {
+  /** LIMIT 之前的命中总数 */
+  count: number;
+  /** 本次返回上限 */
+  limit: number;
+  /** count > limit 时为 true（按截断约定提示 refine query） */
+  truncated: boolean;
+} & Record<K, T[]>;
+
+/**
+ * 分页查询的唯一装配点：并发执行「计数」与「取数」两条查询，统一产出
+ * count/limit/truncated 与截断后的条目 —— 截断判定与结果拼装不再各处手写。
+ */
+async function runPaged<T, K extends string>(
+  key: K,
+  limit: number,
+  fetchers: { count: () => Promise<number>; items: () => Promise<T[]> },
+): Promise<PagedResult<T, K>> {
+  const [count, items] = await Promise.all([fetchers.count(), fetchers.items()]);
+  return { count, limit, truncated: count > limit, [key]: items.slice(0, limit) } as PagedResult<T, K>;
+}
+
 export interface ViewDefinitionResult {
   /** 仓库对象信息 */
-  object: { packageId: string; objectName: string; objectSuffix: string; versionId: number; activatedAt?: string; activatedBy?: string };
+  object: {
+    packageId: string;
+    objectName: string;
+    objectSuffix: string;
+    versionId: number;
+    activatedAt?: string;
+    activatedBy?: string;
+  };
   /** 结构化视图定义（format=json） */
   definition?: ViewDefinition;
   /** 原始 XML（format=xml） */
@@ -47,7 +98,7 @@ export async function getViewDefinition(
   objectName: string,
   opts: { kind?: ViewKind; format?: 'json' | 'xml' } = {},
 ): Promise<ViewDefinitionResult> {
-  const suffixes = opts.kind ? [VIEW_SUFFIXES[opts.kind]] : Object.values(VIEW_SUFFIXES);
+  const suffixes = suffixesOf(opts.kind);
   const rows = await pool.query<{
     PACKAGE_ID: string;
     OBJECT_NAME: string;
@@ -59,7 +110,7 @@ export async function getViewDefinition(
   }>(
     `SELECT PACKAGE_ID, OBJECT_NAME, OBJECT_SUFFIX, VERSION_ID, ACTIVATED_AT, ACTIVATED_BY, CDATA
      FROM "_SYS_REPO"."ACTIVE_OBJECT"
-     WHERE PACKAGE_ID = ? AND OBJECT_NAME = ? AND OBJECT_SUFFIX IN (${suffixes.map(() => '?').join(',')})
+     WHERE PACKAGE_ID = ? AND OBJECT_NAME = ? AND OBJECT_SUFFIX IN ${suffixInClause(suffixes)}
      ORDER BY VERSION_ID DESC LIMIT 1`,
     [packageId, objectName, ...suffixes],
   );
@@ -104,7 +155,7 @@ export async function listTables(
   pool: HanaPool,
   opts: { schema?: string; pattern?: string; limit?: number } = {},
 ): Promise<TableInfo[]> {
-  const limit = Math.min(Math.max(opts.limit ?? 50, 1), 200);
+  const limit = clampLimit(opts.limit, 50, 1, 200);
   const schema = opts.schema ?? (await currentSchema(pool));
   // 纵深防御：显式传入的 schema 走白名单（系统 schema + HANA_SCHEMA_ALLOW 追加），
   // 防任意 schema 枚举；默认当前 schema 已由数据库权限约束
@@ -152,7 +203,7 @@ export async function getTableColumns(
   table: string,
   opts: { limit?: number } = {},
 ): Promise<ColumnInfo[]> {
-  const limit = Math.min(Math.max(opts.limit ?? 200, 1), 500);
+  const limit = clampLimit(opts.limit, 200, 1, 500);
   // 纵深防御：schema 走白名单、表名做字符集校验（值仍参数绑定，此为第二道防线）
   assertSchemaAllowed(schema);
   assertSafeRuntimeName(table, '表');
@@ -173,7 +224,12 @@ export async function getTableColumns(
     [schema, table, limit],
   );
   if (rows.length === 0) {
-    throw new Error(`未找到表 ${schema}/${table}（或当前用户无权限）。可用 hana_table_list 确认 schema 下可访问的表`);
+    // 必须是 HanaBusinessError：裸 Error 会被 withErrorEnvelope 归入「内部错误」，
+    // 「表不存在 / 无权限」这类**调用方可据以修正**（换 schema、换表名）的原因会被吞掉。
+    throw new HanaBusinessError(
+      `未找到表 ${schema}/${table}（或当前用户无权限）。可用 hana_table_list 确认 schema 下可访问的表`,
+      'TABLE_NOT_FOUND',
+    );
   }
   return rows.map((r) => ({
     columnName: r.COLUMN_NAME,
@@ -187,7 +243,12 @@ export async function getTableColumns(
   }));
 }
 
-async function currentSchema(pool: HanaPool): Promise<string> {
+/**
+ * 当前会话的默认 schema（`SELECT CURRENT_SCHEMA FROM DUMMY`）。
+ * 导出供 repository.service 的脚本读取范围校验复用：未限定 schema 的表名按当前 schema 解析，
+ * 两处各查一次时同一条规则会有两个实现（此前 repository.service 即内联了同一句 SQL）。
+ */
+export async function currentSchema(pool: HanaPool): Promise<string> {
   const rows = await pool.query<{ CURRENT_SCHEMA: string }>('SELECT CURRENT_SCHEMA FROM DUMMY');
   return rows[0]?.CURRENT_SCHEMA ?? '';
 }
@@ -222,11 +283,16 @@ export async function whereUsed(
   objectName: string,
   opts: { kind?: ViewKind; direction?: 'upstream' | 'downstream' | 'both' } = {},
 ): Promise<WhereUsedResult> {
-  const suffixes = opts.kind ? [VIEW_SUFFIXES[opts.kind]] : Object.values(VIEW_SUFFIXES);
-  const suffixIn = `(${suffixes.map(() => '?').join(',')})`;
+  const suffixes = suffixesOf(opts.kind);
+  const suffixIn = suffixInClause(suffixes);
   const direction = opts.direction ?? 'both';
 
-  const mapRow = (r: { PACKAGE_ID: string; OBJECT_NAME: string; OBJECT_SUFFIX: string; REF_TYPE: number }): CrossRefItem => ({
+  const mapRow = (r: {
+    PACKAGE_ID: string;
+    OBJECT_NAME: string;
+    OBJECT_SUFFIX: string;
+    REF_TYPE: number;
+  }): CrossRefItem => ({
     packageId: r.PACKAGE_ID,
     objectName: r.OBJECT_NAME,
     objectSuffix: r.OBJECT_SUFFIX,
@@ -235,24 +301,26 @@ export async function whereUsed(
     isRuntime: r.OBJECT_SUFFIX.startsWith('__RT_'),
   });
 
-  const upstream = direction === 'both' || direction === 'upstream'
-    ? await pool.query<{ PACKAGE_ID: string; OBJECT_NAME: string; OBJECT_SUFFIX: string; REF_TYPE: number }>(
-        `SELECT TO_PACKAGE_ID AS PACKAGE_ID, TO_OBJECT_NAME AS OBJECT_NAME, TO_OBJECT_SUFFIX AS OBJECT_SUFFIX, REF_TYPE
+  const upstream =
+    direction === 'both' || direction === 'upstream'
+      ? await pool.query<{ PACKAGE_ID: string; OBJECT_NAME: string; OBJECT_SUFFIX: string; REF_TYPE: number }>(
+          `SELECT TO_PACKAGE_ID AS PACKAGE_ID, TO_OBJECT_NAME AS OBJECT_NAME, TO_OBJECT_SUFFIX AS OBJECT_SUFFIX, REF_TYPE
          FROM "_SYS_REPO"."ACTIVE_OBJECTCROSSREF"
          WHERE FROM_PACKAGE_ID = ? AND FROM_OBJECT_NAME = ? AND FROM_OBJECT_SUFFIX IN ${suffixIn}
          ORDER BY TO_OBJECT_SUFFIX, TO_OBJECT_NAME`,
-        [packageId, objectName, ...suffixes],
-      )
-    : [];
-  const downstream = direction === 'both' || direction === 'downstream'
-    ? await pool.query<{ PACKAGE_ID: string; OBJECT_NAME: string; OBJECT_SUFFIX: string; REF_TYPE: number }>(
-        `SELECT FROM_PACKAGE_ID AS PACKAGE_ID, FROM_OBJECT_NAME AS OBJECT_NAME, FROM_OBJECT_SUFFIX AS OBJECT_SUFFIX, REF_TYPE
+          [packageId, objectName, ...suffixes],
+        )
+      : [];
+  const downstream =
+    direction === 'both' || direction === 'downstream'
+      ? await pool.query<{ PACKAGE_ID: string; OBJECT_NAME: string; OBJECT_SUFFIX: string; REF_TYPE: number }>(
+          `SELECT FROM_PACKAGE_ID AS PACKAGE_ID, FROM_OBJECT_NAME AS OBJECT_NAME, FROM_OBJECT_SUFFIX AS OBJECT_SUFFIX, REF_TYPE
          FROM "_SYS_REPO"."ACTIVE_OBJECTCROSSREF"
          WHERE TO_PACKAGE_ID = ? AND TO_OBJECT_NAME = ? AND TO_OBJECT_SUFFIX IN ${suffixIn}
          ORDER BY FROM_OBJECT_SUFFIX, FROM_OBJECT_NAME`,
-        [packageId, objectName, ...suffixes],
-      )
-    : [];
+          [packageId, objectName, ...suffixes],
+        )
+      : [];
 
   return {
     object: { packageId, objectName, objectSuffix: opts.kind ?? '?' },
@@ -270,37 +338,20 @@ export function findCalculatedAttribute(
   attributeId: string,
 ): ViewCalculatedAttribute | undefined {
   for (const node of definition.nodes) {
-    const attr = node.calculatedAttributes.find(ca => ca.id === attributeId);
+    const attr = node.calculatedAttributes.find((ca) => ca.id === attributeId);
     if (attr) {
       return attr;
     }
   }
   // 也检查输出中的计算属性
-  return definition.outputs.calculatedAttributes.find(ca => ca.id === attributeId);
+  return definition.outputs.calculatedAttributes.find((ca) => ca.id === attributeId);
 }
 
 /**
  * 在视图定义中查找节点 by ID
  */
 export function findNode(definition: ViewDefinition, nodeId: string): ViewNode | undefined {
-  return definition.nodes.find(node => node.id === nodeId);
-}
-
-/**
- * 在视图定义中查找输出字段（属性/度量）by ID
- */
-export function findOutputField(
-  definition: ViewDefinition,
-  fieldId: string,
-): ViewOutputField | undefined {
-  const allOutputs = [
-    ...definition.outputs.attributes,
-    ...definition.outputs.calculatedAttributes,
-    ...definition.outputs.measures,
-    ...definition.outputs.calculatedMeasures,
-    ...definition.outputs.restrictedMeasures,
-  ];
-  return allOutputs.find(field => field.id === fieldId);
+  return definition.nodes.find((node) => node.id === nodeId);
 }
 
 /**
@@ -358,52 +409,13 @@ export function searchFields(
 }
 
 /**
- * 获取计算属性的公式（简化版，适用于 ZDEMO008_CV001 类似场景）
- * @param definition 视图定义
- * @param attributeId 计算属性 ID（如 "ZDEMO_FLD_NEW"）
- * @returns 公式字符串，未找到返回 undefined
- */
-export function getCalculatedAttributeFormula(
-  definition: ViewDefinition,
-  attributeId: string,
-): string | undefined {
-  const attr = findCalculatedAttribute(definition, attributeId);
-  return attr?.formula;
-}
-
-/**
- * 获取视图的数据源汇总信息
- * 返回所有引用的表、视图和其他计算视图
- */
-export interface DataSourceSummary {
-  id: string;
-  type: string;
-  schemaName?: string;
-  tableName?: string;
-  resourceUri?: string;
-  /** 是否为计算视图引用 */
-  isCalculationView: boolean;
-}
-
-export function getDataSourcesSummary(definition: ViewDefinition): DataSourceSummary[] {
-  return definition.dataSources.map(ds => ({
-    id: ds.id,
-    type: ds.type,
-    schemaName: ds.schemaName,
-    tableName: ds.columnObjectName,
-    resourceUri: ds.resourceUri,
-    isCalculationView: ds.type === 'CALCULATION_VIEW',
-  }));
-}
-
-/**
  * 获取视图的节点链路（数据流）
  * 从数据源到输出的节点连接关系
  */
 export interface NodeConnection {
-  from: string;  // 源节点 ID
-  to: string;    // 目标节点 ID
-  mappings: ViewNodeMapping[];  // 字段映射
+  from: string; // 源节点 ID
+  to: string; // 目标节点 ID
+  mappings: ViewNodeMapping[]; // 字段映射
 }
 
 export function getNodeConnections(definition: ViewDefinition): NodeConnection[] {
@@ -437,11 +449,24 @@ export function extractFormulaSourceColumns(formula: string | undefined): string
     columns.add(m[1]);
   }
   // 2. 剔除双引号引用与单引号字符串字面量后，匹配裸标识符
-  const withoutLiterals = formula
-    .replace(/"(?:[^"\\]|\\.)*"/g, '')
-    .replace(/'[^']*'/g, '');
+  const withoutLiterals = formula.replace(/"(?:[^"\\]|\\.)*"/g, '').replace(/'[^']*'/g, '');
   const bare = /\b([A-Z_][A-Z0-9_]*)\b/g;
-  const SKIP = new Set(['CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'AND', 'OR', 'NOT', 'NULL', 'TRUE', 'FALSE', 'IF', 'IN', 'IS']);
+  const SKIP = new Set([
+    'CASE',
+    'WHEN',
+    'THEN',
+    'ELSE',
+    'END',
+    'AND',
+    'OR',
+    'NOT',
+    'NULL',
+    'TRUE',
+    'FALSE',
+    'IF',
+    'IN',
+    'IS',
+  ]);
   while ((m = bare.exec(withoutLiterals)) !== null) {
     if (!SKIP.has(m[1])) columns.add(m[1]);
   }
@@ -688,7 +713,13 @@ export async function getViewFieldList(
   pool: HanaPool,
   packageId: string,
   objectName: string,
-  opts: { kind?: ViewKind; pattern?: string; exact?: boolean; caseSensitive?: boolean; includeNodeCalculated?: boolean } = {},
+  opts: {
+    kind?: ViewKind;
+    pattern?: string;
+    exact?: boolean;
+    caseSensitive?: boolean;
+    includeNodeCalculated?: boolean;
+  } = {},
 ): Promise<{ object: ViewDefinitionResult['object']; list: ListFieldsResult }> {
   const result = await getViewDefinition(pool, packageId, objectName, { format: 'json', kind: opts.kind });
   if (!result.definition) {
@@ -707,15 +738,7 @@ export interface ObjectSearchItem {
   activatedBy?: string;
 }
 
-export interface ObjectSearchResult {
-  /** 总命中数（LIMIT 之前） */
-  count: number;
-  /** 本次返回上限 */
-  limit: number;
-  /** count > limit 时为 true（按截断约定提示 refine query） */
-  truncated: boolean;
-  objects: ObjectSearchItem[];
-}
+export type ObjectSearchResult = PagedResult<ObjectSearchItem, 'objects'>;
 
 /**
  * 按名称片段搜索仓库对象（视图定位用）：
@@ -728,43 +751,44 @@ export async function searchObjects(
   pool: HanaPool,
   opts: { pattern: string; kind?: ViewKind; limit?: number } = { pattern: '' },
 ): Promise<ObjectSearchResult> {
-  const limit = Math.min(Math.max(opts.limit ?? 20, 1), 100);
-  const suffixes = opts.kind ? [VIEW_SUFFIXES[opts.kind]] : Object.values(VIEW_SUFFIXES);
-  const suffixIn = `(${suffixes.map(() => '?').join(',')})`;
-  // 值一律参数绑定；pattern 仅作为 LIKE 片段，UPPER 两侧做大小写不敏感匹配
-  const countRow = await pool.query<{ C: number }>(
-    `SELECT COUNT(*) AS C FROM "_SYS_REPO"."ACTIVE_OBJECT"
-     WHERE UPPER(OBJECT_NAME) LIKE UPPER(?) AND OBJECT_SUFFIX IN ${suffixIn}`,
-    [`%${opts.pattern}%`, ...suffixes],
-  );
-  const count = countRow[0]?.C ?? 0;
-  const rows = await pool.query<{
-    PACKAGE_ID: string;
-    OBJECT_NAME: string;
-    OBJECT_SUFFIX: string;
-    VERSION_ID: number;
-    ACTIVATED_AT: string | null;
-    ACTIVATED_BY: string | null;
-  }>(
-    `SELECT PACKAGE_ID, OBJECT_NAME, OBJECT_SUFFIX, VERSION_ID, ACTIVATED_AT, ACTIVATED_BY
-     FROM "_SYS_REPO"."ACTIVE_OBJECT"
-     WHERE UPPER(OBJECT_NAME) LIKE UPPER(?) AND OBJECT_SUFFIX IN ${suffixIn}
-     ORDER BY PACKAGE_ID, OBJECT_NAME LIMIT ?`,
-    [`%${opts.pattern}%`, ...suffixes, limit],
-  );
-  return {
-    count,
-    limit,
-    truncated: count > limit,
-    objects: rows.map((r) => ({
-      packageId: r.PACKAGE_ID,
-      objectName: r.OBJECT_NAME,
-      objectSuffix: r.OBJECT_SUFFIX,
-      versionId: r.VERSION_ID,
-      activatedAt: r.ACTIVATED_AT ?? undefined,
-      activatedBy: r.ACTIVATED_BY ?? undefined,
-    })),
-  };
+  const limit = clampLimit(opts.limit, 20, 1, 100);
+  const suffixes = suffixesOf(opts.kind);
+  const suffixIn = suffixInClause(suffixes);
+  return runPaged('objects', limit, {
+    // 值一律参数绑定；pattern 仅作为 LIKE 片段，UPPER 两侧做大小写不敏感匹配
+    count: async () => {
+      const countRow = await pool.query<{ C: number }>(
+        `SELECT COUNT(*) AS C FROM "_SYS_REPO"."ACTIVE_OBJECT"
+         WHERE UPPER(OBJECT_NAME) LIKE UPPER(?) AND OBJECT_SUFFIX IN ${suffixIn}`,
+        [`%${opts.pattern}%`, ...suffixes],
+      );
+      return countRow[0]?.C ?? 0;
+    },
+    items: async () => {
+      const rows = await pool.query<{
+        PACKAGE_ID: string;
+        OBJECT_NAME: string;
+        OBJECT_SUFFIX: string;
+        VERSION_ID: number;
+        ACTIVATED_AT: string | null;
+        ACTIVATED_BY: string | null;
+      }>(
+        `SELECT PACKAGE_ID, OBJECT_NAME, OBJECT_SUFFIX, VERSION_ID, ACTIVATED_AT, ACTIVATED_BY
+         FROM "_SYS_REPO"."ACTIVE_OBJECT"
+         WHERE UPPER(OBJECT_NAME) LIKE UPPER(?) AND OBJECT_SUFFIX IN ${suffixIn}
+         ORDER BY PACKAGE_ID, OBJECT_NAME LIMIT ?`,
+        [`%${opts.pattern}%`, ...suffixes, limit],
+      );
+      return rows.map((r) => ({
+        packageId: r.PACKAGE_ID,
+        objectName: r.OBJECT_NAME,
+        objectSuffix: r.OBJECT_SUFFIX,
+        versionId: r.VERSION_ID,
+        activatedAt: r.ACTIVATED_AT ?? undefined,
+        activatedBy: r.ACTIVATED_BY ?? undefined,
+      }));
+    },
+  });
 }
 
 /** 包清单条目（_SYS_REPO.PACKAGE_CATALOG） */
@@ -777,15 +801,7 @@ export interface PackageItem {
   level: number;
 }
 
-export interface PackageListResult {
-  /** 总命中数（LIMIT 之前） */
-  count: number;
-  /** 本次返回上限 */
-  limit: number;
-  /** count > limit 时为 true（按截断约定提示 refine query） */
-  truncated: boolean;
-  packages: PackageItem[];
-}
+export type PackageListResult = PagedResult<PackageItem, 'packages'>;
 
 /**
  * 包清单/包树：来源 _SYS_REPO.PACKAGE_CATALOG（PACKAGE_ID 为 . 分隔的完整路径）。
@@ -796,39 +812,40 @@ export async function listPackages(
   pool: HanaPool,
   opts: { pattern?: string; limit?: number } = {},
 ): Promise<PackageListResult> {
-  const limit = Math.min(Math.max(opts.limit ?? 100, 1), 500);
+  const limit = clampLimit(opts.limit, 100, 1, 500);
   const pattern = opts.pattern?.trim();
   const where = pattern ? 'WHERE UPPER(PACKAGE_ID) LIKE UPPER(?)' : '';
   const likeParams: string[] = pattern ? [`%${pattern}%`] : [];
 
-  const countRow = await pool.query<{ C: number }>(
-    `SELECT COUNT(*) AS C FROM "_SYS_REPO"."PACKAGE_CATALOG" ${where}`,
-    likeParams,
-  );
-  const count = countRow[0]?.C ?? 0;
-  const rows = await pool.query<{
-    PACKAGE_ID: string;
-    RESPONSIBLE: string | null;
-    ORIG_LANG: string | null;
-    DELIVERY_UNIT: string | null;
-  }>(
-    `SELECT PACKAGE_ID, RESPONSIBLE, ORIG_LANG, DELIVERY_UNIT
-     FROM "_SYS_REPO"."PACKAGE_CATALOG" ${where}
-     ORDER BY PACKAGE_ID LIMIT ?`,
-    [...likeParams, limit],
-  );
-  return {
-    count,
-    limit,
-    truncated: count > limit,
-    packages: rows.map((r) => ({
-      packageId: r.PACKAGE_ID,
-      responsible: r.RESPONSIBLE ?? undefined,
-      origLang: r.ORIG_LANG ?? undefined,
-      deliveryUnit: r.DELIVERY_UNIT ?? undefined,
-      level: r.PACKAGE_ID.split('.').length - 1,
-    })),
-  };
+  return runPaged('packages', limit, {
+    count: async () => {
+      const countRow = await pool.query<{ C: number }>(
+        `SELECT COUNT(*) AS C FROM "_SYS_REPO"."PACKAGE_CATALOG" ${where}`,
+        likeParams,
+      );
+      return countRow[0]?.C ?? 0;
+    },
+    items: async () => {
+      const rows = await pool.query<{
+        PACKAGE_ID: string;
+        RESPONSIBLE: string | null;
+        ORIG_LANG: string | null;
+        DELIVERY_UNIT: string | null;
+      }>(
+        `SELECT PACKAGE_ID, RESPONSIBLE, ORIG_LANG, DELIVERY_UNIT
+         FROM "_SYS_REPO"."PACKAGE_CATALOG" ${where}
+         ORDER BY PACKAGE_ID LIMIT ?`,
+        [...likeParams, limit],
+      );
+      return rows.map((r) => ({
+        packageId: r.PACKAGE_ID,
+        responsible: r.RESPONSIBLE ?? undefined,
+        origLang: r.ORIG_LANG ?? undefined,
+        deliveryUnit: r.DELIVERY_UNIT ?? undefined,
+        level: r.PACKAGE_ID.split('.').length - 1,
+      }));
+    },
+  });
 }
 
 /** 包内对象条目（ACTIVE_OBJECT / INACTIVE_OBJECT 合并） */
@@ -845,16 +862,7 @@ export interface PackageObjectItem {
   changedBy?: string;
 }
 
-export interface PackageObjectsResult {
-  packageId: string;
-  /** 总命中数（LIMIT 之前，active + inactive） */
-  count: number;
-  /** 本次返回上限 */
-  limit: number;
-  /** count > limit 时为 true */
-  truncated: boolean;
-  objects: PackageObjectItem[];
-}
+export type PackageObjectsResult = PagedResult<PackageObjectItem, 'objects'> & { packageId: string };
 
 /**
  * 包内对象清单：合并 _SYS_REPO.ACTIVE_OBJECT（已激活）与 INACTIVE_OBJECT（未激活）。
@@ -866,10 +874,10 @@ export async function listPackageObjects(
   packageId: string,
   opts: { pattern?: string; kind?: ViewKind; limit?: number } = {},
 ): Promise<PackageObjectsResult> {
-  const limit = Math.min(Math.max(opts.limit ?? 100, 1), 500);
+  const limit = clampLimit(opts.limit, 100, 1, 500);
   const pattern = opts.pattern?.trim();
-  const suffixes = opts.kind ? [VIEW_SUFFIXES[opts.kind]] : null;
-  const suffixIn = suffixes ? `(${suffixes.map(() => '?').join(',')})` : null;
+  const suffixes = opts.kind ? suffixesOf(opts.kind) : null;
+  const suffixIn = suffixes ? suffixInClause(suffixes) : null;
   const clauses = ['PACKAGE_ID = ?'];
   const params: Array<string | number> = [packageId];
   if (suffixIn) {
@@ -881,77 +889,78 @@ export async function listPackageObjects(
     params.push(`%${pattern}%`);
   }
   const where = `WHERE ${clauses.join(' AND ')}`;
-
-  const [activeCount, inactiveCount, activeRows, inactiveRows] = await Promise.all([
-    pool.query<{ C: number }>(
-      `SELECT COUNT(*) AS C FROM "_SYS_REPO"."ACTIVE_OBJECT" ${where}`,
+  // 表名来自本函数的字面量联合类型，仍统一走 quoteIdentifier（标识符引用只此一种拼法）
+  const countOf = async (table: 'ACTIVE_OBJECT' | 'INACTIVE_OBJECT'): Promise<number> => {
+    const rows = await pool.query<{ C: number }>(
+      `SELECT COUNT(*) AS C FROM "_SYS_REPO".${quoteIdentifier(table)} ${where}`,
       params,
-    ),
-    pool.query<{ C: number }>(
-      `SELECT COUNT(*) AS C FROM "_SYS_REPO"."INACTIVE_OBJECT" ${where}`,
-      params,
-    ),
-    pool.query<{
-      PACKAGE_ID: string;
-      OBJECT_NAME: string;
-      OBJECT_SUFFIX: string;
-      VERSION_ID: number;
-      ACTIVATED_AT: string | null;
-      ACTIVATED_BY: string | null;
-    }>(
-      `SELECT PACKAGE_ID, OBJECT_NAME, OBJECT_SUFFIX, VERSION_ID, ACTIVATED_AT, ACTIVATED_BY
-       FROM "_SYS_REPO"."ACTIVE_OBJECT" ${where}
-       ORDER BY OBJECT_NAME LIMIT ?`,
-      [...params, limit],
-    ),
-    pool.query<{
-      PACKAGE_ID: string;
-      OBJECT_NAME: string;
-      OBJECT_SUFFIX: string;
-      VERSION_ID: number;
-      LAST_CHANGED_AT: string | null;
-      OWNER: string | null;
-    }>(
-      `SELECT PACKAGE_ID, OBJECT_NAME, OBJECT_SUFFIX, VERSION_ID, LAST_CHANGED_AT, OWNER
-       FROM "_SYS_REPO"."INACTIVE_OBJECT" ${where}
-       ORDER BY OBJECT_NAME LIMIT ?`,
-      [...params, limit],
-    ),
-  ]);
+    );
+    return rows[0]?.C ?? 0;
+  };
 
-  const all: PackageObjectItem[] = [
-    ...activeRows.map<PackageObjectItem>((r) => ({
-      packageId: r.PACKAGE_ID,
-      objectName: r.OBJECT_NAME,
-      objectSuffix: r.OBJECT_SUFFIX,
-      status: 'active',
-      versionId: r.VERSION_ID,
-      changedAt: r.ACTIVATED_AT ?? undefined,
-      changedBy: r.ACTIVATED_BY ?? undefined,
-    })),
-    ...inactiveRows.map<PackageObjectItem>((r) => ({
-      packageId: r.PACKAGE_ID,
-      objectName: r.OBJECT_NAME,
-      objectSuffix: r.OBJECT_SUFFIX,
-      status: 'inactive',
-      versionId: r.VERSION_ID,
-      changedAt: r.LAST_CHANGED_AT ?? undefined,
-      changedBy: r.OWNER ?? undefined,
-    })),
-  ];
-  // 排序：已激活优先，同名按类型，稳定可读
-  all.sort((a, b) => {
-    if (a.status !== b.status) return a.status === 'active' ? -1 : 1;
-    if (a.objectName !== b.objectName) return a.objectName < b.objectName ? -1 : 1;
-    return a.objectSuffix < b.objectSuffix ? -1 : 1;
+  const page = await runPaged<PackageObjectItem, 'objects'>('objects', limit, {
+    count: async () => {
+      const [activeCount, inactiveCount] = await Promise.all([countOf('ACTIVE_OBJECT'), countOf('INACTIVE_OBJECT')]);
+      return activeCount + inactiveCount;
+    },
+    items: async () => {
+      const [activeRows, inactiveRows] = await Promise.all([
+        pool.query<{
+          PACKAGE_ID: string;
+          OBJECT_NAME: string;
+          OBJECT_SUFFIX: string;
+          VERSION_ID: number;
+          ACTIVATED_AT: string | null;
+          ACTIVATED_BY: string | null;
+        }>(
+          `SELECT PACKAGE_ID, OBJECT_NAME, OBJECT_SUFFIX, VERSION_ID, ACTIVATED_AT, ACTIVATED_BY
+           FROM "_SYS_REPO"."ACTIVE_OBJECT" ${where}
+           ORDER BY OBJECT_NAME LIMIT ?`,
+          [...params, limit],
+        ),
+        pool.query<{
+          PACKAGE_ID: string;
+          OBJECT_NAME: string;
+          OBJECT_SUFFIX: string;
+          VERSION_ID: number;
+          LAST_CHANGED_AT: string | null;
+          OWNER: string | null;
+        }>(
+          `SELECT PACKAGE_ID, OBJECT_NAME, OBJECT_SUFFIX, VERSION_ID, LAST_CHANGED_AT, OWNER
+           FROM "_SYS_REPO"."INACTIVE_OBJECT" ${where}
+           ORDER BY OBJECT_NAME LIMIT ?`,
+          [...params, limit],
+        ),
+      ]);
+      const all: PackageObjectItem[] = [
+        ...activeRows.map<PackageObjectItem>((r) => ({
+          packageId: r.PACKAGE_ID,
+          objectName: r.OBJECT_NAME,
+          objectSuffix: r.OBJECT_SUFFIX,
+          status: 'active',
+          versionId: r.VERSION_ID,
+          changedAt: r.ACTIVATED_AT ?? undefined,
+          changedBy: r.ACTIVATED_BY ?? undefined,
+        })),
+        ...inactiveRows.map<PackageObjectItem>((r) => ({
+          packageId: r.PACKAGE_ID,
+          objectName: r.OBJECT_NAME,
+          objectSuffix: r.OBJECT_SUFFIX,
+          status: 'inactive',
+          versionId: r.VERSION_ID,
+          changedAt: r.LAST_CHANGED_AT ?? undefined,
+          changedBy: r.OWNER ?? undefined,
+        })),
+      ];
+      // 排序：已激活优先，同名按类型，稳定可读
+      all.sort((a, b) => {
+        if (a.status !== b.status) return a.status === 'active' ? -1 : 1;
+        if (a.objectName !== b.objectName) return a.objectName < b.objectName ? -1 : 1;
+        return a.objectSuffix < b.objectSuffix ? -1 : 1;
+      });
+      return all;
+    },
   });
 
-  const count = (activeCount[0]?.C ?? 0) + (inactiveCount[0]?.C ?? 0);
-  return {
-    packageId,
-    count,
-    limit,
-    truncated: count > limit,
-    objects: all.slice(0, limit),
-  };
+  return { packageId, count: page.count, limit: page.limit, truncated: page.truncated, objects: page.objects };
 }

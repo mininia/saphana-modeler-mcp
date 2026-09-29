@@ -30,7 +30,15 @@ import type { HanaConfig } from '../config/config.js';
 import { HanaBusinessError } from './errors.js';
 import { logger } from './logger.js';
 
-/** XS HTTP 服务端口（80<instance>，与官方文档 §8.2 及本库实测一致） */
+/**
+ * XS Classic 设计时 REST 基础路径的默认值（官方默认安装路径）。
+ *
+ * 定义在这里而非 config，是因为构造 XsRestClient 时要对**任何** HanaConfig 都成立 ——
+ * 包括单元测试里刻意构造的极简桩（只有 host/instance/user/password）。缺了兜底，
+ * 一个传了不完整配置的调用方会在构造器里拿到 `undefined.replace` 的 TypeError，
+ * 而那个报错完全指不出"少了哪个字段"。
+ * config.ts 的 HANA_XS_BASE_PATH 默认值引用本常量，故默认值全仓只有这一份定义。
+ */
 export const XS_BASE_PATH = '/sap/hana/xs/dt/base';
 
 /** SapBackPack 头 JSON 的字段（集中在常量表，便于按 SPS 调字段名/大小写） */
@@ -55,7 +63,14 @@ export interface FileMeta {
   Attributes?: { SapBackPack?: { Activated?: boolean; IsDeletion?: boolean } };
   /** 乐观锁 ETag（字符串，实测为毫秒时间戳） */
   ETag?: string;
-  SapBackPack?: { Version?: number; Type?: number; ActivatedAt?: number; ActivatedBy?: string; ObjectStatus?: string; IsDeletion?: boolean };
+  SapBackPack?: {
+    Version?: number;
+    Type?: number;
+    ActivatedAt?: number;
+    ActivatedBy?: string;
+    ObjectStatus?: string;
+    IsDeletion?: boolean;
+  };
   [key: string]: unknown;
 }
 
@@ -106,7 +121,7 @@ export function extractCheckResult(
   const msg = cr.error_msg ?? cr.errorMsg;
   return {
     consistent: activated,
-    message: activated ? undefined : (msg ? String(msg) : '激活检查未通过'),
+    message: activated ? undefined : msg ? String(msg) : '激活检查未通过',
     errorCode: code !== undefined ? String(code) : undefined,
     raw: cr,
   };
@@ -203,7 +218,9 @@ export class XsRestClient {
     const host = config.host;
     const port = config.xsPort ?? Number(`80${config.instance}`);
     this.baseUrl = `http://${host}:${port}`;
-    this.basePath = config.xsBasePath?.replace(/\/+$/, '') ?? XS_BASE_PATH;
+    // 默认值单点在 XS_BASE_PATH（本文件），config 的 HANA_XS_BASE_PATH zod default 引用同一常量；
+    // 这里保留兜底是因为 XsRestClient 要对"字段缺失的配置"也能给出可用行为，而不是 TypeError
+    this.basePath = (config.xsBasePath ?? XS_BASE_PATH).replace(/\/+$/, '');
     this.user = config.user;
     this.password = config.password;
   }
@@ -355,41 +372,43 @@ export class XsRestClient {
       workspaces: safeJson<{ UserName?: string; Id?: string; Workspaces?: unknown[] }>(resp.body),
     };
   }
-/** GET /base/workspace 原始体（当前用户 workspace 列表） */
-    async workspace(): Promise<{ UserName?: string; Id?: string; Workspaces?: Array<{ Name?: string; Id?: string }> }> {
-      const resp = await this.authed(`${this.restBase}/workspace`, { method: 'GET' });
-      this.assertOk(resp, 'workspace 列表');
-      return safeJson<{ UserName?: string; Id?: string; Workspaces?: Array<{ Name?: string; Id?: string }> }>(resp.body) ?? {};
-    }
+  /** GET /base/workspace 原始体（当前用户 workspace 列表） */
+  async workspace(): Promise<{ UserName?: string; Id?: string; Workspaces?: Array<{ Name?: string; Id?: string }> }> {
+    const resp = await this.authed(`${this.restBase}/workspace`, { method: 'GET' });
+    this.assertOk(resp, 'workspace 列表');
+    return (
+      safeJson<{ UserName?: string; Id?: string; Workspaces?: Array<{ Name?: string; Id?: string }> }>(resp.body) ?? {}
+    );
+  }
 
-    /**
-     * POST /base/workspace：建立 workspace（XS 会话级，仓库写 inactive 版本的前置上下文）。
-     * 实测：201，JSON 体 {"Name":…} + Slug 头。
-     */
-    async createWorkspace(name: string): Promise<unknown> {
-      const resp = await this.authed(`${this.restBase}/workspace`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Slug: name },
-        body: JSON.stringify({ Name: name }),
-      });
-      // 允许 200/201（部分 SPS 对已存在 workspace 返回 200）
-      if (resp.status !== 200 && resp.status !== 201) {
-        throw new HanaBusinessError(this.describeError(resp, `创建 workspace ${name}`));
-      }
-      return safeJson(resp.body) ?? {};
+  /**
+   * POST /base/workspace：建立 workspace（XS 会话级，仓库写 inactive 版本的前置上下文）。
+   * 实测：201，JSON 体 {"Name":…} + Slug 头。
+   */
+  async createWorkspace(name: string): Promise<unknown> {
+    const resp = await this.authed(`${this.restBase}/workspace`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Slug: name },
+      body: JSON.stringify({ Name: name }),
+    });
+    // 允许 200/201（部分 SPS 对已存在 workspace 返回 200）
+    if (resp.status !== 200 && resp.status !== 201) {
+      throw new HanaBusinessError(this.describeError(resp, `创建 workspace ${name}`));
     }
+    return safeJson(resp.body) ?? {};
+  }
 
-    /**
-     * get-or-create workspace：列表命中直接复用，否则创建。
-     * @param name 建议名（如 'ZDEMO'）；按名字精确匹配复用，避免重复创建。
-     */
-    async getOrCreateWorkspace(name: string): Promise<string> {
-      const list = await this.workspace();
-      const existing = (list.Workspaces ?? []).find((w) => w.Name === name);
-      if (existing?.Name) return existing.Name;
-      await this.createWorkspace(name);
-      return name;
-    }
+  /**
+   * get-or-create workspace：列表命中直接复用，否则创建。
+   * @param name 建议名（如 'ZDEMO'）；按名字精确匹配复用，避免重复创建。
+   */
+  async getOrCreateWorkspace(name: string): Promise<string> {
+    const list = await this.workspace();
+    const existing = (list.Workspaces ?? []).find((w) => w.Name === name);
+    if (existing?.Name) return existing.Name;
+    await this.createWorkspace(name);
+    return name;
+  }
 
   /**
    * GET /base/file/<path>?parts=meta：文件元数据（ETag / 激活状态 / workspace 版本）。
@@ -430,17 +449,14 @@ export class XsRestClient {
       Directory: true,
       ...(description ? { Description: description } : {}),
     });
-    const resp = await this.authed(
-      `${this.restBase}/file/${encodePath(target)}/`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Slug: packageName,
-        },
-        body,
+    const resp = await this.authed(`${this.restBase}/file/${encodePath(target)}/`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Slug: packageName,
       },
-    );
+      body,
+    });
     this.assertOk(resp, `创建包 ${packageId}`);
     return safeJson<FileMeta>(resp.body) ?? ({} as FileMeta);
   }
@@ -470,17 +486,14 @@ export class XsRestClient {
     }
     const headers: Record<string, string> = {
       'Content-Type': 'application/xml; charset=utf-8',
-      ...(Object.keys(sapBackPack).length > 0 ? { 'SapBackPack': JSON.stringify(sapBackPack) } : {}),
+      ...(Object.keys(sapBackPack).length > 0 ? { SapBackPack: JSON.stringify(sapBackPack) } : {}),
     };
     if (opts.ifMatch) headers['If-Match'] = opts.ifMatch;
-    const resp = await this.authed(
-      `${this.restBase}/file/${encodePath(path)}`,
-      {
-        method: 'PUT',
-        headers,
-        body: content,
-      },
-    );
+    const resp = await this.authed(`${this.restBase}/file/${encodePath(path)}`, {
+      method: 'PUT',
+      headers,
+      body: content,
+    });
     // 乐观锁冲突（显式 If-Match 与服务端不符）：412 Precondition Failed。
     // 只认「带 If-Match 的 412」，避免激活失败等其他 4xx 被误分类。
     if (opts.ifMatch && resp.status === 412) {
@@ -505,12 +518,7 @@ export class XsRestClient {
         );
         return parsed as FileMeta & { CheckResult?: WriteCheckResult };
       }
-      throw new XsWriteError(
-        this.describeError(resp, `写文件 ${path}`),
-        resp.status,
-        cr,
-        capDetail(resp.body),
-      );
+      throw new XsWriteError(this.describeError(resp, `写文件 ${path}`), resp.status, cr, capDetail(resp.body));
     }
     return parsed ?? ({} as FileMeta);
   }
@@ -527,7 +535,7 @@ export class XsRestClient {
       method: 'PUT',
       headers: {
         'Content-Type': 'application/xml; charset=utf-8',
-        'SapBackPack': JSON.stringify({ Check: true }),
+        SapBackPack: JSON.stringify({ Check: true }),
       },
       body: content,
     });
@@ -552,7 +560,7 @@ export class XsRestClient {
     const msg = cr?.error_msg ?? cr?.errorMsg ?? j?.Message ?? (activated ? undefined : extractErrorDetail(resp.body));
     return {
       consistent: activated,
-      message: activated ? undefined : (msg ? String(msg) : `校验未通过（HTTP ${resp.status}）`),
+      message: activated ? undefined : msg ? String(msg) : `校验未通过（HTTP ${resp.status}）`,
       errorCode: code !== undefined ? String(code) : undefined,
       raw: resp.body,
     };
@@ -585,7 +593,12 @@ export class XsRestClient {
     let lastError = '';
     for (const v of variants) {
       const resp = await this.authed(`${this.restBase}/xfer/export/${v}`, { method: 'GET' }, { raw: true });
-      if (resp.status >= 200 && resp.status < 300 && resp.buffer && resp.buffer.subarray(0, 2).toString('ascii') === 'PK') {
+      if (
+        resp.status >= 200 &&
+        resp.status < 300 &&
+        resp.buffer &&
+        resp.buffer.subarray(0, 2).toString('ascii') === 'PK'
+      ) {
         return { buffer: resp.buffer, url: `${this.restBase}/xfer/export/${v}` };
       }
       lastError = `HTTP ${resp.status}: ${resp.body.replace(/\s+/g, ' ').slice(0, 200)}`;
@@ -620,12 +633,18 @@ export class XsRestClient {
     this.assertOk(post, `发起导入 ${packageId}/${fileName}`, true);
     const location = post.headers['location'] ?? post.headers['contentlocation'];
     if (!location) {
-      throw new HanaBusinessError(`XS 导入 ${packageId}/${fileName} 未返回上传 Location（HTTP ${post.status}）：${post.body.slice(0, 200)}`);
+      throw new HanaBusinessError(
+        `XS 导入 ${packageId}/${fileName} 未返回上传 Location（HTTP ${post.status}）：${post.body.slice(0, 200)}`,
+      );
     }
     const uploadUrl = /^https?:\/\//i.test(location) ? location : `${this.baseUrl}${location}`;
     // 实测：文本内容必须显式声明 charset=utf-8——缺省时 XS 层按 Latin-1 解码请求体，
     // 中文等非 ASCII 描述会被双重编码成乱码
-    const contentType = opts.contentType ?? (fileName.endsWith('.xml') || fileName.endsWith('.calculationview') ? 'application/xml; charset=utf-8' : 'application/octet-stream');
+    const contentType =
+      opts.contentType ??
+      (fileName.endsWith('.xml') || fileName.endsWith('.calculationview')
+        ? 'application/xml; charset=utf-8'
+        : 'application/octet-stream');
     const put = await this.authed(uploadUrl, {
       method: 'PUT',
       headers: {
@@ -658,7 +677,10 @@ export class XsRestClient {
 
 /** 路径片段 URL 编码（保留 '/'，'..' 等非法序列由上层白名单拦截） */
 function encodePath(path: string): string {
-  return path.split('/').map((s) => encodeURIComponent(s)).join('/');
+  return path
+    .split('/')
+    .map((s) => encodeURIComponent(s))
+    .join('/');
 }
 
 /** 安全 JSON 解析（失败返回 undefined，不抛） */

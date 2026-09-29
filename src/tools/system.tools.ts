@@ -1,8 +1,16 @@
+/**
+ * 系统信息工具（分组 **read**）：hana_system_get_info（数据库/主机基础信息）、
+ * hana_check_privileges（当前用户权限矩阵与建模能力摘要）。
+ *
+ * 两者都是对 SYS.M_* 的只读查询，经 registerVisibleTool 注册，不经写预检。
+ */
+
 import type { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import { withErrorEnvelope } from '../core/errors.js';
 import { getPrivileges, getSystemInfo } from '../services/system.service.js';
 import { registerVisibleTool, type ToolContext } from './index.js';
+import { toToolResult } from './common.js';
 import type { Envelope } from '../types/hana.js';
 
 export function registerSystemTools(server: McpServer, ctx: ToolContext): void {
@@ -19,10 +27,7 @@ export function registerSystemTools(server: McpServer, ctx: ToolContext): void {
     },
     async (_params) => {
       const envelope: Envelope = await withErrorEnvelope(() => getSystemInfo(ctx.pool));
-      return {
-        content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }],
-        structuredContent: envelope,
-      };
+      return toToolResult(envelope);
     },
   );
 
@@ -39,10 +44,7 @@ export function registerSystemTools(server: McpServer, ctx: ToolContext): void {
     },
     async (_params) => {
       const envelope: Envelope = await withErrorEnvelope(() => getPrivileges(ctx.pool));
-      return {
-        content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }],
-        structuredContent: envelope,
-      };
+      return toToolResult(envelope);
     },
   );
 }

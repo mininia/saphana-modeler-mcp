@@ -11,8 +11,11 @@
  */
 
 import type { HanaPool } from '../core/hana-client.js';
+import { num, round, US_PER_SECOND } from '../core/num.js';
+import { truncateWithNote } from '../core/text.js';
+import { logger } from '../core/logger.js';
 import { probeVisibility, emptyIsAmbiguous, type Visibility } from './visibility.service.js';
-import { formatDuration } from './health.rules.js';
+import { addCaveat, formatDuration, reportCheckedAt, type DiagnosticReportBase } from './health.rules.js';
 
 /** 可查询的段落 */
 export type ActivitySection = 'blocking' | 'transactions' | 'statements';
@@ -81,8 +84,7 @@ export interface LongStatementItem {
   connectionInfo: ConnInfo | null;
 }
 
-export interface ActivityReport {
-  checkedAt: string;
+export interface ActivityReport extends DiagnosticReportBase {
   minDurationSec: number;
   /**
    * 可见性上下文。缺 CATALOG READ / MONITORING 时，这些视图只返回**自己**的会话/事务/语句，
@@ -97,11 +99,6 @@ export interface ActivityReport {
   caveats: string[];
 }
 
-const num = (v: unknown): number => (v == null ? 0 : Number(v));
-const round = (v: number, d = 2): number => Number(v.toFixed(d));
-const truncate = (s: string | null | undefined, n = 400): string =>
-  s == null ? '' : s.length > n ? `${s.slice(0, n)}…（已截断，共 ${s.length} 字符）` : s;
-
 /** 取一批连接的画像：按需 IN 查询，避免把 M_CONNECTIONS（实测 8810 行）整表拉回 */
 async function fetchConnections(pool: HanaPool, ids: number[]): Promise<Map<number, ConnInfo>> {
   const uniq = Array.from(new Set(ids.filter((i) => Number.isFinite(i))));
@@ -109,8 +106,12 @@ async function fetchConnections(pool: HanaPool, ids: number[]): Promise<Map<numb
   if (uniq.length === 0) return map;
   const placeholders = uniq.map(() => '?').join(', ');
   const rows = await pool.query<{
-    CONNECTION_ID: unknown; USER_NAME: string; CLIENT_HOST: string; CLIENT_APPLICATION: string;
-    CURRENT_SCHEMA_NAME: string; CONNECTION_TYPE: string;
+    CONNECTION_ID: unknown;
+    USER_NAME: string;
+    CLIENT_HOST: string;
+    CLIENT_APPLICATION: string;
+    CURRENT_SCHEMA_NAME: string;
+    CONNECTION_TYPE: string;
   }>(
     `SELECT CONNECTION_ID, USER_NAME, CLIENT_HOST, CLIENT_APPLICATION, CURRENT_SCHEMA_NAME, CONNECTION_TYPE
      FROM SYS.M_CONNECTIONS WHERE CONNECTION_ID IN (${placeholders})`,
@@ -143,16 +144,22 @@ async function fetchCurrentStatements(pool: HanaPool, ids: number[]): Promise<Ma
   );
   for (const r of rows) {
     const id = num(r.CONNECTION_ID);
-    if (!map.has(id)) map.set(id, truncate(r.STATEMENT_STRING)); // ORDER BY 保证首次遇到的就是最新
+    if (!map.has(id)) map.set(id, truncateWithNote(r.STATEMENT_STRING, 400)); // ORDER BY 保证首次遇到的就是最新
   }
   return map;
 }
 
 async function collectBlocking(pool: HanaPool, limit: number): Promise<NonNullable<ActivityReport['blocking']>> {
   const rows = await pool.query<{
-    BLOCKED_CONNECTION_ID: unknown; LOCK_OWNER_CONNECTION_ID: unknown; BLOCKED_TIME: string;
-    WAITING_SCHEMA_NAME: string; WAITING_TABLE_NAME: string; WAITING_OBJECT_NAME: string;
-    LOCK_TYPE: string; LOCK_MODE: string; WAIT_SEC: unknown;
+    BLOCKED_CONNECTION_ID: unknown;
+    LOCK_OWNER_CONNECTION_ID: unknown;
+    BLOCKED_TIME: string;
+    WAITING_SCHEMA_NAME: string;
+    WAITING_TABLE_NAME: string;
+    WAITING_OBJECT_NAME: string;
+    LOCK_TYPE: string;
+    LOCK_MODE: string;
+    WAIT_SEC: unknown;
   }>(
     `SELECT BLOCKED_CONNECTION_ID, LOCK_OWNER_CONNECTION_ID, BLOCKED_TIME,
             WAITING_SCHEMA_NAME, WAITING_TABLE_NAME, WAITING_OBJECT_NAME,
@@ -172,8 +179,7 @@ async function collectBlocking(pool: HanaPool, limit: number): Promise<NonNullab
       blockedConnection: num(r.BLOCKED_CONNECTION_ID),
       ownerConnection: num(r.LOCK_OWNER_CONNECTION_ID),
       blockedSince: r.BLOCKED_TIME,
-      object: [r.WAITING_SCHEMA_NAME, r.WAITING_TABLE_NAME || r.WAITING_OBJECT_NAME]
-        .filter(Boolean).join('.'),
+      object: [r.WAITING_SCHEMA_NAME, r.WAITING_TABLE_NAME || r.WAITING_OBJECT_NAME].filter(Boolean).join('.'),
       lockType: r.LOCK_TYPE,
       lockMode: r.LOCK_MODE,
       owner: conns.get(num(r.LOCK_OWNER_CONNECTION_ID)) ?? null,
@@ -188,9 +194,15 @@ async function collectTransactions(
   limit: number,
 ): Promise<NonNullable<ActivityReport['transactions']>> {
   const rows = await pool.query<{
-    CONNECTION_ID: unknown; TRANSACTION_ID: unknown; START_TIME: string; ELAPSED_SEC: unknown;
-    UNDO_LOG_AMOUNT: unknown; CREATED_VERSION_COUNT: unknown; ALLOCATED_VERSION_SIZE: unknown;
-    ACQUIRED_LOCK_COUNT: unknown; LOCK_WAIT_COUNT: unknown;
+    CONNECTION_ID: unknown;
+    TRANSACTION_ID: unknown;
+    START_TIME: string;
+    ELAPSED_SEC: unknown;
+    UNDO_LOG_AMOUNT: unknown;
+    CREATED_VERSION_COUNT: unknown;
+    ALLOCATED_VERSION_SIZE: unknown;
+    ACQUIRED_LOCK_COUNT: unknown;
+    LOCK_WAIT_COUNT: unknown;
   }>(
     `SELECT CONNECTION_ID, TRANSACTION_ID, START_TIME,
             SECONDS_BETWEEN(START_TIME, CURRENT_TIMESTAMP) AS ELAPSED_SEC,
@@ -236,9 +248,16 @@ async function collectStatements(
   // 并把 COMPILED_TIME / LAST_EXECUTED_TIME 一并放进 evidence 供复核。
   // 注意 M_EXPENSIVE_STATEMENTS 才有现成的 DURATION_MICROSEC，但它在两套实测环境里都是空表。
   const rows = await pool.query<{
-    CONNECTION_ID: unknown; STATEMENT_ID: string; STATEMENT_HASH: string; STATEMENT_STATUS: string;
-    ELAPSED_SEC: unknown; COMPILED_TIME: string; LAST_EXECUTED_TIME: string;
-    USED_MEMORY_SIZE: unknown; MAX_LOCKWAIT_TIME: unknown; APPLICATION_SOURCE: string;
+    CONNECTION_ID: unknown;
+    STATEMENT_ID: string;
+    STATEMENT_HASH: string;
+    STATEMENT_STATUS: string;
+    ELAPSED_SEC: unknown;
+    COMPILED_TIME: string;
+    LAST_EXECUTED_TIME: string;
+    USED_MEMORY_SIZE: unknown;
+    MAX_LOCKWAIT_TIME: unknown;
+    APPLICATION_SOURCE: string;
     STATEMENT_STRING: string;
   }>(
     `SELECT CONNECTION_ID, STATEMENT_ID, STATEMENT_HASH, STATEMENT_STATUS,
@@ -267,9 +286,9 @@ async function collectStatements(
         compiledTime: r.COMPILED_TIME,
         lastExecutedTime: r.LAST_EXECUTED_TIME,
         usedMemoryBytes: num(r.USED_MEMORY_SIZE),
-        lockWaitSec: round(num(r.MAX_LOCKWAIT_TIME) / 1e6, 2),
+        lockWaitSec: round(num(r.MAX_LOCKWAIT_TIME) / US_PER_SECOND, 2),
         application: r.APPLICATION_SOURCE ?? '',
-        statement: truncate(r.STATEMENT_STRING),
+        statement: truncateWithNote(r.STATEMENT_STRING, 400),
         connectionInfo: conns.get(id) ?? null,
       };
     }),
@@ -280,7 +299,7 @@ async function collectStatements(
 export async function runActivity(pool: HanaPool, req: ActivityRequest): Promise<ActivityReport> {
   const visibility = await probeVisibility(pool);
   const report: ActivityReport = {
-    checkedAt: new Date().toISOString(),
+    checkedAt: reportCheckedAt(),
     minDurationSec: req.minDurationSec,
     visibility,
     caveats: [],
@@ -304,7 +323,9 @@ export async function runActivity(pool: HanaPool, req: ActivityRequest): Promise
       parts.push(`无超过 ${req.minDurationSec} 秒的活跃事务`);
       pushCaveat(report, visibility, '长事务');
     } else {
-      parts.push(`${report.transactions.count} 个长事务，最长 ${formatDuration(report.transactions.items[0].elapsedSec)}`);
+      parts.push(
+        `${report.transactions.count} 个长事务，最长 ${formatDuration(report.transactions.items[0].elapsedSec)}`,
+      );
     }
   }
   if (req.sections.includes('statements')) {
@@ -321,14 +342,22 @@ export async function runActivity(pool: HanaPool, req: ActivityRequest): Promise
   return report;
 }
 
-/** 空结果 + 无全量权限 → 附一条 caveat（不让"0 条"被读成"没问题"） */
+/**
+ * 空结果 + 无全量权限 → 附一条 caveat（不让"0 条"被读成"没问题"）。
+ * 同时记一条服务端日志：caveat 意味着结论被降级，排障时需要知道是哪一段、在什么权限档位下发生的。
+ */
 function pushCaveat(report: ActivityReport, visibility: Visibility, what: string): void {
   const c = emptyIsAmbiguous(0, visibility.unfiltered);
-  if (c) report.caveats.push(`${what}：${c}`);
+  if (c) {
+    logger.warn({ section: what, unfiltered: visibility.unfiltered }, '空结果可能来自行过滤，已附加 caveat');
+    addCaveat(report.caveats, `${what}：${c}`);
+  }
 }
 
 /** 校验 sections 参数（工具层调用） */
-export function normalizeSections(sections?: string[]): { ok: true; value: ActivitySection[] } | { ok: false; message: string } {
+export function normalizeSections(
+  sections?: string[],
+): { ok: true; value: ActivitySection[] } | { ok: false; message: string } {
   if (!sections || sections.length === 0) return { ok: true, value: [...ALL_SECTIONS] };
   const invalid = sections.filter((s) => !ALL_SECTIONS.includes(s as ActivitySection));
   if (invalid.length > 0) {

@@ -5,7 +5,6 @@ import {
   shouldRegisterTool,
   type ToolFilterConfig,
   type ToolGroup,
-  GROUP_LABELS,
   ALL_TOOL_GROUPS,
   TOOL_GROUPS,
 } from './groups.js';
@@ -119,8 +118,8 @@ function preflightWriteCall(
   );
   return mcpErrorText(
     `被 MCP 安全策略拦截（${verdict.blocking.map((g) => g.code).join(', ')}），请求未执行`,
-    // 先给"本来会发生什么"，再给"为什么被拦"——但**不给**绕过方法：
-    // 拦截消息是返回给调用方（通常是模型）的，写明"改哪项配置可放行"等于把绕过方法交给被拦的一方。
+    // 先给「本来会发生什么」，再给「为什么被拦」——但**不给**绕过方法：
+    // 拦截消息是返回给调用方（通常是模型）的，写明「改哪项配置可放行」等于把绕过方法交给被拦的一方。
     // 补救指引只出现在面向运维的位置（服务启动自检、README）。
     `${formatWritePlan(plan)}\n\n${verdict.text}\n\n该限制由 MCP 服务端的权限策略施加，调用方无法自行解除。`,
   );
@@ -159,8 +158,8 @@ export function logToolFilterSummary(filter: ToolFilterConfig): void {
   if (visibleCount === 0) {
     logger.warn(
       { enabledGroups: groupSummary, allow: filter.allowPatterns, deny: filter.denyPatterns },
-      '当前配置导致没有任何工具被注册——MCP 客户端将看不到任何工具（tools/list 不被服务端声明）。'
-        + '若非预期，请检查 HANA_TOOL_GROUPS/HANA_TOOL_ALLOW/HANA_TOOL_DENY 配置。',
+      '当前配置导致没有任何工具被注册——MCP 客户端将看不到任何工具（tools/list 不被服务端声明）。' +
+        '若非预期，请检查 HANA_TOOL_GROUPS/HANA_TOOL_ALLOW/HANA_TOOL_DENY 配置。',
     );
   }
 }
@@ -184,6 +183,9 @@ export function registerAllTools(server: McpServer, ctx: ToolContext): void {
   const filter = ctx.toolFilter;
   const anyVisible = Object.keys(TOOL_GROUPS).some((name) => shouldRegisterTool(name, filter));
   if (!anyVisible) {
+    // 占位工具在 TOOL_GROUPS 里登记为 read（一致性测试据此扫出"已注册但未登记"的漏配），
+    // 但这里**刻意**不走 registerVisibleTool：它存在的意义正是"其余工具全不可见"时仍让
+    // tools/list 可达，再经一遍可见性过滤就永远不会被注册。
     server.registerTool(
       'hana_no_tools_available',
       {
@@ -204,11 +206,9 @@ export function registerAllTools(server: McpServer, ctx: ToolContext): void {
         ],
       }),
     );
-    logger.warn(
-      '已注册占位工具 hana_no_tools_available：当前配置未启用任何业务工具。',
-    );
+    logger.warn('已注册占位工具 hana_no_tools_available：当前配置未启用任何业务工具。');
   }
 }
 
-/** 导出分组元信息供文档/测试/外部使用 */
-export { type ToolGroup, GROUP_LABELS, ALL_TOOL_GROUPS, TOOL_GROUPS, shouldRegisterTool };
+/** 导出分组元信息供文档/测试/外部使用（分组中文标签在 groups.ts，需要时直接从此处或彼处引入） */
+export { type ToolGroup, ALL_TOOL_GROUPS, TOOL_GROUPS, shouldRegisterTool };

@@ -176,7 +176,10 @@ export function deriveNodeSql(def: ViewDefinition, nodeId: string): DerivedNodeS
         for (const g of aggGroupBy(child)) childE.add(g);
         for (const m of aggMeasures(child)) childE.add(m.column);
       }
-      emitCols.set(inp.node, outputColumns(child).filter((c) => childE.has(c)));
+      emitCols.set(
+        inp.node,
+        outputColumns(child).filter((c) => childE.has(c)),
+      );
       propagate(inp.node);
     });
   };
@@ -216,33 +219,48 @@ function assertSupportedNode(node: ViewNode): void {
   }
 }
 
+/**
+ * BW on HANA：XML 中 schemaName="ABAP" 是**源系统名**而非数据库 schema，真实表在 SAPABAP1。
+ *
+ * 单点导出：XML 推导（leafSql）与诊断追溯（preview-diagnose 基表可达性）必须用同一映射，
+ * 否则同一张表会出现「推导能查、诊断报不可访问」的自相矛盾结论。
+ */
+export function normalizeBwSchema(schemaName: string): string {
+  return schemaName === 'ABAP' ? 'SAPABAP1' : schemaName;
+}
+
+/**
+ * 外部计算视图数据源的 resourceUri → _SYS_BIC 运行时对象（包路径 + 对象名）。
+ * 形如 `/包路径/calculationviews/对象名`；无法解析返回 null，由调用方决定报错（推导）或跳过（诊断）。
+ *
+ * 单点导出：推导与诊断共用同一解析规则，避免正则在两处漂移（漂移的表现是
+ * 「能推导出 SQL，诊断却说该上游对象不存在」）。
+ */
+export function parseResourceUri(uri: string): { pkg: string; name: string } | null {
+  const m = /^\/(.+)\/calculationviews\/([^/]+)$/.exec(uri);
+  return m ? { pkg: m[1], name: m[2] } : null;
+}
+
 /** 叶子数据源：基表（DATA_BASE_TABLE）或外部计算视图（CALCULATION_VIEW，引用其 _SYS_BIC 运行时对象）；按需选列 */
 function leafSql(ds: ViewDataSource, need: string[] | undefined): string {
   const cols = need && need.length > 0 ? need.map((c) => quoteIdentifier(c)).join(', ') : '*';
   if (ds.type === 'DATA_BASE_TABLE' && ds.schemaName && ds.columnObjectName) {
-    // 纵深防御：叶子表 schema 走白名单（SAPABAP1 等）；不在白名单提示用 HANA_SCHEMA_ALLOW 追加
-    // BW on HANA：XML 中 schemaName="ABAP" 是源系统名而非数据库 schema，真实表在 SAPABAP1
-    const schema = ds.schemaName === 'ABAP' ? 'SAPABAP1' : ds.schemaName;
-    try {
-      assertSchemaAllowed(schema);
-    } catch {
-      throw new HanaBusinessError(
-        `叶子表 schema "${schema}" 不在允许列表（系统 schema：_SYS_BIC/_SYS_BI/_SYS_REPO/SYS/_SYS_XS/SAPABAP1，或通过 HANA_SCHEMA_ALLOW 配置追加）`,
-      );
-    }
+    // 纵深防御：叶子表 schema 走白名单（SAPABAP1 等）。不在白名单时 assertSchemaAllowed 直接抛
+    // HanaBusinessError（文案由 core/sql 用 describeSchemaWhitelist 生成，含 HANA_SCHEMA_ALLOW 指引），
+    // 此处不再包一层改写文案——改写只会让白名单变更时漏改这份副本。
+    const schema = normalizeBwSchema(ds.schemaName);
+    assertSchemaAllowed(schema);
     return `( SELECT ${cols} FROM ${quoteIdentifier(schema)}.${quoteIdentifier(ds.columnObjectName)} )`;
   }
   if (ds.type === 'CALCULATION_VIEW' && ds.resourceUri) {
     // resourceUri 形如 /包路径/calculationviews/对象名 → _SYS_BIC."包路径/对象名"（引用上游已激活视图）
-    const m = /^\/(.+)\/calculationviews\/([^/]+)$/.exec(ds.resourceUri);
-    if (!m) {
+    const parsed = parseResourceUri(ds.resourceUri);
+    if (!parsed) {
       throw new HanaBusinessError(`数据源 ${ds.id} 的 resourceUri "${ds.resourceUri}" 无法解析为 _SYS_BIC 对象`);
     }
-    const pkg = m[1];
-    const name = m[2];
-    assertSafeRuntimeName(pkg, '数据源包名');
-    assertSafeRuntimeName(name, '数据源对象名');
-    return `( SELECT ${cols} FROM ${qualifyName('_SYS_BIC', `${pkg}/${name}`)} )`;
+    assertSafeRuntimeName(parsed.pkg, '数据源包名');
+    assertSafeRuntimeName(parsed.name, '数据源对象名');
+    return `( SELECT ${cols} FROM ${qualifyName('_SYS_BIC', `${parsed.pkg}/${parsed.name}`)} )`;
   }
   throw new HanaBusinessError(
     `数据源 ${ds.id}（type=${ds.type || '?'}）暂不支持推导预览；当前仅支持基表（DATA_BASE_TABLE）与外部计算视图（CALCULATION_VIEW）`,
@@ -416,7 +434,10 @@ function splitTopLevelArgs(s: string): string[] {
 }
 
 /** 单一输入节点的通用解析：别名（带引号，防保留字冲突）+ 输入 SQL + 输出列→来源映射 */
-function singleInput(node: ViewNode, gen: (ref: string) => string): { alias: string; src: string; map: Map<string, string> } {
+function singleInput(
+  node: ViewNode,
+  gen: (ref: string) => string,
+): { alias: string; src: string; map: Map<string, string> } {
   if (node.inputs.length !== 1) {
     throw new HanaBusinessError(`节点 ${node.id} 应有 1 个输入，实际 ${node.inputs.length}，无法推导`);
   }
@@ -465,7 +486,9 @@ function joinSql(node: ViewNode, gen: (ref: string) => string, emit: string[]): 
   }
   const joinType = JOIN_TYPE_MAP[(node.joinType ?? 'inner').toLowerCase().replace(/[\s_]/g, '')];
   if (!joinType) {
-    throw new HanaBusinessError(`Join 节点 ${node.id} 的 joinType=${node.joinType ?? '?'} 暂不支持（支持 inner/leftOuter/rightOuter/fullOuter）`);
+    throw new HanaBusinessError(
+      `Join 节点 ${node.id} 的 joinType=${node.joinType ?? '?'} 暂不支持（支持 inner/leftOuter/rightOuter/fullOuter）`,
+    );
   }
   const inputs = node.inputs.map((inp, i) => ({ inp, alias: `"I${i + 1}"`, src: gen(inp.node) }));
   // 输出列 → 提供它的输入别名与源列（后置覆盖：equi-join 键任一侧等价）
@@ -518,7 +541,10 @@ function aggregationSql(node: ViewNode, gen: (ref: string) => string, emit: stri
   const parts = emit.map((a) => {
     if (measureMap.has(a)) {
       const agg = AGG_MAP[(measureMap.get(a) ?? 'sum').toLowerCase()];
-      if (!agg) throw new HanaBusinessError(`Aggregation 节点 ${node.id} 的聚合函数 ${measureMap.get(a)} 暂不支持（支持 sum/count/min/max/avg）`);
+      if (!agg)
+        throw new HanaBusinessError(
+          `Aggregation 节点 ${node.id} 的聚合函数 ${measureMap.get(a)} 暂不支持（支持 sum/count/min/max/avg）`,
+        );
       return `${agg}(${resolve(a)}) AS ${quoteIdentifier(a)}`;
     }
     if (groupSet.has(a)) return emitCol(alias, map.get(a) ?? a, a);
@@ -571,7 +597,9 @@ function rankSql(node: ViewNode, gen: (ref: string) => string, emit: string[]): 
     return emitCol(alias, map.get(a) ?? a, a);
   });
   const partition = rk.partitionBy.map((c) => resolve(c)).join(', ');
-  const order = rk.orderBy.map((o) => `${resolve(o.column)} ${(o.direction ?? 'ASC').toUpperCase() === 'DESC' ? 'DESC' : 'ASC'}`).join(', ');
+  const order = rk.orderBy
+    .map((o) => `${resolve(o.column)} ${(o.direction ?? 'ASC').toUpperCase() === 'DESC' ? 'DESC' : 'ASC'}`)
+    .join(', ');
   const threshold = Math.max(1, Math.floor(rk.threshold));
   const windowCol = `"__RANK_${node.id.replace(/[^A-Za-z0-9_]/g, '')}"`;
   const outList = emit.map((c) => quoteIdentifier(c)).join(', ');
@@ -586,13 +614,17 @@ function rankSql(node: ViewNode, gen: (ref: string) => string, emit: string[]): 
 /** Aggregation 分组列（格式 A=aggregateBy；格式 B=无聚合函数的 viewAttribute） */
 function aggGroupBy(node: ViewNode): string[] {
   const formatA = node.aggregateBy.length > 0 || node.measures.length > 0;
-  return formatA ? node.aggregateBy : node.attributes.filter((a) => !node.attributeAggregations.some((m) => m.id === a));
+  return formatA
+    ? node.aggregateBy
+    : node.attributes.filter((a) => !node.attributeAggregations.some((m) => m.id === a));
 }
 
 /** Aggregation 度量（格式 A=measureMapping；格式 B=带 aggregationType 的 viewAttribute） */
 function aggMeasures(node: ViewNode): ViewNodeMeasure[] {
   const formatA = node.aggregateBy.length > 0 || node.measures.length > 0;
-  return formatA ? node.measures : node.attributeAggregations.map((m) => ({ column: m.id, aggregationType: m.aggregationType }));
+  return formatA
+    ? node.measures
+    : node.attributeAggregations.map((m) => ({ column: m.id, aggregationType: m.aggregationType }));
 }
 
 /** 节点自身引用的列（filter + 计算列公式 + 属性过滤 ID，均以输出列名表示） */

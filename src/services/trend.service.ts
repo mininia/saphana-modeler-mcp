@@ -22,7 +22,10 @@
  */
 
 import type { HanaPool } from '../core/hana-client.js';
+import { GIB, KIB, num, round } from '../core/num.js';
+import { logger } from '../core/logger.js';
 import { probeVisibility, emptyIsAmbiguous, type Visibility } from './visibility.service.js';
+import { addCaveat, reportCheckedAt, type DiagnosticReportBase } from './health.rules.js';
 
 /** 可选的指标组 */
 export type TrendMetric = 'cpu' | 'memory' | 'disk' | 'network' | 'swap';
@@ -53,8 +56,7 @@ export interface TrendPoint {
   values: Record<string, TrendValue>;
 }
 
-export interface TrendReport {
-  checkedAt: string;
+export interface TrendReport extends DiagnosticReportBase {
   window: { from: string; to: string; hours: number; bucketMinutes: number; buckets: number };
   metrics: TrendMetric[];
   /**
@@ -68,11 +70,6 @@ export interface TrendReport {
   visibility: Visibility;
   caveats: string[];
 }
-
-const num = (v: unknown): number => (v == null ? 0 : Number(v));
-const round = (v: number, d = 2): number => Number(v.toFixed(d));
-const GIB = 1024 ** 3;
-const KIB = 1024;
 
 export const DEFAULT_BUCKET_MINUTES = 60;
 /** 窗口上限（90 天）：超过保留期没有意义，且能防住误传超大值把库拖住 */
@@ -90,15 +87,16 @@ export function normalizeTrendMetrics(
   return { ok: true, value: metrics as TrendMetric[] };
 }
 
-/** 每个指标组产出哪些数值列（键名即输出里的字段名，带单位后缀以免误读） */
-const METRIC_KEYS: Record<TrendMetric, readonly string[]> = {
-  cpu: ['cpuPct'],
-  memory: ['memoryUsedGiB', 'memoryUsedPct'],
-  disk: ['diskUsedGiB', 'diskUsedPct'],
-  network: ['networkInKiB', 'networkOutKiB'],
-  // 采样间隔约 10 秒，故这两列是"每个采样周期内的字节数"，不是速率
-  swap: ['swapInBytes', 'swapOutBytes'],
-};
+/*
+ * 各指标组产出的数值列（键名即输出字段名，带单位后缀以免误读）——与下方 `put(...)` 调用
+ * 一一对应，原先那份 `METRIC_KEYS` 常量表零引用（死代码）已删除，但把口径留在这里：
+ *   cpu     → cpuPct
+ *   memory  → memoryUsedGiB / memoryUsedPct（占**配额**比，与 Cockpit 的 "Used %" 同口径）
+ *   disk    → diskUsedGiB / diskUsedPct
+ *   network → networkInKiB / networkOutKiB
+ *   swap    → swapInBytes / swapOutBytes
+ * ⚠ 采样间隔约 10 秒，故 network / swap 是"每个采样周期内的量"，**不是速率**。
+ */
 
 /**
  * 执行趋势查询。
@@ -121,18 +119,36 @@ export async function runTrend(pool: HanaPool, req: TrendRequest): Promise<Trend
       `SELECT MIN(TIME) AS T0, MAX(TIME) AS T1 FROM _SYS_STATISTICS.HOST_LOAD_HISTORY_HOST`,
     );
     if (r[0]?.T0 && r[0]?.T1) {
+      // ⚠ 口径不一致（已知，暂不在此处修）：这里用 `new Date(时间串)` 在**客户端**解析 HANA 的
+      // TIME 值（无时区后缀 → 按进程时区解释），而窗口与分桶基准是**库内的 CURRENT_TIMESTAMP**。
+      // 两者相差一个时区偏移时，spansHours 会有整小时级偏差（DST 切换处再差 1 小时）。
+      // 正解是把跨度的计算下推到 SQL（如 SECONDS_BETWEEN(MIN(TIME), MAX(TIME))/3600.0），
+      // 那要改这条既有语句的文本；本模块的实机验收已通过，**没有实机环境不凭空改 SQL**，
+      // 故保留现状并由下面的 Number.isFinite 兜底把"解析失败"如实报出来。
       const spansHours = round((new Date(r[0].T1).getTime() - new Date(r[0].T0).getTime()) / 3_600_000, 1);
       const coversWindow = spansHours >= req.hours;
       retention = { earliest: r[0].T0, latest: r[0].T1, spansHours, coversWindow };
       if (!coversWindow) {
         caveats.push(
-          `请求窗口 ${req.hours} 小时超出了历史层保留期（实测该实例约 ${spansHours} 小时）——`
-          + `返回的只是窗口的后半段。**未覆盖的那部分不等于"正常"**，只是没有数据。`
-          + '要拉长保留期需调整统计服务的收集配置。',
+          `请求窗口 ${req.hours} 小时超出了历史层保留期（实测该实例约 ${spansHours} 小时）——` +
+            `返回的只是窗口的后半段。**未覆盖的那部分不等于"正常"**，只是没有数据。` +
+            '要拉长保留期需调整统计服务的收集配置。',
+        );
+      }
+      // 时间串的可解析性：MIN/MAX(TIME) 原样来自库（驱动可能给字符串或 Date），
+      // 若解析不出有限值，spansHours 会是 NaN 而 coversWindow 恒为 false——
+      // 结论方向没错（"不能说覆盖了窗口"），但必须把"这是解析失败而非真的保留期不足"讲清楚。
+      if (!Number.isFinite(spansHours)) {
+        logger.warn({ view: 'HOST_LOAD_HISTORY_HOST' }, '保留期时间串无法解析为有限时长，已按"未确认覆盖"处理');
+        caveats.push(
+          '历史层保留期的起止时刻无法解析为时长（时间串缺少时区/格式不可识别），' +
+            '故无法确认请求窗口是否被保留期截断——请以 retention 里的原始 earliest/latest 自行核对。',
         );
       }
     }
-  } catch {
+  } catch (e) {
+    // 这条 catch 原先完全静默（只推 caveat）；记一条日志便于区分"视图不可读"与"确实没有保留期数据"
+    logger.warn({ err: e, view: 'HOST_LOAD_HISTORY_HOST' }, '未能确定历史层保留期');
     caveats.push('未能确定历史层保留期（统计服务视图不可读或权限不足），无法判断窗口是否被截断。');
   }
 
@@ -157,11 +173,29 @@ export async function runTrend(pool: HanaPool, req: TrendRequest): Promise<Trend
   );
 
   if (rows.length === 0) {
+    // 窗口边界与"非空"分支取**同一个口径**：都来自库内时间（非空分支透传 TIME 的 MIN/MAX，
+    // 这里没有行可取，就单独向库要一次窗口起止）。原先这里用 `new Date().toISOString()`（JS 的 UTC），
+    // 与非空分支的库内值放在一起会得到两套时间基准——同一字段在不同分支含义不同，是最难发现的坑。
+    let winFrom = '';
+    let winTo = '';
+    try {
+      const w = await pool.query<{ T0: unknown; T1: unknown }>(
+        'SELECT ADD_SECONDS(CURRENT_TIMESTAMP, -?) AS T0, CURRENT_TIMESTAMP AS T1 FROM DUMMY',
+        [windowSec],
+      );
+      winFrom = String(w[0]?.T0 ?? '');
+      winTo = String(w[0]?.T1 ?? '');
+    } catch (e) {
+      // 库内时钟都取不到时如实说明（window.from/to 留空）——不退回客户端时钟，避免两套基准
+      logger.warn({ err: e }, '空窗口分支未能从库内取得窗口起止时刻');
+      caveats.push('未能从库内取到窗口起止时刻（DUMMY 查询失败）：window.from/to 为空串。');
+    }
+    addCaveat(caveats, emptyIsAmbiguous(0, visibility.unfiltered));
     return {
-      checkedAt: new Date().toISOString(),
+      checkedAt: reportCheckedAt(),
       window: {
-        from: new Date(Date.now() - windowSec * 1000).toISOString(),
-        to: new Date().toISOString(),
+        from: winFrom,
+        to: winTo,
         hours: req.hours,
         bucketMinutes: req.bucketMinutes,
         buckets: 0,
@@ -171,10 +205,7 @@ export async function runTrend(pool: HanaPool, req: TrendRequest): Promise<Trend
       points: [],
       summary: '指定窗口内没有任何历史采样点（可能是保留期设置过短，或统计服务未收集主机负载历史）。',
       visibility,
-      caveats: [
-        ...caveats,
-        emptyIsAmbiguous(0, visibility.unfiltered) ?? '',
-      ].filter(Boolean),
+      caveats,
     };
   }
 
@@ -250,8 +281,9 @@ export async function runTrend(pool: HanaPool, req: TrendRequest): Promise<Trend
   }
 
   return {
-    checkedAt: new Date().toISOString(),
+    checkedAt: reportCheckedAt(),
     window: {
+      // 与非空分支同一口径：窗口边界即**库内 TIME 的首尾桶**（不是客户端时钟算出来的）
       from: first.from,
       to: last.to,
       hours: req.hours,
@@ -261,8 +293,9 @@ export async function runTrend(pool: HanaPool, req: TrendRequest): Promise<Trend
     metrics: req.metrics,
     retention,
     points,
-    summary: `${points.length} 个桶（每桶 ${req.bucketMinutes} 分钟，共 ${points.reduce((s, p) => s + p.samples, 0)} 个采样点）：`
-      + (parts.length > 0 ? parts.join(' ｜ ') : '（未选择 cpu/memory/disk 指标）'),
+    summary:
+      `${points.length} 个桶（每桶 ${req.bucketMinutes} 分钟，共 ${points.reduce((s, p) => s + p.samples, 0)} 个采样点）：` +
+      (parts.length > 0 ? parts.join(' ｜ ') : '（未选择 cpu/memory/disk 指标）'),
     visibility,
     caveats,
   };

@@ -1,15 +1,34 @@
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { basename, dirname, resolve } from 'node:path';
 import type { HanaPool } from '../core/hana-client.js';
+import { toHanaDateTime } from '../core/datetime.js';
 import { HanaBusinessError } from '../core/errors.js';
 import { withKeyedLock } from '../core/keyed-mutex.js';
 import { logger } from '../core/logger.js';
+import { clampLimit } from '../core/num.js';
 import { currentClientId } from '../core/request-context.js';
-import { assertSafeObjectName, assertSafeRuntimeName, assertSchemaAllowed, qualifyName } from '../core/sql.js';
+import {
+  assertSafeObjectName,
+  assertSafeRuntimeName,
+  assertSchemaAllowed,
+  qualifyName,
+  quoteIdentifier,
+} from '../core/sql.js';
 import { isPackageAllowed } from '../config/write-boundary.js';
 import { XsRestClient, extractCheckResult, type FileMeta, type WriteCheckResult } from '../core/xs-rest.js';
 import type { HanaConfig } from '../config/config.js';
 import { buildMinCalcViewXml, buildScriptedCalcViewXml, type ScriptedCalcViewSpec } from '../model/view-builder.js';
-import { addJoinToViewXml, chooseDefaultJoinFields, getJoinTargetAttrs, guardFullXmlUpdate, setScriptInViewXml, type FullXmlGuardResult, type SetScriptSpec } from '../model/view-edit.js';
-import { getViewDefinition } from './metadata.service.js';
+import {
+  addJoinToViewXml,
+  chooseDefaultJoinFields,
+  getJoinTargetAttrs,
+  guardFullXmlUpdate,
+  setScriptInViewXml,
+  type FullXmlGuardResult,
+  type SetScriptSpec,
+} from '../model/view-edit.js';
+import { isNumericType } from '../model/view-types.js';
+import { currentSchema, getTableColumns, getViewDefinition } from './metadata.service.js';
 import { assertSqlReadScopes } from './read-scope.service.js';
 
 /**
@@ -36,9 +55,7 @@ let WRITE_ALLOWED_PACKAGES: string[] = [];
  * 空数组 = 不限制（fail-open）；非空 = 仅配置包及其子包可写。
  */
 export function configureWritePackages(packages: string[]): void {
-  WRITE_ALLOWED_PACKAGES = packages
-    .map((p) => p.trim().toUpperCase())
-    .filter((p) => p.length > 0);
+  WRITE_ALLOWED_PACKAGES = packages.map((p) => p.trim().toUpperCase()).filter((p) => p.length > 0);
 }
 
 /** 包名安全字符集校验（写操作前纵深防御；值仍参数绑定） */
@@ -115,12 +132,13 @@ function decodeRepoV2(buf: Buffer): RepoRestResponse {
 }
 
 /**
- * REPOSITORY_REST 的调用封装（repoV2 信封）：
+ * REPOSITORY_REST 的调用封装（repoV2 信封）——本文件内部通道（写路径与读 XML 兜底），故不导出：
+ * 对外只有高层的 create/update/activate/delete 语义，避免调用方绕过包/对象校验直连裸 REST。
  * @param request JSON 请求对象
  * @param files 文件槽内容（写对象时传 [名称, 内容]；读时 []）
  * @param outParamIndex OUT 参数在 CALL 语句中的序号（默认 1，即第 2 个参数）
  */
-export async function repositoryRest(
+async function repositoryRest(
   pool: HanaPool,
   request: Record<string, unknown>,
   files: Buffer[] = [],
@@ -148,32 +166,8 @@ function assertNoRepoRestError(resp: RepoRestResponse, action: string): void {
   if (typeof code === 'string' && code !== '0') {
     const msg = String(resp.content['error-msg'] ?? 'unknown');
     const arg = String(resp.content['error-arg'] ?? '');
-    throw new HanaBusinessError(
-      `仓库 ${action} 失败：${msg}（code=${code}${arg ? `, arg=${arg}` : ''}）`,
-      code,
-    );
+    throw new HanaBusinessError(`仓库 ${action} 失败：${msg}（code=${code}${arg ? `, arg=${arg}` : ''}）`, code);
   }
-}
-
-/** 读取对象设计时 XML（read object，XML 在附件槽 0） */
-export async function readObjectXml(
-  pool: HanaPool,
-  packageId: string,
-  objectName: string,
-  suffix = 'calculationview',
-): Promise<string> {
-  const resp = await repositoryRest(pool, {
-    action: 'read',
-    what: 'object',
-    object: { package: packageId, name: objectName, suffix },
-  });
-  const xml = resp.attachments.find((a) => a.length > 0);
-  if (!xml) {
-    throw new HanaBusinessError(
-      `read object 未返回设计时 XML（${packageId}/${objectName}）。响应 content: ${JSON.stringify(resp.content).slice(0, 300)}`,
-    );
-  }
-  return xml.toString('utf8');
 }
 
 /** 新建 Calculation View 的输入规格 */
@@ -318,7 +312,7 @@ export async function probeRuntimeRows(
   probeRows: number,
 ): Promise<RowProbe> {
   const empty: RowProbe = { sampledRows: 0, truncated: false, columns: [], rows: [] };
-  const limit = Math.min(Math.max(Math.trunc(probeRows), 1), MAX_PROBE_ROWS);
+  const limit = clampLimit(Math.trunc(probeRows), 1, 1, MAX_PROBE_ROWS);
   try {
     const rows = await pool.query<Record<string, unknown>>(
       `SELECT * FROM ${qualifyName('_SYS_BIC', `${packageId}/${objectName}`)} LIMIT ?`,
@@ -368,25 +362,15 @@ async function probeIfActivated(
  * 判定规则已提取到 read-scope.service（SQL 分析工具要在**已持有连接**上做同一件事），此处只注入读法。
  */
 async function assertScriptReadScopes(pool: HanaPool, script: string): Promise<void> {
-  return assertSqlReadScopes(
-    script,
-    async () => {
-      const rows = await pool.query<{ CURRENT_SCHEMA: string }>('SELECT CURRENT_SCHEMA FROM DUMMY');
-      return rows[0]?.CURRENT_SCHEMA ?? '';
-    },
-    '脚本',
-  );
+  return assertSqlReadScopes(script, () => currentSchema(pool), '脚本');
 }
 
 /** 检查对象是否已存在（ACTIVE_OBJECT 或 INACTIVE_OBJECT） */
-async function objectExists(
-  pool: HanaPool,
-  packageId: string,
-  objectName: string,
-): Promise<boolean> {
+async function objectExists(pool: HanaPool, packageId: string, objectName: string): Promise<boolean> {
   for (const table of ['ACTIVE_OBJECT', 'INACTIVE_OBJECT']) {
+    // 表名来自本函数内的字面量常量，仍统一走 quoteIdentifier（纵深防御：标识符引用只此一种拼法）
     const rows = await pool.query<{ C: number }>(
-      `SELECT COUNT(*) AS C FROM "_SYS_REPO"."${table}"
+      `SELECT COUNT(*) AS C FROM "_SYS_REPO".${quoteIdentifier(table)}
        WHERE PACKAGE_ID = ? AND OBJECT_NAME = ? AND OBJECT_SUFFIX = 'calculationview'`,
       [packageId, objectName],
     );
@@ -401,7 +385,6 @@ async function resolveColumns(
   source: NonNullable<CreateCalcViewInput['source']>,
 ): Promise<Array<{ columnName: string; dataTypeName?: string }>> {
   if (source.columns && source.columns.length > 0) return source.columns;
-  const { getTableColumns } = await import('./metadata.service.js');
   const cols = await getTableColumns(pool, source.schema, source.name, { limit: 500 });
   return cols.map((c) => ({ columnName: c.columnName, dataTypeName: c.dataTypeName }));
 }
@@ -432,8 +415,10 @@ async function writeViaInactiveObject(
   packageId: string,
   objectName: string,
   xml: string,
+  timezone: string,
 ): Promise<void> {
-  const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+  // 写库时间与日志同口径（此前此处用 UTC 的 toISOString，与日志相差一个时区）
+  const now = toHanaDateTime(new Date(), timezone);
   await pool.execute(
     `INSERT INTO "_SYS_REPO"."INACTIVE_OBJECT"
        (PACKAGE_ID, OBJECT_NAME, OBJECT_SUFFIX, OWNER, WORKSPACE, VERSION_ID, LAST_CHANGED_AT, IS_DELETION, EDIT, CDATA)
@@ -441,9 +426,26 @@ async function writeViaInactiveObject(
     [packageId, objectName, now, xml],
   );
 }
-/** 构造 XS REST 客户端（凭据来自 config，不落日志） */
-function makeRestClient(config: HanaConfig): XsRestClient {
-  return new XsRestClient(config);
+
+/** 设计时文件后缀（= _SYS_REPO.OBJECT_SUFFIX 的 calculationview；写通道共用同一常量，不再各处手拼） */
+const CALC_VIEW_FILE_SUFFIX = '.calculationview';
+
+/** 设计时对象在 XS 仓库中的文件名（<对象名>.calculationview） */
+function designTimeFile(objectName: string): string {
+  return `${objectName}${CALC_VIEW_FILE_SUFFIX}`;
+}
+
+/**
+ * XS 设计时文件通道的唯一入口：解析会话（调用方未显式传入则新建）+ 目标文件路径。
+ * 写/激活/更新/删除四路此前各自重复这两步（建客户端 + `${objectName}.calculationview`），
+ * 是「同一个拼法写四遍」的唯一来源；集中后凭据只在此处进入客户端。
+ */
+function designTimeTarget(
+  config: HanaConfig,
+  objectName: string,
+  client?: XsRestClient,
+): { rest: XsRestClient; file: string } {
+  return { rest: client ?? new XsRestClient(config), file: designTimeFile(objectName) };
 }
 
 /** XS REST 写路径（实测：PUT 为 create-or-update，写 inactive 无需 workspace 上下文，无 40106） */
@@ -454,27 +456,26 @@ async function writeViaRest(
   xml: string,
   opts: { activate?: boolean } = {},
 ): Promise<FileMeta> {
-  const rest = makeRestClient(config);
-  return rest.writeFile(packageId, `${objectName}.calculationview`, xml, {
+  const { rest, file } = designTimeTarget(config, objectName);
+  return rest.writeFile(packageId, file, xml, {
     activate: opts.activate ?? false,
   });
 }
 
 /** XS REST 通道：激活设计时对象（PUT + SapBackPack {"Activate":true}，失败 555 + 编译明细） */
-async function activateViaRest(
-  config: HanaConfig,
-  packageId: string,
-  objectName: string,
-): Promise<FileMeta> {
-  const rest = makeRestClient(config);
+async function activateViaRest(config: HanaConfig, packageId: string, objectName: string): Promise<FileMeta> {
+  const { rest, file } = designTimeTarget(config, objectName);
   // 激活基于服务端当前版本：PUT 传回原内容 + Activate:true（无需 If-Match，激活失败 555 透传）
-  const content = await rest.fileContent(packageId, `${objectName}.calculationview`);
-  return rest.writeFile(packageId, `${objectName}.calculationview`, content, {
+  const content = await rest.fileContent(packageId, file);
+  return rest.writeFile(packageId, file, content, {
     activate: true,
   });
 }
 
-/** XS REST 通道：更新设计时对象（PUT 新内容 + If-Match ETag 乐观锁） */
+/**
+ * XS REST 通道：更新设计时对象（PUT 新内容 + If-Match ETag 乐观锁）。
+ * 注：参数较多（6 个，含可选 opts/client），tools 层调用点未同步改造，故签名保持现状。
+ */
 export async function updateViaRest(
   config: HanaConfig,
   packageId: string,
@@ -483,30 +484,30 @@ export async function updateViaRest(
   opts: { ifMatch?: string; activate?: boolean } = {},
   client?: XsRestClient,
 ): Promise<FileMeta> {
-  const rest = client ?? makeRestClient(config);
+  const { rest, file } = designTimeTarget(config, objectName, client);
   // ifMatch 由调用方在请求入口捕获（「读时取」：窗口一直覆盖到 PUT，期间任何并发写入都使基线失效）。
   // 仅当调用方未提供时才在此取当前 ETag —— 此时基线必然匹配，等于没有并发保护（保留分支仅为向后兼容）。
-  const ifMatch = opts.ifMatch ?? (await rest.fileMeta(packageId, `${objectName}.calculationview`)).ETag;
-  return rest.writeFile(packageId, `${objectName}.calculationview`, xml, {
+  const ifMatch = opts.ifMatch ?? (await rest.fileMeta(packageId, file)).ETag;
+  return rest.writeFile(packageId, file, xml, {
     activate: opts.activate ?? false,
     ifMatch,
   });
 }
 
 /** XS REST 通道：删除设计时对象（DELETE） */
-async function deleteViaRest(
-  config: HanaConfig,
-  packageId: string,
-  objectName: string,
-): Promise<void> {
-  const rest = makeRestClient(config);
-  await rest.deleteFile(packageId, `${objectName}.calculationview`);
+async function deleteViaRest(config: HanaConfig, packageId: string, objectName: string): Promise<void> {
+  const { rest, file } = designTimeTarget(config, objectName);
+  await rest.deleteFile(packageId, file);
 }
 
 /** 包创建（XS REST：POST /base/file/<pkg>/ 建目录） */
-export async function createPackageViaRest(config: HanaConfig, packageId: string, description?: string): Promise<FileMeta> {
+export async function createPackageViaRest(
+  config: HanaConfig,
+  packageId: string,
+  description?: string,
+): Promise<FileMeta> {
   assertWritePackageAllowed(packageId);
-  const rest = makeRestClient(config);
+  const rest = new XsRestClient(config);
   const segments = packageId.split('.');
   const leafName = segments[segments.length - 1];
   return rest.createPackage(packageId, leafName, description);
@@ -599,6 +600,7 @@ export interface UpdateCalculationViewResult {
  *   （view-edit，BW 方言同款），再走原有 PUT 更新路径；模型无需读取也不生成 XML。多条 operations 依序应用（可连续追加多个 join）。
  * 并发：两种方式都在**请求入口**捕获当前 ETag 作基线（「读时取」），到 PUT 之间任何并发写入
  * 都会使基线失效并以 412 显式暴露；调用方显式传 ifMatch 时以传入值为准（跨调用强一致场景）。
+ * 注：参数较多（7 个，含可选 opts/client），tools 层调用点未同步改造，故签名保持现状。
  */
 export async function updateCalculationView(
   config: HanaConfig,
@@ -620,14 +622,14 @@ export async function updateCalculationView(
   const startedAt = Date.now();
   // 写入全程复用同一 XS 会话（读基线 → 变换 → PUT）：省掉一次登录往返，也让读到的基线
   // 与写出的 If-Match 出自同一会话视角
-  const rest = client ?? makeRestClient(config);
+  const { rest, file: designFile } = designTimeTarget(config, objectName, client);
   // 乐观锁基线：请求入口（最早时刻）取当前 ETag —— 读时取。
   // 全量 xml 模式此前在「写入前」才取 ETag，基线必然匹配，等于没有并发保护；现在两种方式一致。
   // 调用方显式传 ifMatch 时以传入值为准（跨调用强一致场景），此处仍读一次元数据作为存在性检查
   // （对象不存在 → 立即失败，不会经 PUT 误建）。
   // 注意：全量 xml 的内容由调用方给出，若其基于更早的一次读取，服务端无从得知 ——
   // 返回 envelope 里的 412 是唯一的冲突信号，需要更强保证请显式传 ifMatch。
-  const baseMeta = await rest.fileMeta(packageId, `${objectName}.calculationview`);
+  const baseMeta = await rest.fileMeta(packageId, designFile);
   const ifMatch = opts.ifMatch ?? baseMeta.ETag;
   let xml: string;
   let operationsResult: UpdateCalculationViewResult['operationsResult'];
@@ -635,7 +637,7 @@ export async function updateCalculationView(
   if (hasOperations) {
     // 变换基线取设计时文件当前内容（与 ETag 同会话读取），而非已激活版本（ACTIVE_OBJECT）：
     // 存在未激活的挂起改动时，若以激活版为基线变换再覆盖设计时文件会静默丢失挂起工作。
-    const designTimeXml = await rest.fileContent(packageId, `${objectName}.calculationview`);
+    const designTimeXml = await rest.fileContent(packageId, designFile);
     if (!designTimeXml || designTimeXml.trim() === '') {
       throw new HanaBusinessError(`视图 ${packageId}/${objectName} 无设计时内容，无法应用 operations`);
     }
@@ -671,7 +673,8 @@ export async function updateCalculationView(
     xml = input.xml!;
   }
 
-  const meta = await updateViaRest(config, packageId, objectName, xml, { ...opts, ifMatch }, rest);
+  // 显式挑字段：opts 还带 probeRows（供行探测用），不得作为写参数透传给 updateViaRest
+  const meta = await updateViaRest(config, packageId, objectName, xml, { ifMatch, activate: opts.activate }, rest);
   const activated = meta.Attributes?.SapBackPack?.Activated === true;
   const detail = activationDetailOf(meta);
   // 行探测：对象确实激活后才探（同 create，让"激活成功但 0 行"当场可见）
@@ -887,10 +890,9 @@ export async function createCalculationView(
     });
 
     // 度量计数（与 builder 的 SUM_NUMERIC 判定一致：数值类型进 baseMeasures）
-    const NUMERIC = new Set(['TINYINT', 'SMALLINT', 'INTEGER', 'INT', 'BIGINT', 'DECIMAL', 'SMALLDECIMAL', 'REAL', 'DOUBLE', 'FLOAT', 'SECONDDATE', 'DATE', 'TIME', 'TIMESTAMP', 'LONGDATE']);
-    measureCount = measureMode === 'SUM_NUMERIC'
-      ? columns.filter((c) => NUMERIC.has((c.dataTypeName ?? '').toUpperCase())).length
-      : 0;
+    // 类型表已单点化到 model/view-types（此前此处与 view-builder 各存一份逐项相同的集合），
+    // 回执里的度量数必须与生成的 XML 用同一判定，否则两边都"看起来对"却互相矛盾。
+    measureCount = measureMode === 'SUM_NUMERIC' ? columns.filter((c) => isNumericType(c.dataTypeName)).length : 0;
   }
 
   const result: CreateCalcViewResult = {
@@ -935,7 +937,7 @@ export async function createCalculationView(
         result.activationDetail = detail;
       }
     } else if (transport === 'inactive_object') {
-      await writeViaInactiveObject(pool, input.packageId, input.objectName, xml);
+      await writeViaInactiveObject(pool, input.packageId, input.objectName, xml, config.timezone);
       result.wrote = true;
       result.manualActivateHint =
         `设计时对象已写入 _SYS_REPO.INACTIVE_OBJECT（${input.packageId}/${input.objectName}），` +
@@ -957,13 +959,22 @@ export async function createCalculationView(
   }
 
   // 行探测：对象确实激活后才探，避免在未激活对象上做无意义查询
-  const rowProbe = await probeIfActivated(pool, input.packageId, input.objectName, result.activated === true, input.probeRows);
+  const rowProbe = await probeIfActivated(
+    pool,
+    input.packageId,
+    input.objectName,
+    result.activated === true,
+    input.probeRows,
+  );
   if (rowProbe) result.rowProbe = rowProbe;
 
   return result;
 }
 
-/** 激活 Calculation View：xs_rest=PUT+SapBackPack.Activate（官方写路径）；repo_rest=裸 repoV2（兼容，部分环境会 40106） */
+/**
+ * 激活 Calculation View：xs_rest=PUT+SapBackPack.Activate（官方写路径）；repo_rest=裸 repoV2（兼容，部分环境会 40106）。
+ * 注：参数较多（5 个，transport 有默认值），tools 层调用点未同步改造，故签名保持现状。
+ */
 export async function activateCalculationView(
   config: HanaConfig,
   pool: HanaPool,
@@ -980,13 +991,10 @@ export async function activateCalculationView(
     if (meta.Attributes?.SapBackPack?.Activated !== true) {
       const detail = activationDetailOf(meta);
       const errDetail = detail?.message ?? describeActivationFailure(meta);
-      throw new HanaBusinessError(
+      // 原始载荷与 create/update 路径同形（envelope.raw.errorDetail）；只填有值的槽，构造函数签名不变
+      throw HanaBusinessError.withRawDetail(
         `激活失败：${packageId}/${objectName} 写入成功但未激活。${errDetail}`,
         detail?.errorCode,
-        undefined,
-        [],
-        undefined,
-        // 原始载荷与 create/update 路径同形（envelope.raw.errorDetail）
         { httpStatus: meta['_httpStatus'], ...(detail ?? {}) },
       );
     }
@@ -1026,6 +1034,7 @@ export interface ExportPackageResult {
 /**
  * 导出包为 zip（GET /base/xfer/export，官方 Transfer API）。
  * 导出是读操作：不限制包（与读侧工具同一边界）；saveTo 落盘为本地备份文件。
+ * 注：4 个参数（saveTo/client 可选），tools 层调用点未同步改造，故签名保持现状。
  */
 export async function exportPackageViaRest(
   config: HanaConfig,
@@ -1034,12 +1043,10 @@ export async function exportPackageViaRest(
   client?: XsRestClient,
 ): Promise<ExportPackageResult> {
   assertSafeObjectName(packageId, '包');
-  const rest = client ?? makeRestClient(config);
+  const rest = client ?? new XsRestClient(config);
   const { buffer, url } = await rest.exportPackageZip(packageId);
   const result: ExportPackageResult = { packageId, sizeBytes: buffer.length, url };
   if (saveTo) {
-    const { mkdir, writeFile } = await import('node:fs/promises');
-    const { dirname, resolve } = await import('node:path');
     const abs = resolve(saveTo);
     await mkdir(dirname(abs), { recursive: true });
     await writeFile(abs, buffer);
@@ -1063,6 +1070,7 @@ export interface ImportObjectResult {
  * 【默认拒绝覆盖】目标文件已存在时抛错并指引改用 hana_view_update（已有对象的修改走更新通道，
  * 禁止 delete+重建或静默覆盖）；确需覆盖导入（如备份恢复）须显式 overwrite=true。
  * 来源：content 内联内容（须配 fileName），或 filePath 本地文件（默认取 basename 做目标文件名）。
+ * 注：3 个参数（input/client），tools 层调用点未同步改造，故签名保持现状。
  */
 export async function importObjectViaRest(
   config: HanaConfig,
@@ -1073,18 +1081,17 @@ export async function importObjectViaRest(
   let content: Buffer | string;
   let fileName = input.fileName;
   if (input.content !== undefined) {
-    if (!fileName) throw new HanaBusinessError('内联内容导入必须提供 fileName（目标文件名，如 ZDEMO_CV_X.calculationview）');
+    if (!fileName)
+      throw new HanaBusinessError('内联内容导入必须提供 fileName（目标文件名，如 ZDEMO_CV_X.calculationview）');
     content = input.content;
   } else if (input.filePath) {
-    const { readFile } = await import('node:fs/promises');
-    const { basename } = await import('node:path');
     content = await readFile(input.filePath);
     fileName ??= basename(input.filePath);
   } else {
     throw new HanaBusinessError('导入需要提供 content 或 filePath 之一');
   }
   assertSafeObjectName(fileName!, '目标文件名');
-  const rest = client ?? makeRestClient(config);
+  const rest = client ?? new XsRestClient(config);
   // 默认拒绝覆盖：已有对象的修改应走 hana_view_update（PUT + If-Match），保持版本演进而非删除重建
   if (!input.overwrite) {
     let existing: FileMeta | undefined;
@@ -1117,7 +1124,7 @@ export async function listChangesViaRest(
   opts: { user?: string; status?: number } = {},
   client?: XsRestClient,
 ): Promise<unknown> {
-  const rest = client ?? makeRestClient(config);
+  const rest = client ?? new XsRestClient(config);
   return rest.changeList(opts);
 }
 
@@ -1156,9 +1163,8 @@ export async function checkCalculationViewDesignTime(
 ): Promise<DesignCheckResult> {
   assertWritePackageAllowed(packageId, objectName);
   assertSafeObjectName(objectName, '视图');
-  const rest = client ?? makeRestClient(config);
-  const suffix = '.calculationview';
-  const content = await rest.fileContent(packageId, `${objectName}${suffix}`);
+  const { rest } = designTimeTarget(config, objectName, client);
+  const content = await rest.fileContent(packageId, designTimeFile(objectName));
   const tempObject = tempCheckName(objectName);
   // 临界区（keyed lock，key=包/对象）：临时对象名由对象名确定性推导（<NAME>_CHKTMP），
   // 同一对象的并发校验会互相删掉对方的临时对象 —— 把「清理残留 → 写入校验 → 删除副本」
@@ -1166,7 +1172,7 @@ export async function checkCalculationViewDesignTime(
   return withKeyedLock(writeLockKey(packageId, objectName), async () => {
     // 残留清理（上次校验异常中断可能遗留临时对象；best-effort）
     try {
-      await rest.deleteFile(packageId, `${tempObject}${suffix}`);
+      await rest.deleteFile(packageId, designTimeFile(tempObject));
     } catch {
       /* 不存在即忽略 */
     }
@@ -1174,13 +1180,13 @@ export async function checkCalculationViewDesignTime(
     let errors: string | undefined;
     let errorCode: string | undefined;
     try {
-      const r = await rest.checkFile(packageId, `${tempObject}${suffix}`, content);
+      const r = await rest.checkFile(packageId, designTimeFile(tempObject), content);
       consistent = r.consistent;
       errors = r.message;
       errorCode = r.errorCode;
     } finally {
       try {
-        await rest.deleteFile(packageId, `${tempObject}${suffix}`);
+        await rest.deleteFile(packageId, designTimeFile(tempObject));
       } catch {
         /* 清理失败不掩盖校验结果 */
       }

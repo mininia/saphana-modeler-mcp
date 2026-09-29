@@ -29,6 +29,17 @@ export class HanaBusinessError extends Error {
     super(message);
     this.name = 'HanaBusinessError';
   }
+
+  /**
+   * 便捷构造：只带「服务端原始错误载荷」（→ envelope.raw.errorDetail）。
+   *
+   * 位置参数构造器有 6 个槽，而这条失败路径（如 XS 激活失败）实际只有 message/code/rawDetail
+   * 三个有值 —— 直接调用会写成 `new HanaBusinessError(msg, code, undefined, [], undefined, detail)`，
+   * 占位噪声把「到底带了什么」淹没。本工厂只暴露有值的字段，构造器签名保持不变。
+   */
+  static withRawDetail(message: string, code: string | undefined, rawDetail: unknown): HanaBusinessError {
+    return new HanaBusinessError(message, code, undefined, [], undefined, rawDetail);
+  }
 }
 
 /** 归一化任意驱动回调错误 → HanaBusinessError（message 经脱敏，防止连接目标/账号进错误返回） */
@@ -99,7 +110,10 @@ export async function withErrorEnvelope<T>(fn: () => Promise<T>): Promise<Envelo
  * 硬错误返回（§5.3）：参数非法 / 对象不存在等不可恢复错误，返回 MCP isError
  * 并附恢复提示（把死胡同变成下一步）。工具 handler 直接 return 此对象。
  */
-export function mcpErrorText(message: string, hint?: string): {
+export function mcpErrorText(
+  message: string,
+  hint?: string,
+): {
   isError: true;
   content: [{ type: 'text'; text: string }];
 } {

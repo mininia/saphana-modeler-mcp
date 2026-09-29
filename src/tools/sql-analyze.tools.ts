@@ -9,13 +9,14 @@ import {
   validateAnalyzeRequest,
 } from '../services/sql-analyze.rules.js';
 import { registerWriteTool, type ToolContext } from './index.js';
+import { toToolResult } from './common.js';
 import type { Envelope } from '../types/hana.js';
 
 /**
  * SQL 分析工具（hana_sql_analyze，分组 **admin**）。
  *
  * 走 registerWriteTool 而不是 registerVisibleTool：要的就是它**在 handler 之前**的预检闸门
- * （规划本次会读哪些 schema → 对照生效策略判定）。该闸门只做"规划 + 判定"，与工具归哪个分组无关；
+ * （规划本次会读哪些 schema → 对照生效策略判定）。该闸门只做「规划 + 判定」，与工具归哪个分组无关；
  * 因为本工具不声明可写包，写边界的 boundary_off 不适用于它。
  */
 export function registerSqlAnalyzeTools(server: McpServer, ctx: ToolContext): void {
@@ -47,36 +48,58 @@ export function registerSqlAnalyzeTools(server: McpServer, ctx: ToolContext): vo
         '读取范围：语句内的 schema 必须落在服务端允许范围内（未限定表名按当前用户默认 schema 判定）。\n' +
         '限制：一次只分析**一条 SELECT/WITH**；多语句、绑定占位符（? 或 :name）、DML/DDL/过程调用一律拒绝。',
       inputSchema: z.object({
-        sql: z.string().min(1).max(100000).optional()
+        sql: z
+          .string()
+          .min(1)
+          .max(100000)
+          .optional()
           .describe('要分析的语句（仅 SELECT/WITH；与 planId 二选一）。默认只编译不执行'),
-        planId: z.number().int().positive().optional()
+        planId: z
+          .number()
+          .int()
+          .positive()
+          .optional()
           .describe('计划缓存条目编号（与 sql 二选一）：SYS.M_SQL_PLAN_CACHE.PLAN_ID；需 OPTIMIZER ADMIN'),
-        analyze: z.boolean().default(false)
-          .describe('仅 sql 模式：true=先真执行再分析（走 PlanViz 通道拿逐算子实测 + 六栏 panels；通道不可用时降级为估计计划 + 语句级统计）。护栏：只允许 SELECT、单次执行最多 5 分钟、最多取 100 行、不返回数据行；默认 false'),
-        statementName: z.string().min(1).max(MAX_LABEL_LENGTH).optional()
+        analyze: z
+          .boolean()
+          .default(false)
+          .describe(
+            '仅 sql 模式：true=先真执行再分析（走 PlanViz 通道拿逐算子实测 + 六栏 panels；通道不可用时降级为估计计划 + 语句级统计）。护栏：只允许 SELECT、单次执行最多 5 分钟、最多取 100 行、不返回数据行；默认 false',
+          ),
+        statementName: z
+          .string()
+          .min(1)
+          .max(MAX_LABEL_LENGTH)
+          .optional()
           .describe('输出标签（原样回显便于对照）；不影响服务端生成并使用的唯一语句名'),
-        raw: z.boolean().default(false)
+        raw: z
+          .boolean()
+          .default(false)
           .describe('true=附带**原始执行计划**（算子行 + 缩进文本树）；默认 false，只给分析结论'),
-        verbose: z.boolean().default(false)
+        verbose: z
+          .boolean()
+          .default(false)
           .describe('仅 raw=true 时生效：附带算子明细 OPERATOR_DETAILS/PROPERTIES（服务端截断至 4000 字符）'),
-        limit: z.number().int().min(1).max(MAX_OPERATOR_LIMIT).default(DEFAULT_OPERATOR_LIMIT)
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(MAX_OPERATOR_LIMIT)
+          .default(DEFAULT_OPERATOR_LIMIT)
           .describe(`raw=true 时返回算子条数上限（默认 ${DEFAULT_OPERATOR_LIMIT}，最大 ${MAX_OPERATOR_LIMIT}）`),
       }),
       // 不破坏任何数据，但接受任意 SQL 且 analyze 模式会真跑——分组为 admin，客户端不应自动放行
-      annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false, openWorldHint: false },
+      annotations: { readOnlyHint: false, idempotentHint: false, openWorldHint: false, destructiveHint: false },
     },
     async ({ sql, planId, analyze, statementName, raw, verbose, limit }) => {
-      // "sql 与 planId 恰有其一" zod 表达不了：在 handler 里给可恢复错误（与 hana_view_create 同法）
+      // 「sql 与 planId 恰有其一」 zod 表达不了：在 handler 里给可恢复错误（与 hana_view_create 同法）
       const problem = validateAnalyzeRequest({ sql, planId, analyze, statementName });
       if (problem) return mcpErrorText(problem.message, problem.hint);
 
       const envelope: Envelope = await withErrorEnvelope(() =>
         analyzeSql(ctx.pool, { sql, planId, analyze, statementName, raw, verbose, limit }),
       );
-      return {
-        content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }],
-        structuredContent: envelope,
-      };
+      return toToolResult(envelope);
     },
   );
 }

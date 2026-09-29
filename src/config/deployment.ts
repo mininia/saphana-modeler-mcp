@@ -25,6 +25,17 @@ export function isLoopbackHost(host: string): boolean {
 /** 显式承认"对外监听且不认证"风险的开关名（对照 tableau-mcp 的 DANGEROUSLY_* 约定） */
 export const ALLOW_ANONYMOUS_ENV = 'MCP_HTTP_ALLOW_ANONYMOUS';
 
+/**
+ * 安全默认值（**单点**）：未显式配置时的监听地址、连接加密与证书校验。
+ *
+ * 为什么必须是常量：这三项各自出现在 config 的 zod 默认值、preflight 的缺省部署姿态
+ * （SAFE_DEPLOYMENT_POSTURE）与 preflight 的原生 env 解析三处。三处各写一遍字面量时，
+ * 任何一处被改动都会造成「判定用的默认值 ≠ 运行用的默认值」——正是预检层要防的那种分叉。
+ */
+export const DEFAULT_HTTP_HOST = '127.0.0.1';
+export const DEFAULT_TLS = true;
+export const DEFAULT_SSL_VALIDATE = true;
+
 /** 部署姿态：与"权限"有关的连接侧配置 */
 export interface DeploymentPosture {
   /** HTTP 传输端口；undefined = stdio 传输（不对外监听） */
@@ -80,9 +91,7 @@ export function checkDeploymentInvariants(posture: DeploymentPosture): Deploymen
       message:
         `HTTP 监听地址为 "${posture.httpHost}"（非回环 = 对外可达），且未配置任何 Bearer Token：` +
         '任何能连上该端口的人都能调用全部工具（含写操作），且调用无法归因。',
-      remedy:
-        '请配置 MCP_HTTP_TOKEN 或 MCP_HTTP_TOKENS、将监听地址改回 127.0.0.1，' +
-        '或将其置于带认证的反向代理之后',
+      remedy: '请配置 MCP_HTTP_TOKEN 或 MCP_HTTP_TOKENS、将监听地址改回 127.0.0.1，' + '或将其置于带认证的反向代理之后',
       override: ALLOW_ANONYMOUS_ENV,
     });
   }

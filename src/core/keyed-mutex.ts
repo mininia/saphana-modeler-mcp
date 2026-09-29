@@ -41,3 +41,12 @@ export async function withKeyedLock<T>(key: string, fn: () => Promise<T>): Promi
 export function keyedLockSize(): number {
   return tails.size;
 }
+
+/**
+ * 清空全部锁条目（**仅测试用**）：跨用例隔离。
+ * 与 view-cache 的 clear() 对称 —— 模块级可变状态都要有显式的重置入口，
+ * 否则测试之间只能靠"跑完自然排空"隐式隔离。
+ */
+export function resetKeyedLocks(): void {
+  tails.clear();
+}

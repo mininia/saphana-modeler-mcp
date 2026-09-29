@@ -1,6 +1,6 @@
 import type { HanaPool } from '../core/hana-client.js';
 import { HanaBusinessError, normalizeHanaError } from '../core/errors.js';
-import { assertSchemaAllowed } from '../core/sql.js';
+import { assertSafeRuntimeName, assertSchemaAllowed } from '../core/sql.js';
 
 /**
  * 视图校验服务：
@@ -36,9 +36,7 @@ export async function getCheckActions(pool: HanaPool, checkProcedureName: string
     );
   }
   // CALL 返回结果集（table 输出），走 query 通道
-  const rows = await pool.query<{ ACTION: string; DESCRIPTION?: string }>(
-    `CALL SYS.GET_CHECK_ACTIONS('${proc}')`,
-  );
+  const rows = await pool.query<{ ACTION: string; DESCRIPTION?: string }>(`CALL SYS.GET_CHECK_ACTIONS('${proc}')`);
   return rows.map((r) => ({ action: r.ACTION, description: r.DESCRIPTION }));
 }
 
@@ -65,10 +63,9 @@ export async function validateCalculationView(
   action = 'CHECK_CONSISTENCY',
 ): Promise<ViewValidateResult> {
   assertSchemaAllowed(schema);
-  // 运行时名允许 /（_SYS_BIC 的 "包/视图" 形态）；值仍参数绑定
-  if (!/^[A-Za-z0-9_$#./\-]+$/.test(viewName)) {
-    throw new HanaBusinessError(`运行时视图名 "${viewName}" 含非法字符，已拒绝`);
-  }
+  // 运行时名允许 /（_SYS_BIC 的 "包/视图" 形态）；值仍参数绑定。
+  // 字符集与错误文案统一走 core/sql（原先这里是 SAFE_RUNTIME_NAME_RE 的手抄副本，两份会漂移）
+  assertSafeRuntimeName(viewName, '运行时视图名');
   // action 白名单：calculationview 相关仅 CHECK_CONSISTENCY（实测 GET_CHECK_ACTIONS 结论）
   const SAFE_ACTIONS = new Set(['CHECK_CONSISTENCY']);
   if (!SAFE_ACTIONS.has(action)) {
@@ -84,10 +81,6 @@ export async function validateCalculationView(
   } catch (e) {
     // CE 校验失败：向上转成带细节的业务错误（normalizeHanaError 保留 code/message）
     const norm = normalizeHanaError(e);
-    throw new HanaBusinessError(
-      `视图 ${schema}/${viewName} 一致性校验失败：${norm.message}`,
-      norm.code,
-      norm.sqlState,
-    );
+    throw new HanaBusinessError(`视图 ${schema}/${viewName} 一致性校验失败：${norm.message}`, norm.code, norm.sqlState);
   }
 }

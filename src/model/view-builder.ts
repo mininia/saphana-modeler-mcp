@@ -1,6 +1,7 @@
 import { HanaBusinessError } from '../core/errors.js';
-import { createXmlBuilder } from '../core/xml.js';
-import type { ColumnInfo } from '../services/metadata.service.js';
+import { isSafeRuntimeName } from '../core/sql.js';
+import { createXmlBuilder, escapeXmlAttr } from '../core/xml.js';
+import { CHAR_TYPES, isNumericType } from './view-types.js';
 
 /**
  * 视图 XML 生成器：
@@ -20,27 +21,15 @@ export interface MinCalcViewSpec {
   schema: string;
   /** 源表名 */
   table: string;
-  /** 源表列（列名 + 类型 + 是否度量：数值且非主键 → 度量） */
+  /**
+   * 源表列（列名 + 类型名）。
+   * 刻意保持内联形状，不用 metadata.service 的 ColumnInfo：调用方是把查到的列映射成
+   * `{columnName, dataTypeName}` 字面量再传进来，而 ColumnInfo 还要求 position/isNullable 等
+   * 本生成器用不到的字段——挂上它会让调用点被迫造多余字段（曾经的 import 就是这样变成死代码的）。
+   */
   columns: Array<{ columnName: string; dataTypeName?: string }>;
   /** 度量策略：SUM_NUMERIC=数值列进 baseMeasures 聚合 sum；ALL_ATTRIBUTES=全部当属性（默认后者最保守） */
   measureMode?: 'SUM_NUMERIC' | 'ALL_ATTRIBUTES';
-}
-
-/** 判定某列是否按默认策略当作度量（数值类型 + 名称以常见度量子串结束可选） */
-const NUMERIC_TYPES = new Set([
-  'TINYINT', 'SMALLINT', 'INTEGER', 'INT', 'BIGINT',
-  'DECIMAL', 'SMALLDECIMAL', 'REAL', 'DOUBLE', 'FLOAT',
-  'SECONDDATE', 'DATE', 'TIME', 'TIMESTAMP', 'LONGDATE',
-]);
-
-function isNumericMeasure(col: { columnName: string; dataTypeName?: string }): boolean {
-  const t = (col.dataTypeName ?? '').toUpperCase();
-  return NUMERIC_TYPES.has(t);
-}
-
-/** XML 转义（元素文本内 & < > 必须转义；属性值还需转义 "） */
-function esc(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
 /**
@@ -50,18 +39,24 @@ function esc(s: string): string {
 export function buildMinCalcViewXml(spec: MinCalcViewSpec): string {
   const { objectName, schema, table } = spec;
   const desc = spec.description ?? objectName;
-  const columns = (spec.columns ?? []).filter((c) => /^[A-Za-z0-9_$#./-]+$/.test(c.columnName));
+  // 列名过滤用运行时名口径（允许 /）：与 core/sql 的 SAFE_RUNTIME_NAME_RE 字符集逐字符相同。
+  // 刻意不收紧成 isSafeObjectName（禁 /）：那会改变"哪些列被映射"的行为——本生成器在已实机验证的
+  // 写路径上，收紧必须是带测试的独立决定，不能藏在去重里。
+  const columns = (spec.columns ?? []).filter((c) => isSafeRuntimeName(c.columnName));
   if (columns.length === 0) {
-    throw new Error(`源表 ${schema}/${table} 无可映射列（或列名含非法字符），无法生成视图`);
+    // 抛业务错误而不是裸 Error：裸 Error 会被 withErrorEnvelope 降级成"内部错误"，
+    // 把"源表无可映射列"这个可操作原因吞掉
+    throw new HanaBusinessError(
+      `源表 ${schema}/${table} 无可映射列（或列名含非法字符），无法生成视图`,
+      'NO_MAPPABLE_COLUMNS',
+    );
   }
 
   const dsId = 'SRC_1';
   const nodeId = 'Projection_1';
   const measureMode = spec.measureMode ?? 'ALL_ATTRIBUTES';
   const measures =
-    measureMode === 'SUM_NUMERIC'
-      ? columns.filter((c) => isNumericMeasure(c)).map((c) => c.columnName)
-      : [];
+    measureMode === 'SUM_NUMERIC' ? columns.filter((c) => isNumericType(c.dataTypeName)).map((c) => c.columnName) : [];
   const measureSet = new Set(measures);
   const attributes = columns.filter((c) => !measureSet.has(c.columnName)).map((c) => c.columnName);
 
@@ -128,7 +123,7 @@ export function buildMinCalcViewXml(spec: MinCalcViewSpec): string {
       '@_calculationScenarioType': 'TREE_BASED',
       '@_enforceSqlExecution': 'false',
       origin: {},
-      descriptions: { '@_defaultDescription': esc(desc) },
+      descriptions: { '@_defaultDescription': escapeXmlAttr(desc) },
       metadata: { '@_changedAt': '' },
       localVariables: {},
       variableMappings: {},
@@ -228,11 +223,12 @@ export function wrapScriptedBody(script: string): string {
   return endsWithLineComment ? `BEGIN\n  VAR_OUT = ${query}\n;\nEND` : `BEGIN\n  VAR_OUT = ${query};\nEND`;
 }
 
-/** 列名/类型字符集校验（类型允许精度写法，如 DECIMAL(15,2)、NVARCHAR(60)） */
-const COLUMN_NAME_RE = /^[A-Za-z0-9_$#./-]+$/;
+/**
+ * 数据类型写法校验（允许精度写法，如 DECIMAL(15,2)、NVARCHAR(60)）。
+ * 列名字符集不在此处：用 core/sql 的 isSafeRuntimeName（与原先的本地正则逐字符相同，见
+ * buildMinCalcViewXml 的说明）；"必须给 length 的字符型"用 view-types 的 CHAR_TYPES（同一份集合）。
+ */
 const DATA_TYPE_RE = /^[A-Z][A-Z0-9_ ]*(\(\s*\d+\s*(,\s*\d+\s*)?\))?$/;
-/** 必须显式给 length 的字符型（缺 length 时 HANA 生成的 VAR_OUT 表类型会与脚本实际类型不符） */
-const CHAR_TYPES = new Set(['NVARCHAR', 'VARCHAR', 'NCHAR', 'CHAR', 'ALPHANUM', 'SHORTTEXT']);
 
 /** 归一化后的脚本输出列（两条写路径共用同一份校验与归一化结果） */
 export interface NormalizedScriptedColumn {
@@ -258,7 +254,7 @@ export function normalizeScriptedColumns(columns: ScriptedColumnSpec[]): Normali
   const seen = new Set<string>();
   return columns.map((c) => {
     const name = c.name.trim();
-    if (!COLUMN_NAME_RE.test(name)) throw new HanaBusinessError(`输出列名 "${c.name}" 含非法字符，已拒绝`);
+    if (!isSafeRuntimeName(name)) throw new HanaBusinessError(`输出列名 "${c.name}" 含非法字符，已拒绝`);
     if (seen.has(name)) throw new HanaBusinessError(`输出列名 "${name}" 重复，已拒绝（列名须唯一）`);
     seen.add(name);
     const dataType = c.dataType.trim().toUpperCase();
@@ -291,12 +287,41 @@ export function normalizeScriptedColumns(columns: ScriptedColumnSpec[]): Normali
   });
 }
 
+/** 单个 SQL 模式 viewAttribute 元素（datatype 必填；字符型的 length 由调用方校验） */
+function scriptedViewAttributeXml(c: NormalizedScriptedColumn, indent: string): string {
+  const length = c.length !== undefined ? ` length="${String(c.length)}"` : '';
+  const id = escapeXmlAttr(c.name);
+  return `${indent}  <viewAttribute id="${id}" datatype="${escapeXmlAttr(c.dataType)}"${length}/>`;
+}
+
 /** SqlScriptView 节点的 <viewAttributes> 段（本环境实测必须带 datatype，字符型还需 length） */
 export function scriptedViewAttributesXml(cols: NormalizedScriptedColumn[], indent = '      '): string {
-  const items = cols
-    .map((c) => `${indent}  <viewAttribute id="${esc(c.name)}" datatype="${esc(c.dataType)}"${c.length !== undefined ? ` length="${String(c.length)}"` : ''}/>`)
-    .join('\n');
+  const items = cols.map((c) => scriptedViewAttributeXml(c, indent)).join('\n');
   return `${indent}<viewAttributes>\n${items}\n${indent}</viewAttributes>`;
+}
+
+/** 单个 logicalModel <attribute> 元素（属性列；order 在调用方按输出顺序算） */
+function scriptedAttributeXml(c: NormalizedScriptedColumn, order: number, nodeId: string, indent: string): string {
+  const id = escapeXmlAttr(c.name);
+  return (
+    `${indent}  <attribute id="${id}" order="${String(order)}"` +
+    ` attributeHierarchyActive="false" displayAttribute="false">\n` +
+    `${indent}    <descriptions defaultDescription="${escapeXmlAttr(c.description)}"/>\n` +
+    `${indent}    <keyMapping columnObjectName="${escapeXmlAttr(nodeId)}" columnName="${id}"/>\n` +
+    `${indent}  </attribute>`
+  );
+}
+
+/** 单个 logicalModel <measure> 元素（度量列；order 接在属性之后） */
+function scriptedMeasureXml(c: NormalizedScriptedColumn, order: number, nodeId: string, indent: string): string {
+  const id = escapeXmlAttr(c.name);
+  return (
+    `${indent}  <measure id="${id}" order="${String(order)}"` +
+    ` aggregationType="${escapeXmlAttr(c.aggregationType)}" measureType="simple">\n` +
+    `${indent}    <descriptions defaultDescription="${escapeXmlAttr(c.description)}"/>\n` +
+    `${indent}    <measureMapping columnObjectName="${escapeXmlAttr(nodeId)}" columnName="${id}"/>\n` +
+    `${indent}  </measure>`
+  );
 }
 
 /** logicalModel 的 <attributes> 与 <baseMeasures> 段（输出字段与类型；属性在前、度量在后） */
@@ -307,27 +332,16 @@ export function scriptedOutputSectionsXml(
 ): { attributes: string; measures: string } {
   const attributes = cols.filter((c) => !c.isMeasure);
   const measures = cols.filter((c) => c.isMeasure);
-  const attrItems = attributes
-    .map(
-      (c, i) =>
-        `${indent}  <attribute id="${esc(c.name)}" order="${String(i + 1)}" attributeHierarchyActive="false" displayAttribute="false">\n` +
-        `${indent}    <descriptions defaultDescription="${esc(c.description)}"/>\n` +
-        `${indent}    <keyMapping columnObjectName="${esc(nodeId)}" columnName="${esc(c.name)}"/>\n` +
-        `${indent}  </attribute>`,
-    )
-    .join('\n');
+  const attrItems = attributes.map((c, i) => scriptedAttributeXml(c, i + 1, nodeId, indent)).join('\n');
   const measureItems = measures
-    .map(
-      (c, i) =>
-        `${indent}  <measure id="${esc(c.name)}" order="${String(attributes.length + i + 1)}" aggregationType="${esc(c.aggregationType)}" measureType="simple">\n` +
-        `${indent}    <descriptions defaultDescription="${esc(c.description)}"/>\n` +
-        `${indent}    <measureMapping columnObjectName="${esc(nodeId)}" columnName="${esc(c.name)}"/>\n` +
-        `${indent}  </measure>`,
-    )
+    .map((c, i) => scriptedMeasureXml(c, attributes.length + i + 1, nodeId, indent))
     .join('\n');
+  /** 段包裹：空集合收敛为自闭合段 */
+  const wrapSection = (tag: string, items: string): string =>
+    items === '' ? `${indent}<${tag}/>` : `${indent}<${tag}>\n${items}\n${indent}</${tag}>`;
   return {
-    attributes: attrItems === '' ? `${indent}<attributes/>` : `${indent}<attributes>\n${attrItems}\n${indent}</attributes>`,
-    measures: measureItems === '' ? `${indent}<baseMeasures/>` : `${indent}<baseMeasures>\n${measureItems}\n${indent}</baseMeasures>`,
+    attributes: wrapSection('attributes', attrItems),
+    measures: wrapSection('baseMeasures', measureItems),
   };
 }
 
@@ -353,15 +367,17 @@ export function buildScriptedCalcViewXml(spec: ScriptedCalcViewSpec): string {
   // 直接把含 < > & 的 SQL 塞进元素会产出非法 XML（激活必然失败）。仓库既有对象的公式/脚本
   // 同款使用实体转义（见 view-xml.ts 的 text() 解码注释），故与既有形态一致。
   return [
-    `<Calculation:scenario xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:Calculation="http://www.sap.com/ndb/BiModelCalculation.ecore"` +
-      ` schemaVersion="2.3" id="${esc(objectName)}" applyPrivilegeType="ANALYTIC_PRIVILEGE" checkAnalyticPrivileges="false"` +
+    `<Calculation:scenario xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"` +
+      ` xmlns:Calculation="http://www.sap.com/ndb/BiModelCalculation.ecore"` +
+      ` schemaVersion="2.3" id="${escapeXmlAttr(objectName)}" applyPrivilegeType="ANALYTIC_PRIVILEGE"` +
+      ` checkAnalyticPrivileges="false"` +
       ` defaultClient="$$client$$" defaultLanguage="$$language$$"` +
       // 含度量 → CUBE（与图形化形态同规则；无度量会被激活器以 40117 拒绝）
       ` dataCategory="${measureCount > 0 ? 'CUBE' : 'DEFAULT'}" outputViewType="Projection"` +
       // SQL 模式的判定标志：激活器据此按脚本节点（而非图形化节点树）编译
       ` calculationScenarioType="SCRIPT_BASED" enforceSqlExecution="false">`,
     `  <origin/>`,
-    `  <descriptions defaultDescription="${esc(desc)}"/>`,
+    `  <descriptions defaultDescription="${escapeXmlAttr(desc)}"/>`,
     `  <metadata changedAt=""/>`,
     `  <localVariables/>`,
     `  <variableMappings/>`,
@@ -371,7 +387,7 @@ export function buildScriptedCalcViewXml(spec: ScriptedCalcViewSpec): string {
     `    <calculationView xsi:type="Calculation:SqlScriptView" id="${SCRIPT_NODE_ID}">`,
     `      <descriptions/>`,
     scriptedViewAttributesXml(columns),
-    `      <definition>${esc(script)}</definition>`,
+    `      <definition>${escapeXmlAttr(script)}</definition>`,
     `    </calculationView>`,
     `  </calculationViews>`,
     `  <logicalModel id="${SCRIPT_NODE_ID}">`,

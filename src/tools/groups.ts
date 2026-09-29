@@ -1,7 +1,8 @@
 /**
  * 工具功能分组与可见性过滤（单一事实源）。
  *
- * 本模块为纯叶子模块（无外部依赖，不 import config/services/logger），可被 config 与 tools 双向引用而无环。
+ * 本模块为纯叶子模块（除 core/text 的列表解析外无依赖：不 import config/services/logger），
+ * 可被 config 与 tools 双向引用而无环。
  *
  * 三类分组：
  * - read  数据读取：只读访问 HANA 数据/元数据/系统信息/审计/导出（GET 类，不改动仓库）
@@ -14,6 +15,8 @@
  * - HANA_TOOL_DENY    强制禁用的工具名 glob（优先级最高，覆盖 allow 与分组）
  * 优先级：deny > allow > 分组开关。
  */
+
+import { splitList } from '../core/text.js';
 
 /** 工具功能分组 */
 export type ToolGroup = 'read' | 'write' | 'admin';
@@ -74,8 +77,15 @@ export const TOOL_GROUPS: Record<string, ToolGroup> = {
   // —— 管理操作（admin）——
   // hana_sql_analyze：接受任意 SQL 文本（analyze=true 时**真实执行**），且 plan_id 模式需要
   // OPTIMIZER ADMIN。它不写业务数据、不碰仓库——归 admin 是**暴露面控制**（最严的一组），
-  // 不是因为它有副作用。预留：hana_privilege_create 等管理类工具继续登记于此。
+  // 不是因为它有副作用。后续若新增 hana_privilege_create 等管理类工具，继续登记于此
+  // （当前**未注册**，不要在本文件或文档里把它写成已存在）。
   hana_sql_analyze: 'admin',
+
+  // —— 占位工具 ——
+  // 可见性配置把所有业务工具都关掉时，registerAllTools 会注册它，避免 SDK 不声明 tools 能力
+  // （tools/list 可达性所需）。它是只读的（不做任何事，只回一条提示），故归 read。
+  // 登记在这里而不是绕过分组机制：测试据 TOOL_GROUPS 断言语义，未登记的工具属编程错误。
+  hana_no_tools_available: 'read',
 };
 
 /** 工具过滤配置（来自环境变量，启动时解析一次） */
@@ -118,14 +128,6 @@ export function expandGroupTokens(tokens: string[]): string[] {
   return out;
 }
 
-/** 逗号分隔 → 去空白 → 去空串 */
-function splitTrim(s: string): string[] {
-  return s
-    .split(',')
-    .map((x) => x.trim())
-    .filter(Boolean);
-}
-
 /**
  * glob 匹配：支持 * 通配（如 hana_metadata_* 匹配所有元数据工具）。
  * 不含 * 时按精确相等。空模式列表=不匹配任何工具。
@@ -146,24 +148,18 @@ export function matchGlob(name: string, patterns: string[]): boolean {
  * - allow/deny 里的**组名**会展开成该组的全部工具名（见 expandGroupTokens），其余 token 原样保留
  *   （工具名大小写敏感，均为 hana_* 小写）。
  */
-export function parseToolFilter(
-  rawGroups: string,
-  rawAllow: string,
-  rawDeny: string,
-): ToolFilterConfig {
-  const groups = splitTrim(rawGroups).map((g) => g.toLowerCase());
+export function parseToolFilter(rawGroups: string, rawAllow: string, rawDeny: string): ToolFilterConfig {
+  const groups = splitList(rawGroups).map((g) => g.toLowerCase());
   if (groups.length > 0) {
     const invalid = groups.filter((g) => !ALL_TOOL_GROUPS.includes(g as ToolGroup));
     if (invalid.length > 0) {
-      throw new Error(
-        `HANA_TOOL_GROUPS 含未知分组：${invalid.join(', ')}；合法值：${ALL_TOOL_GROUPS.join(', ')}`,
-      );
+      throw new Error(`HANA_TOOL_GROUPS 含未知分组：${invalid.join(', ')}；合法值：${ALL_TOOL_GROUPS.join(', ')}`);
     }
   }
   return {
     enabledGroups: new Set(groups as ToolGroup[]),
-    allowPatterns: expandGroupTokens(splitTrim(rawAllow)),
-    denyPatterns: expandGroupTokens(splitTrim(rawDeny)),
+    allowPatterns: expandGroupTokens(splitList(rawAllow)),
+    denyPatterns: expandGroupTokens(splitList(rawDeny)),
   };
 }
 

@@ -1,0 +1,18 @@
+# 依赖与构建产物
+node_modules/
+dist/
+
+# 锁文件由 npm 维护，不参与格式化
+package-lock.json
+
+# 文档：README 表格与中文排版经手工调整，格式化会重排
+*.md
+
+# 本地/实机资产（不入库，见 .gitignore）
+docs/
+templates/
+test-verification/
+probe-temp/
+.claude/
+.comate/
+.dsh/

@@ -11,12 +11,16 @@
  */
 
 import type { HanaPool } from '../core/hana-client.js';
+import { classifyHanaError } from '../core/hana-errors.js';
+import { logger } from '../core/logger.js';
 import { probeVisibility, type Visibility } from './visibility.service.js';
 import {
   ALL_CHECKS,
   DEFAULT_CHECKS,
   DEFAULT_THRESHOLDS,
   HEALTH_RULES,
+  reportCheckedAt,
+  type DiagnosticReportBase,
   type FindingLevel,
   type HealthCategory,
   type HealthFinding,
@@ -38,11 +42,8 @@ export type HealthVerdict =
   | 'indeterminate';
 
 /** 单次健康检查的完整报告 */
-export interface HealthReport {
+export interface HealthReport extends DiagnosticReportBase {
   verdict: HealthVerdict;
-  /** 一句话总述（可直接读给用户） */
-  summary: string;
-  checkedAt: string;
   /** 被检查的库与版本（便于判断这份报告对应哪套环境） */
   database: { name: string; sid: string; version: string; usage: string };
   /**
@@ -78,31 +79,26 @@ export interface HealthRequest {
   thresholds: Partial<HealthThresholds>;
 }
 
-/** HANA 错误码 → unknown 成因 */
-function classifyHanaError(e: unknown): { reason: UnknownReason; detail: string } {
-  const err = e as { code?: string; message?: string };
-  const code = err?.code ? String(err.code) : '';
-  const detail = String(err?.message ?? e);
-  // 259 = invalid table name：该版本没有这个视图（与权限无关，换环境也不会出现）
-  if (code === '259') return { reason: 'view_missing', detail };
-  // 258 = insufficient privilege：语句被拒（与"静默空集"不同，这类有明确报错）
-  if (code === '258' || code === '7') return { reason: 'permission_denied', detail };
-  return { reason: 'error', detail };
-}
-
 /**
  * 探测规则上下文所需的库信息。可见性单独由 visibility.service 提供（三个诊断工具共用同一判定，
  * 避免出现"健康检查认为全量可见、活动工具认为被过滤"这类自相矛盾的输出）。
+ *
+ * 返回 `empty` 标记供上层留 caveat：取不到行时字段全是空串，若不说明，
+ * 读者会以为自己拿到了一份"库名就叫空"的报告（静默失败）。
  */
-async function probeDatabase(pool: HanaPool): Promise<HealthReport['database']> {
+async function probeDatabase(pool: HanaPool): Promise<{ info: HealthReport['database']; empty: boolean }> {
   const db = await pool.query<{ DATABASE_NAME: string; SYSTEM_ID: string; VERSION: string; USAGE: string }>(
     'SELECT DATABASE_NAME, SYSTEM_ID, VERSION, USAGE FROM SYS.M_DATABASE',
   );
+  const row = db[0];
   return {
-    name: db[0]?.DATABASE_NAME ?? '',
-    sid: db[0]?.SYSTEM_ID ?? '',
-    version: db[0]?.VERSION ?? '',
-    usage: db[0]?.USAGE ?? '',
+    info: {
+      name: row?.DATABASE_NAME ?? '',
+      sid: row?.SYSTEM_ID ?? '',
+      version: row?.VERSION ?? '',
+      usage: row?.USAGE ?? '',
+    },
+    empty: !row,
   };
 }
 
@@ -155,16 +151,25 @@ export function computeVerdict(levels: readonly FindingLevel[]): HealthVerdict {
  * （各项均为点查询，实测最慢的备份检查也在 2 秒内）。串行还让日志与输出顺序稳定，便于排障。
  */
 export async function runHealth(pool: HanaPool, req: HealthRequest): Promise<HealthReport> {
-  const [visibility, database] = await Promise.all([probeVisibility(pool), probeDatabase(pool)]);
+  const [visibility, dbProbe] = await Promise.all([probeVisibility(pool), probeDatabase(pool)]);
+  const database = dbProbe.info;
   const thresholds: HealthThresholds = { ...DEFAULT_THRESHOLDS, ...stripUndefined(req.thresholds) };
   const wanted = new Set(req.checks);
   const rules = HEALTH_RULES.filter((r) => wanted.has(r.category));
+  const caveats: string[] = [];
+  if (dbProbe.empty) {
+    logger.warn({ view: 'SYS.M_DATABASE' }, 'SYS.M_DATABASE 返回 0 行：报告中的库名/版本为空');
+    caveats.push('未能读取 SYS.M_DATABASE（返回 0 行）：database 字段为空，无法据此确认这份报告对应哪套环境。');
+  }
 
   const findings: HealthFinding[] = [];
   for (const rule of rules) {
     try {
       findings.push(await rule.run({ pool, unfiltered: visibility.unfiltered, t: thresholds }));
     } catch (e) {
+      // 规则抛错 → 归一成 unknown（引擎只负责调度与归一，不猜"什么算异常"）。
+      // 留一条服务端日志：调用方看到的是"无法判定"，而排障需要知道原始错误。
+      logger.warn({ err: e, rule: rule.id, category: rule.category }, '健康检查规则执行失败，已归一为 unknown');
       findings.push(errorToFinding(rule, e));
     }
   }
@@ -176,16 +181,27 @@ export async function runHealth(pool: HanaPool, req: HealthRequest): Promise<Hea
   const warnN = levels.filter((l) => l === 'warn').length;
   const critN = levels.filter((l) => l === 'critical').length;
 
+  // 报告级提示：把"有多少项看不见"提到顶层（与 activity/trend/storage 的 caveats 同形），
+  // 使调用方不必遍历 findings 才知道这份报告覆盖得完不完整。
+  if (unknownN > 0) {
+    const unknownCats = findings.filter((f) => f.level === 'unknown').map((f) => f.category);
+    caveats.push(
+      `有 ${unknownN} 项无法判定（${unknownCats.join(', ')}）——"未见异常"不等于"没有问题"，` +
+        '各项的成因与解锁方式见对应 finding 的 unknownReason / advice。',
+    );
+  }
+
   return {
     verdict,
     summary: buildSummary(verdict, findings, database.name),
-    checkedAt: new Date().toISOString(),
+    checkedAt: reportCheckedAt(),
     database,
     visibility,
     coverage: { requested: req.checks, ok: okN, warn: warnN, critical: critN, unknown: unknownN },
     // 读数平铺到顶层：调用方要"看占用情况"时不必去 findings 里翻（且 ok 项默认不在 findings 里）
     metrics: findings.flatMap((f) => f.metrics ?? []),
     findings,
+    caveats,
   };
 }
 
@@ -206,20 +222,26 @@ function buildSummary(verdict: HealthVerdict, findings: HealthFinding[], dbName:
       return `${dbName}：${findings.length} 项检查全部通过，未发现异常。`;
     case 'critical': {
       const crits = findings.filter((f) => f.level === 'critical');
-      return `${dbName}：发现 ${crits.length} 项严重问题，需立即处理 —— ${crits.map((f) => f.title).join('；')}`
-        + (bad.length > crits.length ? `（另有 ${bad.length - crits.length} 项警告）` : '');
+      return (
+        `${dbName}：发现 ${crits.length} 项严重问题，需立即处理 —— ${crits.map((f) => f.title).join('；')}` +
+        (bad.length > crits.length ? `（另有 ${bad.length - crits.length} 项警告）` : '')
+      );
     }
     case 'warn':
       return `${dbName}：未发现严重问题，但有 ${bad.length} 项需要关注 —— ${bad.map((f) => f.title).join('；')}`;
     case 'indeterminate':
-      return `${dbName}：已执行的检查项中未见异常，但有 ${unknowns.length} 项**无法判定**`
-        + `（${unknowns.map((f) => f.category).join(', ')}），因此不能得出"系统健康"的结论。`
-        + '无法判定的原因见各 finding 的 unknownReason 与 advice。';
+      return (
+        `${dbName}：已执行的检查项中未见异常，但有 ${unknowns.length} 项**无法判定**` +
+        `（${unknowns.map((f) => f.category).join(', ')}），因此不能得出"系统健康"的结论。` +
+        '无法判定的原因见各 finding 的 unknownReason 与 advice。'
+      );
   }
 }
 
 /** 校验并规范化 checks 参数（工具层调用） */
-export function normalizeChecks(checks?: string[]): { ok: true; value: HealthCategory[] } | { ok: false; message: string } {
+export function normalizeChecks(
+  checks?: string[],
+): { ok: true; value: HealthCategory[] } | { ok: false; message: string } {
   if (!checks || checks.length === 0) return { ok: true, value: [...DEFAULT_CHECKS] };
   const invalid = checks.filter((c) => !ALL_CHECKS.includes(c as HealthCategory));
   if (invalid.length > 0) {

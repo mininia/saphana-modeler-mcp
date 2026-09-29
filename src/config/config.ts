@@ -1,23 +1,51 @@
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
+import { DEFAULT_TIMEZONE } from '../core/datetime.js';
+import { logger } from '../core/logger.js';
+import { splitList } from '../core/text.js';
+import { XS_BASE_PATH } from '../core/xs-rest.js';
 import { findInvalidWritePackages } from './write-boundary.js';
+import { DEFAULT_HTTP_HOST, DEFAULT_SSL_VALIDATE, DEFAULT_TLS } from './deployment.js';
 
-/** 默认时区（IANA 名称），默认上海；可在 mcp.json env / .env 用 HANA_TIMEZONE 覆盖 */
-export const DEFAULT_TIMEZONE = 'Asia/Shanghai';
+export { DEFAULT_TIMEZONE };
 
 /** 默认 Locale，与 HANA Studio 登录页默认值一致 */
 export const DEFAULT_LOCALE = 'zh_CN';
 
 /**
- * 布尔环境变量解析：'true'/'1'/'TRUE' → true，其余 → false。
- * 避免 z.coerce.boolean() 把字符串 'false' 强转为 true 的经典坑。
+ * 布尔环境变量的真值集合（其余取值在 boolSchema 下 fail-fast 拒绝）。
+ * preflight 的原生 env 解析（mcp.json 路径）读的是原始值、无法走 zod，
+ * 但它必须与这里的真值口径**同源**，故共用本常量 + {@link isEnvTrue}。
+ */
+export const ENV_TRUE_VALUES = ['true', '1', 'TRUE'] as const;
+const ENV_FALSE_VALUES = ['false', '0', 'FALSE'] as const;
+/** boolSchema 的合法取值全集（真值 + 假值；其它取值在启动时即报错，不被静默当成假） */
+const BOOL_ENV_VALUES = [...ENV_TRUE_VALUES, ...ENV_FALSE_VALUES] as const;
+
+/**
+ * 真值判定（与 boolSchema 同一集合）。
+ * 供读原始 env 的调用点复用（preflight 的 mcp.json / 进程 env 路径）——那边拿不到 zod，
+ * 非真值一律按假处理；语义差异见 preflight.deploymentFromEnvValues 的注释。
+ */
+export function isEnvTrue(v: unknown): boolean {
+  return (ENV_TRUE_VALUES as readonly string[]).includes(String(v));
+}
+
+/** 值是否存在且非空（空串/全空白视为未设置）；非字符串先 String() 归一，null/undefined 直接为假 */
+export function hasValue(v: unknown): boolean {
+  return v != null && String(v).trim() !== '';
+}
+
+/**
+ * 布尔环境变量解析：'true'/'1'/'TRUE' → true，'false'/'0'/'FALSE' → false，
+ * 其余取值**启动即失败**（zod 枚举拒绝）。避免 z.coerce.boolean() 把字符串 'false' 强转为 true 的经典坑。
  * @param defaultValue 未配置时的默认值（fail-closed：安全相关开关默认 true）
  */
-const boolSchema = (defaultValue: 'true' | 'false') =>
+const boolSchema = (defaultValue: boolean) =>
   z
-    .enum(['true', 'false', '1', '0', 'TRUE', 'FALSE'])
-    .default(defaultValue)
-    .transform((v) => v === 'true' || v === '1' || v === 'TRUE');
+    .enum(BOOL_ENV_VALUES)
+    .default(defaultValue ? 'true' : 'false')
+    .transform(isEnvTrue);
 
 /** 时区校验：必须是合法 IANA 名称（如 Asia/Shanghai、UTC），非法值在配置加载时即报错 */
 const timeZoneSchema = z
@@ -56,12 +84,12 @@ const envSchema = z.object({
    * 是否启用 TLS 加密连接。默认 true（fail-closed：未显式配置时不允许明文传输凭据/数据）。
    * 仅当确认网络链路可信（如 localhost）且需兼容自签证书时才显式置 false。
    */
-  HANA_TLS: boolSchema('true'),
+  HANA_TLS: boolSchema(DEFAULT_TLS),
   /**
    * TLS 下是否校验服务器证书。默认 true（防止中间人替换证书窃取认证与数据）。
    * 内网自签证书环境需跳过校验时显式置 false（应与 HANA_TLS=false 权衡，避免加密但不认证）。
    */
-  HANA_SSL_VALIDATE: boolSchema('true'),
+  HANA_SSL_VALIDATE: boolSchema(DEFAULT_SSL_VALIDATE),
   HANA_TIMEZONE: timeZoneSchema,
   /**
    * 启用的工具功能分组（逗号分隔：read/write/admin）。
@@ -69,19 +97,22 @@ const envSchema = z.object({
    * 例：HANA_TOOL_GROUPS="read" → 仅暴露数据读取，关闭全部写工具（含校验）。
    * 合法值校验在 src/tools/groups.ts 的 parseToolFilter 完成（启动即失败）。
    */
-  HANA_TOOL_GROUPS: z.string().default('').transform((s) => s.trim()),
+  HANA_TOOL_GROUPS: z
+    .string()
+    .default('')
+    .transform((s) => s.trim()),
   /**
    * 强制启用的工具名 glob（逗号分隔，支持 * 通配；即便其分组未启用也注册）。
    * 用于在分组开关之外单独放行个别工具。例：HANA_TOOL_ALLOW="hana_some_tool"
    */
-  HANA_TOOL_ALLOW: z.string().default('').transform((s) => s.split(',').map((x) => x.trim()).filter(Boolean)),
+  HANA_TOOL_ALLOW: z.string().default('').transform(splitList),
   /**
    * 强制禁用的工具名 glob（逗号分隔，支持 * 通配；优先级最高，覆盖 allow 与分组）。
    * 例：HANA_TOOL_DENY="hana_data_preview_*" 关闭所有预览工具。
    */
-  HANA_TOOL_DENY: z.string().default('').transform((s) => s.split(',').map((x) => x.trim()).filter(Boolean)),
+  HANA_TOOL_DENY: z.string().default('').transform(splitList),
   /** 额外允许的 SQL 查询 schema（逗号分隔，追加到 core/sql.ts 白名单；默认仅系统 schema） */
-  HANA_SCHEMA_ALLOW: z.string().default('').transform((s) => s.split(',').map((x) => x.trim()).filter(Boolean)),
+  HANA_SCHEMA_ALLOW: z.string().default('').transform(splitList),
   /**
    * 允许写操作的仓库包（逗号分隔的包前缀；含子包）。
    * 空/未填 = 不限制（所有包均可写）；填写后仅允许指定包及其下级子包写操作。
@@ -92,7 +123,7 @@ const envSchema = z.object({
     .string()
     .default('')
     .transform((s) => {
-      const entries = s.split(',').map((x) => x.trim().toUpperCase()).filter(Boolean);
+      const entries = splitList(s).map((x) => x.toUpperCase());
       // 非法条目（"ZDEMO." / "ZDE MO" / "*" 等）会被静默保留成永不匹配的前缀：
       // 表现为「所有写操作被拒」或「边界形同虚设」，两种都只会在写链路末端才暴露，
       // 故在配置加载时即失败（fail-closed），并把修复方式写进错误消息。
@@ -107,13 +138,16 @@ const envSchema = z.object({
       return entries;
     }),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
-/**
-     * XS Classic 设计时 REST 端口（直连 HTTP）。
-     * 缺省按实例号推导 80<instance>（与官方文档 §8.2 / 本库实测一致）。
-     */
-    HANA_XS_PORT: z.string().regex(/^[0-9]+$/, 'XS 端口必须是数字').optional(),
-    /** XS 设计时 REST 基础路径（默认 /sap/hana/xs/dt/base） */
-    HANA_XS_BASE_PATH: z.string().min(1).default('/sap/hana/xs/dt/base'),
+  /**
+   * XS Classic 设计时 REST 端口（直连 HTTP）。
+   * 缺省按实例号推导 80<instance>（与官方文档 §8.2 / 本库实测一致）。
+   */
+  HANA_XS_PORT: z
+    .string()
+    .regex(/^[0-9]+$/, 'XS 端口必须是数字')
+    .optional(),
+  /** XS 设计时 REST 基础路径（默认 /sap/hana/xs/dt/base） */
+  HANA_XS_BASE_PATH: z.string().min(1).default(XS_BASE_PATH),
   /**
    * Streamable HTTP transport 端口。未设置 = stdio 传输（默认，向后兼容）；
    * 设置后以 Streamable HTTP 模式监听（端点 /mcp）。0 = 随机端口（测试用）。
@@ -128,11 +162,13 @@ const envSchema = z.object({
    * Streamable HTTP 监听地址。默认 127.0.0.1（仅本机，fail-closed）；
    * 对外暴露需显式配置（如 0.0.0.0），并同步放行 MCP_HTTP_ALLOWED_HOSTS/ORIGINS。
    */
-  MCP_HTTP_HOST: z.string().min(1).default('127.0.0.1'),
+  MCP_HTTP_HOST: z.string().min(1).default(DEFAULT_HTTP_HOST),
   /**
-   * Streamable HTTP Bearer Token（可选）。设置后所有请求须带 `Authorization: Bearer <token>`，
-   * 缺失/不匹配 → 401（sha256 摘要后 timingSafeEqual 比较，防时序侧信道）。
-   * HTTP 模式暴露到网络时的最低限度认证；默认未设置（回环监听即为访问边界）。≥16 字符防弱凭据。
+   * [DEPRECATED] Streamable HTTP Bearer Token。等价于 MCP_HTTP_TOKENS="shared:<token>"
+   * ——读入**同一张 Token → 身份映射表**（clientId=shared），401 语义与归因行为完全不变。
+   * 保留为别名只为向后兼容（现有只配本项的部署不需要改配置）；新部署请只配 MCP_HTTP_TOKENS，
+   * 本项计划在下一个大版本删除。
+   * sha256 摘要后 timingSafeEqual 比较，防时序侧信道。≥16 字符防弱凭据。
    */
   MCP_HTTP_TOKEN: z
     .string()
@@ -144,31 +180,33 @@ const envSchema = z.object({
    * 用于 HTTP 模式下把请求归属到具体客户端：envelope.clientId、审计日志与排障都据此归因
    * （多客户端共享同一 HANA 技术账号，仓库侧的修改记录无法区分调用方，归属信息只有这里能给）。
    * name 限 [A-Za-z0-9_.-]{1,32}；token ≥16 字符；name/token 重复或格式非法在启动时即失败。
-   * 可与 MCP_HTTP_TOKEN 并存（后者映射为身份 shared）。格式：alice:<token>,bob:<token>
+   * 可与 MCP_HTTP_TOKEN（deprecated 别名，映射为身份 shared）并存。格式：alice:<token>,bob:<token>
    */
-  MCP_HTTP_TOKENS: z.string().default('').transform((s) => s.trim()),
+  MCP_HTTP_TOKENS: z
+    .string()
+    .default('')
+    .transform((s) => s.trim()),
   /**
    * 允许的 Host 头主机名（DNS rebinding 防护；逗号分隔，不含端口，IPv6 带方括号）。
    * 默认仅本机名；经对外主机名访问时须追加对应主机名。
    */
-  MCP_HTTP_ALLOWED_HOSTS: z
-    .string()
-    .default('localhost,127.0.0.1,[::1]')
-    .transform((s) => s.split(',').map((x) => x.trim()).filter(Boolean)),
+  MCP_HTTP_ALLOWED_HOSTS: z.string().default('localhost,127.0.0.1,[::1]').transform(splitList),
   /**
    * 允许的 Origin 主机名（浏览器类客户端防护；逗号分隔，不含 scheme/端口）。
-   * 无 Origin 头的请求一律放行（非浏览器 MCP 客户端不发 Origin）。默认仅本机名。
+   * 无 Origin 头的请求一律放行（非浏览器 MCP 客户端不发 Origin）。
+   * **未设置时继承 MCP_HTTP_ALLOWED_HOSTS**（默认即回环名）——对外暴露时只在一个变量里放行，
+   * 不放松安全：默认仍是回环名；显式置空则拒绝一切带 Origin 的请求。
    */
   MCP_HTTP_ALLOWED_ORIGINS: z
     .string()
-    .default('localhost,127.0.0.1,[::1]')
-    .transform((s) => s.split(',').map((x) => x.trim()).filter(Boolean)),
+    .optional()
+    .transform((s) => (s === undefined ? undefined : splitList(s))),
   /**
    * 显式承认「HTTP 对外监听且不配置任何 Bearer Token」的风险（默认 false = 拒绝启动）。
    * 非回环监听 + 无 Token 时，任何可达者都能调用全部工具（含写操作）且无法归因，
    * 故默认 fail-closed；确实需要（如已置于带认证的反向代理之后）再显式置 true。
    */
-  MCP_HTTP_ALLOW_ANONYMOUS: boolSchema('false'),
+  MCP_HTTP_ALLOW_ANONYMOUS: boolSchema(false),
 });
 
 /** HTTP Token → 客户端身份映射条目（MCP_HTTP_TOKENS 解析结果） */
@@ -199,7 +237,7 @@ export function parseHttpClients(raw: string, singleToken?: string): HttpClientI
     names.add(SHARED_CLIENT_ID);
     tokens.add(singleToken);
   }
-  const entries = raw.split(',').map((s) => s.trim()).filter(Boolean);
+  const entries = splitList(raw);
   entries.forEach((entry, idx) => {
     const sep = entry.indexOf(':');
     if (sep <= 0 || sep === entry.length - 1) {
@@ -209,9 +247,7 @@ export function parseHttpClients(raw: string, singleToken?: string): HttpClientI
     const clientId = entry.slice(0, sep).trim();
     const token = entry.slice(sep + 1).trim();
     if (!CLIENT_ID_RE.test(clientId)) {
-      throw new Error(
-        `MCP_HTTP_TOKENS 第 ${idx + 1} 项的客户端名非法：仅允许字母/数字/下划线/点/连字符且长度 ≤32`,
-      );
+      throw new Error(`MCP_HTTP_TOKENS 第 ${idx + 1} 项的客户端名非法：仅允许字母/数字/下划线/点/连字符且长度 ≤32`);
     }
     if (token.length < 16) {
       throw new Error(`MCP_HTTP_TOKENS 中客户端 "${clientId}" 的 Token 长度须 ≥16 字符（防弱凭据）`);
@@ -287,10 +323,10 @@ export interface HanaConfig {
    * 风险：某个变量的外部残留值会静默覆盖 .env 里的同名值，可能连到另一套环境 —— 入口处告警。
    */
   connectionSourceMixed: boolean;
-/** XS Classic 设计时 REST 直连端口（80<instance>）；未配置时运行时按实例号推导 */
-    xsPort?: number;
-    /** XS 设计时 REST 基础路径（默认 /sap/hana/xs/dt/base） */
-    xsBasePath: string;
+  /** XS Classic 设计时 REST 直连端口（80<instance>）；未配置时运行时按实例号推导 */
+  xsPort?: number;
+  /** XS 设计时 REST 基础路径（默认 /sap/hana/xs/dt/base） */
+  xsBasePath: string;
 }
 
 /**
@@ -309,11 +345,15 @@ function derivePort(instance: string, dbName?: string): number {
  * 连接目标与凭据：这组变量决定「连到哪个库、以谁的身份」，跨来源混用会导致静默误连
  * （例：shell 里残留的 HANA_USER 覆盖 .env 里的用户名，其余变量仍来自 .env）。
  * 仅这组参与「来源一致性」判定——日志级别/工具分组/HTTP 端口等调优项混用无此风险。
+ *
+ * HANA_XS_PORT 同属此组：它决定写通道（XS REST）连到哪个端点，且 XS 走**明文 HTTP**——
+ * 混用时同样会静默连到另一套环境，且在 TLS 的 HANA_PORT 之外多一条不太被注意的明文链路。
  */
 const CONNECTION_KEYS = [
   'HANA_HOST',
   'HANA_INSTANCE',
   'HANA_PORT',
+  'HANA_XS_PORT',
   'HANA_DB_NAME',
   'HANA_USER',
   'HANA_PASSWORD',
@@ -326,11 +366,6 @@ const CREDENTIAL_KEYS: readonly ConnectionKey[] = ['HANA_HOST', 'HANA_USER', 'HA
 
 /** 来源标签：mcp.json env（客户端注入）/ shell / 容器注入都归此列 */
 const SOURCE_PROCESS_ENV = '进程环境变量';
-
-/** 值是否存在且非空（`HANA_PORT=` 这类空值视为未设置） */
-function hasValue(v: string | undefined): boolean {
-  return v !== undefined && v.trim() !== '';
-}
 
 /** .env 查找结果（只记录来源标签与文件，不记录任何值） */
 export interface DotEnvLoadResult {
@@ -363,9 +398,7 @@ export function tryLoadDotEnv(env: NodeJS.ProcessEnv = process.env): DotEnvLoadR
   const load = (process as NodeJS.Process & { loadEnvFile?: (p?: string) => void }).loadEnvFile;
   if (typeof load !== 'function') return { loadedFiles: [], sources };
 
-  const candidates: Array<{ dir: string; label: string }> = [
-    { dir: process.cwd(), label: '.env（工作目录）' },
-  ];
+  const candidates: Array<{ dir: string; label: string }> = [{ dir: process.cwd(), label: '.env（工作目录）' }];
   try {
     // dist/config/config.js → 项目根（.env 所在目录），需上两级
     candidates.push({ dir: fileURLToPath(new URL('../../', import.meta.url)), label: '.env（项目根）' });
@@ -400,16 +433,16 @@ export function tryLoadDotEnv(env: NodeJS.ProcessEnv = process.env): DotEnvLoadR
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): HanaConfig {
   const dotenv = tryLoadDotEnv(env);
   const parsed = envSchema.parse(env);
-  
+
   // 解析端口：显式配置优先，否则按实例号推导
   const derivedPort = derivePort(parsed.HANA_INSTANCE, parsed.HANA_DB_NAME);
   const explicitPort = parsed.HANA_PORT?.trim();
   const port = explicitPort ? parseInt(explicitPort, 10) : derivedPort;
-  
+
   if (isNaN(port) || port < 1 || port > 65535) {
     throw new Error(`无效的 SQL 端口: ${explicitPort || derivedPort}`);
   }
-  
+
   // 将解析后的时区应用到整个进程（影响 new Date() 等本地时间语义）
   process.env.TZ = parsed.HANA_TIMEZONE;
 
@@ -418,6 +451,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HanaConfig {
 
   // 连接目标/凭据的来源归因：多于一个来源 = 混用（如 shell 残留的 HANA_USER + .env 其余项）
   const connectionSourceMixed = new Set(Object.values(dotenv.sources)).size > 1;
+
+  // 弃用提示（不打印任何值）：TOKEN 仍完全生效，只是提醒迁移到 TOKENS
+  if (hasValue(parsed.MCP_HTTP_TOKEN)) {
+    logger.warn(
+      'MCP_HTTP_TOKEN 已弃用（仍生效）：它等价于 MCP_HTTP_TOKENS="shared:<token>"，' +
+        '两者读入同一张 Token→身份映射表；请在下一个大版本前改用 MCP_HTTP_TOKENS',
+    );
+  }
 
   return {
     host: parsed.HANA_HOST,
@@ -436,14 +477,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HanaConfig {
     toolAllow: parsed.HANA_TOOL_ALLOW,
     toolDeny: parsed.HANA_TOOL_DENY,
     logLevel: parsed.LOG_LEVEL,
-xsPort: parsed.HANA_XS_PORT ? parseInt(parsed.HANA_XS_PORT, 10) : parseInt(`80${parsed.HANA_INSTANCE}`, 10),
+    xsPort: parsed.HANA_XS_PORT ? parseInt(parsed.HANA_XS_PORT, 10) : parseInt(`80${parsed.HANA_INSTANCE}`, 10),
     xsBasePath: parsed.HANA_XS_BASE_PATH,
     httpPort: parsed.MCP_HTTP_PORT,
     httpHost: parsed.MCP_HTTP_HOST,
-    // Token → 身份映射（MCP_HTTP_TOKENS + 单一 MCP_HTTP_TOKEN 合并；非空即强制 Bearer 校验）
+    // Token → 身份映射（MCP_HTTP_TOKENS + deprecated 别名 MCP_HTTP_TOKEN 合并进同一张表；非空即强制 Bearer 校验）
     httpTokens: parseHttpClients(parsed.MCP_HTTP_TOKENS, parsed.MCP_HTTP_TOKEN),
     httpAllowedHosts: parsed.MCP_HTTP_ALLOWED_HOSTS,
-    httpAllowedOrigins: parsed.MCP_HTTP_ALLOWED_ORIGINS,
+    // Origin 白名单未设置时继承 Host 白名单（默认即回环名；显式置空 = 拒绝一切带 Origin 的请求）
+    httpAllowedOrigins: parsed.MCP_HTTP_ALLOWED_ORIGINS ?? parsed.MCP_HTTP_ALLOWED_HOSTS,
     httpAllowAnonymous: parsed.MCP_HTTP_ALLOW_ANONYMOUS,
     connectionSources: dotenv.sources,
     connectionSourceMixed,

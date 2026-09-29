@@ -217,7 +217,10 @@ function tableNameRegion(text: string, start: number): string {
   let depth = 0;
   for (let i = start; i < text.length; i++) {
     const ch = text[i];
-    if (ch === '(') { depth++; continue; }
+    if (ch === '(') {
+      depth++;
+      continue;
+    }
     if (ch === ')') {
       if (depth === 0) return text.slice(start, i);
       depth--;
@@ -243,8 +246,21 @@ const CLAUSE_KEYWORD = /\b(?:ON|WHERE|GROUP|ORDER|HAVING|UNION|EXCEPT|INTERSECT|
 
 /** SQL 里不会作为 schema 出现的保留字（表位置上的兜底过滤） */
 const SQL_NON_SCHEMA = new Set([
-  'SELECT', 'FROM', 'WHERE', 'GROUP', 'ORDER', 'HAVING', 'INTO', 'VALUES', 'UNION', 'EXCEPT',
-  'INTERSECT', 'LATERAL', 'DUMMY', 'CURRENT_USER', 'SESSION_USER',
+  'SELECT',
+  'FROM',
+  'WHERE',
+  'GROUP',
+  'ORDER',
+  'HAVING',
+  'INTO',
+  'VALUES',
+  'UNION',
+  'EXCEPT',
+  'INTERSECT',
+  'LATERAL',
+  'DUMMY',
+  'CURRENT_USER',
+  'SESSION_USER',
 ]);
 
 /**
@@ -266,9 +282,12 @@ export function stripSqlLiteralsAndComments(sql: string): string {
     if (c === "'") {
       i++; // 跳过起始引号
       while (i < sql.length) {
-        if (sql[i] === "'" && sql[i + 1] === "'") i += 2; // '' 转义
-        else if (sql[i] === "'") { i++; break; }
-        else i++;
+        if (sql[i] === "'" && sql[i + 1] === "'")
+          i += 2; // '' 转义
+        else if (sql[i] === "'") {
+          i++;
+          break;
+        } else i++;
       }
       out += "''";
       continue;
@@ -281,9 +300,12 @@ export function stripSqlLiteralsAndComments(sql: string): string {
       const start = i;
       i++;
       while (i < sql.length) {
-        if (sql[i] === '"' && sql[i + 1] === '"') i += 2; // "" 转义
-        else if (sql[i] === '"') { i++; break; }
-        else i++;
+        if (sql[i] === '"' && sql[i + 1] === '"')
+          i += 2; // "" 转义
+        else if (sql[i] === '"') {
+          i++;
+          break;
+        } else i++;
       }
       out += sql.slice(start, i);
       continue;
@@ -314,9 +336,6 @@ export function stripSqlLiteralsAndComments(sql: string): string {
   }
   return out;
 }
-
-/** 表位置子句的边界关键字：进入这些词即认为 FROM/JOIN 的表名区结束 */
-const CLAUSE_BOUNDARY = /[(=)]|\b(ON|WHERE|GROUP|ORDER|HAVING|UNION|EXCEPT|INTERSECT|AS)\b/i;
 
 /**
  * 从 SQL 脚本里扫出 schema 引用（`FROM SCHEMA."表"` / `JOIN "schema".t` / 逗号列表内的后续表）。
@@ -386,7 +405,8 @@ function collectQualifiedRefs(region: string, out: Set<string>): void {
       const start = i + 1;
       let j = start;
       while (j < region.length) {
-        if (region[j] === '"' && region[j + 1] === '"') j += 2; // "" 转义
+        if (region[j] === '"' && region[j + 1] === '"')
+          j += 2; // "" 转义
         else if (region[j] === '"') break;
         else j++;
       }

@@ -82,7 +82,7 @@ Connection info is only allowed from environment variables / `mcp.json` `env` (*
 | `HANA_DB_NAME` | optional | Tenant database name (required for MDC) | `SYSTEMDB` / tenant name |
 | `HANA_TLS` | optional | TLS encryption, default `true` (fail-closed; set `false` only on trusted links) | `true` |
 | `HANA_SSL_VALIDATE` | optional | Validate certificate under TLS, default `true`; set `false` for self-signed certs | `true` |
-| `HANA_TIMEZONE` | optional | Session timezone, default `Asia/Shanghai` | `Asia/Shanghai` |
+| `HANA_TIMEZONE` | optional | Process timezone (sets `TZ`, affecting log timestamps and local-time semantics); **not pushed down to the HANA session**. Default `Asia/Shanghai` | `Asia/Shanghai` |
 | `HANA_SCHEMA_ALLOW` | optional | Extra queryable schemas (comma-separated, appended to built-in allowlist) | `SAPABAP1,OTHER_SCHEMA` |
 | `HANA_WRITE_PACKAGES` | optional | Writable repository package prefixes (comma-separated, incl. sub-packages). **Empty = no restriction (all writable)**; when set, only configured packages and their sub-packages are writable | `ZDEMO1,ZDEMO2.ZDEMO_SD` |
 | `HANA_XS_PORT` | optional | XS Classic design-time REST port (write path); auto-derived as `80<instance>` if omitted | `8010` |
@@ -93,10 +93,10 @@ Connection info is only allowed from environment variables / `mcp.json` `env` (*
 | `LOG_LEVEL` | optional | Log level, default `info` | `debug` |
 | `MCP_HTTP_PORT` | optional | Streamable HTTP port; when set the server starts in HTTP mode (endpoint `/mcp`), unset = stdio (default). `0` = random port | `3000` |
 | `MCP_HTTP_HOST` | optional | HTTP listen address, default `127.0.0.1` (loopback only, fail-closed); set explicitly (e.g. `0.0.0.0`) to expose | `127.0.0.1` |
-| `MCP_HTTP_TOKEN` | optional | HTTP bearer token (≥16 chars): when set, all requests must carry `Authorization: Bearer <token>` (timing-safe comparison); missing/mismatched → 401. Strongly recommended when exposing externally. A single token cannot identify callers — every request is attributed to the identity `shared` | — |
+| `MCP_HTTP_TOKEN` | **deprecated** | Kept for backward compatibility only; equivalent to `MCP_HTTP_TOKENS=shared:<token>` (read into the same token→identity table; 401 semantics and attribution unchanged). Scheduled for removal in the next major version — use `MCP_HTTP_TOKENS` for new deployments | — |
 | `MCP_HTTP_TOKENS` | optional | **Multi-client token → identity map** (comma-separated `name:token`): each token maps to its own `clientId`, surfaced in `envelope.clientId` and the audit log (the only attribution source when clients share one HANA account). `name` is limited to `[A-Za-z0-9_.-]{1,32}`, `token` ≥16 chars; duplicates/invalid entries abort startup. May coexist with `MCP_HTTP_TOKEN` | `alice:<token>,bob:<token>` |
 | `MCP_HTTP_ALLOWED_HOSTS` | optional | Allowed `Host` header hostnames (DNS rebinding protection; comma-separated, no ports, IPv6 in brackets), defaults to loopback names only | `localhost,myhost.corp` |
-| `MCP_HTTP_ALLOWED_ORIGINS` | optional | Allowed `Origin` hostnames (comma-separated, no scheme/port; requests without an Origin header pass), defaults to loopback names only | `localhost` |
+| `MCP_HTTP_ALLOWED_ORIGINS` | optional | Allowed `Origin` hostnames (comma-separated, no scheme/port; requests without an Origin header pass). **Defaults to inheriting `MCP_HTTP_ALLOWED_HOSTS`**; explicitly empty = reject every request carrying an Origin | `localhost` |
 | `MCP_HTTP_ALLOW_ANONYMOUS` | optional | Explicitly accepts the risk of "listening externally with no Bearer token" (default `false`). **A non-loopback bind with no token is refused at startup** (in that posture the write boundary, tool groups and schema allowlist are all moot); set it to `true` only when something in front already authenticates (e.g. a reverse proxy) | `false` |
 
 ## Transports
@@ -163,7 +163,7 @@ invoked. All-empty config = all enabled (backwards-compatible default).
 
 **Typical deployment shapes:**
 
-- **Read-only analyst**: `HANA_TOOL_GROUPS=read` — exposes only 16 read-only tools; all write/validate tools hidden.
+- **Read-only analyst**: `HANA_TOOL_GROUPS=read` — exposes only 20 read-only tools; all write/validate tools hidden.
 - **Modeling developer**: `HANA_TOOL_GROUPS=read,write` — exposes read & write (the default shape, equivalent to all-empty).
 - **Disable specific tools**: `HANA_TOOL_DENY=hana_view_delete` — disables only delete; the rest are unaffected.
 
@@ -171,7 +171,7 @@ On startup, if filter variables are configured, the log prints the enabled group
 
 ## Tool Reference
 
-24 tools in total, all carrying annotations (`readOnlyHint` / `destructiveHint` / `idempotentHint`) so hosts can auto-approve and confirm dangerous operations.
+28 tools in total, all carrying annotations (`readOnlyHint` / `destructiveHint` / `idempotentHint`) so hosts can auto-approve and confirm dangerous operations.
 
 | Tool | Type | Description |
 | --- | --- | --- |
@@ -249,7 +249,9 @@ You can also use `hana_data_preview_diagnose` to pre-check manually, focusing on
 | `npm test` | Unit tests (node --test + tsx; test files kept locally, not in repo) |
 | `npm run smoke` | Build + stdio smoke test |
 | `npm run smoke:http` | Build + Streamable HTTP smoke test (handshake/tool registration/Host guard; no real HANA needed) |
-| `npm run typecheck` | Type-check only |
+| `npm run typecheck` | Type-check only (also acts as the dead-code gate: `noUnusedLocals` rejects unused imports and variables) |
+| `npm run format` | Prettier formatting (`format:check` verifies without writing) |
+| `npm run check` | `typecheck` + `test` — run this before committing |
 | `npm run verify:system` | Build + real-HANA system-tool verification |
 | `npm run verify:p1-5` | Build + read-path/preview/field-logic black-box verification |
 | `npm run verify:lifecycle` | Build + write-path full-lifecycle verification (create→validate→activate→preview→update-conflict→delete→import; scripts in local `test-verification/`, not in repo) |

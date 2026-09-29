@@ -1,11 +1,18 @@
 import type { HanaPool } from '../core/hana-client.js';
 import { HanaBusinessError } from '../core/errors.js';
+import { isPermissionError, shouldDiagnoseAccessError, PREVIEW_PERMISSION_CODES } from '../core/hana-errors.js';
 import { withKeyedLock } from '../core/keyed-mutex.js';
+import { logger } from '../core/logger.js';
 import { assertSafeRuntimeName, assertSchemaAllowed, quoteIdentifier, quoteLiteral, qualifyName } from '../core/sql.js';
 import { viewDefinitionCache } from '../model/view-cache.js';
 import type { ViewKind } from '../model/view-types.js';
 import { deriveNodeSql } from './preview.derive.js';
-import { diagnosePreview, runtimeViewExists, type PreviewChannel } from './preview-diagnose.service.js';
+import {
+  diagnosePreview,
+  hasExecutePrivilege,
+  runtimeViewExists,
+  type PreviewChannel,
+} from './preview-diagnose.service.js';
 
 /**
  * hana_data_preview 数据预览。支持范围有限；
@@ -167,6 +174,21 @@ function intermediateLockKey(viewName: string): string {
   return `dp:${viewName}`;
 }
 
+/** 数值收敛到 [lo, hi]：limit / sampleRows 的入参归一（越界收敛而非报错，与既有行为一致） */
+function clamp(v: number, lo: number, hi: number): number {
+  return Math.min(Math.max(v, lo), hi);
+}
+
+/**
+ * LIMIT n+1 → truncated 的**统一截断判定与切片**。
+ * 四处预览/勘察（direct / intermediate / derived / 基表勘察）逐字节相同，合并为单点，
+ * 避免某一路径漏取一行或多切一行造成 truncated 与 rows 不自洽。
+ */
+function slicePage<T>(rows: T[], limit: number): { rows: T[]; truncated: boolean } {
+  const truncated = rows.length > limit;
+  return { rows: truncated ? rows.slice(0, limit) : rows, truncated };
+}
+
 /** 视图名 → 本进程内正在使用该中间视图的预览调用数 */
 const intermediateInUse = new Map<string, number>();
 /** 本服务创建过（因而有权清理）的中间视图名；预存在的他人对象不入册 → 释放时不动 */
@@ -181,7 +203,7 @@ export async function previewData(
   // 包名/对象名字符集校验（纵深防御；值一律参数绑定）
   assertSafeRuntimeName(packageId, '包名');
   assertSafeRuntimeName(objectName, '对象名');
-  const limit = Math.min(Math.max(opts.limit ?? (opts.filter && opts.filter.length > 0 ? 100 : 10), 1), MAX_LIMIT);
+  const limit = clamp(opts.limit ?? (opts.filter && opts.filter.length > 0 ? 100 : 10), 1, MAX_LIMIT);
 
   // 节点预览：默认仅走 HANA 中间视图；缺权限直接返回「不支持」（不自动回退其他尝试）
   if (opts.node) {
@@ -198,8 +220,10 @@ export async function previewData(
     }
     // 前置权限检查 + 中间视图预览整体包在诊断包装内：任一权限类失败自动定位阻塞点
     return withPermissionDiagnosis(pool, packageId, objectName, opts.kind, 'intermediate', async () => {
-      // 前置权限检查：无 EXECUTE 直接提示无权限，不尝试 CREATE
-      if (!(await hasIntermediatePermission(pool))) {
+      // 前置权限检查：无 EXECUTE 直接提示无权限，不尝试 CREATE。
+      // family 口径：一次问 CREATE_/DROP_ 中间视图过程族（过程名可能带 _DEV 等后缀）；
+      // 判定唯一实现在 preview-diagnose.hasExecutePrivilege。
+      if (!(await hasExecutePrivilege(pool, 'CREATE_INTERMEDIATE_CALCULATION_VIEW', 'family'))) {
         throw new HanaBusinessError(
           `无权限：当前用户缺少 SYS.CREATE_INTERMEDIATE_CALCULATION_VIEW_DEV 的执行权限，无法进行节点预览。` +
             `可授予 EXECUTE 后重试，或显式 forceDerive=true 使用只读推导模式`,
@@ -208,8 +232,10 @@ export async function previewData(
       try {
         return await previewNodeViaIntermediate(pool, packageId, objectName, opts, limit);
       } catch (e) {
-        if (isPermissionError(e)) {
-          // 泛化提示（失败可能是中间视图创建/查询任一步骤的授权问题），保留原始错误码供诊断（envelope.raw）
+        if (classifyPreviewError(e).permission) {
+          // 权限拒绝：节点预览主路径不可用（失败可能是中间视图创建/查询任一步骤的授权问题）。
+          // 归一为泛化提示，保留原始错误码供诊断（envelope.raw）；服务端留痕便于排障
+          logger.warn({ packageId, objectName, node: opts.node, err: e }, '节点预览被权限拒绝（中间视图通道）');
           throw new HanaBusinessError(
             `无权限：节点预览被拒绝（缺少中间视图创建或查询所需权限/相关授权）。` +
               `可授予 EXECUTE on SYS.CREATE_INTERMEDIATE_CALCULATION_VIEW_DEV 后重试，或显式 forceDerive=true 使用只读推导模式`,
@@ -230,8 +256,7 @@ export async function previewData(
   const rows = await withPermissionDiagnosis(pool, packageId, objectName, opts.kind, 'direct', () =>
     pool.query<Record<string, unknown>>(sql, [...where.params, limit + 1]),
   );
-  const truncated = rows.length > limit;
-  const sliced = truncated ? rows.slice(0, limit) : rows;
+  const { rows: sliced, truncated } = slicePage(rows, limit);
   return {
     object: { packageId, objectName, objectSuffix: opts.kind },
     node: opts.node,
@@ -260,7 +285,7 @@ async function withPermissionDiagnosis<T>(
   try {
     return await fn();
   } catch (e) {
-    if (!shouldAutoDiagnose(e)) throw e;
+    if (!classifyPreviewError(e).diagnose) throw e;
     try {
       const diagnosis = await diagnosePreview(pool, packageId, objectName, {
         kind,
@@ -278,7 +303,11 @@ async function withPermissionDiagnosis<T>(
       throw new HanaBusinessError(e instanceof Error ? e.message : String(e), undefined, undefined, [], diagnosis);
     } catch (rethrow) {
       // 诊断失败：抛原始错误（若 rethrow 已是带诊断的新错误则用它，否则回退原始 e）
-      if (rethrow === e || !(rethrow instanceof HanaBusinessError) || !rethrow.diagnosis) throw e;
+      if (rethrow === e || !(rethrow instanceof HanaBusinessError) || !rethrow.diagnosis) {
+        // 诊断降级：不掩盖原错、不阻断调用，但服务端留痕（诊断本身为何失败）
+        logger.warn({ packageId, objectName, channel, err: rethrow }, '预览权限诊断失败，回退原始错误');
+        throw e;
+      }
       throw rethrow;
     }
   }
@@ -335,8 +364,7 @@ async function previewNodeViaIntermediate(
     // 无论成败都解除占用（失败路径下由释放策略决定是否清理）
     release = await releaseIntermediateView(pool, viewName);
   }
-  const truncated = rows.length > limit;
-  const sliced = truncated ? rows.slice(0, limit) : rows;
+  const { rows: sliced, truncated } = slicePage(rows, limit);
   return {
     object: { packageId, objectName, objectSuffix: opts.kind },
     node,
@@ -385,8 +413,9 @@ async function releaseIntermediateView(
       ]);
       intermediateOwned.delete(viewName);
       return { dropped: true };
-    } catch {
+    } catch (e) {
       // 占用中（其他会话正在读）或权限不足：保留视图供下次复用（清理失败不得掩盖原始错误）
+      logger.warn({ viewName, err: e }, '中间视图 DROP 被拒绝，已保留供后续复用');
       return { dropped: false, reason: '视图正被其他会话占用或 DROP 被拒绝，已保留供后续复用' };
     }
   });
@@ -408,8 +437,7 @@ async function previewNodeViaDerivation(
   const where = buildWhere(opts.filter);
   const sql = `SELECT * FROM (${derived.sql}) AS "PREVIEW"${where.clause} LIMIT ?`;
   const rows = await pool.query<Record<string, unknown>>(sql, [...where.params, limit + 1]);
-  const truncated = rows.length > limit;
-  const sliced = truncated ? rows.slice(0, limit) : rows;
+  const { rows: sliced, truncated } = slicePage(rows, limit);
   return {
     object: { packageId, objectName, objectSuffix: opts.kind },
     node: opts.node,
@@ -423,39 +451,19 @@ async function previewNodeViaDerivation(
   };
 }
 
-/** 是否为权限类错误（缺 EXECUTE/授权）→ 映射为「无权限」提示 */
-function isPermissionError(e: unknown): boolean {
-  if (e instanceof HanaBusinessError) {
-    const msg = e.message;
-    // 含本服务自有「无权限：」前缀（前置权限检查/中间视图失败归一化），或 HANA 权限类消息/错误码
-    if (/not authorized|insufficient privilege|is not authorized|无权限/i.test(msg)) return true;
-    if (e.code === '10' || e.code === '2950') return true;
-    return false;
-  }
-  const msg = e instanceof Error ? e.message : String(e);
-  return /not authorized|insufficient privilege|无权限/i.test(msg);
-}
-
 /**
- * 是否应自动触发权限诊断：权限类错误 + HANA 访问类错误码（258=无效表名 / 259=对象不存在）。
- * 后两者在 _SYS_BIC 预览语境下常是「缺 SELECT → 运行时对象对当前用户不可见」的伪装形态
- * （HANA 对无权访问的对象倾向返回 259 而非权限码），纳入诊断避免漏掉这类隐蔽根因。
- * 诊断报告自身会区分「真缺失权限」与「对象确实未激活/不存在」，给出准确结论。
+ * 预览失败错误的**统一判定**（单点：消除原先 isPermissionError / shouldAutoDiagnose 两份重复正则）：
+ * - permission：权限类（码集 PREVIEW_PERMISSION_CODES=10/2950 + 权限消息正则，见 core/hana-errors）
+ *   → 归一为「无权限」提示（含本服务自有的「无权限：」前缀）；
+ * - diagnose：是否自动触发权限诊断 = 权限类 + 对象不可见类（258/259）。后两者在 _SYS_BIC 预览语境下
+ *   常是「缺 SELECT → 运行时对象对当前用户不可见」的伪装形态（HANA 对无权访问的对象倾向返回 259
+ *   而非权限码），纳入诊断避免漏掉这类隐蔽根因；诊断报告自身会区分「真缺权限」与「对象确实未激活」。
  */
-function shouldAutoDiagnose(e: unknown): boolean {
-  if (isPermissionError(e)) return true;
-  if (e instanceof HanaBusinessError && (e.code === '258' || e.code === '259')) return true;
-  return false;
-}
-
-/** 前置权限检查：当前用户是否有 SYS.CREATE_INTERMEDIATE_CALCULATION_VIEW_DEV 等中间视图过程的 EXECUTE */
-async function hasIntermediatePermission(pool: HanaPool): Promise<boolean> {
-  const rows = await pool.query<{ C: number }>(
-    `SELECT COUNT(*) AS C FROM SYS.EFFECTIVE_PRIVILEGES
-     WHERE USER_NAME = CURRENT_USER AND PRIVILEGE = 'EXECUTE'
-     AND (OBJECT_NAME LIKE 'CREATE_INTERMEDIATE_CALCULATION_VIEW%' OR OBJECT_NAME LIKE 'DROP_INTERMEDIATE_CALCULATION_VIEW%')`,
-  );
-  return (rows[0]?.C ?? 0) > 0;
+function classifyPreviewError(e: unknown): { permission: boolean; diagnose: boolean } {
+  return {
+    permission: isPermissionError(e, PREVIEW_PERMISSION_CODES),
+    diagnose: shouldDiagnoseAccessError(e),
+  };
 }
 
 /** 构建 WHERE 子句：AND 连接，列名校验 + 双引号，值参数绑定 */
@@ -508,7 +516,11 @@ function displayValue(v: unknown): string {
 }
 
 /** 单列统计（纯函数；输入为采样行） */
-function profileColumn(name: string, values: unknown[], meta?: { dataType?: string; length?: number }): TableColumnProfile {
+function profileColumn(
+  name: string,
+  values: unknown[],
+  meta?: { dataType?: string; length?: number },
+): TableColumnProfile {
   const nonNull = values.filter((v) => v !== null && v !== undefined);
   const nullCount = values.length - nonNull.length;
   const distinct = new Map<string, unknown>();
@@ -539,19 +551,12 @@ function profileColumn(name: string, values: unknown[], meta?: { dataType?: stri
  * 基表/视图勘察：采样 N 行 + 逐列统计（去重值样例、长度区间、前导零样例）。
  * 与视图预览共用筛选语义（filter 为 AND 连接、值参数绑定）。
  */
-export async function inspectTable(
-  pool: HanaPool,
-  opts: TableInspectOptions,
-): Promise<TableInspectResult> {
-  // 这些断言来自 core/sql（抛裸 Error），而 withErrorEnvelope 只把 HanaBusinessError 转成结构化信封——
-  // 不在这里包一层的话，调用方只会看到「内部错误，详情见服务端日志」（实测）。
-  try {
-    assertSchemaAllowed(opts.schema);
-    assertSafeRuntimeName(opts.table, '表/视图');
-  } catch (e) {
-    throw new HanaBusinessError(e instanceof Error ? e.message : String(e));
-  }
-  const sampleRows = Math.min(Math.max(opts.sampleRows ?? INSPECT_DEFAULT_ROWS, 1), INSPECT_MAX_ROWS);
+export async function inspectTable(pool: HanaPool, opts: TableInspectOptions): Promise<TableInspectResult> {
+  // core/sql 的断言直接抛 HanaBusinessError（带 code），由 withErrorEnvelope 归一为结构化信封；
+  // 此处不再包一层改写文案（改写既丢错误码，又让白名单描述与 core 漂移）。
+  assertSchemaAllowed(opts.schema);
+  assertSafeRuntimeName(opts.table, '表/视图');
+  const sampleRows = clamp(opts.sampleRows ?? INSPECT_DEFAULT_ROWS, 1, INSPECT_MAX_ROWS);
   const { clause, params } = buildWhere(opts.filter);
 
   // 列清单：显式给出则校验后用；缺省按元数据取（有上限，避免宽表把上下文塞满）。
@@ -559,13 +564,7 @@ export async function inspectTable(
   // 元数据里的类型/长度一并留下：画像里的 dataType/length 就是给「NUMC(10) vs CHAR(18)」这类判断用的。
   const metaByName = new Map<string, { dataType?: string; length?: number }>();
   let columnNames = opts.columns?.map((c) => c.trim());
-  for (const c of columnNames ?? []) {
-    try {
-      assertSafeRuntimeName(c, '列名');
-    } catch (e) {
-      throw new HanaBusinessError(e instanceof Error ? e.message : String(e));
-    }
-  }
+  for (const c of columnNames ?? []) assertSafeRuntimeName(c, '列名');
   try {
     const { getTableColumns } = await import('./metadata.service.js');
     const cols = await getTableColumns(pool, opts.schema, opts.table, { limit: 50 });
@@ -574,16 +573,23 @@ export async function inspectTable(
   } catch (e) {
     // 显式给了列清单时元数据失败不致命（仍可采样）；缺省取列时失败必须上抛（否则无从采起）
     if (!columnNames || columnNames.length === 0) throw e;
+    // 降级留痕：画像里不会有 dataType/length，但采样与值形态信号仍然给出
+    logger.warn({ schema: opts.schema, table: opts.table, err: e }, '列元数据读取失败，按显式列清单继续采样');
   }
 
   const target = `${quoteIdentifier(opts.schema)}.${quoteIdentifier(opts.table)}`;
   const selectList = columnNames.map((c) => quoteIdentifier(c)).join(', ');
   const sql = `SELECT ${selectList} FROM ${target}${clause} LIMIT ?`;
   const rows = await pool.query<Record<string, unknown>>(sql, [...params, sampleRows + 1]);
-  const truncated = rows.length > sampleRows;
-  const sliced = truncated ? rows.slice(0, sampleRows) : rows;
+  const { rows: sliced, truncated } = slicePage(rows, sampleRows);
 
-  const profiles = columnNames.map((name) => profileColumn(name, sliced.map((r) => r[name]), metaByName.get(name)));
+  const profiles = columnNames.map((name) =>
+    profileColumn(
+      name,
+      sliced.map((r) => r[name]),
+      metaByName.get(name),
+    ),
+  );
 
   return {
     table: { schema: opts.schema, table: opts.table },

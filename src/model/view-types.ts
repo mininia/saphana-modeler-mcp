@@ -8,6 +8,46 @@
 
 export type ViewKind = 'calculationview' | 'attributeview' | 'analyticview';
 
+/**
+ * 判定某列是否按默认策略当作**度量**的数值类型表。
+ *
+ * 单点定义的原因：这张表曾在 view-builder（生成 XML 时选度量）与 repository.service
+ * （创建后重算 measureCount 做回执）各存一份，两边注释都写着"要保持一致"却靠人工同步 ——
+ * 一旦漂移，回执里的度量数会与生成的 XML 不符，而两者都"看起来对"。
+ */
+export const NUMERIC_TYPES: ReadonlySet<string> = new Set([
+  'TINYINT',
+  'SMALLINT',
+  'INTEGER',
+  'INT',
+  'BIGINT',
+  'DECIMAL',
+  'SMALLDECIMAL',
+  'REAL',
+  'DOUBLE',
+  'FLOAT',
+  'SECONDDATE',
+  'DATE',
+  'TIME',
+  'TIMESTAMP',
+  'LONGDATE',
+]);
+
+/** 字符类类型（判定是否可作为属性/文本列） */
+export const CHAR_TYPES: ReadonlySet<string> = new Set([
+  'CHAR',
+  'VARCHAR',
+  'NCHAR',
+  'NVARCHAR',
+  'SHORTTEXT',
+  'ALPHANUM',
+]);
+
+/** 列类型是否为数值（度量候选）；类型名大小写不敏感，缺类型视为非数值 */
+export function isNumericType(dataTypeName?: string): boolean {
+  return NUMERIC_TYPES.has((dataTypeName ?? '').toUpperCase());
+}
+
 /** 数据源：计算视图引用 / 数据库表 / 数据库视图 */
 export interface ViewDataSource {
   id: string;
@@ -34,15 +74,15 @@ export interface ViewNodeInput {
   mappings: ViewNodeMapping[];
 }
 
-/** 计算字段（节点内计算列 / 公式） */
-export interface ViewCalculatedAttribute {
-  id: string;
-  datatype?: string;
-  length?: string;
-  /** 公式语言：SQL / COLUMN_ENGINE */
-  expressionLanguage?: string;
-  formula?: string;
-}
+/**
+ * 计算字段（节点内计算列 / 公式）。
+ * 与 ViewOutputField 的公式相关字段是同一形状（计算列本质就是"带公式的输出字段"，而 logicalModel
+ * 里的 calculatedAttributes 用 ViewOutputField 解析）——两处各声明一份必然漂移，故按 Pick 复用。
+ */
+export type ViewCalculatedAttribute = Pick<
+  ViewOutputField,
+  'id' | 'datatype' | 'length' | 'expressionLanguage' | 'formula'
+>;
 
 /** Aggregation 节点的度量映射（measureMapping：列 + 聚合函数） */
 export interface ViewNodeMeasure {

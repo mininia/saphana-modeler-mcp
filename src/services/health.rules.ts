@@ -21,6 +21,51 @@
  */
 
 import type { HanaPool } from '../core/hana-client.js';
+import { GIB, US_PER_SECOND, num, round } from '../core/num.js';
+import { classifyHanaError, hanaErrorCode, hanaErrorMessage, type UnknownReason } from '../core/hana-errors.js';
+import { DEFAULT_TIMEZONE, toIsoInTimezone } from '../core/datetime.js';
+import { logger } from '../core/logger.js';
+import type { Visibility } from './visibility.service.js';
+
+// ────────────────────────────────────────────────────────────
+// 四份诊断报告共用的骨架（本文件是 services 内的共享落点，不放 core：core 不认"报告"这个概念）
+// ────────────────────────────────────────────────────────────
+
+/**
+ * health / activity / storage / trend 四份报告都会带上的字段。
+ *
+ * 抽出来的理由：这四个字段原先在四份报告类型里各写一遍，形状逐步漂移——storage 用
+ * `caveat?: string` 而 activity/trend 用 `caveats: string[]`，调用方得记四套。统一后
+ * "要不要提示不确定性"只有一种答案：**caveats 恒为数组**（无提示时是空数组，不是省略字段）。
+ */
+export interface DiagnosticReportBase {
+  /**
+   * 报告生成时刻。按**运行进程时区**格式化（与日志时间戳同源同格式），
+   * 不再用 `new Date().toISOString()` —— 那会让同一份报告里的时间戳比日志早 8 小时，
+   * 排障时对不上（时间戳不带时区后缀，口径由 reportCheckedAt 的时区参数决定）。
+   */
+  checkedAt: string;
+  /** 可见性上下文：`unfiltered=false` 时"空结果"不能读作"没有问题" */
+  visibility: Visibility;
+  /** 一句话总述（可直接读给用户） */
+  summary: string;
+  /** 结果可能被行过滤 / 被窗口截断 / 某层取不到时的提示；无提示时为空数组 */
+  caveats: string[];
+}
+
+/**
+ * 报告时刻（与日志时间戳同一时区口径）。
+ * TZ 由 config 在启动时按 HANA_TIMEZONE 写入进程环境（见 config.ts 的 process.env.TZ 赋值），
+ * 故此处直读 TZ 与日志侧一致；未设置时（如单测直接调服务）退回 DEFAULT_TIMEZONE。
+ */
+export function reportCheckedAt(now: Date = new Date()): string {
+  return toIsoInTimezone(now, process.env.TZ ?? DEFAULT_TIMEZONE);
+}
+
+/** 追加一条不确定提示（空值不追加）。四份报告统一用它，避免各处自写 `?.push(...)` 分支 */
+export function addCaveat(list: string[], text: string | undefined | null): void {
+  if (text) list.push(text);
+}
 
 /** 单项检查的结论级别 */
 export type FindingLevel =
@@ -33,18 +78,14 @@ export type FindingLevel =
   /** **看不见**——不是"正常"，是"无法判定"。绝不可折叠成 ok */
   | 'unknown';
 
-/** unknown 的成因（让调用方知道"为什么没结论"，以及补什么能解锁） */
-export type UnknownReason =
-  /** 该 HANA 版本没有这个视图（换环境也不会出现） */
-  | 'view_missing'
-  /** 权限不足（语句被拒 258） */
-  | 'permission_denied'
-  /** 权限不足导致视图静默返回空集（无报错，最危险的一类） */
-  | 'filtered'
-  /** 功能未启用（如未配系统复制）——这是"确实没有"，不是"看不见" */
-  | 'not_configured'
-  /** 执行出错 */
-  | 'error';
+/**
+ * unknown 的成因（让调用方知道"为什么没结论"，以及补什么能解锁）。
+ *
+ * 定义已迁到 core/hana-errors.ts —— 同一组错误码在 preview / preview-diagnose 等链路里
+ * 也曾各判一份，两处判定必然漂移。此处**只做转出**，保持既有导入方（health.service、
+ * 工具层、测试）的 import 路径不变。
+ */
+export type { UnknownReason } from '../core/hana-errors.js';
 
 /**
  * 一条"读数"——与 finding 的区别：finding 回答"有没有问题"，metric 回答"现在是多少"。
@@ -208,20 +249,16 @@ export interface HealthRule {
   run(ctx: HealthRuleContext): Promise<HealthFinding>;
 }
 
-/** 数值归一：HANA 的 DECIMAL/BIGINT 经驱动可能回来是字符串 */
-const num = (v: unknown): number => (v == null ? 0 : Number(v));
-/** 保留小数位（避免 evidence 里出现 18 位浮点尾巴） */
-const round = (v: number, d = 2): number => Number(v.toFixed(d));
+// num / round / GIB 一律用 core/num.ts 的唯一实现（四个服务曾各写一份逐字节相同的副本）
 
 /**
- * 字节 → **GiB**（1024³）。
+ * 字节 → **GiB**（1024³，来自 core/num.ts 的 GIB）。
  *
  * 单位选择不是风格问题：HANA Cockpit / HANA Studio 的"Used Memory 451.00 / Total Disk Size 499.76"
  * 全部是 GiB。若这里按 GB(10⁹) 输出，同一台机器同一时刻会显示 484.26 / 536.60，
  * 而比值恒为 2³⁰/10⁹ = 1.0737 —— DBA 拿工具的数字去和 Cockpit 核对时会以为读错了库。
  * 故一律用 GiB，并在单位标签里写明。
  */
-const GIB = 1024 ** 3;
 const toGiB = (bytes: unknown, d = 2): number => round(num(bytes) / GIB, d);
 
 /** 按阈值给级别 */
@@ -284,8 +321,8 @@ function emptyMeans(
       // 读数留痕：让"看不到"这件事本身可见，而不是让该项从 metrics 里静默消失
       metrics: what ? [{ name: what, value: '无法判定', detail: '视图被权限过滤成空集', source: '—' }] : undefined,
       unknownReason: 'filtered',
-      advice: '为该 HANA 用户授予 MONITORING 角色或 CATALOG READ 系统权限后重试。'
-        + '在此之前，本项的空结果不能读作"正常"。',
+      advice:
+        '为该 HANA 用户授予 MONITORING 角色或 CATALOG READ 系统权限后重试。' + '在此之前，本项的空结果不能读作"正常"。',
     };
   }
   return whatIfAbsent;
@@ -320,8 +357,8 @@ export function emptyLayer(
       value: '无法判定',
       detail: ctx.unfiltered
         ? '视图返回空集。该实例正在运行时本不应为空，请核对视图名与版本——此层未取到数据，不代表正常'
-        : '视图返回空集，且当前用户不具备解除行过滤所需的权限（缺 CATALOG READ / MONITORING）'
-          + '——此层未取到数据，**不代表正常**',
+        : '视图返回空集，且当前用户不具备解除行过滤所需的权限（缺 CATALOG READ / MONITORING）' +
+          '——此层未取到数据，**不代表正常**',
       source,
     },
     level: carriesJudgment ? 'unknown' : 'ok',
@@ -339,7 +376,11 @@ const diskRule: HealthRule = {
     // DATA_BACKUP 与 LOG_BACKUP+CATALOG_BACKUP），故按 (HOST, MOUNT_PATH) 聚合取 MAX，
     // 用 SUM 会重复计数。
     const rows = await ctx.pool.query<{
-      HOST: string; MOUNT_PATH: string; TOTAL: unknown; USED: unknown; TYPES: unknown;
+      HOST: string;
+      MOUNT_PATH: string;
+      TOTAL: unknown;
+      USED: unknown;
+      TYPES: unknown;
     }>(
       `SELECT HOST, MOUNT_PATH, MAX(TOTAL_SIZE) AS TOTAL, MAX(USED_SIZE) AS USED,
               COUNT(DISTINCT USAGE_TYPE) AS TYPES
@@ -348,11 +389,19 @@ const diskRule: HealthRule = {
        ORDER BY (MAX(USED_SIZE) * 1.0 / NULLIF(MAX(TOTAL_SIZE), 0)) DESC`,
     );
     if (rows.length === 0) {
-      return emptyMeans(ctx, diskRule, {
-        id: diskRule.id, category: 'disk', level: 'unknown',
-        title: '未取得任何文件系统信息',
-        evidence: {}, unknownReason: 'error',
-      }, '文件系统使用率');
+      return emptyMeans(
+        ctx,
+        diskRule,
+        {
+          id: diskRule.id,
+          category: 'disk',
+          level: 'unknown',
+          title: '未取得任何文件系统信息',
+          evidence: {},
+          unknownReason: 'error',
+        },
+        '文件系统使用率',
+      );
     }
     // 口径二：M_DISK_USAGE.FILE_SIZE 是该用途**卷文件**的大小（HANA 分配给它的空间），
     // 与文件系统剩余空间无关（写满自己是常态，实测 7 类里 5 类接近 100%）。
@@ -362,7 +411,11 @@ const diskRule: HealthRule = {
       `SELECT HOST, USAGE_TYPE, MAX(FILE_SIZE) AS VOL FROM SYS.M_DISK_USAGE GROUP BY HOST, USAGE_TYPE`,
     );
     const fsRows = await ctx.pool.query<{
-      HOST: string; MOUNT_PATH: string; USAGE_TYPE: string; TOTAL: unknown; USED: unknown;
+      HOST: string;
+      MOUNT_PATH: string;
+      USAGE_TYPE: string;
+      TOTAL: unknown;
+      USED: unknown;
     }>(
       `SELECT HOST, MOUNT_PATH, USAGE_TYPE, MAX(TOTAL_SIZE) AS TOTAL, MAX(USED_SIZE) AS USED
        FROM SYS.M_DISKS GROUP BY HOST, MOUNT_PATH, USAGE_TYPE`,
@@ -428,8 +481,9 @@ const diskRule: HealthRule = {
             name: '卷读写失败次数',
             value: failed,
             unit: '次',
-            detail: `读失败 ${num(v.FR)} / 写失败 ${num(v.FW)}（共 ${num(v.N)} 个卷；`
-              + `累计读 ${num(v.R)} 次、写 ${num(v.W)} 次）。非零即说明存储链路出过错`,
+            detail:
+              `读失败 ${num(v.FR)} / 写失败 ${num(v.FW)}（共 ${num(v.N)} 个卷；` +
+              `累计读 ${num(v.R)} 次、写 ${num(v.W)} 次）。非零即说明存储链路出过错`,
             source: 'SYS.M_VOLUME_IO_TOTAL_STATISTICS',
           },
           {
@@ -443,13 +497,14 @@ const diskRule: HealthRule = {
             name: '卷 IO 软异常',
             value: soft,
             unit: '次',
-            detail: `短读 ${num(v.SR)}、短写 ${num(v.SW)}、整块重试读 ${num(v.RR)}、重试写 ${num(v.RW)}`
-              + '（重试成功通常无感，持续增长则说明链路不稳）',
+            detail:
+              `短读 ${num(v.SR)}、短写 ${num(v.SW)}、整块重试读 ${num(v.RR)}、重试写 ${num(v.RW)}` +
+              '（重试成功通常无感，持续增长则说明链路不稳）',
             source: 'SYS.M_VOLUME_IO_TOTAL_STATISTICS',
           },
           {
             name: '卷累计 IO 时间',
-            value: round(num(v.IOT) / 1e6, 1),
+            value: round(num(v.IOT) / US_PER_SECOND, 1),
             unit: '秒',
             detail: '各卷 TOTAL_IO_TIME 合计（微秒→秒）',
             source: 'SYS.M_VOLUME_IO_TOTAL_STATISTICS',
@@ -457,11 +512,17 @@ const diskRule: HealthRule = {
         );
       }
     } catch (e) {
+      // 附加层取不到：读数里留痕 + 日志留痕（服务层原本几乎不记日志，降级路径出问题时无从复盘）
+      logger.warn(
+        { err: e, rule: diskRule.id, view: 'SYS.M_VOLUME_IO_TOTAL_STATISTICS' },
+        '卷 IO 层不可读：容量结论不受影响，但本次报告缺该层读数',
+      );
       ioMetrics.push({
         name: '卷 IO 健康',
         value: '无法判定',
-        detail: `M_VOLUME_IO_TOTAL_STATISTICS 不可读（${String((e as { message?: string })?.message ?? e).slice(0, 120)}）；`
-          + '该视图需 MONITORING / CATALOG READ。缺它只影响 IO 层读数，不影响上方容量结论',
+        detail:
+          `M_VOLUME_IO_TOTAL_STATISTICS 不可读（${hanaErrorMessage(e).slice(0, 120)}）；` +
+          '该视图需 MONITORING / CATALOG READ。缺它只影响 IO 层读数，不影响上方容量结论',
         source: 'SYS.M_VOLUME_IO_TOTAL_STATISTICS',
       });
     }
@@ -474,16 +535,18 @@ const diskRule: HealthRule = {
         `SELECT FILE_TYPE, COUNT(*) AS N, SUM(USED_SIZE) AS U, SUM(TOTAL_SIZE) AS T
          FROM SYS.M_VOLUME_FILES GROUP BY FILE_TYPE ORDER BY SUM(TOTAL_SIZE) DESC`,
       );
-      const parts = vf.filter((f) => num(f.T) > 0).map((f) => {
-        const pct = round((num(f.U) / num(f.T)) * 100, 1);
-        return {
-          文件类型: f.FILE_TYPE,
-          文件数: num(f.N),
-          已用GiB: toGiB(f.U, 1),
-          总量GiB: toGiB(f.T, 1),
-          占比: pct,
-        };
-      });
+      const parts = vf
+        .filter((f) => num(f.T) > 0)
+        .map((f) => {
+          const pct = round((num(f.U) / num(f.T)) * 100, 1);
+          return {
+            文件类型: f.FILE_TYPE,
+            文件数: num(f.N),
+            已用GiB: toGiB(f.U, 1),
+            总量GiB: toGiB(f.T, 1),
+            占比: pct,
+          };
+        });
       if (parts.length === 0) {
         // 卷文件用量是**明确不判级**的纯读数（预分配写满属常态），故取不到只留痕、不降级
         ioMetrics.push(emptyLayer(ctx, '卷文件用量', 'SYS.M_VOLUME_FILES', false).metric);
@@ -491,18 +554,34 @@ const diskRule: HealthRule = {
         ioMetrics.push({
           name: '卷文件用量',
           value: parts.map((p) => `${p.文件类型} ${p.占比}%`).join(' ｜ '),
-          detail: parts.map((p) => `${p.文件类型}: ${p.已用GiB}/${p.总量GiB} GiB（${p.文件数} 个文件）`).join('；')
-            + '。**此读数不参与判级**：卷文件由 HANA 预分配，接近 100% 属常态，'
-            + '判容量只看上方的文件系统使用率',
+          detail:
+            parts.map((p) => `${p.文件类型}: ${p.已用GiB}/${p.总量GiB} GiB（${p.文件数} 个文件）`).join('；') +
+            '。**此读数不参与判级**：卷文件由 HANA 预分配，接近 100% 属常态，' +
+            '判容量只看上方的文件系统使用率',
           source: 'SYS.M_VOLUME_FILES',
         });
       }
-    } catch { /* 卷文件明细取不到不影响容量判定 */ }
+    } catch (e) {
+      // 原先这里是空 catch：该层会从 metrics 里静默消失（读者看到一份"完整"的读数却少一块）。
+      // 本层不参与判级，故只留痕 + 记日志，不改结论级别。
+      logger.warn(
+        { err: e, rule: diskRule.id, view: 'SYS.M_VOLUME_FILES' },
+        '卷文件用量层不可读，已留下"无法判定"读数',
+      );
+      ioMetrics.push({
+        name: '卷文件用量',
+        value: '无法判定',
+        detail:
+          `SYS.M_VOLUME_FILES 不可读（${hanaErrorMessage(e).slice(0, 120)}）；` +
+          '该层**只作读数、不参与判级**（卷文件预分配写满属常态），取不到不影响容量判定',
+        source: 'SYS.M_VOLUME_FILES',
+      });
+    }
 
     const level = worst([
-      ...mounts.map((m) => (m.usedPct < 0
-        ? 'unknown' as FindingLevel
-        : grade(m.usedPct, ctx.t.diskWarnPct, ctx.t.diskCritPct))),
+      ...mounts.map((m) =>
+        m.usedPct < 0 ? ('unknown' as FindingLevel) : grade(m.usedPct, ctx.t.diskWarnPct, ctx.t.diskCritPct),
+      ),
       ioLevel,
     ]);
     const peak = mounts.reduce((a, b) => (b.usedPct > a.usedPct ? b : a), mounts[0]);
@@ -512,22 +591,25 @@ const diskRule: HealthRule = {
       id: diskRule.id,
       category: 'disk',
       level,
-      title: ioLevel !== 'ok'
-        ? `卷 IO 出现异常：${num(ioFailedTotal) > 0 ? `读写失败 ${ioFailedTotal} 次` : ''}`
-          + `${num(ioBlockedTotal) > 0 ? `${num(ioFailedTotal) > 0 ? '，' : ''}阻塞写请求 ${ioBlockedTotal} 次` : ''}`
-          + `（容量侧最高使用率 ${peak.usedPct}%，${peak.mount}）`
-        : level === 'ok'
-          ? `文件系统剩余空间充足（最高使用率 ${peak.usedPct}%，${peak.mount}）`
-          : `文件系统使用率偏高：${peak.mount} 已用 ${peak.usedPct}%（${peak.usedGiB}/${peak.totalGiB} GiB）`,
+      title:
+        ioLevel !== 'ok'
+          ? `卷 IO 出现异常：${num(ioFailedTotal) > 0 ? `读写失败 ${ioFailedTotal} 次` : ''}` +
+            `${num(ioBlockedTotal) > 0 ? `${num(ioFailedTotal) > 0 ? '，' : ''}阻塞写请求 ${ioBlockedTotal} 次` : ''}` +
+            `（容量侧最高使用率 ${peak.usedPct}%，${peak.mount}）`
+          : level === 'ok'
+            ? `文件系统剩余空间充足（最高使用率 ${peak.usedPct}%，${peak.mount}）`
+            : `文件系统使用率偏高：${peak.mount} 已用 ${peak.usedPct}%（${peak.usedGiB}/${peak.totalGiB} GiB）`,
       evidence: {
-        阈值: `文件系统 warn ${ctx.t.diskWarnPct}% / critical ${ctx.t.diskCritPct}%；`
-          + `卷读写失败 ≥ ${ctx.t.ioFailedWarn} 次即告警；阻塞写 ≥ ${ctx.t.ioBlockedWriteWarn} 次即告警`,
+        阈值:
+          `文件系统 warn ${ctx.t.diskWarnPct}% / critical ${ctx.t.diskCritPct}%；` +
+          `卷读写失败 ≥ ${ctx.t.ioFailedWarn} 次即告警；阻塞写 ≥ ${ctx.t.ioBlockedWriteWarn} 次即告警`,
         挂载点: mounts,
         卷与文件系统: volumes,
-        说明: '"卷大小"是 HANA 分配给该用途的文件大小（M_DISK_USAGE.FILE_SIZE），'
-          + '与"文件系统还剩多少"无关，接近满属正常；判容量只看使用率。单位统一为 GiB（与 HANA Cockpit 一致）。'
-          + '本项同时给**容量**（还剩多少）与**IO**（盘稳不稳）两个正交读数：'
-          + '容量充足但读写失败非零，说明存储链路有问题而不是空间不够。',
+        说明:
+          '"卷大小"是 HANA 分配给该用途的文件大小（M_DISK_USAGE.FILE_SIZE），' +
+          '与"文件系统还剩多少"无关，接近满属正常；判容量只看使用率。单位统一为 GiB（与 HANA Cockpit 一致）。' +
+          '本项同时给**容量**（还剩多少）与**IO**（盘稳不稳）两个正交读数：' +
+          '容量充足但读写失败非零，说明存储链路有问题而不是空间不够。',
       },
       metrics: [
         ...mounts.map((m) => ({
@@ -537,22 +619,26 @@ const diskRule: HealthRule = {
           detail: `已用 ${m.usedGiB} / 总量 ${m.totalGiB} GiB`,
           source: 'SYS.M_DISKS',
         })),
-        ...volumes.filter((v) => v.卷大小GiB > 0).map((v) => ({
-          name: `卷大小 ${v.用途}`,
-          value: v.卷大小GiB,
-          unit: 'GiB',
-          detail: `挂载点 ${v.挂载点}，该文件系统已用 ${v.文件系统已用GiB}/${v.文件系统总量GiB} GiB（${v.使用率}%）`,
-          source: 'SYS.M_DISK_USAGE',
-        })),
+        ...volumes
+          .filter((v) => v.卷大小GiB > 0)
+          .map((v) => ({
+            name: `卷大小 ${v.用途}`,
+            value: v.卷大小GiB,
+            unit: 'GiB',
+            detail: `挂载点 ${v.挂载点}，该文件系统已用 ${v.文件系统已用GiB}/${v.文件系统总量GiB} GiB（${v.使用率}%）`,
+            source: 'SYS.M_DISK_USAGE',
+          })),
         ...ioMetrics,
       ],
-      advice: level === 'ok' ? undefined
-        : ioLevel !== 'ok'
-          ? '卷 IO 出错要先查存储侧，不是查数据库：确认多路径状态、HBA/交换机链路、存储端告警。'
-            + '**阻塞写请求尤其要紧**——日志卷写阻塞会直接挂起整库，出现即需立即介入。'
-            + '失败读写非零时建议同时核对操作系统层面的 IO 日志。'
-          : '优先处理 /hana/log（日志卷写满会导致整库挂起）；备份卷可清理过期备份集（backup catalog 中已删除的条目对应的文件）。'
-            + '注意：不要用 M_DISK_USAGE 的 FILE_SIZE 占比判断容量，那是卷文件自身的大小占比，接近 100% 属正常。',
+      advice:
+        level === 'ok'
+          ? undefined
+          : ioLevel !== 'ok'
+            ? '卷 IO 出错要先查存储侧，不是查数据库：确认多路径状态、HBA/交换机链路、存储端告警。' +
+              '**阻塞写请求尤其要紧**——日志卷写阻塞会直接挂起整库，出现即需立即介入。' +
+              '失败读写非零时建议同时核对操作系统层面的 IO 日志。'
+            : '优先处理 /hana/log（日志卷写满会导致整库挂起）；备份卷可清理过期备份集（backup catalog 中已删除的条目对应的文件）。' +
+              '注意：不要用 M_DISK_USAGE 的 FILE_SIZE 占比判断容量，那是卷文件自身的大小占比，接近 100% 属正常。',
     };
   },
 };
@@ -560,8 +646,9 @@ const diskRule: HealthRule = {
 const cpuRule: HealthRule = {
   id: 'cpu.utilization',
   category: 'cpu',
-  purpose: '主机 CPU 使用率与数据库服务占用（来源 _SYS_STATISTICS.HOST_RESOURCE_UTILIZATION_STATISTICS / '
-    + 'SYS.M_SERVICE_STATISTICS）',
+  purpose:
+    '主机 CPU 使用率与数据库服务占用（来源 _SYS_STATISTICS.HOST_RESOURCE_UTILIZATION_STATISTICS / ' +
+    'SYS.M_SERVICE_STATISTICS）',
   // 统计服务视图需 _SYS_STATISTICS 的 SELECT；缺权限时会报 258（由引擎归一为 unknown）
   silentlyFiltered: true,
   async run(ctx) {
@@ -570,13 +657,18 @@ const cpuRule: HealthRule = {
     // 正解是用统计服务：HOST_RESOURCE_UTILIZATION_STATISTICS 按 ~60 秒落一次快照，
     // 并把相邻两次的差值**预先算好**放在 *_DELTA 列里 —— 取最近一行就能直接得出区间 CPU 使用率。
     let hostPct = -1;
-    let window: { snapshot: string; seconds: number; idle: number; sys: number; user: number; wio: number } | null = null;
+    let window: { snapshot: string; seconds: number; idle: number; sys: number; user: number; wio: number } | null =
+      null;
     let statsErr: string | null = null;
     let statsErrCode = '';
     try {
       const rows = await ctx.pool.query<{
-        SERVER_TIMESTAMP: string; SNAPSHOT_DELTA: unknown; TOTAL_CPU_IDLE_TIME_DELTA: unknown;
-        TOTAL_CPU_SYSTEM_TIME_DELTA: unknown; TOTAL_CPU_USER_TIME_DELTA: unknown; TOTAL_CPU_WIO_TIME_DELTA: unknown;
+        SERVER_TIMESTAMP: string;
+        SNAPSHOT_DELTA: unknown;
+        TOTAL_CPU_IDLE_TIME_DELTA: unknown;
+        TOTAL_CPU_SYSTEM_TIME_DELTA: unknown;
+        TOTAL_CPU_USER_TIME_DELTA: unknown;
+        TOTAL_CPU_WIO_TIME_DELTA: unknown;
       }>(
         `SELECT SERVER_TIMESTAMP, SNAPSHOT_DELTA, TOTAL_CPU_IDLE_TIME_DELTA,
                 TOTAL_CPU_SYSTEM_TIME_DELTA, TOTAL_CPU_USER_TIME_DELTA, TOTAL_CPU_WIO_TIME_DELTA
@@ -594,8 +686,9 @@ const cpuRule: HealthRule = {
         window = { snapshot: d.SERVER_TIMESTAMP, seconds: round(num(d.SNAPSHOT_DELTA) / 1000), idle, sys, user, wio };
       }
     } catch (e) {
-      statsErr = String((e as { message?: string })?.message ?? e);
-      statsErrCode = String((e as { code?: string })?.code ?? '');
+      // 统一走 core/hana-errors：消息经脱敏（避免连接目标/账号进 evidence），错误码归一为字符串
+      statsErr = hanaErrorMessage(e);
+      statsErrCode = hanaErrorCode(e);
     }
 
     // 数据库服务自身的 CPU：各服务 PROCESS_CPU 之和（-1 = 该服务不提供，剔除）
@@ -604,26 +697,32 @@ const cpuRule: HealthRule = {
     );
     const svcCpu = svc.filter((s) => num(s.PROCESS_CPU) >= 0);
     const dbPct = svcCpu.reduce((sum, s) => sum + num(s.PROCESS_CPU), 0);
-    const top = svcCpu.slice().sort((a, b) => num(b.PROCESS_CPU) - num(a.PROCESS_CPU)).slice(0, ctx.t.topN);
+    const top = svcCpu
+      .slice()
+      .sort((a, b) => num(b.PROCESS_CPU) - num(a.PROCESS_CPU))
+      .slice(0, ctx.t.topN);
 
     if (hostPct < 0) {
-      // 成因按错误码分：259 是"该版本没这个视图"（授予权限也没用），258 才是缺权限。
-      // 早先这里一律标 permission_denied，会把版本差异误导成"去加权限"。
-      const reason: UnknownReason = statsErrCode === '259'
-        ? 'view_missing'
-        : statsErrCode === '258' || statsErrCode === '7' ? 'permission_denied' : 'error';
+      // 成因判定统一走 core/hana-errors 的 classifyHanaError：259 = 该版本没这个视图（授予权限也没用）、
+      // 258/7 = 权限不足被拒、其余 = 执行出错。此前这里是一段内联三元式，与引擎里的另一份判定并存，
+      // 两份判定必然漂移（同一个错误在不同工具里被解释成不同原因）。
+      const { reason } = classifyHanaError({ code: statsErrCode, message: statsErr });
       return {
-        id: cpuRule.id, category: 'cpu', level: 'unknown',
-        title: reason === 'view_missing'
-          ? '无法判定：该 HANA 版本没有 CPU 统计视图（版本差异，非权限问题）'
-          : '无法判定：取不到 CPU 使用率（需要 _SYS_STATISTICS 的 SELECT 权限）',
+        id: cpuRule.id,
+        category: 'cpu',
+        level: 'unknown',
+        title:
+          reason === 'view_missing'
+            ? '无法判定：该 HANA 版本没有 CPU 统计视图（版本差异，非权限问题）'
+            : '无法判定：取不到 CPU 使用率（需要 _SYS_STATISTICS 的 SELECT 权限）',
         evidence: { 统计服务查询错误: statsErr, 错误码: statsErrCode, 规则用途: cpuRule.purpose },
         metrics: [{ name: 'CPU 使用率', value: '无法判定', detail: statsErr ?? '统计服务无快照', source: '—' }],
         unknownReason: reason,
-        advice: reason === 'view_missing'
-          ? '这是版本能力差异，授予权限也读不到；请对照目标 HANA 版本的统计服务视图清单。'
-          : '授予该用户 _SYS_STATISTICS 的 SELECT（或 MONITORING 角色）后可读。'
-            + 'M_HOST_RESOURCE_UTILIZATION 的 CPU 列是从开机起的累计计数器，单次读取算不出百分比，故不能替代。',
+        advice:
+          reason === 'view_missing'
+            ? '这是版本能力差异，授予权限也读不到；请对照目标 HANA 版本的统计服务视图清单。'
+            : '授予该用户 _SYS_STATISTICS 的 SELECT（或 MONITORING 角色）后可读。' +
+              'M_HOST_RESOURCE_UTILIZATION 的 CPU 列是从开机起的累计计数器，单次读取算不出百分比，故不能替代。',
       };
     }
     const level = grade(hostPct, ctx.t.cpuWarnPct, ctx.t.cpuCritPct);
@@ -631,33 +730,41 @@ const cpuRule: HealthRule = {
       id: cpuRule.id,
       category: 'cpu',
       level,
-      title: level === 'ok'
-        ? `CPU 充裕：主机使用率 ${hostPct}%（数据库服务合计 ${dbPct}%）`
-        : `主机 CPU 使用率偏高：${hostPct}%（数据库服务合计 ${dbPct}%）`,
+      title:
+        level === 'ok'
+          ? `CPU 充裕：主机使用率 ${hostPct}%（数据库服务合计 ${dbPct}%）`
+          : `主机 CPU 使用率偏高：${hostPct}%（数据库服务合计 ${dbPct}%）`,
       evidence: {
         阈值: `warn ${ctx.t.cpuWarnPct}% / critical ${ctx.t.cpuCritPct}%`,
         统计窗口: window,
         服务CPU: svcCpu.map((s) => ({ 服务: s.SERVICE_NAME, CPU: `${num(s.PROCESS_CPU)}%` })),
-        说明: '主机 CPU 来自统计服务的相邻快照差值（区间均值，非瞬时值），'
-          + '与 HANA Cockpit 概览页同源；数据库服务 CPU 是各服务 PROCESS_CPU 之和（daemon 等不提供该值的以 -1 剔除）',
+        说明:
+          '主机 CPU 来自统计服务的相邻快照差值（区间均值，非瞬时值），' +
+          '与 HANA Cockpit 概览页同源；数据库服务 CPU 是各服务 PROCESS_CPU 之和（daemon 等不提供该值的以 -1 剔除）',
       },
       metrics: [
         {
-          name: '主机 CPU 使用率', value: hostPct, unit: '%',
+          name: '主机 CPU 使用率',
+          value: hostPct,
+          unit: '%',
           detail: window
             ? `统计区间 ${window.snapshot}（${window.seconds} 秒）：idle ${window.idle} / sys ${window.sys} / user ${window.user} / wio ${window.wio}`
             : undefined,
           source: '_SYS_STATISTICS.HOST_RESOURCE_UTILIZATION_STATISTICS',
         },
         {
-          name: '数据库服务 CPU 合计', value: dbPct, unit: '%',
+          name: '数据库服务 CPU 合计',
+          value: dbPct,
+          unit: '%',
           detail: top.map((s) => `${s.SERVICE_NAME} ${num(s.PROCESS_CPU)}%`).join('、') || '（无）',
           source: 'SYS.M_SERVICE_STATISTICS',
         },
       ],
-      advice: level === 'ok' ? undefined
-        : 'CPU 饱和会直接表现为响应时间劣化。用 hana_system_activity 看是否有长语句在跑；'
-          + '用 hana_sql_analyze 分析高代价语句的执行计划（planId 模式可分析已执行过的语句）。',
+      advice:
+        level === 'ok'
+          ? undefined
+          : 'CPU 饱和会直接表现为响应时间劣化。用 hana_system_activity 看是否有长语句在跑；' +
+            '用 hana_sql_analyze 分析高代价语句的执行计划（planId 模式可分析已执行过的语句）。',
     };
   },
 };
@@ -670,13 +777,19 @@ const servicesRule: HealthRule = {
   silentlyFiltered: false,
   async run(ctx) {
     const rows = await ctx.pool.query<{
-      SERVICE_NAME: string; HOST: string; ACTIVE_STATUS: string; COORDINATOR_TYPE: string;
+      SERVICE_NAME: string;
+      HOST: string;
+      ACTIVE_STATUS: string;
+      COORDINATOR_TYPE: string;
     }>('SELECT SERVICE_NAME, HOST, ACTIVE_STATUS, COORDINATOR_TYPE FROM SYS.M_SERVICES ORDER BY SERVICE_NAME');
     if (rows.length === 0) {
       return {
-        id: servicesRule.id, category: 'services', level: 'unknown',
+        id: servicesRule.id,
+        category: 'services',
+        level: 'unknown',
         title: '未取得任何服务信息（M_SERVICES 返回空）',
-        evidence: {}, unknownReason: 'error',
+        evidence: {},
+        unknownReason: 'error',
       };
     }
     const down = rows.filter((r) => r.ACTIVE_STATUS !== 'YES');
@@ -684,9 +797,10 @@ const servicesRule: HealthRule = {
       id: servicesRule.id,
       category: 'services',
       level: down.length > 0 ? 'critical' : 'ok',
-      title: down.length > 0
-        ? `${down.length} 个服务未处于 ACTIVE 状态：${down.map((d) => d.SERVICE_NAME).join(', ')}`
-        : `${rows.length} 个服务全部处于 ACTIVE 状态`,
+      title:
+        down.length > 0
+          ? `${down.length} 个服务未处于 ACTIVE 状态：${down.map((d) => d.SERVICE_NAME).join(', ')}`
+          : `${rows.length} 个服务全部处于 ACTIVE 状态`,
       evidence: {
         服务总数: rows.length,
         非活动: down.map((d) => ({ 服务: d.SERVICE_NAME, 主机: d.HOST, 状态: d.ACTIVE_STATUS })),
@@ -696,9 +810,10 @@ const servicesRule: HealthRule = {
         { name: '服务总数', value: rows.length, unit: '个', source: 'SYS.M_SERVICES' },
         { name: '非 ACTIVE 服务', value: down.length, unit: '个', source: 'SYS.M_SERVICES' },
       ],
-      advice: down.length > 0
-        ? '服务未启动/未就绪会直接导致连接失败或功能不可用。检查对应服务的 trace 文件与崩溃转储，必要时用 HANA Cockpit 重启该服务。'
-        : undefined,
+      advice:
+        down.length > 0
+          ? '服务未启动/未就绪会直接导致连接失败或功能不可用。检查对应服务的 trace 文件与崩溃转储，必要时用 HANA Cockpit 重启该服务。'
+          : undefined,
     };
   },
 };
@@ -712,7 +827,10 @@ const backupRule: HealthRule = {
     // 必须带时间窗：该视图实测 258105 行，无窗口的 ORDER BY 会拖全表。
     // 90 天窗口足以覆盖"最后一次成功全备"，若窗内为空则本身就说明备份长期未成功。
     const last = await ctx.pool.query<{
-      ENTRY_TYPE_NAME: string; STATE_NAME: string; SYS_START_TIME: string; BACKUP_ID: unknown;
+      ENTRY_TYPE_NAME: string;
+      STATE_NAME: string;
+      SYS_START_TIME: string;
+      BACKUP_ID: unknown;
     }>(
       `SELECT ENTRY_TYPE_NAME, STATE_NAME, SYS_START_TIME, BACKUP_ID
        FROM SYS.M_BACKUP_CATALOG
@@ -728,17 +846,25 @@ const backupRule: HealthRule = {
 
     if (last.length === 0) {
       // 空集是歧义的：可能真没备份，也可能被权限滤掉了
-      return emptyMeans(ctx, backupRule, {
-        id: backupRule.id, category: 'backup', level: 'critical',
-        title: '近 90 天内没有成功的全量备份记录',
-        evidence: { 查询窗口: '90 天', 近期失败备份数: failedN },
-        metrics: [
-          { name: '距上次成功全备', value: '90 天以上或从未', source: 'SYS.M_BACKUP_CATALOG' },
-          { name: '近 7 天失败备份', value: failedN, unit: '次', source: 'SYS.M_BACKUP_CATALOG' },
-        ],
-        advice: '数据库当前不具备可恢复性。立即确认备份任务是否在运行（HANA Cockpit → Backup，'
-          + '或检查 backint/SQL 备份脚本），并尽快完成一次全量备份 + 日志备份。',
-      }, '距上次成功全备');
+      return emptyMeans(
+        ctx,
+        backupRule,
+        {
+          id: backupRule.id,
+          category: 'backup',
+          level: 'critical',
+          title: '近 90 天内没有成功的全量备份记录',
+          evidence: { 查询窗口: '90 天', 近期失败备份数: failedN },
+          metrics: [
+            { name: '距上次成功全备', value: '90 天以上或从未', source: 'SYS.M_BACKUP_CATALOG' },
+            { name: '近 7 天失败备份', value: failedN, unit: '次', source: 'SYS.M_BACKUP_CATALOG' },
+          ],
+          advice:
+            '数据库当前不具备可恢复性。立即确认备份任务是否在运行（HANA Cockpit → Backup，' +
+            '或检查 backint/SQL 备份脚本），并尽快完成一次全量备份 + 日志备份。',
+        },
+        '距上次成功全备',
+      );
     }
     const ageHours = await ctx.pool.query<{ H: unknown }>(
       `SELECT SECONDS_BETWEEN(SYS_START_TIME, CURRENT_TIMESTAMP) / 3600.0 AS H
@@ -753,10 +879,11 @@ const backupRule: HealthRule = {
       id: backupRule.id,
       category: 'backup',
       level: finalLevel,
-      title: finalLevel === 'ok'
-        ? `备份正常：上次成功全备于 ${round(hours / 24, 1)} 天前，近 7 天无失败记录`
-        : `备份需关注：上次成功全备于 ${round(hours / 24, 1)} 天前（${hours} 小时）`
-          + (failedN > 0 ? `，近 7 天有 ${failedN} 次失败` : ''),
+      title:
+        finalLevel === 'ok'
+          ? `备份正常：上次成功全备于 ${round(hours / 24, 1)} 天前，近 7 天无失败记录`
+          : `备份需关注：上次成功全备于 ${round(hours / 24, 1)} 天前（${hours} 小时）` +
+            (failedN > 0 ? `，近 7 天有 ${failedN} 次失败` : ''),
       evidence: {
         阈值: `warn ${ctx.t.backupWarnHours}h / critical ${ctx.t.backupCritHours}h`,
         上次成功全备: last[0].SYS_START_TIME,
@@ -774,8 +901,10 @@ const backupRule: HealthRule = {
         },
         { name: '近 7 天失败备份', value: failedN, unit: '次', source: 'SYS.M_BACKUP_CATALOG' },
       ],
-      advice: finalLevel === 'ok' ? undefined
-        : '检查备份任务是否按计划执行、备份卷是否有足够空间；失败条目可在 SYS.M_BACKUP_CATALOG 中按 STATE_NAME=\'failed\' 查看 MESSAGE 列的具体原因。',
+      advice:
+        finalLevel === 'ok'
+          ? undefined
+          : "检查备份任务是否按计划执行、备份卷是否有足够空间；失败条目可在 SYS.M_BACKUP_CATALOG 中按 STATE_NAME='failed' 查看 MESSAGE 列的具体原因。",
     };
   },
 };
@@ -783,13 +912,17 @@ const backupRule: HealthRule = {
 const memoryRule: HealthRule = {
   id: 'memory.host',
   category: 'memory',
-  purpose: '主机物理内存、实例内存占配额比与驻留内存（来源 SYS.M_HOST_RESOURCE_UTILIZATION / '
-    + 'SYS.M_SERVICE_MEMORY / _SYS_STATISTICS.HOST_LOAD_HISTORY_HOST）',
+  purpose:
+    '主机物理内存、实例内存占配额比与驻留内存（来源 SYS.M_HOST_RESOURCE_UTILIZATION / ' +
+    'SYS.M_SERVICE_MEMORY / _SYS_STATISTICS.HOST_LOAD_HISTORY_HOST）',
   silentlyFiltered: true,
   async run(ctx) {
     const rows = await ctx.pool.query<{
-      HOST: string; FREE_PHYSICAL_MEMORY: unknown; USED_PHYSICAL_MEMORY: unknown;
-      ALLOCATION_LIMIT: unknown; INSTANCE_TOTAL_MEMORY_USED_SIZE: unknown;
+      HOST: string;
+      FREE_PHYSICAL_MEMORY: unknown;
+      USED_PHYSICAL_MEMORY: unknown;
+      ALLOCATION_LIMIT: unknown;
+      INSTANCE_TOTAL_MEMORY_USED_SIZE: unknown;
       INSTANCE_TOTAL_MEMORY_PEAK_USED_SIZE: unknown;
     }>(
       `SELECT HOST, FREE_PHYSICAL_MEMORY, USED_PHYSICAL_MEMORY, ALLOCATION_LIMIT,
@@ -797,11 +930,19 @@ const memoryRule: HealthRule = {
        FROM SYS.M_HOST_RESOURCE_UTILIZATION`,
     );
     if (rows.length === 0) {
-      return emptyMeans(ctx, memoryRule, {
-        id: memoryRule.id, category: 'memory', level: 'unknown',
-        title: '未取得主机内存信息',
-        evidence: {}, unknownReason: 'error',
-      }, '内存使用率');
+      return emptyMeans(
+        ctx,
+        memoryRule,
+        {
+          id: memoryRule.id,
+          category: 'memory',
+          level: 'unknown',
+          title: '未取得主机内存信息',
+          evidence: {},
+          unknownReason: 'error',
+        },
+        '内存使用率',
+      );
     }
     const hosts = rows.map((r) => {
       const total = num(r.FREE_PHYSICAL_MEMORY) + num(r.USED_PHYSICAL_MEMORY);
@@ -820,9 +961,11 @@ const memoryRule: HealthRule = {
         instancePeakOfLimitPct: limit > 0 ? round((num(r.INSTANCE_TOTAL_MEMORY_PEAK_USED_SIZE) / limit) * 100, 2) : -1,
       };
     });
-    const level = worst(hosts.map((h) => (h.hostUsedPct < 0
-      ? 'unknown' as FindingLevel
-      : grade(h.hostUsedPct, ctx.t.memWarnPct, ctx.t.memCritPct))));
+    const level = worst(
+      hosts.map((h) =>
+        h.hostUsedPct < 0 ? ('unknown' as FindingLevel) : grade(h.hostUsedPct, ctx.t.memWarnPct, ctx.t.memCritPct),
+      ),
+    );
     const peak = hosts.reduce((a, b) => (b.hostUsedPct > a.hostUsedPct ? b : a), hosts[0]);
 
     // 驻留内存：Cockpit 概览页的 "Database Resident / Total Resident"。
@@ -840,8 +983,9 @@ const memoryRule: HealthRule = {
         name: '数据库驻留内存',
         value: toGiB(svc[0].PHYS_SUM),
         unit: 'GiB',
-        detail: `${num(svc[0].N)} 个服务的物理内存合计（Cockpit 的 "Database Resident"）；`
-          + `已用合计 ${toGiB(svc[0].USED_SUM)} GiB`,
+        detail:
+          `${num(svc[0].N)} 个服务的物理内存合计（Cockpit 的 "Database Resident"）；` +
+          `已用合计 ${toGiB(svc[0].USED_SUM)} GiB`,
         source: 'SYS.M_SERVICE_MEMORY',
       });
     }
@@ -858,8 +1002,33 @@ const memoryRule: HealthRule = {
           detail: `全主机驻留（Cockpit 的 "Total Resident"）；统计口径的 MEMORY_RESIDENT=${toGiB(lh[0].MEMORY_RESIDENT)} GiB`,
           source: '_SYS_STATISTICS.HOST_LOAD_HISTORY_HOST',
         });
+      } else {
+        // 视图可读但一行都没有：同样是"这一层没取到"，不能让它从 metrics 里静默消失
+        logger.warn({ rule: memoryRule.id, view: 'HOST_LOAD_HISTORY_HOST' }, '主机驻留内存层返回空集');
+        residentMetrics.push({
+          name: '主机驻留内存',
+          value: '无法判定',
+          detail:
+            '统计服务 HOST_LOAD_HISTORY_HOST 返回空集。该层只作读数、不参与判级，' + '取不到不影响上方的内存使用率结论',
+          source: '_SYS_STATISTICS.HOST_LOAD_HISTORY_HOST',
+        });
       }
-    } catch { /* 无 _SYS_STATISTICS 授权时跳过，不影响内存判定 */ }
+    } catch (e) {
+      // 无 _SYS_STATISTICS 授权时走到这里。原先这里是空 catch，这一层会从读数里静默消失
+      // （代码注释本就写着"取不到时只记 metric 说明"，只是没实现）；不改结论级别，只留痕。
+      logger.warn(
+        { err: e, rule: memoryRule.id, view: 'HOST_LOAD_HISTORY_HOST' },
+        '主机驻留内存层不可读，已留下"无法判定"读数',
+      );
+      residentMetrics.push({
+        name: '主机驻留内存',
+        value: '无法判定',
+        detail:
+          `_SYS_STATISTICS.HOST_LOAD_HISTORY_HOST 不可读（${hanaErrorMessage(e).slice(0, 120)}）；` +
+          '该层只作读数、不参与判级，缺它不影响上方内存使用率结论',
+        source: '_SYS_STATISTICS.HOST_LOAD_HISTORY_HOST',
+      });
+    }
 
     // ── 内存对象层：内存被**谁**占着、以及**回收得动吗** ────────────────
     // 上一层（主机/实例内存）只回答"用了多少"，回答不了"还能不能腾出来"。
@@ -872,9 +1041,18 @@ const memoryRule: HealthRule = {
     let objLevel: FindingLevel = 'ok';
     try {
       const mo = await ctx.pool.query<{
-        SIZE: unknown; NOSWAP: unknown; SWAP: unknown; PUTS: unknown; PUTFAIL: unknown;
-        HIT: unknown; MISS: unknown; EVICT: unknown; TEVICT: unknown;
-        FSHRINK: unknown; SHRINK: unknown; N: unknown;
+        SIZE: unknown;
+        NOSWAP: unknown;
+        SWAP: unknown;
+        PUTS: unknown;
+        PUTFAIL: unknown;
+        HIT: unknown;
+        MISS: unknown;
+        EVICT: unknown;
+        TEVICT: unknown;
+        FSHRINK: unknown;
+        SHRINK: unknown;
+        N: unknown;
       }>(
         `SELECT SUM(OBJECT_SIZE) AS SIZE, SUM(NON_SWAPPABLE_SIZE) AS NOSWAP, SUM(SWAPPABLE_SIZE) AS SWAP,
                 SUM(PUT_COUNT) AS PUTS, SUM(PUT_FAILURE_COUNT) AS PUTFAIL,
@@ -914,16 +1092,18 @@ const memoryRule: HealthRule = {
             name: '不可换出内存',
             value: toGiB(r.NOSWAP),
             unit: 'GiB',
-            detail: `占内存对象总量 ${noswapPct}%（总量 ${toGiB(size)} GiB，可换出 ${toGiB(r.SWAP)} GiB）；`
-              + '**此项只作读数**——行存数据页天然不可换出，无统一健康线，异常与否看趋势变化',
+            detail:
+              `占内存对象总量 ${noswapPct}%（总量 ${toGiB(size)} GiB，可换出 ${toGiB(r.SWAP)} GiB）；` +
+              '**此项只作读数**——行存数据页天然不可换出，无统一健康线，异常与否看趋势变化',
             source: 'SYS.M_MEMORY_OBJECTS',
           },
           {
             name: '内存对象分配失败率',
             value: putFailPct,
             unit: '%',
-            detail: `失败 ${num(r.PUTFAIL)} 次 / 共 ${num(r.PUTS)} 次 put；`
-              + `阈值 warn ${ctx.t.memPutFailWarnPct}% / critical ${ctx.t.memPutFailCritPct}%`,
+            detail:
+              `失败 ${num(r.PUTFAIL)} 次 / 共 ${num(r.PUTS)} 次 put；` +
+              `阈值 warn ${ctx.t.memPutFailWarnPct}% / critical ${ctx.t.memPutFailCritPct}%`,
             source: 'SYS.M_MEMORY_OBJECTS',
           },
           {
@@ -963,22 +1143,44 @@ const memoryRule: HealthRule = {
             objMetrics.push({
               name: '内存可回收性梯度',
               value: `不可换出 ${toGiB(d.NOSWAP)} GiB`,
-              detail: `临时 ${toGiB(d.TEMP)} ｜ 可换页 ${toGiB(d.PAGELOAD)} ｜ 提前卸载 ${toGiB(d.EARLY)} ｜ `
-                + `短期 ${toGiB(d.SHORT)} ｜ 中期 ${toGiB(d.MID)} ｜ 长期 ${toGiB(d.LONG)} ｜ `
-                + `不可换出 ${toGiB(d.NOSWAP)} ｜ 可收缩 ${toGiB(d.SHRINK)} GiB`,
+              detail:
+                `临时 ${toGiB(d.TEMP)} ｜ 可换页 ${toGiB(d.PAGELOAD)} ｜ 提前卸载 ${toGiB(d.EARLY)} ｜ ` +
+                `短期 ${toGiB(d.SHORT)} ｜ 中期 ${toGiB(d.MID)} ｜ 长期 ${toGiB(d.LONG)} ｜ ` +
+                `不可换出 ${toGiB(d.NOSWAP)} ｜ 可收缩 ${toGiB(d.SHRINK)} GiB`,
               source: 'SYS.M_MEMORY_OBJECT_DISPOSITIONS',
             });
           }
-        } catch { /* 可回收性梯度取不到不影响上方的分配失败/收缩失败判定 */ }
+        } catch (e) {
+          // 取不到不影响上方的分配失败/收缩失败判定，但**不能静默**：留一条读数痕迹 + 日志。
+          // 名称与成功路径的"内存可回收性梯度"刻意不同（多一层"对象"），避免外部按名字找到它
+          // 却读到"无法判定"而误判成"梯度全 0"。
+          logger.warn(
+            { err: e, rule: memoryRule.id, view: 'SYS.M_MEMORY_OBJECT_DISPOSITIONS' },
+            '内存可回收性梯度层不可读，已留下"无法判定"读数',
+          );
+          objMetrics.push({
+            name: '内存对象可回收性梯度',
+            value: '无法判定',
+            detail:
+              `SYS.M_MEMORY_OBJECT_DISPOSITIONS 不可读（${hanaErrorMessage(e).slice(0, 120)}）；` +
+              '该层只作读数（不参与判级），缺它不影响上方的分配失败/收缩失败判定',
+            source: 'SYS.M_MEMORY_OBJECT_DISPOSITIONS',
+          });
+        }
       }
     } catch (e) {
       // 归因层取不到时**只留读数痕迹**，不改本项结论——主机/实例内存的判定本身仍然成立。
       // 但不能静默：否则 metrics 里会少一块而读者无从察觉（与引擎的告警设计同一条纪律）。
+      logger.warn(
+        { err: e, rule: memoryRule.id, view: 'SYS.M_MEMORY_OBJECTS' },
+        '内存对象归因层不可读，已留下"无法判定"读数',
+      );
       objMetrics.push({
         name: '内存对象归因',
         value: '无法判定',
-        detail: `M_MEMORY_OBJECTS 不可读（${String((e as { message?: string })?.message ?? e).slice(0, 120)}）；`
-          + '该视图需 MONITORING / CATALOG READ。缺它只影响"内存被谁占着"的归因，不影响上方内存使用率结论',
+        detail:
+          `M_MEMORY_OBJECTS 不可读（${hanaErrorMessage(e).slice(0, 120)}）；` +
+          '该视图需 MONITORING / CATALOG READ。缺它只影响"内存被谁占着"的归因，不影响上方内存使用率结论',
         source: 'SYS.M_MEMORY_OBJECTS',
       });
     }
@@ -995,25 +1197,30 @@ const memoryRule: HealthRule = {
       // 若落到最后那个分支会输出"主机内存使用率偏高"——把"判不了"说成"有问题"，
       // 与"把看不见说成正常"是同一种错误的镜像。
       title: objTrouble
-        ? `内存对象层出现异常信号：${objMetrics.filter((m) => m.name.includes('失败')).map((m) => `${m.name} ${m.value}${m.unit ?? ''}`).join('，')}`
-          + `（主机使用率 ${peak.hostUsedPct}%，实例已用 ${peak.instanceUsedGiB} / 配额 ${peak.allocationLimitGiB} GiB）`
+        ? `内存对象层出现异常信号：${objMetrics
+            .filter((m) => m.name.includes('失败'))
+            .map((m) => `${m.name} ${m.value}${m.unit ?? ''}`)
+            .join('，')}` +
+          `（主机使用率 ${peak.hostUsedPct}%，实例已用 ${peak.instanceUsedGiB} / 配额 ${peak.allocationLimitGiB} GiB）`
         : finalLevel === 'unknown'
-          ? `主机内存未见异常（使用率最高 ${peak.hostUsedPct}%），但**内存对象层无法判定**——`
-            + '不能据此认为"内存回收正常"'
+          ? `主机内存未见异常（使用率最高 ${peak.hostUsedPct}%），但**内存对象层无法判定**——` +
+            '不能据此认为"内存回收正常"'
           : finalLevel === 'ok'
             ? `内存充足：主机使用率最高 ${peak.hostUsedPct}%（实例已用 ${peak.instanceUsedGiB} / 配额 ${peak.allocationLimitGiB} GiB，占 ${peak.instanceOfLimitPct}%）`
             : `主机内存使用率偏高：${peak.host} 已用 ${peak.hostUsedPct}%（${peak.hostUsedGiB}/${peak.hostTotalGiB} GiB）`,
       evidence: {
-        阈值: `主机内存 warn ${ctx.t.memWarnPct}% / critical ${ctx.t.memCritPct}%；`
-          + `分配失败率 warn ${ctx.t.memPutFailWarnPct}% / critical ${ctx.t.memPutFailCritPct}%；`
-          + `收缩失败 ≥ ${ctx.t.memShrinkFailWarn} 次即告警`,
+        阈值:
+          `主机内存 warn ${ctx.t.memWarnPct}% / critical ${ctx.t.memCritPct}%；` +
+          `分配失败率 warn ${ctx.t.memPutFailWarnPct}% / critical ${ctx.t.memPutFailCritPct}%；` +
+          `收缩失败 ≥ ${ctx.t.memShrinkFailWarn} 次即告警`,
         主机: hosts,
         内存对象层: objMetrics,
-        说明: 'instanceOfLimitPct / instancePeakOfLimitPct 与 HANA Cockpit 概览页的 '
-          + '"Used % / Peak %" 同口径（实例已用/峰值 ÷ 分配配额），比主机使用率更贴近 HANA 自身的压力。'
-          + '单位统一为 GiB（与 HANA Cockpit 一致）。'
-          + '内存对象层的判级只依据"分配失败率"与"收缩失败次数"两个有明确物理含义的信号；'
-          + '"不可换出内存"只给读数不判级——行存数据页天然 100% 不可换出，全局占比无统一健康线。',
+        说明:
+          'instanceOfLimitPct / instancePeakOfLimitPct 与 HANA Cockpit 概览页的 ' +
+          '"Used % / Peak %" 同口径（实例已用/峰值 ÷ 分配配额），比主机使用率更贴近 HANA 自身的压力。' +
+          '单位统一为 GiB（与 HANA Cockpit 一致）。' +
+          '内存对象层的判级只依据"分配失败率"与"收缩失败次数"两个有明确物理含义的信号；' +
+          '"不可换出内存"只给读数不判级——行存数据页天然 100% 不可换出，全局占比无统一健康线。',
       },
       metrics: [
         ...hosts.flatMap((h) => [
@@ -1021,8 +1228,9 @@ const memoryRule: HealthRule = {
             name: `实例内存已用（${h.host}）`,
             value: h.instanceUsedGiB,
             unit: 'GiB',
-            detail: `占配额 ${h.instanceOfLimitPct}% ｜ 峰值 ${h.instancePeakGiB} GiB（占 ${h.instancePeakOfLimitPct}%）`
-              + ` ｜ 配额 ${h.allocationLimitGiB} GiB`,
+            detail:
+              `占配额 ${h.instanceOfLimitPct}% ｜ 峰值 ${h.instancePeakGiB} GiB（占 ${h.instancePeakOfLimitPct}%）` +
+              ` ｜ 配额 ${h.allocationLimitGiB} GiB`,
             source: 'SYS.M_HOST_RESOURCE_UTILIZATION',
           },
           {
@@ -1036,18 +1244,20 @@ const memoryRule: HealthRule = {
         ...residentMetrics,
         ...objMetrics,
       ],
-      advice: finalLevel === 'ok' ? undefined
-        : objTrouble
-          ? '内存对象层的失败计数（分配失败 / 收缩失败）指向"HANA 想拿内存但拿不到"。'
-            + '先看 hana_table_storage（mode=memory）定位占用最大的表，再看 hana_system_activity '
-            + '是否有长事务钉住版本导致内存无法回收；若主机物理内存也已接近用满，需评估扩容或调低配额。'
-          : finalLevel === 'unknown'
-            // 主机内存读到了、对象层没读到：此时给"内存紧张"的处置建议是误导，该说的是怎么解锁这一层
-            ? '主机与实例内存的使用率已读到且未见异常，**但内存对象层（分配失败 / 收缩失败 / 可回收性）没读到**，'
-              + '所以"内存回收是否正常"这一问题尚无结论。'
-              + '该视图需 MONITORING 角色或 CATALOG READ 系统权限，授权后重查即可补上这一层。'
-            : '先看是 HANA 涨还是别的进程涨：对比 instanceUsedGiB 与 allocationLimitGiB。若 HANA 内部涨，'
-              + '用 hana_table_storage（mode=memory）定位哪张表占得多，用 hana_system_activity 看是否有长事务阻止版本回收。',
+      advice:
+        finalLevel === 'ok'
+          ? undefined
+          : objTrouble
+            ? '内存对象层的失败计数（分配失败 / 收缩失败）指向"HANA 想拿内存但拿不到"。' +
+              '先看 hana_table_storage（mode=memory）定位占用最大的表，再看 hana_system_activity ' +
+              '是否有长事务钉住版本导致内存无法回收；若主机物理内存也已接近用满，需评估扩容或调低配额。'
+            : finalLevel === 'unknown'
+              ? // 主机内存读到了、对象层没读到：此时给"内存紧张"的处置建议是误导，该说的是怎么解锁这一层
+                '主机与实例内存的使用率已读到且未见异常，**但内存对象层（分配失败 / 收缩失败 / 可回收性）没读到**，' +
+                '所以"内存回收是否正常"这一问题尚无结论。' +
+                '该视图需 MONITORING 角色或 CATALOG READ 系统权限，授权后重查即可补上这一层。'
+              : '先看是 HANA 涨还是别的进程涨：对比 instanceUsedGiB 与 allocationLimitGiB。若 HANA 内部涨，' +
+                '用 hana_table_storage（mode=memory）定位哪张表占得多，用 hana_system_activity 看是否有长事务阻止版本回收。',
     };
   },
 };
@@ -1064,8 +1274,13 @@ const alertsRule: HealthRule = {
     // ALERT_RATING 实测取值 1（info）与 2（warning）；配合 STATISTICS_ALERT_THRESHOLDS 的
     // SEVERITY 2/3（同一条告警的告警级/错误级阈值）可确定分级为 1=info / 2=warn / >=3=error 及以上。
     const rows = await ctx.pool.query<{
-      ALERT_ID: unknown; ALERT_NAME: string; ALERT_RATING: unknown; ALERT_TIMESTAMP: string;
-      ALERT_HOST: string; ALERT_DETAILS: string; INDEX: string;
+      ALERT_ID: unknown;
+      ALERT_NAME: string;
+      ALERT_RATING: unknown;
+      ALERT_TIMESTAMP: string;
+      ALERT_HOST: string;
+      ALERT_DETAILS: string;
+      INDEX: string;
     }>(
       `SELECT ALERT_ID, ALERT_NAME, ALERT_RATING, ALERT_TIMESTAMP, ALERT_HOST, ALERT_DETAILS, INDEX
        FROM _SYS_STATISTICS.STATISTICS_CURRENT_ALERTS
@@ -1080,19 +1295,28 @@ const alertsRule: HealthRule = {
       evidence: Record<string, unknown>,
       metrics?: HealthMetric[],
     ): HealthFinding => ({
-      id: alertsRule.id, category: 'alerts', level, title, evidence, metrics,
-      advice: level === 'ok' ? undefined
-        : '逐条核对 ALERT_DETAILS。阈值类告警（内存/磁盘）的当前阈值可用 '
-          + '_SYS_STATISTICS.STATISTICS_ALERT_THRESHOLDS 查看；'
-          + '告警的采集与邮件通知在 HANA Cockpit → Alerts 中配置。',
+      id: alertsRule.id,
+      category: 'alerts',
+      level,
+      title,
+      evidence,
+      metrics,
+      advice:
+        level === 'ok'
+          ? undefined
+          : '逐条核对 ALERT_DETAILS。阈值类告警（内存/磁盘）的当前阈值可用 ' +
+            '_SYS_STATISTICS.STATISTICS_ALERT_THRESHOLDS 查看；' +
+            '告警的采集与邮件通知在 HANA Cockpit → Alerts 中配置。',
     });
     if (rows.length === 0) {
-      return emptyMeans(ctx, alertsRule, toFinding(
-        'ok',
-        '当前无 warning 及以上级别的告警',
-        { 说明: 'ALERT_RATING >= 2 的记录为 0 条' },
-        [{ name: '活动告警（≥warning）', value: 0, unit: '条', source: '_SYS_STATISTICS.STATISTICS_CURRENT_ALERTS' }],
-      ), '活动告警数');
+      return emptyMeans(
+        ctx,
+        alertsRule,
+        toFinding('ok', '当前无 warning 及以上级别的告警', { 说明: 'ALERT_RATING >= 2 的记录为 0 条' }, [
+          { name: '活动告警（≥warning）', value: 0, unit: '条', source: '_SYS_STATISTICS.STATISTICS_CURRENT_ALERTS' },
+        ]),
+        '活动告警数',
+      );
     }
     const items = rows.map((r) => ({
       等级: num(r.ALERT_RATING),
@@ -1112,9 +1336,19 @@ const alertsRule: HealthRule = {
       `${items.length} 条活动告警（最高等级 ${items[0].等级}）：${items[0].告警}`,
       { 阈值: '1=info（已忽略），2=warning，>=3=error', 告警: items },
       [
-        { name: '活动告警（≥warning）', value: items.length, unit: '条', detail: JSON.stringify(byLevel), source: '_SYS_STATISTICS.STATISTICS_CURRENT_ALERTS' },
+        {
+          name: '活动告警（≥warning）',
+          value: items.length,
+          unit: '条',
+          detail: JSON.stringify(byLevel),
+          source: '_SYS_STATISTICS.STATISTICS_CURRENT_ALERTS',
+        },
         ...items.slice(0, 5).map((i) => ({
-          name: `告警：${i.告警}`, value: i.等级, unit: '级', detail: i.详情, source: 'STATISTICS_CURRENT_ALERTS',
+          name: `告警：${i.告警}`,
+          value: i.等级,
+          unit: '级',
+          detail: i.详情,
+          source: 'STATISTICS_CURRENT_ALERTS',
         })),
       ],
     );
@@ -1130,9 +1364,15 @@ const blockedRule: HealthRule = {
   silentlyFiltered: true,
   async run(ctx) {
     const rows = await ctx.pool.query<{
-      BLOCKED_CONNECTION_ID: unknown; LOCK_OWNER_CONNECTION_ID: unknown; BLOCKED_TIME: string;
-      WAITING_SCHEMA_NAME: string; WAITING_TABLE_NAME: string; WAITING_OBJECT_NAME: string;
-      LOCK_TYPE: string; LOCK_MODE: string; WAIT_SEC: unknown;
+      BLOCKED_CONNECTION_ID: unknown;
+      LOCK_OWNER_CONNECTION_ID: unknown;
+      BLOCKED_TIME: string;
+      WAITING_SCHEMA_NAME: string;
+      WAITING_TABLE_NAME: string;
+      WAITING_OBJECT_NAME: string;
+      LOCK_TYPE: string;
+      LOCK_MODE: string;
+      WAIT_SEC: unknown;
     }>(
       `SELECT BLOCKED_CONNECTION_ID, LOCK_OWNER_CONNECTION_ID, BLOCKED_TIME,
               WAITING_SCHEMA_NAME, WAITING_TABLE_NAME, WAITING_OBJECT_NAME,
@@ -1146,12 +1386,19 @@ const blockedRule: HealthRule = {
       // 同 transactions：监视视图按权限行级过滤，别人的阻塞事务在无权限时看不见。
       // 本视图两套环境都恰好为 0 行，**无法直接证伪**，故按"疑罪从有"处理——
       // 两种错的代价不对称：漏报阻塞会让人以为没事，多报一次 unknown 只是提示去授权。
-      return emptyMeans(ctx, blockedRule, {
-        id: blockedRule.id, category: 'blocked', level: 'ok',
-        title: '当前没有被阻塞的事务',
-        evidence: { 说明: 'SYS.M_BLOCKED_TRANSACTIONS 返回 0 行' },
-        metrics: [{ name: '被阻塞事务', value: 0, unit: '个', source: 'SYS.M_BLOCKED_TRANSACTIONS' }],
-      }, '被阻塞事务');
+      return emptyMeans(
+        ctx,
+        blockedRule,
+        {
+          id: blockedRule.id,
+          category: 'blocked',
+          level: 'ok',
+          title: '当前没有被阻塞的事务',
+          evidence: { 说明: 'SYS.M_BLOCKED_TRANSACTIONS 返回 0 行' },
+          metrics: [{ name: '被阻塞事务', value: 0, unit: '个', source: 'SYS.M_BLOCKED_TRANSACTIONS' }],
+        },
+        '被阻塞事务',
+      );
     }
     const items = rows.map((r) => ({
       被阻塞连接: num(r.BLOCKED_CONNECTION_ID),
@@ -1176,14 +1423,17 @@ const blockedRule: HealthRule = {
       metrics: [
         { name: '被阻塞事务', value: items.length, unit: '个', source: 'SYS.M_BLOCKED_TRANSACTIONS' },
         {
-          name: '最长等待', value: items[0].等待秒数, unit: '秒',
+          name: '最长等待',
+          value: items[0].等待秒数,
+          unit: '秒',
           detail: `对象 ${items[0].对象}，阻塞者连接 ${items[0].阻塞者连接}`,
           source: 'SYS.M_BLOCKED_TRANSACTIONS',
         },
       ],
-      advice: '用 hana_system_activity 查看阻塞者连接正在执行什么语句（sections=blocking）。'
-        + 'HANA 的事务锁等待默认 30 分钟后强制回滚（indexserver.ini [transaction] lock_wait_timeout），'
-        + '在此之前应主动处理：请应用侧尽快提交或回滚，必要时终止阻塞会话。',
+      advice:
+        '用 hana_system_activity 查看阻塞者连接正在执行什么语句（sections=blocking）。' +
+        'HANA 的事务锁等待默认 30 分钟后强制回滚（indexserver.ini [transaction] lock_wait_timeout），' +
+        '在此之前应主动处理：请应用侧尽快提交或回滚，必要时终止阻塞会话。',
     };
   },
 };
@@ -1199,9 +1449,15 @@ const transactionsRule: HealthRule = {
   async run(ctx) {
     // 把阈值下推到 SQL，避免把全部活跃事务拉回来再过滤
     const rows = await ctx.pool.query<{
-      HOST: string; CONNECTION_ID: unknown; TRANSACTION_ID: unknown; START_TIME: string;
-      ELAPSED_SEC: unknown; UNDO_LOG_AMOUNT: unknown; CREATED_VERSION_COUNT: unknown;
-      ALLOCATED_VERSION_SIZE: unknown; ACQUIRED_LOCK_COUNT: unknown;
+      HOST: string;
+      CONNECTION_ID: unknown;
+      TRANSACTION_ID: unknown;
+      START_TIME: string;
+      ELAPSED_SEC: unknown;
+      UNDO_LOG_AMOUNT: unknown;
+      CREATED_VERSION_COUNT: unknown;
+      ALLOCATED_VERSION_SIZE: unknown;
+      ACQUIRED_LOCK_COUNT: unknown;
     }>(
       `SELECT HOST, CONNECTION_ID, TRANSACTION_ID, START_TIME,
               SECONDS_BETWEEN(START_TIME, CURRENT_TIMESTAMP) AS ELAPSED_SEC,
@@ -1216,14 +1472,21 @@ const transactionsRule: HealthRule = {
       // 走 emptyMeans 而不是写死 ok：M_TRANSACTIONS 实测**确实按行过滤**
       // （同一实例，环境 A 7 项权限看到 59 行、环境 B 23 项权限看到 130 行），
       // 所以"查不到长事务"在没有全量权限时不能读作"没有长事务"。
-      return emptyMeans(ctx, transactionsRule, {
-        id: transactionsRule.id, category: 'transactions', level: 'ok',
-        title: `没有超过 ${ctx.t.txWarnSec} 秒未提交的活跃事务`,
-        evidence: { 说明: `SYS.M_TRANSACTIONS 中 ACTIVE 的 USER TRANSACTION 无超过阈值者` },
-        metrics: [
-          { name: `超过 ${ctx.t.txWarnSec} 秒的活跃事务`, value: 0, unit: '个', source: 'SYS.M_TRANSACTIONS' },
-        ],
-      }, `超过 ${ctx.t.txWarnSec} 秒的活跃事务`);
+      return emptyMeans(
+        ctx,
+        transactionsRule,
+        {
+          id: transactionsRule.id,
+          category: 'transactions',
+          level: 'ok',
+          title: `没有超过 ${ctx.t.txWarnSec} 秒未提交的活跃事务`,
+          evidence: { 说明: `SYS.M_TRANSACTIONS 中 ACTIVE 的 USER TRANSACTION 无超过阈值者` },
+          metrics: [
+            { name: `超过 ${ctx.t.txWarnSec} 秒的活跃事务`, value: 0, unit: '个', source: 'SYS.M_TRANSACTIONS' },
+          ],
+        },
+        `超过 ${ctx.t.txWarnSec} 秒的活跃事务`,
+      );
     }
     const items = rows.map((r) => ({
       连接: num(r.CONNECTION_ID),
@@ -1243,8 +1506,7 @@ const transactionsRule: HealthRule = {
       id: transactionsRule.id,
       category: 'transactions',
       level,
-      title: `${items.length} 个长事务，最长 ${formatDuration(items[0].持续秒数)}未提交`
-        + `（连接 ${items[0].连接}）`,
+      title: `${items.length} 个长事务，最长 ${formatDuration(items[0].持续秒数)}未提交` + `（连接 ${items[0].连接}）`,
       evidence: {
         阈值: `warn ${ctx.t.txWarnSec}s / critical ${ctx.t.txCritSec}s`,
         长事务: items,
@@ -1252,22 +1514,28 @@ const transactionsRule: HealthRule = {
       },
       metrics: [
         {
-          name: `超过 ${ctx.t.txWarnSec} 秒的活跃事务`, value: items.length, unit: '个',
-          detail: `其中 ${idleOnes.length} 个无 undo 无锁`, source: 'SYS.M_TRANSACTIONS',
+          name: `超过 ${ctx.t.txWarnSec} 秒的活跃事务`,
+          value: items.length,
+          unit: '个',
+          detail: `其中 ${idleOnes.length} 个无 undo 无锁`,
+          source: 'SYS.M_TRANSACTIONS',
         },
         {
-          name: '最长未提交时长', value: items[0].持续秒数, unit: '秒',
+          name: '最长未提交时长',
+          value: items[0].持续秒数,
+          unit: '秒',
           detail: `${formatDuration(items[0].持续秒数)}（连接 ${items[0].连接}）`,
           source: 'SYS.M_TRANSACTIONS',
         },
       ],
-      advice: '长事务会阻止 MVCC 旧版本回收，导致内存与日志持续增长，最终表现为"无原因的内存上涨"。'
-        + (idleOnes.length > 0
+      advice:
+        '长事务会阻止 MVCC 旧版本回收，导致内存与日志持续增长，最终表现为"无原因的内存上涨"。' +
+        (idleOnes.length > 0
           ? `其中 ${idleOnes.length} 个无 undo 也无锁，通常是客户端关闭了自动提交却长期不提交——这类只需请应用侧提交或断连即可。`
-          : '当前长事务持有锁或有 undo 量，需尽快确认其业务合理性。')
-        + ' 若持续时长远超系统启动时间，说明该连接自启动起就一直挂着（多为运维工具或应用侧连接池遗留）；'
-        + '连接用户为 SYSTEM/SYS 的还需确认是否为 HANA 自身组件。'
-        + ' 用 hana_system_activity（sections=transactions）看这些连接在做什么。',
+          : '当前长事务持有锁或有 undo 量，需尽快确认其业务合理性。') +
+        ' 若持续时长远超系统启动时间，说明该连接自启动起就一直挂着（多为运维工具或应用侧连接池遗留）；' +
+        '连接用户为 SYSTEM/SYS 的还需确认是否为 HANA 自身组件。' +
+        ' 用 hana_system_activity（sections=transactions）看这些连接在做什么。',
     };
   },
 };
@@ -1279,21 +1547,32 @@ const replicationRule: HealthRule = {
   silentlyFiltered: true,
   async run(ctx) {
     const rows = await ctx.pool.query<{
-      HOST: string; SITE_NAME: string; SECONDARY_SITE_NAME: string; REPLICATION_MODE: string;
-      REPLICATION_STATUS: string; REPLICATION_STATUS_DETAILS: string;
+      HOST: string;
+      SITE_NAME: string;
+      SECONDARY_SITE_NAME: string;
+      REPLICATION_MODE: string;
+      REPLICATION_STATUS: string;
+      REPLICATION_STATUS_DETAILS: string;
     }>(
       `SELECT HOST, SITE_NAME, SECONDARY_SITE_NAME, REPLICATION_MODE,
               REPLICATION_STATUS, REPLICATION_STATUS_DETAILS
        FROM SYS.M_SERVICE_REPLICATION`,
     );
     if (rows.length === 0) {
-      return emptyMeans(ctx, replicationRule, {
-        id: replicationRule.id, category: 'replication', level: 'info',
-        title: '未配置系统复制（M_SERVICE_REPLICATION 为空）',
-        evidence: { 说明: '该实例没有系统复制关系，此项无需关注' },
-        metrics: [{ name: '系统复制', value: '未配置', source: 'SYS.M_SERVICE_REPLICATION' }],
-        unknownReason: 'not_configured',
-      }, '系统复制状态');
+      return emptyMeans(
+        ctx,
+        replicationRule,
+        {
+          id: replicationRule.id,
+          category: 'replication',
+          level: 'info',
+          title: '未配置系统复制（M_SERVICE_REPLICATION 为空）',
+          evidence: { 说明: '该实例没有系统复制关系，此项无需关注' },
+          metrics: [{ name: '系统复制', value: '未配置', source: 'SYS.M_SERVICE_REPLICATION' }],
+          unknownReason: 'not_configured',
+        },
+        '系统复制状态',
+      );
     }
     const items = rows.map((r) => ({
       主机: r.HOST,
@@ -1308,18 +1587,26 @@ const replicationRule: HealthRule = {
       id: replicationRule.id,
       category: 'replication',
       level: bad.length > 0 ? 'critical' : 'ok',
-      title: bad.length > 0
-        ? `系统复制异常：${bad.length}/${items.length} 个站点状态非 ACTIVE（${bad[0].状态}）`
-        : `系统复制正常（${items.length} 个站点均 ACTIVE）`,
+      title:
+        bad.length > 0
+          ? `系统复制异常：${bad.length}/${items.length} 个站点状态非 ACTIVE（${bad[0].状态}）`
+          : `系统复制正常（${items.length} 个站点均 ACTIVE）`,
       evidence: { 站点: items },
       metrics: [
         { name: '复制站点数', value: items.length, unit: '个', source: 'SYS.M_SERVICE_REPLICATION' },
-        { name: '非 ACTIVE 站点', value: bad.length, unit: '个', detail: bad.map((b) => `${b.主站}→${b.备站}: ${b.状态}`).join('；') || undefined, source: 'SYS.M_SERVICE_REPLICATION' },
+        {
+          name: '非 ACTIVE 站点',
+          value: bad.length,
+          unit: '个',
+          detail: bad.map((b) => `${b.主站}→${b.备站}: ${b.状态}`).join('；') || undefined,
+          source: 'SYS.M_SERVICE_REPLICATION',
+        },
       ],
-      advice: bad.length > 0
-        ? '复制中断意味着失去高可用保护——主库此时故障将丢失备库上的数据。'
-          + '检查网络、备站服务状态与复制积压（M_SERVICE_REPLICATION 的 BACKLOG_SIZE/REPLAY_BACKLOG_SIZE）。'
-        : undefined,
+      advice:
+        bad.length > 0
+          ? '复制中断意味着失去高可用保护——主库此时故障将丢失备库上的数据。' +
+            '检查网络、备站服务状态与复制积压（M_SERVICE_REPLICATION 的 BACKLOG_SIZE/REPLAY_BACKLOG_SIZE）。'
+          : undefined,
     };
   },
 };
@@ -1352,11 +1639,19 @@ const configRule: HealthRule = {
        FROM SYS.M_CONFIGURATION_PARAMETER_VALUES`,
     );
     if (num(agg[0]?.N) === 0) {
-      return emptyMeans(ctx, configRule, {
-        id: configRule.id, category: 'config', level: 'unknown',
-        title: '未取得任何配置参数',
-        evidence: {}, unknownReason: 'error',
-      }, '配置参数');
+      return emptyMeans(
+        ctx,
+        configRule,
+        {
+          id: configRule.id,
+          category: 'config',
+          level: 'unknown',
+          title: '未取得任何配置参数',
+          evidence: {},
+          unknownReason: 'error',
+        },
+        '配置参数',
+      );
     }
     const total = num(agg[0].N);
     const violated = num(agg[0].VIOLATED);
@@ -1377,24 +1672,26 @@ const configRule: HealthRule = {
     );
 
     // 违规与待重启的明细（各取 topN 条）——只在这两项非零时才查，避免无谓往返
-    const violatedRows = violated > 0
-      ? await ctx.pool.query<Record<string, unknown>>(
-        `SELECT FILE_NAME, SECTION, KEY, VALUE, LAYER_NAME, VIOLATED_RESTRICTIONS
+    const violatedRows =
+      violated > 0
+        ? await ctx.pool.query<Record<string, unknown>>(
+            `SELECT FILE_NAME, SECTION, KEY, VALUE, LAYER_NAME, VIOLATED_RESTRICTIONS
          FROM SYS.M_CONFIGURATION_PARAMETER_VALUES
          WHERE VIOLATED_RESTRICTIONS IS NOT NULL AND VIOLATED_RESTRICTIONS != ''
          ORDER BY FILE_NAME, SECTION, KEY LIMIT ?`,
-        [ctx.t.topN],
-      )
-      : [];
-    const restartRows = restart > 0
-      ? await ctx.pool.query<Record<string, unknown>>(
-        `SELECT FILE_NAME, SECTION, KEY, VALUE, LAYER_NAME
+            [ctx.t.topN],
+          )
+        : [];
+    const restartRows =
+      restart > 0
+        ? await ctx.pool.query<Record<string, unknown>>(
+            `SELECT FILE_NAME, SECTION, KEY, VALUE, LAYER_NAME
          FROM SYS.M_CONFIGURATION_PARAMETER_VALUES
          WHERE RESTART_REQUIRED = 'TRUE'
          ORDER BY FILE_NAME, SECTION, KEY LIMIT ?`,
-        [ctx.t.topN],
-      )
-      : [];
+            [ctx.t.topN],
+          )
+        : [];
 
     const level: FindingLevel = worst([
       violated > 0 ? 'warn' : 'ok',
@@ -1408,9 +1705,10 @@ const configRule: HealthRule = {
       id: configRule.id,
       category: 'config',
       level,
-      title: level === 'ok'
-        ? `配置参数未见异常（共 ${total} 项，非默认层覆盖 ${num(driftedTotal[0]?.N)} 项）`
-        : `配置需关注：${parts.join('；')}`,
+      title:
+        level === 'ok'
+          ? `配置参数未见异常（共 ${total} 项，非默认层覆盖 ${num(driftedTotal[0]?.N)} 项）`
+          : `配置需关注：${parts.join('；')}`,
       evidence: {
         阈值: `待重启生效 ≥ ${ctx.t.configRestartWarn} 项即告警；违反限制 > 0 即告警`,
         参数总数: total,
@@ -1420,32 +1718,42 @@ const configRule: HealthRule = {
         覆盖分布: layers.map((l) => ({ 文件: l.FILE_NAME, 层: l.LAYER_NAME, 项数: num(l.N) })),
         违规明细: violatedRows,
         待重启明细: restartRows,
-        说明: '本项**不做"参数应该设成多少"的比对**——推荐值会随版本过时而变成噪声。'
-          + '只报三种可验证的事实：违反限制、改了未生效、非默认层覆盖。'
-          + '第三项本身不是问题，但它是"这套库为什么和那套库行为不同"的答案所在。',
+        说明:
+          '本项**不做"参数应该设成多少"的比对**——推荐值会随版本过时而变成噪声。' +
+          '只报三种可验证的事实：违反限制、改了未生效、非默认层覆盖。' +
+          '第三项本身不是问题，但它是"这套库为什么和那套库行为不同"的答案所在。',
       },
       metrics: [
         {
-          name: '参数违规限制', value: violated, unit: '项',
+          name: '参数违规限制',
+          value: violated,
+          unit: '项',
           detail: violated > 0 ? '参数值违反了系统声明的取值限制，需按 VIOLATED_RESTRICTIONS 调整' : '无',
           source: 'SYS.M_CONFIGURATION_PARAMETER_VALUES',
         },
         {
-          name: '参数待重启生效', value: restart, unit: '项',
+          name: '参数待重启生效',
+          value: restart,
+          unit: '项',
           detail: restart > 0 ? '改动已落配置但尚未生效，重启后才会起作用' : '无',
           source: 'SYS.M_CONFIGURATION_PARAMETER_VALUES',
         },
         {
-          name: '非默认层参数覆盖', value: num(driftedTotal[0]?.N), unit: '项',
-          detail: `占全部 ${total} 项的 ${total > 0 ? round((num(driftedTotal[0]?.N) / total) * 100, 1) : 0}%；`
-            + layers.map((l) => `${l.FILE_NAME}[${l.LAYER_NAME}] ${num(l.N)}`).join('，'),
+          name: '非默认层参数覆盖',
+          value: num(driftedTotal[0]?.N),
+          unit: '项',
+          detail:
+            `占全部 ${total} 项的 ${total > 0 ? round((num(driftedTotal[0]?.N) / total) * 100, 1) : 0}%；` +
+            layers.map((l) => `${l.FILE_NAME}[${l.LAYER_NAME}] ${num(l.N)}`).join('，'),
           source: 'SYS.M_CONFIGURATION_PARAMETER_VALUES',
         },
       ],
-      advice: level === 'ok' ? undefined
-        : '违规项按 VIOLATED_RESTRICTIONS 给出的限制调整；待重启项在下一个维护窗口重启对应服务生效'
-          + '（部分参数只需重启单个服务，见 RESTART_REQUIRED 所在分层）。'
-          + '调整前先用 hana_system_get_info / 本工具的 config 项留一份当前值，便于回退对照。',
+      advice:
+        level === 'ok'
+          ? undefined
+          : '违规项按 VIOLATED_RESTRICTIONS 给出的限制调整；待重启项在下一个维护窗口重启对应服务生效' +
+            '（部分参数只需重启单个服务，见 RESTART_REQUIRED 所在分层）。' +
+            '调整前先用 hana_system_get_info / 本工具的 config 项留一份当前值，便于回退对照。',
     };
   },
 };
@@ -1475,24 +1783,26 @@ const lifecycleRule: HealthRule = {
     const inUse = num(agg[0]?.IN_USE);
     const calls = num(agg[0]?.CALLS);
 
-    const top = inUse > 0
-      ? await ctx.pool.query<Record<string, unknown>>(
-        `SELECT COMPONENT_NAME, FEATURE_NAME, CALL_COUNT, LAST_TIMESTAMP, LAST_USER_NAME, LAST_APPLICATION_NAME
+    const top =
+      inUse > 0
+        ? await ctx.pool.query<Record<string, unknown>>(
+            `SELECT COMPONENT_NAME, FEATURE_NAME, CALL_COUNT, LAST_TIMESTAMP, LAST_USER_NAME, LAST_APPLICATION_NAME
          FROM SYS.M_FEATURE_USAGE
          WHERE IS_DEPRECATED = 'TRUE' AND CALL_COUNT > 0
          ORDER BY CALL_COUNT DESC LIMIT ?`,
-        [ctx.t.topN],
-      )
-      : [];
+            [ctx.t.topN],
+          )
+        : [];
 
     const level: FindingLevel = inUse >= ctx.t.deprecatedFeatureWarn ? 'warn' : 'ok';
     return {
       id: lifecycleRule.id,
       category: 'lifecycle',
       level,
-      title: level === 'ok'
-        ? `无已弃用特性在使用（${total} 项特性中 ${deprecated} 项已弃用，调用量均为 0）`
-        : `${inUse} 项**已弃用特性仍在使用**（累计 ${calls} 次调用）——不影响当前运行，但会在版本升级时中断`,
+      title:
+        level === 'ok'
+          ? `无已弃用特性在使用（${total} 项特性中 ${deprecated} 项已弃用，调用量均为 0）`
+          : `${inUse} 项**已弃用特性仍在使用**（累计 ${calls} 次调用）——不影响当前运行，但会在版本升级时中断`,
       evidence: {
         阈值: `在用弃用特性 ≥ ${ctx.t.deprecatedFeatureWarn} 项即告警`,
         特性总数: total,
@@ -1500,29 +1810,37 @@ const lifecycleRule: HealthRule = {
         在用弃用特性数: inUse,
         弃用特性累计调用: calls,
         明细: top,
-        说明: '本项衡量的是**升级风险**而非当前健康度：已被 SAP 标记为弃用的特性仍在被调用，'
-          + '在升级到后续 SPS/版本时会被移除，届时对应功能会一次性中断。'
-          + '调用量为 0 的弃用特性不计入（已弃用但没用 = 无需处理）。',
+        说明:
+          '本项衡量的是**升级风险**而非当前健康度：已被 SAP 标记为弃用的特性仍在被调用，' +
+          '在升级到后续 SPS/版本时会被移除，届时对应功能会一次性中断。' +
+          '调用量为 0 的弃用特性不计入（已弃用但没用 = 无需处理）。',
       },
       metrics: [
         {
-          name: '在用弃用特性数', value: inUse, unit: '项',
+          name: '在用弃用特性数',
+          value: inUse,
+          unit: '项',
           detail: `全部 ${total} 项特性中，已弃用 ${deprecated} 项，其中 ${inUse} 项仍在被调用`,
           source: 'SYS.M_FEATURE_USAGE',
         },
         {
-          name: '弃用特性调用次数', value: calls, unit: '次',
-          detail: top.length > 0
-            ? top.map((t) => `${t.COMPONENT_NAME}/${t.FEATURE_NAME} ${num(t.CALL_COUNT)} 次`).join('；')
-            : '无',
+          name: '弃用特性调用次数',
+          value: calls,
+          unit: '次',
+          detail:
+            top.length > 0
+              ? top.map((t) => `${t.COMPONENT_NAME}/${t.FEATURE_NAME} ${num(t.CALL_COUNT)} 次`).join('；')
+              : '无',
           source: 'SYS.M_FEATURE_USAGE',
         },
       ],
-      advice: level === 'ok' ? undefined
-        : '按调用量排序逐个评估替代方案：调用量最大且最近仍在被调用的项优先。'
-          + '明细里的 LAST_USER_NAME / LAST_APPLICATION_NAME 指出**是谁在用**，'
-          + '据此找对应应用团队确认迁移计划，而不是直接关停。'
-          + '注意这不会影响当前运行——它是升级前的待办清单，不是当下的故障。',
+      advice:
+        level === 'ok'
+          ? undefined
+          : '按调用量排序逐个评估替代方案：调用量最大且最近仍在被调用的项优先。' +
+            '明细里的 LAST_USER_NAME / LAST_APPLICATION_NAME 指出**是谁在用**，' +
+            '据此找对应应用团队确认迁移计划，而不是直接关停。' +
+            '注意这不会影响当前运行——它是升级前的待办清单，不是当下的故障。',
     };
   },
 };
@@ -1548,11 +1866,19 @@ const encryptionRule: HealthRule = {
        FROM SYS.M_ENCRYPTION_OVERVIEW ORDER BY SCOPE`,
     );
     if (rows.length === 0) {
-      return emptyMeans(ctx, encryptionRule, {
-        id: encryptionRule.id, category: 'encryption', level: 'unknown',
-        title: '未取得加密状态',
-        evidence: {}, unknownReason: 'error',
-      }, '加密状态');
+      return emptyMeans(
+        ctx,
+        encryptionRule,
+        {
+          id: encryptionRule.id,
+          category: 'encryption',
+          level: 'unknown',
+          title: '未取得加密状态',
+          evidence: {},
+          unknownReason: 'error',
+        },
+        '加密状态',
+      );
     }
     const scopes = rows.map((r) => ({
       SCOPE: String(r.SCOPE),
@@ -1567,13 +1893,15 @@ const encryptionRule: HealthRule = {
       category: 'encryption',
       // 恒为 info：未加密是不是问题取决于合规要求，工具无从判断，更不能据此把 verdict 拉成 warn
       level: 'info',
-      title: `加密状态（读数）：${scopes.length} 个范围中 ${onCount} 个已启用 —— `
-        + scopes.map((s) => `${s.SCOPE} ${s.生效}`).join('，'),
+      title:
+        `加密状态（读数）：${scopes.length} 个范围中 ${onCount} 个已启用 —— ` +
+        scopes.map((s) => `${s.SCOPE} ${s.生效}`).join('，'),
       evidence: {
         范围: scopes,
-        说明: 'SYS.M_ENCRYPTION_OVERVIEW 是加密状态的**权威视图**（比从 INI 读 encryption 字符串可靠）。'
-          + '本项恒为 info 级：是否要求加密是合规决策，不是稳定性缺陷，'
-          + '故只把读数放进报告，不参与 warn/critical 判定，也不会让整体 verdict 变成非 ok。',
+        说明:
+          'SYS.M_ENCRYPTION_OVERVIEW 是加密状态的**权威视图**（比从 INI 读 encryption 字符串可靠）。' +
+          '本项恒为 info 级：是否要求加密是合规决策，不是稳定性缺陷，' +
+          '故只把读数放进报告，不参与 warn/critical 判定，也不会让整体 verdict 变成非 ok。',
       },
       metrics: scopes.map((s) => ({
         name: `加密状态 ${s.SCOPE}`,
@@ -1601,11 +1929,16 @@ export const HEALTH_RULES: readonly HealthRule[] = [
   encryptionRule,
 ];
 
-/** 默认执行的检查项：全部（都是便宜的查询；重查询在 hana_table_storage / hana_system_activity 里） */
-export const DEFAULT_CHECKS: readonly HealthCategory[] = HEALTH_RULES.map((r) => r.category);
-
-/** 全部类别（参数校验用） */
+/**
+ * 全部类别（参数校验用）。
+ * 与 DEFAULT_CHECKS 曾是**逐字节相同的两份定义**（同一个 map 表达式写两遍），
+ * 留着两份只会让人以为"默认项"与"全部"将来可以不同——而本模块的语义是"默认全做"。
+ * 现以 ALL_CHECKS 为唯一来源，DEFAULT_CHECKS 仅作别名（health.service 与单测仍按原名导入）。
+ */
 export const ALL_CHECKS: readonly HealthCategory[] = HEALTH_RULES.map((r) => r.category);
+
+/** 默认执行的检查项：全部（都是便宜的查询；重查询在 hana_table_storage / hana_system_activity 里） */
+export const DEFAULT_CHECKS: readonly HealthCategory[] = ALL_CHECKS;
 
 /** 取某类别下的规则 */
 export function rulesOf(category: HealthCategory): HealthRule[] {

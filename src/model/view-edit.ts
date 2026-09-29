@@ -1,5 +1,5 @@
-import { parseViewDefinition } from './view-xml.js';
 import { HanaBusinessError } from '../core/errors.js';
+import { escapeXmlAttr } from '../core/xml.js';
 import {
   normalizeScriptedColumns,
   scriptedOutputSectionsXml,
@@ -8,6 +8,7 @@ import {
   type ScriptedColumnSpec,
 } from './view-builder.js';
 import type { ViewNode } from './view-types.js';
+import { parseViewDefinition } from './view-xml.js';
 
 /**
  * 计算视图「声明式加 join」的确定性 XML 变换（修改 CV 无需模型手写 XML）。
@@ -64,11 +65,6 @@ export interface AddJoinEditResult {
   joinAttributeNames: string[];
   /** 新增的输出字段（id + logicalModel order） */
   addedOutputFields: Array<{ id: string; order: number }>;
-}
-
-/** XML 属性值转义（与 view-builder 的 esc 同规则） */
-function esc(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
 /** 从节点 id 集合推下一个序号：Projection_19 存在 → 下一个 Projection_20（BW 链里编号可乱序，取 max+1） */
@@ -159,7 +155,12 @@ export function guardFullXmlUpdate(xml: string, objectName: string): FullXmlGuar
   return {
     scenarioId: def.id,
     logicalModelNode: lmId,
-    outputFieldCount: o.attributes.length + o.measures.length + o.calculatedAttributes.length + o.calculatedMeasures.length + o.restrictedMeasures.length,
+    outputFieldCount:
+      o.attributes.length +
+      o.measures.length +
+      o.calculatedAttributes.length +
+      o.calculatedMeasures.length +
+      o.restrictedMeasures.length,
     dataCategory: def.dataCategory,
   };
 }
@@ -188,14 +189,16 @@ export function addJoinToViewXml(xml: string, spec: AddJoinSpec): AddJoinEditRes
           `join 条件的左字段必须是视图已有字段`,
       );
     }
-    if (seenLeft.has(c.leftField)) throw new HanaBusinessError(`join 条件左字段 "${c.leftField}" 重复（同目标字段不允许两组条件）`);
+    if (seenLeft.has(c.leftField))
+      throw new HanaBusinessError(`join 条件左字段 "${c.leftField}" 重复（同目标字段不允许两组条件）`);
     seenLeft.add(c.leftField);
   }
 
   // 带出字段校验：不得与左侧已有字段同名（会冲突）；不得重复
   const seenBring = new Set<string>();
   for (const f of spec.fields) {
-    if (leftAttrs.includes(f.id)) throw new HanaBusinessError(`带出字段 "${f.id}" 与视图已有字段同名，将产生冲突；请勿带出或先处理重名`);
+    if (leftAttrs.includes(f.id))
+      throw new HanaBusinessError(`带出字段 "${f.id}" 与视图已有字段同名，将产生冲突；请勿带出或先处理重名`);
     if (seenBring.has(f.id)) throw new HanaBusinessError(`带出字段 "${f.id}" 重复`);
     seenBring.add(f.id);
   }
@@ -205,26 +208,28 @@ export function addJoinToViewXml(xml: string, spec: AddJoinSpec): AddJoinEditRes
 
   // ── 生成 XML 片段（缩进对齐 BW 方言：节/段 2 空格起，逐层 +2）──────────────
   const mapping = (target: string, source: string): string =>
-    `        <mapping xsi:type="Calculation:AttributeMapping" target="${esc(target)}" source="${esc(source)}"/>`;
+    `        <mapping xsi:type="Calculation:AttributeMapping"` +
+    ` target="${escapeXmlAttr(target)}" source="${escapeXmlAttr(source)}"/>`;
 
   const dataSourceBlock = [
-    `    <DataSource id="${esc(spec.sourceId)}" type="CALCULATION_VIEW">`,
+    `    <DataSource id="${escapeXmlAttr(spec.sourceId)}" type="CALCULATION_VIEW">`,
     `      <viewAttributes allViewAttributes="true"/>`,
-    `      <resourceUri>${esc(spec.sourceResourceUri)}</resourceUri>`,
+    `      <resourceUri>${escapeXmlAttr(spec.sourceResourceUri)}</resourceUri>`,
     `    </DataSource>`,
   ].join('\n');
 
   // Projection 输出源侧原始列名（join 条件右字段 + 带出字段，去重保序）
-  const projFields = [...spec.conditions.map((c) => c.rightField), ...spec.fields.map((f) => f.id)]
-    .filter((f, i, a) => a.indexOf(f) === i);
+  const projFields = [...spec.conditions.map((c) => c.rightField), ...spec.fields.map((f) => f.id)].filter(
+    (f, i, a) => a.indexOf(f) === i,
+  );
   const projectionBlock = [
     `    <calculationView xsi:type="Calculation:ProjectionView" id="${projectionId}">`,
     `      <descriptions/>`,
     `      <viewAttributes>`,
-    ...projFields.map((f) => `        <viewAttribute id="${esc(f)}"/>`),
+    ...projFields.map((f) => `        <viewAttribute id="${escapeXmlAttr(f)}"/>`),
     `      </viewAttributes>`,
     `      <calculatedViewAttributes/>`,
-    `      <input node="#${esc(spec.sourceId)}">`,
+    `      <input node="#${escapeXmlAttr(spec.sourceId)}">`,
     ...projFields.map((f) => mapping(f, f)),
     `      </input>`,
     `    </calculationView>`,
@@ -234,27 +239,28 @@ export function addJoinToViewXml(xml: string, spec: AddJoinSpec): AddJoinEditRes
   // 右输入 = 条件重命名（target=左字段 source=右字段，与 BW 范本同款）+ 带出字段透传
   const joinAttrs = [...leftAttrs, ...spec.fields.map((f) => f.id)];
   const joinBlock = [
-    `    <calculationView xsi:type="Calculation:JoinView" id="${joinId}" joinOrder="OUTSIDE_IN" joinType="${esc(spec.joinType)}">`,
+    `    <calculationView xsi:type="Calculation:JoinView" id="${joinId}"` +
+      ` joinOrder="OUTSIDE_IN" joinType="${escapeXmlAttr(spec.joinType)}">`,
     `      <descriptions/>`,
     `      <viewAttributes>`,
-    ...joinAttrs.map((f) => `        <viewAttribute id="${esc(f)}"/>`),
+    ...joinAttrs.map((f) => `        <viewAttribute id="${escapeXmlAttr(f)}"/>`),
     `      </viewAttributes>`,
     `      <calculatedViewAttributes/>`,
-    `      <input node="#${esc(finalNodeId)}">`,
+    `      <input node="#${escapeXmlAttr(finalNodeId)}">`,
     ...leftAttrs.map((f) => mapping(f, f)),
     `      </input>`,
     `      <input node="#${projectionId}">`,
     ...spec.conditions.map((c) => mapping(c.leftField, c.rightField)),
     ...spec.fields.map((f) => mapping(f.id, f.id)),
     `      </input>`,
-    ...spec.conditions.map((c) => `      <joinAttribute name="${esc(c.leftField)}"/>`),
+    ...spec.conditions.map((c) => `      <joinAttribute name="${escapeXmlAttr(c.leftField)}"/>`),
     `    </calculationView>`,
   ].join('\n');
 
   // ── 锚点手术（每步断言锚点唯一，打不准就整体失败）────────────────────────
   let out = xml;
-  out = insertBeforeClose(out, 'dataSources', dataSourceBlock);
-  out = insertBeforeClose(out, 'calculationViews', `${projectionBlock}\n${joinBlock}`);
+  out = replaceSection(out, 'dataSources', { kind: 'append', block: dataSourceBlock });
+  out = replaceSection(out, 'calculationViews', { kind: 'append', block: `${projectionBlock}\n${joinBlock}` });
 
   // logicalModel 重接线（在插入后的最新文本上重新定位，位置已因插入而偏移）：
   // id → 新 join 节点；全部 columnObjectName="旧节点" → 新节点
@@ -266,12 +272,14 @@ export function addJoinToViewXml(xml: string, spec: AddJoinSpec): AddJoinEditRes
   const maxOrder = [...lmNew.matchAll(/order="(\d+)"/g)].reduce((m, x) => Math.max(m, Number(x[1])), 0);
   const addedOutputFields = spec.fields.map((f, i) => ({ id: f.id, order: maxOrder + i + 1 }));
   const attrBlocks = spec.fields.map((f, i) => {
+    const order = String(maxOrder + i + 1);
     const lines = [
-      `      <attribute id="${esc(f.id)}" order="${String(maxOrder + i + 1)}" attributeHierarchyActive="false" displayAttribute="false">`,
+      `      <attribute id="${escapeXmlAttr(f.id)}" order="${order}"` +
+        ` attributeHierarchyActive="false" displayAttribute="false">`,
     ];
-    if (f.description) lines.push(`        <descriptions defaultDescription="${esc(f.description)}"/>`);
+    if (f.description) lines.push(`        <descriptions defaultDescription="${escapeXmlAttr(f.description)}"/>`);
     lines.push(
-      `        <keyMapping columnObjectName="${joinId}" columnName="${esc(f.id)}"/>`,
+      `        <keyMapping columnObjectName="${joinId}" columnName="${escapeXmlAttr(f.id)}"/>`,
       `      </attribute>`,
     );
     return lines.join('\n');
@@ -306,32 +314,89 @@ export function addJoinToViewXml(xml: string, spec: AddJoinSpec): AddJoinEditRes
   };
 }
 
+/** 标签段的定位结果（定位逻辑全仓一份，见 replaceSection） */
+interface Section {
+  /** 段首：开标签的 `<` 下标 */
+  start: number;
+  /** 段尾：闭标签之后（自闭合段为标签自身之后） */
+  end: number;
+  selfClosed: boolean;
+  /** 标签独占一行时该行的行首缩进；行内标签前还有其他内容（紧凑 XML）时为 '' */
+  indent: string;
+  /** append 模式的插入点：闭标签独占一行时取行首（块与子元素对齐），否则取闭标签处 */
+  appendAt: number;
+}
+
 /**
- * 在「</tag>」闭合锚点前插入块。三种形态都要能落：
- * - 逐行排版（Studio 导出）：与锚点行缩进对齐；
- * - **单行紧凑 XML**（本服务自己的生成器 format:false 产出）：无缩进可依，直接插在闭合标签前
- *   （元素间无需空白，仍是合法 XML）——漏了这一类，「刚 create 出来的视图」就加不了 join；
- * - 自闭合空段（`<tag/>`，如 SQL 模式视图的 `<dataSources/>`）：展开成对标签后插入。
+ * 定位标签段：`<tag …>…</tag>` 或自闭合 `<tag/>`。
+ * 锚点必须唯一（开/闭标签各只允许一处）：重复说明文档结构不是我们理解的样子，
+ * 改错段比报错更糟。
  */
-function insertBeforeClose(xml: string, tag: string, block: string): string {
-  const close = `</${tag}>`;
-  const first = xml.indexOf(close);
-  if (first < 0) {
-    const selfClosed = new RegExp(`<${tag}\\s*/>`).exec(xml);
-    if (selfClosed) {
-      return `${xml.slice(0, selfClosed.index)}<${tag}>\n${block}\n  </${tag}>${xml.slice(selfClosed.index + selfClosed[0].length)}`;
-    }
+function locateSection(xml: string, tag: string): Section {
+  const opens = [...xml.matchAll(new RegExp(`<${tag}(\\s[^>]*)?/?>`, 'g'))];
+  if (opens.length === 0) {
     throw new HanaBusinessError(`XML 中找不到 <${tag}> 段，拒绝变换（该视图形态可能不受支持）`);
   }
-  if (xml.indexOf(close, first + 1) >= 0) throw new HanaBusinessError(`XML 中 </${tag}> 锚点不唯一，拒绝变换`);
-  const lineStart = xml.lastIndexOf('\n', first);
-  const prefix = xml.slice(lineStart + 1, first);
-  if (prefix.trim() === '') {
-    // 逐行排版：块与既有子元素对齐
-    return `${xml.slice(0, lineStart + 1)}${block}\n${prefix}${xml.slice(first)}`;
+  if (opens.length > 1) throw new HanaBusinessError(`XML 中 <${tag}> 段不唯一（${opens.length} 处），拒绝变换`);
+  const open = opens[0];
+  const start = open.index;
+  const end = start + open[0].length;
+  const lineStart = xml.lastIndexOf('\n', start) + 1;
+  const prefix = xml.slice(lineStart, start);
+  const indent = prefix.trim() === '' ? prefix : '';
+  if (open[0].endsWith('/>')) return { start, end, selfClosed: true, indent, appendAt: start };
+  const close = `</${tag}>`;
+  const closeAt = xml.indexOf(close, end);
+  if (closeAt < 0) throw new HanaBusinessError(`XML 中 <${tag}> 未闭合，拒绝变换`);
+  if (xml.indexOf(close, closeAt + close.length) >= 0) {
+    throw new HanaBusinessError(`XML 中 </${tag}> 锚点不唯一，拒绝变换`);
   }
-  // 紧凑/单行：无缩进可依，插在闭合标签前（块自带换行）
-  return `${xml.slice(0, first)}${block}\n${xml.slice(first)}`;
+  const closeLineStart = xml.lastIndexOf('\n', closeAt) + 1;
+  const closePrefix = xml.slice(closeLineStart, closeAt);
+  return {
+    start,
+    end: closeAt + close.length,
+    selfClosed: false,
+    indent,
+    appendAt: closePrefix.trim() === '' ? closeLineStart : closeAt,
+  };
+}
+
+/**
+ * 标签段的唯一手术入口（原先 findSection / replaceSectionInner / stripSectionWrapper /
+ * insertBeforeClose 四个助手各写一遍「找段 + 锚点唯一 + 自闭合 + 缩进」，规则会各自漂移）：
+ * - replace：整段（含标签）换掉；
+ * - inner：  只换段内容，开/闭标签与缩进沿用原文（内容为空 → 收敛为自闭合段）；
+ * - append： 在闭标签前插入块。三种形态都要能落：逐行排版（块与锚点行缩进对齐）、
+ *   单行紧凑 XML（无缩进可依，直接插在闭标签前；漏了这一类，「刚 create 出来的视图」就加不了
+ *   join）、自闭合空段（如 SQL 模式视图的 `<dataSources/>`：展开成对标签后插入）。
+ */
+function replaceSection(
+  xml: string,
+  tag: string,
+  rewrite: { kind: 'replace'; text: string } | { kind: 'inner'; content: string } | { kind: 'append'; block: string },
+): string {
+  const sec = locateSection(xml, tag);
+  let text: string;
+  if (rewrite.kind === 'replace') {
+    text = rewrite.text;
+  } else if (rewrite.kind === 'inner') {
+    // 与旧实现严格同形：开标签重建为裸 <tag>（不带属性），闭标签前补一个换行 + 行首缩进
+    text = rewrite.content === '' ? `<${tag}/>` : `<${tag}>${rewrite.content}\n${sec.indent}</${tag}>`;
+  } else if (sec.selfClosed) {
+    text = `<${tag}>\n${rewrite.block}\n  </${tag}>`;
+  } else {
+    const whole = xml.slice(sec.start, sec.end);
+    const at = sec.appendAt - sec.start;
+    text = `${whole.slice(0, at)}${rewrite.block}\n${whole.slice(at)}`;
+  }
+  return `${xml.slice(0, sec.start)}${text}${xml.slice(sec.end)}`;
+}
+
+/** 取段原文的内部内容（生成器产出的 `<tag>…</tag>` → 内容；自闭合段 → ''） */
+function sectionContent(section: string, tag: string): string {
+  const m = new RegExp(`^\\s*<${tag}>([\\s\\S]*?)</${tag}>\\s*$`).exec(section);
+  return m ? m[1] : '';
 }
 
 /* ── op=set_script：替换 SQL 模式视图的脚本与输出列（零 XML）────────────────
@@ -361,16 +426,6 @@ export interface SetScriptEditResult {
   scriptBytes: { before: number; after: number };
 }
 
-/** 取标签段的起止下标：`<tag ...>…</tag>` 或自闭合 `<tag/>`（自闭合时 start=end 段为空） */
-function findSection(xml: string, tag: string): { start: number; end: number; selfClosed: boolean } {
-  const open = new RegExp(`<${tag}(\\s[^>]*)?/?>`).exec(xml);
-  if (!open || open.index < 0) throw new HanaBusinessError(`XML 中找不到 <${tag}> 节点，拒绝变换`);
-  if (open[0].endsWith('/>')) return { start: open.index, end: open.index + open[0].length, selfClosed: true };
-  const close = xml.indexOf(`</${tag}>`, open.index + open[0].length);
-  if (close < 0) throw new HanaBusinessError(`XML 中 <${tag}> 未闭合，拒绝变换`);
-  return { start: open.index, end: close + `</${tag}>`.length, selfClosed: false };
-}
-
 /**
  * 替换 SQL 模式视图的脚本与输出列。
  * @throws 非 SQL 模式（无 SqlScriptView 节点）或锚点缺失时抛错，不产出半成品
@@ -378,7 +433,6 @@ function findSection(xml: string, tag: string): { start: number; end: number; se
 export function setScriptInViewXml(xml: string, spec: SetScriptSpec): SetScriptEditResult {
   // 与 create 同一包装规则：正文必须是 BEGIN…VAR_OUT = <查询>;…END 的过程体（见 wrapScriptedBody）
   const script = wrapScriptedBody(spec.script);
-  
 
   const def = parseViewDefinition(xml, 'calculationview');
   const scriptNodes = def.nodes.filter((n) => n.type === 'SqlScriptView');
@@ -411,13 +465,16 @@ export function setScriptInViewXml(xml: string, spec: SetScriptSpec): SetScriptE
   let nodeBlock = xml.slice(nodeOpen.index, nodeClose);
 
   // 1a) <definition>：整段替换为新脚本（XML 实体转义，与仓库既有形态一致）
-  const dsection = findSection(nodeBlock, 'definition');
-  nodeBlock = `${nodeBlock.slice(0, dsection.start)}<definition>${esc(script)}</definition>${nodeBlock.slice(dsection.end)}`;
+  nodeBlock = replaceSection(nodeBlock, 'definition', {
+    kind: 'replace',
+    text: `<definition>${escapeXmlAttr(script)}</definition>`,
+  });
 
   // 1b) <viewAttributes>：列 + 显式 datatype/length（与 create 同一生成器）
-  const vaSection = findSection(nodeBlock, 'viewAttributes');
-  const vaBlock = scriptedViewAttributesXml(columns);
-  nodeBlock = `${nodeBlock.slice(0, vaSection.start)}${vaBlock}${nodeBlock.slice(vaSection.end)}`;
+  nodeBlock = replaceSection(nodeBlock, 'viewAttributes', {
+    kind: 'replace',
+    text: scriptedViewAttributesXml(columns),
+  });
 
   let out = `${xml.slice(0, nodeOpen.index)}${nodeBlock}${xml.slice(nodeClose)}`;
 
@@ -428,8 +485,14 @@ export function setScriptInViewXml(xml: string, spec: SetScriptSpec): SetScriptE
   const lmClose = out.indexOf('</logicalModel>', lmOpen.index + lmOpen[0].length);
   if (lmClose < 0) throw new HanaBusinessError('logicalModel 未闭合，拒绝变换');
   let lm = out.slice(lmOpen.index + lmOpen[0].length, lmClose);
-  lm = replaceSectionInner(lm, 'attributes', stripSectionWrapper(sections.attributes, 'attributes'));
-  lm = replaceSectionInner(lm, 'baseMeasures', stripSectionWrapper(sections.measures, 'baseMeasures'));
+  lm = replaceSection(lm, 'attributes', {
+    kind: 'inner',
+    content: sectionContent(sections.attributes, 'attributes'),
+  });
+  lm = replaceSection(lm, 'baseMeasures', {
+    kind: 'inner',
+    content: sectionContent(sections.measures, 'baseMeasures'),
+  });
   out = out.slice(0, lmOpen.index + lmOpen[0].length) + lm + out.slice(lmClose);
 
   // 3) 根节点 dataCategory 随度量集合重写：本环境实测「含度量必须 CUBE」，
@@ -448,29 +511,4 @@ export function setScriptInViewXml(xml: string, spec: SetScriptSpec): SetScriptE
     dataCategory,
     scriptBytes: { before: scriptNode.script?.length ?? 0, after: script.length },
   };
-}
-
-/** 取某节点块的原文（从 `<calculationView ... id="X">` 到其闭合标签） */
-function sliceNodeBlock(xml: string, nodeId: string): string {
-  const open = new RegExp(`<calculationView[^>]*\\sid="${nodeId}"[^>]*>`).exec(xml);
-  if (!open) return '';
-  const close = xml.indexOf('</calculationView>', open.index + open[0].length);
-  return close < 0 ? xml.slice(open.index) : xml.slice(open.index, close);
-}
-
-/** 去掉生成器输出的外层标签，只取内部内容（replaceSectionInner 自己负责包裹） */
-function stripSectionWrapper(section: string, tag: string): string {
-  const m = new RegExp(`^\\s*<${tag}>([\\s\\S]*?)</${tag}>\\s*$`).exec(section);
-  if (!m) return ''; // 自闭合（<attributes/>）→ 无内部内容
-  return m[1];
-}
-
-/** 把某段（如 logicalModel 内的 <attributes>）的**内容**替换为给定文本；自闭合形态展开为成对标签 */
-function replaceSectionInner(scope: string, tag: string, inner: string): string {
-  const sec = findSection(scope, tag);
-  const lineStart = scope.lastIndexOf('\n', sec.start);
-  const rawIndent = lineStart >= 0 ? scope.slice(lineStart + 1, sec.start) : '';
-  const indent = rawIndent.trim() === '' ? rawIndent : '';
-  const replacement = inner === '' ? `<${tag}/>` : `<${tag}>${inner}\n${indent}</${tag}>`;
-  return `${scope.slice(0, sec.start)}${replacement}${scope.slice(sec.end)}`;
 }

@@ -1,4 +1,6 @@
 import type { HanaPool } from '../core/hana-client.js';
+import { HanaBusinessError } from '../core/errors.js';
+import { logger } from '../core/logger.js';
 
 /** hana_system_get_info 返回的系统信息 */
 export interface SystemInfo {
@@ -51,6 +53,15 @@ export async function getSystemInfo(pool: HanaPool): Promise<SystemInfo> {
   );
 
   const row = db[0];
+  if (!row) {
+    // 缺行时**明确报错**，而不是让字段依次取 `?? ''` 悄悄退化成一份"什么都为空"的信息——
+    // 那种输出会被读成"这套库就是没有 SID/版本"，而真实原因是这次探测本身失败了。
+    logger.warn({ view: 'SYS.M_DATABASE' }, 'SYS.M_DATABASE 未返回任何行，系统信息无法取得');
+    throw new HanaBusinessError(
+      'SYS.M_DATABASE 未返回任何行：无法取得 SID / 数据库名 / 版本（连接目标可能不是 HANA，或当前用户缺少读该视图的权限）',
+      'SYSTEM_INFO_UNAVAILABLE',
+    );
+  }
   const hostInfo: Record<string, string> = {};
   for (const h of hostRows) hostInfo[h.KEY] = h.VALUE;
 

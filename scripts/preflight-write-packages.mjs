@@ -59,10 +59,22 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--help' || a === '-h') return { help: true, targets, tools, schemas, fromFile, serverName };
-    if (a === '--from') { fromFile = need(argv[++i], '--from'); continue; }
-    if (a === '--server') { serverName = need(argv[++i], '--server'); continue; }
-    if (a === '--tool') { tools.push(need(argv[++i], '--tool')); continue; }
-    if (a === '--schema') { schemas.push(need(argv[++i], '--schema')); continue; }
+    if (a === '--from') {
+      fromFile = need(argv[++i], '--from');
+      continue;
+    }
+    if (a === '--server') {
+      serverName = need(argv[++i], '--server');
+      continue;
+    }
+    if (a === '--tool') {
+      tools.push(need(argv[++i], '--tool'));
+      continue;
+    }
+    if (a === '--schema') {
+      schemas.push(need(argv[++i], '--schema'));
+      continue;
+    }
     if (a.startsWith('--')) throw new Error(`未知参数：${a}`);
     targets.push(a);
   }
@@ -91,9 +103,7 @@ async function main() {
     return EXIT_USAGE;
   }
 
-  const source = opts.fromFile
-    ? { kind: 'file', path: opts.fromFile, server: opts.serverName }
-    : { kind: 'env' };
+  const source = opts.fromFile ? { kind: 'file', path: opts.fromFile, server: opts.serverName } : { kind: 'env' };
   const verdict = preflight.runPreflight({
     source,
     request: { writePackages: opts.targets, tools: opts.tools, schemas: opts.schemas },

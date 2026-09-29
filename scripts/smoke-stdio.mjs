@@ -88,32 +88,51 @@ try {
   const configuredGroups = (process.env.HANA_TOOL_GROUPS ?? '').trim();
   if (configuredGroups) {
     const groups = configuredGroups.split(',').map((g) => g.trim().toLowerCase());
-    const allowPatterns = (process.env.HANA_TOOL_ALLOW ?? '').split(',').map((s) => s.trim()).filter(Boolean);
-    const denyPatterns = (process.env.HANA_TOOL_DENY ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+    const allowPatterns = (process.env.HANA_TOOL_ALLOW ?? '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const denyPatterns = (process.env.HANA_TOOL_DENY ?? '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
     // read 组工具全集（分组映射见 src/tools/groups.ts）
     const READ_TOOLS = new Set([
-      'hana_system_get_info', 'hana_check_privileges',
-      'hana_package_list', 'hana_package_list_objects',
-      'hana_metadata_get_view', 'hana_metadata_search_objects', 'hana_metadata_list_fields',
-      'hana_metadata_get_field_logic', 'hana_metadata_where_used',
-      'hana_table_list', 'hana_table_columns',
-      'hana_data_preview', 'hana_data_preview_diagnose',
-      'hana_view_check_actions', 'hana_repo_export', 'hana_repo_changelist',
+      'hana_system_get_info',
+      'hana_check_privileges',
+      'hana_package_list',
+      'hana_package_list_objects',
+      'hana_metadata_get_view',
+      'hana_metadata_search_objects',
+      'hana_metadata_list_fields',
+      'hana_metadata_get_field_logic',
+      'hana_metadata_where_used',
+      'hana_table_list',
+      'hana_table_columns',
+      'hana_data_preview',
+      'hana_data_preview_diagnose',
+      'hana_view_check_actions',
+      'hana_repo_export',
+      'hana_repo_changelist',
     ]);
     const WRITE_TOOLS = new Set([
-      'hana_package_create', 'hana_repo_import', 'hana_view_create', 'hana_view_activate',
-      'hana_view_update', 'hana_view_delete', 'hana_view_validate',
+      'hana_package_create',
+      'hana_repo_import',
+      'hana_view_create',
+      'hana_view_activate',
+      'hana_view_update',
+      'hana_view_delete',
+      'hana_view_validate',
     ]);
     // admin 组工具（高权限/管理类）。不登记的话下面的 group 推断会把它当 admin 蒙对，
     // 但断言循环覆盖不到它 —— 等于静默失去这部分的过滤自检。
-    const ADMIN_TOOLS = new Set([
-      'hana_sql_analyze',
-    ]);
-    const matchGlob = (name, patterns) => patterns.some((p) =>
-      p.includes('*')
-        ? new RegExp('^' + p.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$').test(name)
-        : p === name,
-    );
+    const ADMIN_TOOLS = new Set(['hana_sql_analyze']);
+    const matchGlob = (name, patterns) =>
+      patterns.some((p) =>
+        p.includes('*')
+          ? new RegExp('^' + p.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$').test(name)
+          : p === name,
+      );
     const shouldSee = (name) => {
       if (matchGlob(name, denyPatterns)) return false;
       if (matchGlob(name, allowPatterns)) return true;
@@ -128,7 +147,9 @@ try {
       const expected = shouldSee(name);
       const actual = names.includes(name);
       if (expected !== actual) {
-        throw new Error(`工具可见性过滤异常：${name} 期望 ${expected ? '可见' : '隐藏'}，实际 ${actual ? '可见' : '隐藏'}`);
+        throw new Error(
+          `工具可见性过滤异常：${name} 期望 ${expected ? '可见' : '隐藏'}，实际 ${actual ? '可见' : '隐藏'}`,
+        );
       }
     }
     console.log(`[tool-filter] 分组 ${groups.join(',')} → 可见 ${names.length} 个工具，符合预期`);
@@ -147,7 +168,9 @@ try {
   const filterConfigured = (process.env.HANA_TOOL_GROUPS ?? '').trim() || (process.env.HANA_TOOL_DENY ?? '').trim();
   const missing = expected.filter((n) => !names.includes(n));
   if (missing.length > 0 && !filterConfigured) {
-    throw new Error(`工具未注册: ${missing.join(', ')}（若配置了 HANA_TOOL_GROUPS 限制，请确认这些工具所属分组已启用）`);
+    throw new Error(
+      `工具未注册: ${missing.join(', ')}（若配置了 HANA_TOOL_GROUPS 限制，请确认这些工具所属分组已启用）`,
+    );
   }
   // annotations 应在 tools/list 中透出。优先取只读工具样本；只启用 write/admin 的部署里
   // 没有任何只读工具，此时退为断言"工具确实带 annotations"——否则 HANA_TOOL_GROUPS=write/admin

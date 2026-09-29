@@ -1,5 +1,6 @@
 import type { HanaPool } from '../core/hana-client.js';
-import { getViewDefinition, VIEW_SUFFIXES, type ViewDefinitionResult } from '../services/metadata.service.js';
+import { getViewDefinition, VIEW_SUFFIXES } from '../services/metadata.service.js';
+import type { ViewDefinitionResult } from '../services/metadata.service.js';
 import type { ViewDefinition, ViewKind } from './view-types.js';
 
 /**

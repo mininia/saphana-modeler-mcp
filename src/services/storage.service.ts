@@ -22,7 +22,13 @@
  */
 
 import type { HanaPool } from '../core/hana-client.js';
+import { MIB, num, round } from '../core/num.js';
+import { truncateWithNote } from '../core/text.js';
+import { isSafeToolSchemaId, isSafeToolTableName } from '../core/sql.js';
+import { HanaBusinessError } from '../core/errors.js';
+import { logger } from '../core/logger.js';
 import { probeVisibility, emptyIsAmbiguous, type Visibility } from './visibility.service.js';
+import { addCaveat, reportCheckedAt, type DiagnosticReportBase } from './health.rules.js';
 
 /**
  * 画像口径。
@@ -32,7 +38,13 @@ import { probeVisibility, emptyIsAmbiguous, type Visibility } from './visibility
  */
 export type StorageMode = 'memory' | 'disk' | 'fragmentation' | 'hotness' | 'partition' | 'column' | 'index';
 export const ALL_MODES: readonly StorageMode[] = [
-  'memory', 'disk', 'fragmentation', 'hotness', 'partition', 'column', 'index',
+  'memory',
+  'disk',
+  'fragmentation',
+  'hotness',
+  'partition',
+  'column',
+  'index',
 ];
 
 /**
@@ -62,7 +74,15 @@ export interface BwClass {
 
 /** subtype 参数取值（'ALL' = 不过滤） */
 export const ALL_SUBTYPES = [
-  'ALL', 'ACTIVE', 'QUEUE', 'CHANGE_LOG', 'PSA', 'FACT_IMO', 'FACT_E', 'FACT_F', 'ERROR_STACK',
+  'ALL',
+  'ACTIVE',
+  'QUEUE',
+  'CHANGE_LOG',
+  'PSA',
+  'FACT_IMO',
+  'FACT_E',
+  'FACT_F',
+  'ERROR_STACK',
 ] as const;
 
 /** 默认只看活动表（含 InfoCube 事实表这类"活动数据"侧；未分类的表照常列出，非 BW 系统不受影响） */
@@ -185,9 +205,8 @@ export interface IndexRow {
   ofTablePct: number | null;
 }
 
-export interface StorageReport {
+export interface StorageReport extends DiagnosticReportBase {
   mode: StorageMode;
-  checkedAt: string;
   schemaFilter: string | null;
   tableFilter: string | null;
   /** 本次统计覆盖的表数（聚合后的表数，非行数） */
@@ -201,17 +220,14 @@ export interface StorageReport {
   /** 仅 index 模式返回：索引级明细（按索引内存降序） */
   indexes?: IndexRow[];
   summary: string;
-  /** 结果可能有偏时的提示（空集 + 无全量权限） */
-  caveat?: string;
+  /** 结果可能有偏时的提示（空集 + 无全量权限，或某层取不到）；无提示时为空数组 */
+  caveats: string[];
   /** partition 模式按 subtype 过滤时的说明：列出了什么、滤掉了什么、怎么切换 */
   subtypeNote?: string;
 }
 
-const num = (v: unknown): number => (v == null ? 0 : Number(v));
-const round = (v: number, d = 2): number => Number(v.toFixed(d));
-
-/**
- * 表级体量的单位：**MiB（2²⁰）**。
+/*
+ * 表级体量的单位：**MiB（2²⁰，来自 core/num.ts 的 MIB）**。
  *
  * 为什么是二进制单位：HANA Cockpit / HANA Studio 的容量显示全部是 1024 进制（实例级用 GiB，
  * 见 health.rules.ts 的 toGiB）。若这里用 MB(10⁶)，同一块内存会得到两个都"看起来合理"的数字，
@@ -220,7 +236,6 @@ const round = (v: number, d = 2): number => Number(v.toFixed(d));
  * 为什么是 MiB 而不是 GiB：表级数据要保留小数分辨率。实测热度榜里大量表的体量在 0.2 MiB 量级，
  * 换算成 GiB 会变成 0.0002，排行与阈值都失去意义。**进制统一为 2 的幂，量级按数据尺度选**。
  */
-const MIB = 1024 * 1024;
 
 /** 各口径的排序表达式（白名单映射，不接受外部拼接） */
 const ORDER_BY: Record<StorageMode, string> = {
@@ -252,6 +267,22 @@ function havingOf(req: StorageRequest): { sql: string; params: number[] } {
   }
 }
 
+/**
+ * 组织本次报告的 caveats（四份报告统一 `caveats: string[]`，不再是 storage 独有的 `caveat?: string`）。
+ * 两类提示都在这里：① 空集在无全量权限时可能是被行过滤；② BW 分类没取到（与"不是 BW 表"同形，必须说明）。
+ */
+function buildCaveats(count: number, visibility: Visibility, bwClassFailed: readonly string[]): string[] {
+  const caveats: string[] = [];
+  addCaveat(caveats, emptyIsAmbiguous(count, visibility.unfiltered));
+  if (bwClassFailed.length > 0) {
+    caveats.push(
+      `BW 分类未取到（SYS.M_TABLE_PARTITIONS 不可读，涉及 schema：${bwClassFailed.join(', ')}）——` +
+        '相关行的 bwClass 为 null，**不能据此判定"不是 BW 表"**；subtype 过滤对未分类行的取舍规则见工具说明。',
+    );
+  }
+  return caveats;
+}
+
 /** 主查询：按表聚合 M_CS_TABLES，返回所有口径共用的原始数值 */
 async function queryTables(
   pool: HanaPool,
@@ -263,9 +294,18 @@ async function queryTables(
 ): Promise<TableStorageRow[]> {
   const having = havingOf(req);
   const rows = await pool.query<{
-    SCHEMA_NAME: string; TABLE_NAME: string; MEM_BYTES: unknown; MAIN_BYTES: unknown;
-    DELTA_BYTES: unknown; FRAG_PCT: unknown; RECORDS: unknown; READS: unknown;
-    WRITES: unknown; MERGES: unknown; LAST_MERGE: string | null; PARTS: unknown;
+    SCHEMA_NAME: string;
+    TABLE_NAME: string;
+    MEM_BYTES: unknown;
+    MAIN_BYTES: unknown;
+    DELTA_BYTES: unknown;
+    FRAG_PCT: unknown;
+    RECORDS: unknown;
+    READS: unknown;
+    WRITES: unknown;
+    MERGES: unknown;
+    LAST_MERGE: string | null;
+    PARTS: unknown;
   }>(
     `SELECT SCHEMA_NAME, TABLE_NAME,
             SUM(MEMORY_SIZE_IN_TOTAL) AS MEM_BYTES,
@@ -303,7 +343,10 @@ async function queryTables(
 }
 
 /**
- * 补齐 BW 分类（GROUP_TYPE / SUBTYPE / BW 对象名），并返回分类统计。
+ * 补齐 BW 分类（GROUP_TYPE / SUBTYPE / BW 对象名）。
+ *
+ * @returns 分类查询失败的 schema 列表（供上层写进 caveats——"没取到"与"不是 BW 表"
+ *   在数据层同为 bwClass=null，只有报告里说明了才不会把前者读成后者）
  *
  * **性能关键**：必须按 schema 分组、用 `SCHEMA_NAME = ? AND TABLE_NAME IN (...)` 查询。
  * 实测三种写法的代价（对同一批 20 张表）：
@@ -312,12 +355,14 @@ async function queryTables(
  *   (SCHEMA_NAME=? AND ...) OR (...) 多分片   → 5.6 秒  ❌
  * 全表 GROUP BY 更是要 9.7 秒。故只对**已选出的 topN 行**取，且排行榜类查询默认不取。
  */
-async function attachBwClass(pool: HanaPool, rows: TableStorageRow[]): Promise<void> {
-  if (rows.length === 0) return;
+async function attachBwClass(pool: HanaPool, rows: TableStorageRow[]): Promise<string[]> {
+  if (rows.length === 0) return [];
+  const failed: string[] = [];
   const bySchema = new Map<string, TableStorageRow[]>();
   for (const r of rows) {
     const list = bySchema.get(r.schema);
-    if (list) list.push(r); else bySchema.set(r.schema, [r]);
+    if (list) list.push(r);
+    else bySchema.set(r.schema, [r]);
   }
   for (const [schema, list] of bySchema) {
     try {
@@ -332,16 +377,22 @@ async function attachBwClass(pool: HanaPool, rows: TableStorageRow[]): Promise<v
       const map = new Map(cls.map((c) => [c.TABLE_NAME, c]));
       for (const r of list) {
         const c = map.get(r.table);
-        r.bwClass = c
-          ? { groupType: c.GROUP_TYPE ?? '', subtype: c.SUBTYPE ?? '', object: c.GROUP_NAME ?? '' }
-          : null;
+        r.bwClass = c ? { groupType: c.GROUP_TYPE ?? '', subtype: c.SUBTYPE ?? '', object: c.GROUP_NAME ?? '' } : null;
       }
-    } catch {
+    } catch (e) {
       // M_TABLE_PARTITIONS 不可用时（该视图实测较慢且可能受权限影响）不阻断主流程：
-      // 分类只是标签，缺了不影响内存/磁盘/分区数等核心读数
-      for (const r of list) r.bwClass = r.bwClass ?? null;
+      // 分类只是标签，缺了不影响内存/磁盘/分区数等核心读数。
+      // 但**必须留痕**：原先这里只有一句 `r.bwClass = r.bwClass ?? null`（空操作），
+      // 结果是调用方看到一片 bwClass=null 的行，无从分辨"这不是 BW 表"与"分类没取到"。
+      // 行保持 bwClass=null（数据层不变），由报告层的 caveats 说明它可能是"没取到"。
+      logger.warn(
+        { err: e, schema, tables: list.length, view: 'SYS.M_TABLE_PARTITIONS' },
+        'BW 分类未取到：相关行 bwClass 为 null，不能据此判定"不是 BW 表"',
+      );
+      failed.push(schema);
     }
   }
+  return failed;
 }
 
 /**
@@ -388,7 +439,12 @@ async function attachDiskSize(pool: HanaPool, rows: TableStorageRow[]): Promise<
 /** partition + 指定 table：该表的逐分区明细 */
 async function queryPartitions(pool: HanaPool, schema: string, table: string): Promise<PartitionRow[]> {
   const rows = await pool.query<{
-    PART_ID: unknown; HOST: string; MEM: unknown; DELTA: unknown; RECS: unknown; LAST_MERGE: string | null;
+    PART_ID: unknown;
+    HOST: string;
+    MEM: unknown;
+    DELTA: unknown;
+    RECS: unknown;
+    LAST_MERGE: string | null;
   }>(
     `SELECT PART_ID, HOST, MEMORY_SIZE_IN_TOTAL AS MEM, MEMORY_SIZE_IN_DELTA AS DELTA,
             RECORD_COUNT AS RECS, LAST_MERGE_TIME AS LAST_MERGE
@@ -422,8 +478,14 @@ async function queryPartitions(pool: HanaPool, schema: string, table: string): P
 async function queryColumns(pool: HanaPool, req: StorageRequest, limit: number): Promise<ColumnRow[]> {
   const conds: string[] = [];
   const params: (string | number)[] = [];
-  if (req.schema) { conds.push('SCHEMA_NAME = ?'); params.push(req.schema); }
-  if (req.table) { conds.push('TABLE_NAME = ?'); params.push(req.table); }
+  if (req.schema) {
+    conds.push('SCHEMA_NAME = ?');
+    params.push(req.schema);
+  }
+  if (req.table) {
+    conds.push('TABLE_NAME = ?');
+    params.push(req.table);
+  }
   const where = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
   const rows = await pool.query<Record<string, unknown>>(
     `SELECT SCHEMA_NAME, TABLE_NAME, COLUMN_NAME,
@@ -477,8 +539,14 @@ async function queryColumns(pool: HanaPool, req: StorageRequest, limit: number):
 async function queryIndexes(pool: HanaPool, req: StorageRequest, limit: number): Promise<IndexRow[]> {
   const conds: string[] = [];
   const params: (string | number)[] = [];
-  if (req.schema) { conds.push('SCHEMA_NAME = ?'); params.push(req.schema); }
-  if (req.table) { conds.push('TABLE_NAME = ?'); params.push(req.table); }
+  if (req.schema) {
+    conds.push('SCHEMA_NAME = ?');
+    params.push(req.schema);
+  }
+  if (req.table) {
+    conds.push('TABLE_NAME = ?');
+    params.push(req.table);
+  }
   const where = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
   const rows = await pool.query<Record<string, unknown>>(
     `SELECT SCHEMA_NAME, TABLE_NAME, INDEX_NAME,
@@ -539,8 +607,13 @@ async function attachTableMemory(pool: HanaPool, rows: IndexRow[]): Promise<void
       r.tableMemoryMiB = round(m / MIB, 2);
       r.ofTablePct = round((r.memoryMiB / (m / MIB)) * 100, 1);
     }
-  } catch {
-    // 表内存取不到不影响索引内存本身这个读数——两列留 null，调用方自会看到
+  } catch (e) {
+    // 表内存取不到不影响索引内存本身这个读数——两列留 null，调用方自会看到。
+    // 但"取不到"这件事要留痕（原先是空 catch：索引行会静静少掉两列而无人知道为什么）。
+    logger.warn(
+      { err: e, rows: rows.length, view: 'SYS.M_CS_TABLES' },
+      '索引的所属表内存未取到：这些行的 tableMemoryMiB/ofTablePct 为 null，不代表该表不占内存',
+    );
   }
 }
 
@@ -574,12 +647,12 @@ export async function runTableStorage(pool: HanaPool, req: StorageRequest): Prom
     const parts = await queryPartitions(pool, req.schema, req.table);
     const rows = await queryTables(pool, req, conds, params, ORDER_BY.partition, 1);
     await attachDiskSize(pool, rows);
-    await attachBwClass(pool, rows);
+    const bwFailed = await attachBwClass(pool, rows);
     const t = rows[0];
     const vacuous = parts.length === 0;
     return {
       mode: req.mode,
-      checkedAt: new Date().toISOString(),
+      checkedAt: reportCheckedAt(),
       schemaFilter: req.schema,
       tableFilter: req.table,
       tableCount: vacuous ? 0 : 1,
@@ -588,18 +661,20 @@ export async function runTableStorage(pool: HanaPool, req: StorageRequest): Prom
       partitions: parts,
       summary: vacuous
         ? `${req.schema}.${req.table} 没有列存分区信息（表不存在、是行存表，或当前用户不可见）`
-        : `${req.schema}.${req.table}${describeClass(t)}：内存 ${t?.memoryMiB ?? '?'} MiB ｜ 磁盘 ${t?.diskMiB ?? '?'} MiB`
-          + ` ｜ ${parts.length} 个分区 ｜ 碎片 ${t?.fragmentationPct ?? '?'}%`
-          + ` ｜ 记录 ${parts.reduce((s, p) => s + p.records, 0)} 条`,
-      caveat: emptyIsAmbiguous(parts.length, visibility.unfiltered),
+        : `${req.schema}.${req.table}${describeClass(t)}：内存 ${t?.memoryMiB ?? '?'} MiB ｜ 磁盘 ${t?.diskMiB ?? '?'} MiB` +
+          ` ｜ ${parts.length} 个分区 ｜ 碎片 ${t?.fragmentationPct ?? '?'}%` +
+          ` ｜ 记录 ${parts.reduce((s, p) => s + p.records, 0)} 条`,
+      caveats: buildCaveats(parts.length, visibility, bwFailed),
     };
   }
 
   // column / index 是**下钻口径**：单元是"列"/"索引"而不是"表"，视图与排序都不同，
   // 故不走下面的表级主查询路径，各自提前返回（与 partition+table 的逐分区明细同一处理方式）。
   if (isDrilldownMode(req.mode)) {
-    const now = new Date().toISOString();
+    const now = reportCheckedAt();
     const head = `${req.schema ?? '全部 schema'}${req.table ? `.${req.table}` : ''}`;
+    // 下钻口径不取 BW 分类（单元不是"表"），故没有"分类未取到"这一提示
+    const bwFailed: string[] = [];
     if (req.mode === 'column') {
       const columns = await queryColumns(pool, req, req.topN);
       return {
@@ -611,19 +686,22 @@ export async function runTableStorage(pool: HanaPool, req: StorageRequest): Prom
         visibility,
         rows: [],
         columns,
-        summary: columns.length === 0
-          ? `${head} 未找到列存列信息（对象不存在、是行存表，或该列已全部卸载）`
-          : `${columns.length} 个最大的列（${head}）：合计 ${round(columns.reduce((s, c) => s + c.memoryMiB, 0), 1)} MiB ｜ `
-            + `最大 ${columns[0].schema}.${columns[0].table}.${shortId(columns[0].column)} ${columns[0].memoryMiB} MiB`
-            + `（压缩 ${columns[0].compressionType}，${columns[0].count} 行，索引 ${columns[0].indexType}）`,
-        caveat: emptyIsAmbiguous(columns.length, visibility.unfiltered),
+        summary:
+          columns.length === 0
+            ? `${head} 未找到列存列信息（对象不存在、是行存表，或该列已全部卸载）`
+            : `${columns.length} 个最大的列（${head}）：合计 ${round(
+                columns.reduce((s, c) => s + c.memoryMiB, 0),
+                1,
+              )} MiB ｜ ` +
+              `最大 ${columns[0].schema}.${columns[0].table}.${truncateWithNote(columns[0].column, SHORT_ID_MAX, 'none')} ${columns[0].memoryMiB} MiB` +
+              `（压缩 ${columns[0].compressionType}，${columns[0].count} 行，索引 ${columns[0].indexType}）`,
+        caveats: buildCaveats(columns.length, visibility, bwFailed),
       };
     }
     const indexes = await queryIndexes(pool, req, req.topN);
     const withRatio = indexes.filter((i) => i.ofTablePct != null);
-    const avgRatio = withRatio.length > 0
-      ? round(withRatio.reduce((s, i) => s + (i.ofTablePct ?? 0), 0) / withRatio.length, 1)
-      : null;
+    const avgRatio =
+      withRatio.length > 0 ? round(withRatio.reduce((s, i) => s + (i.ofTablePct ?? 0), 0) / withRatio.length, 1) : null;
     return {
       mode: req.mode,
       checkedAt: now,
@@ -633,13 +711,17 @@ export async function runTableStorage(pool: HanaPool, req: StorageRequest): Prom
       visibility,
       rows: [],
       indexes,
-      summary: indexes.length === 0
-        ? `${head} 未找到列存索引信息（对象不存在，或该表没有列存索引）`
-        : `${indexes.length} 个最大的索引（${head}）：合计 ${round(indexes.reduce((s, i) => s + i.memoryMiB, 0), 1)} MiB ｜ `
-          + `最大 ${indexes[0].schema}.${indexes[0].table} ${indexes[0].memoryMiB} MiB`
-          + `（${indexes[0].indexType}${indexes[0].ofTablePct != null ? `，占该表内存 ${indexes[0].ofTablePct}%` : ''}）`
-          + (avgRatio != null ? ` ｜ 平均占表内存 ${avgRatio}%` : ''),
-      caveat: emptyIsAmbiguous(indexes.length, visibility.unfiltered),
+      summary:
+        indexes.length === 0
+          ? `${head} 未找到列存索引信息（对象不存在，或该表没有列存索引）`
+          : `${indexes.length} 个最大的索引（${head}）：合计 ${round(
+              indexes.reduce((s, i) => s + i.memoryMiB, 0),
+              1,
+            )} MiB ｜ ` +
+            `最大 ${indexes[0].schema}.${indexes[0].table} ${indexes[0].memoryMiB} MiB` +
+            `（${indexes[0].indexType}${indexes[0].ofTablePct != null ? `，占该表内存 ${indexes[0].ofTablePct}%` : ''}）` +
+            (avgRatio != null ? ` ｜ 平均占表内存 ${avgRatio}%` : ''),
+      caveats: buildCaveats(indexes.length, visibility, bwFailed),
     };
   }
 
@@ -653,9 +735,12 @@ export async function runTableStorage(pool: HanaPool, req: StorageRequest): Prom
   // 先取更宽的候选再按磁盘量重排截断。
   // partition 模式的起始候选也放宽到 topN×4：实测前几名里常混着 PSA/入站队列（delta 侧），
   // 若起始只取 topN，几乎每次都要触发一轮放宽重查（实测 8.3 秒 vs 放宽后 5 秒）。
-  const baseLimit = req.mode === 'disk' ? Math.max(req.topN * 10, 200)
-    : req.mode === 'partition' ? Math.max(req.topN * 4, 20)
-      : req.topN;
+  const baseLimit =
+    req.mode === 'disk'
+      ? Math.max(req.topN * 10, 200)
+      : req.mode === 'partition'
+        ? Math.max(req.topN * 4, 20)
+        : req.topN;
 
   let limit = baseLimit;
   let rows = await queryTables(pool, req, conds, params, ORDER_BY[req.mode], limit);
@@ -663,6 +748,8 @@ export async function runTableStorage(pool: HanaPool, req: StorageRequest): Prom
 
   let finalRows: TableStorageRow[];
   let subtypeNote: string | undefined;
+  // BW 分类查询失败的 schema（渐进放宽会重查多次，故按 schema 去重累积）
+  const bwFailed = new Set<string>();
 
   if (req.mode === 'partition' && !req.table) {
     // 按 subtype 过滤会改变"前 N 张"的构成，故采用**渐进放宽**：先按 topN 取；若过滤后不足 topN，
@@ -671,7 +758,7 @@ export async function runTableStorage(pool: HanaPool, req: StorageRequest): Prom
     // 非活动表通常只占少数，绝大多数调用一轮即足，不该为极少数情况每次都付全量代价。
     let rounds = 0;
     for (;;) {
-      await attachBwClass(pool, rows);
+      for (const s of await attachBwClass(pool, rows)) bwFailed.add(s);
       const kept = rows.filter((r) => passSubtype(r, subtype, subtypeExplicit));
       // rows.length < limit 说明已到全量末尾，再放宽也取不到更多
       const canWiden = subtype !== 'ALL' && kept.length < req.topN && rows.length >= limit && rounds < 2;
@@ -684,8 +771,9 @@ export async function runTableStorage(pool: HanaPool, req: StorageRequest): Prom
             bySubtype.set(k, (bySubtype.get(k) ?? 0) + 1);
           }
           const dist = [...bySubtype.entries()].map(([k, v]) => `${k} ${v} 张`).join('、');
-          subtypeNote = `已按 subtype=${subtype} 过滤（只看活动数据表）；在分区数前 ${rows.length} 张候选内`
-            + `另有 ${dist || '无'} 未列出——传 subtype='ALL' 或具体值（${ALL_SUBTYPES.filter((s) => s !== 'ALL').join('/')}）可切换`;
+          subtypeNote =
+            `已按 subtype=${subtype} 过滤（只看活动数据表）；在分区数前 ${rows.length} 张候选内` +
+            `另有 ${dist || '无'} 未列出——传 subtype='ALL' 或具体值（${ALL_SUBTYPES.filter((s) => s !== 'ALL').join('/')}）可切换`;
         }
         break;
       }
@@ -695,10 +783,9 @@ export async function runTableStorage(pool: HanaPool, req: StorageRequest): Prom
       await attachDiskSize(pool, rows);
     }
   } else {
-    if (needBwClass) await attachBwClass(pool, rows);
-    finalRows = req.mode === 'disk'
-      ? [...rows].sort((a, b) => (b.diskMiB ?? -1) - (a.diskMiB ?? -1)).slice(0, req.topN)
-      : rows;
+    if (needBwClass) for (const s of await attachBwClass(pool, rows)) bwFailed.add(s);
+    finalRows =
+      req.mode === 'disk' ? [...rows].sort((a, b) => (b.diskMiB ?? -1) - (a.diskMiB ?? -1)).slice(0, req.topN) : rows;
   }
 
   const total = await pool.query<{ N: unknown }>(
@@ -708,20 +795,18 @@ export async function runTableStorage(pool: HanaPool, req: StorageRequest): Prom
   );
 
   const tableCount = num(total[0]?.N);
-  const caveat = emptyIsAmbiguous(finalRows.length, visibility.unfiltered);
 
   return {
     mode: req.mode,
-    checkedAt: new Date().toISOString(),
+    checkedAt: reportCheckedAt(),
     schemaFilter: req.schema ?? null,
     tableFilter: req.table ?? null,
     tableCount,
     visibility,
     rows: finalRows,
-    summary: req.table && finalRows.length === 1
-      ? describeTable(finalRows[0])
-      : buildSummary(req, finalRows, tableCount),
-    caveat,
+    summary:
+      req.table && finalRows.length === 1 ? describeTable(finalRows[0]) : buildSummary(req, finalRows, tableCount),
+    caveats: buildCaveats(finalRows.length, visibility, [...bwFailed]),
     ...(subtypeNote ? { subtypeNote } : {}),
   };
 }
@@ -730,30 +815,36 @@ export async function runTableStorage(pool: HanaPool, req: StorageRequest): Prom
 function describeClass(t: TableStorageRow | undefined): string {
   const c = t?.bwClass;
   if (!c || (!c.groupType && !c.subtype)) return '';
-  const label = c.subtype === 'ACTIVE' || c.subtype === 'ACTIVE_IMO' ? '活动表'
-    : c.subtype === 'QUEUE' ? '入站队列（delta 侧）'
-      : c.subtype === 'CHANGE_LOG' ? '变更日志'
-        : c.subtype === 'PSA' ? 'PSA（暂存区）'
-          : c.subtype || c.groupType;
+  const label =
+    c.subtype === 'ACTIVE' || c.subtype === 'ACTIVE_IMO'
+      ? '活动表'
+      : c.subtype === 'QUEUE'
+        ? '入站队列（delta 侧）'
+        : c.subtype === 'CHANGE_LOG'
+          ? '变更日志'
+          : c.subtype === 'PSA'
+            ? 'PSA（暂存区）'
+            : c.subtype || c.groupType;
   return `（${c.groupType} ${label}${c.object ? ` ${c.object}` : ''}）`;
 }
 
 /** 单表画像的一句话描述（各口径通用——每行本来就带全部字段） */
 function describeTable(t: TableStorageRow): string {
-  return `${t.schema}.${t.table}${describeClass(t)}：内存 ${t.memoryMiB} MiB ｜ 磁盘 ${t.diskMiB ?? '未知'} MiB`
-    + ` ｜ ${t.partitions} 个分区 ｜ 碎片 ${t.fragmentationPct}%`
-    + ` ｜ 记录 ${t.records} 条 ｜ 读 ${t.readCount} / 写 ${t.writeCount} / merge ${t.mergeCount}`
-    + ` ｜ 上次 merge ${t.lastMergeTime ?? '未知'}`;
+  return (
+    `${t.schema}.${t.table}${describeClass(t)}：内存 ${t.memoryMiB} MiB ｜ 磁盘 ${t.diskMiB ?? '未知'} MiB` +
+    ` ｜ ${t.partitions} 个分区 ｜ 碎片 ${t.fragmentationPct}%` +
+    ` ｜ 记录 ${t.records} 条 ｜ 读 ${t.readCount} / 写 ${t.writeCount} / merge ${t.mergeCount}` +
+    ` ｜ 上次 merge ${t.lastMergeTime ?? '未知'}`
+  );
 }
 
 /**
- * 摘要里的标识符截断。
+ * 摘要里的标识符截断长度。
  * BW 的合成列名可以极长（实测 `/BIC/AZDEMO001` 有一个 88 字符的 `$REQUEST$MATNR$…` 列），
  * 直接拼进一句话摘要会把整行撑爆，反而看不见结论。
+ * 截断规则本身用 core/text 的唯一实现（`none` 风格：标识符只加省略号，不报总长）。
  */
-function shortId(s: string, max = 48): string {
-  return s.length > max ? `${s.slice(0, max)}…` : s;
-}
+const SHORT_ID_MAX = 48;
 
 function buildSummary(req: StorageRequest, rows: TableStorageRow[], tableCount: number): string {
   if (rows.length === 0) {
@@ -764,28 +855,43 @@ function buildSummary(req: StorageRequest, rows: TableStorageRow[], tableCount: 
   const top = rows[0];
   switch (req.mode) {
     case 'memory':
-      return `内存占用最高：${top.schema}.${top.table} ${top.memoryMiB} MiB`
-        + `（delta ${top.deltaMiB} MiB / 共 ${tableCount} 张表，列出前 ${rows.length} 张）`;
+      return (
+        `内存占用最高：${top.schema}.${top.table} ${top.memoryMiB} MiB` +
+        `（delta ${top.deltaMiB} MiB / 共 ${tableCount} 张表，列出前 ${rows.length} 张）`
+      );
     case 'disk':
-      return `磁盘占用最高：${top.schema}.${top.table} ${top.diskMiB ?? '?'} MiB`
-        + `（内存 ${top.memoryMiB} MiB / 共 ${tableCount} 张表，列出前 ${rows.length} 张）`;
+      return (
+        `磁盘占用最高：${top.schema}.${top.table} ${top.diskMiB ?? '?'} MiB` +
+        `（内存 ${top.memoryMiB} MiB / 共 ${tableCount} 张表，列出前 ${rows.length} 张）`
+      );
     case 'fragmentation':
-      return `碎片率最高：${top.schema}.${top.table} ${top.fragmentationPct}%`
-        + `（delta ${top.deltaMiB} MiB，上次 merge ${top.lastMergeTime ?? '未知'}；`
-        + `仅统计 >= ${req.minSizeMiB} MiB 的表）`;
+      return (
+        `碎片率最高：${top.schema}.${top.table} ${top.fragmentationPct}%` +
+        `（delta ${top.deltaMiB} MiB，上次 merge ${top.lastMergeTime ?? '未知'}；` +
+        `仅统计 >= ${req.minSizeMiB} MiB 的表）`
+      );
     case 'hotness':
-      return `读最频繁：${top.schema}.${top.table} ${top.readCount} 次读 / ${top.writeCount} 次写`
-        + `（列出前 ${rows.length} 张）`;
+      return (
+        `读最频繁：${top.schema}.${top.table} ${top.readCount} 次读 / ${top.writeCount} 次写` +
+        `（列出前 ${rows.length} 张）`
+      );
     case 'partition': {
       const cls = describeClass(top);
-      return `${top.partitions} 个分区：${top.schema}.${top.table}${cls}`
-        + `（内存 ${top.memoryMiB} MiB / 记录 ${top.records} 条；共列出 ${rows.length} 张）`;
+      return (
+        `${top.partitions} 个分区：${top.schema}.${top.table}${cls}` +
+        `（内存 ${top.memoryMiB} MiB / 记录 ${top.records} 条；共列出 ${rows.length} 张）`
+      );
     }
     default:
       // column / index 已在 runTableStorage 里提前返回，不会走到这里。
       // 故意抛错而不是返回兜底文案：万一将来有人把下钻口径接到表级路径上，
       // 应当立刻炸掉，而不是安静地给出一份"用表级数字描述列级结果"的错误摘要。
-      throw new Error(`buildSummary 不支持下钻口径 ${req.mode}（应由 runTableStorage 的分支提前返回）`);
+      // 抛 HanaBusinessError（而非裸 Error）：裸 Error 会被 withErrorEnvelope 归入"未知错误"，
+      // 对外只剩「内部错误，详情见服务端日志」——这条明确可读的原因会被整体吞掉。
+      throw new HanaBusinessError(
+        `buildSummary 不支持下钻口径 ${req.mode}（应由 runTableStorage 的分支提前返回）`,
+        'STORAGE_MODE_MISMATCH',
+      );
   }
 }
 
@@ -812,11 +918,14 @@ export function normalizeMode(mode?: string): { ok: true; value: StorageMode } |
  * schema/表名校验：只允许 HANA 标识符字符。
  *
  * 虽然查询里用的是绑定参数（无注入风险），仍做形状校验——非法值（含引号/分号/空格）几乎必然是
- * 调用方搞错了参数，早失败比返回空结果更容易排障。表名放宽到含 `/` 与 `%`：BW 的
+ * 调用方搞错了参数，早失败比返回空结果更容易排障。表名放宽到含 `/`：BW 的
  * 信息提供者对象名形如 `/BIC/AZDEMO001`，这类名字完全合法。
+ *
+ * 正则本身在 core/sql.ts（与其它工具入参共用一份，避免规则漂移）；
+ * 这里保留 `{ok,message}` 返回形状，因为工具层按它组织错误文案。
  */
 export function validateSchemaName(schema: string): { ok: true } | { ok: false; message: string } {
-  if (!/^[A-Za-z_][A-Za-z0-9_$#]{0,126}$/.test(schema)) {
+  if (!isSafeToolSchemaId(schema)) {
     return {
       ok: false,
       message: `非法的 schema 名：${schema}。只允许字母/数字/下划线/美元符/井号，且不以数字开头（无需加引号）`,
@@ -826,7 +935,7 @@ export function validateSchemaName(schema: string): { ok: true } | { ok: false; 
 }
 
 export function validateTableName(table: string): { ok: true } | { ok: false; message: string } {
-  if (!/^[A-Za-z_/][A-Za-z0-9_$#/]{0,255}$/.test(table)) {
+  if (!isSafeToolTableName(table)) {
     return {
       ok: false,
       message: `非法的表名：${table}。只允许字母/数字/下划线/美元符/井号/斜杠，且不以数字开头（无需加引号）`,

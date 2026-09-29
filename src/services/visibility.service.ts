@@ -27,7 +27,16 @@ export interface Visibility {
   note: string;
 }
 
-/** 探测当前连接的可见性上下文 */
+/**
+ * 探测当前连接的可见性上下文。
+ *
+ * ⚠️ 与 system.service.getPrivileges 的「系统权限矩阵」查询是同一张表上的两件事（那份在
+ * system.service.ts 内，不属本文件）：
+ * - 那边要"用户持有哪些系统权限"的**完整清单**（OBJECT_NAME IS NULL，不筛 SCHEMA_NAME），用于建模能力摘要；
+ * - 这边只判定 CATALOG READ / MONITORING 是否在列（OBJECT_NAME/SCHEMA_NAME 均 NULL = 纯系统权限，
+ *   排除对象级/ schema 级授权行）。
+ * 两者口径与用途不同，刻意不合并；若后续要抽公共查询，必须同时确认两处口径。
+ */
 export async function probeVisibility(pool: HanaPool): Promise<Visibility> {
   const privs = await pool.query<{ PRIVILEGE: string }>(
     `SELECT DISTINCT PRIVILEGE FROM SYS.EFFECTIVE_PRIVILEGES
@@ -40,8 +49,8 @@ export async function probeVisibility(pool: HanaPool): Promise<Visibility> {
     heldPrivileges: held,
     note: unfiltered
       ? '当前用户持有 CATALOG READ / MONITORING，监视视图返回未过滤数据，空结果可读作"确实没有"。'
-      : '当前用户**不**持有 CATALOG READ / MONITORING：磁盘、备份、主机内存、复制、他人会话等数据可能被静默过滤。'
-        + '**此时"空结果"不等于"没问题"**，相关结论会标记为 unknown 或附不确定性提示。',
+      : '当前用户**不**持有 CATALOG READ / MONITORING：磁盘、备份、主机内存、复制、他人会话等数据可能被静默过滤。' +
+        '**此时"空结果"不等于"没问题"**，相关结论会标记为 unknown 或附不确定性提示。',
   };
 }
 

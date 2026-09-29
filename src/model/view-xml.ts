@@ -121,6 +121,24 @@ function parseCalculatedAttribute(ca: XmlNode): ViewCalculatedAttribute {
   };
 }
 
+/** parseNode 已结构化处理的键；其余键原样透传到 extra（未知节点形态零损耗） */
+const NODE_HANDLED_KEYS = new Set([
+  '@_id',
+  '@_xsi:type',
+  '@_joinType',
+  '@_joinOrder',
+  'viewAttributes',
+  'calculatedViewAttributes',
+  'input',
+  'joinAttribute',
+  'aggregateBy',
+  'measureMapping',
+  'windowFunction',
+  'filter',
+  'definition',
+  'descriptions',
+]);
+
 function parseNode(node: XmlNode): ViewNode {
   const obj = (node ?? {}) as Record<string, unknown>;
   /** 取子节点（宽容：obj[key] 可能是 undefined/单对象/数组） */
@@ -128,7 +146,8 @@ function parseNode(node: XmlNode): ViewNode {
   /** 取嵌套段下的子列表，如 viewAttributes > viewAttribute（空段/空元素不产生幽灵条目） */
   const nested = (section: string, item: string): XmlNode[] => {
     const sec = child(section);
-    const items = sec && typeof sec === 'object' && !Array.isArray(sec) ? (sec as Record<string, unknown>)[item] : undefined;
+    const items =
+      sec && typeof sec === 'object' && !Array.isArray(sec) ? (sec as Record<string, unknown>)[item] : undefined;
     // 空段（<calculatedViewAttributes/> 解析为空串/空对象）不能当成一个条目
     return toArray<XmlNode>(items ?? obj[item]).filter((x) => x != null && typeof x === 'object');
   };
@@ -144,11 +163,15 @@ function parseNode(node: XmlNode): ViewNode {
   const joinAttrs = toArray<XmlNode>(child('joinAttribute')).map((j) => str(j, '@_name') ?? '');
   const filterText = text(child('filter'));
   // Aggregation 节点：分组列（aggregateBy）与度量映射（measureMapping，含聚合函数）
-  const aggregateBy = toArray<XmlNode>(child('aggregateBy')).map((a) => str(a, '@_columnObjectName') ?? '').filter(Boolean);
-  const measures = toArray<XmlNode>(child('measureMapping')).map((m) => ({
-    column: str(m, '@_columnObjectName') ?? '',
-    aggregationType: str(m, '@_aggregationType'),
-  })).filter((m) => m.column);
+  const aggregateBy = toArray<XmlNode>(child('aggregateBy'))
+    .map((a) => str(a, '@_columnObjectName') ?? '')
+    .filter(Boolean);
+  const measures = toArray<XmlNode>(child('measureMapping'))
+    .map((m) => ({
+      column: str(m, '@_columnObjectName') ?? '',
+      aggregationType: str(m, '@_aggregationType'),
+    }))
+    .filter((m) => m.column);
   // viewAttribute：ID + 聚合函数（格式 B）+ 属性级过滤器（SingleValue/MultiValue 展开为列表）
   const viewAttrs = nested('viewAttributes', 'viewAttribute').map((a) => {
     const aobj = (a ?? {}) as Record<string, unknown>;
@@ -183,15 +206,15 @@ function parseNode(node: XmlNode): ViewNode {
     calculatedAttributes: nested('calculatedViewAttributes', 'calculatedViewAttribute').map(parseCalculatedAttribute),
     aggregateBy,
     measures,
-    attributeAggregations: viewAttrs.filter((a) => a.aggregationType).map((a) => ({ id: a.id, aggregationType: a.aggregationType! })),
+    attributeAggregations: viewAttrs
+      .filter((a) => a.aggregationType)
+      .map((a) => ({ id: a.id, aggregationType: a.aggregationType! })),
     attributeFilters: viewAttrs.filter((a) => a.filters.length > 0).map((a) => ({ id: a.id, filters: a.filters })),
     rank,
     script: scriptText,
     inputs,
     filter: filterText,
-    extra: Object.fromEntries(
-      Object.entries(obj).filter(([k]) => !['@_id', '@_xsi:type', '@_joinType', '@_joinOrder', 'viewAttributes', 'calculatedViewAttributes', 'input', 'joinAttribute', 'aggregateBy', 'measureMapping', 'windowFunction', 'filter', 'definition', 'descriptions'].includes(k)),
-    ),
+    extra: Object.fromEntries(Object.entries(obj).filter(([k]) => !NODE_HANDLED_KEYS.has(k))),
   };
 }
 
@@ -236,7 +259,10 @@ function parseOutputField(field: XmlNode, kind: 'attribute' | 'measure'): ViewOu
 
 function parseOutputList(root: XmlNode, section: string, kind: 'attribute' | 'measure'): ViewOutputField[] {
   const sec = root && typeof root === 'object' ? (root as Record<string, unknown>)[section] : undefined;
-  const items = sec && typeof sec === 'object' ? (sec as Record<string, unknown>)[kind === 'attribute' ? 'attribute' : 'measure'] : undefined;
+  const items =
+    sec && typeof sec === 'object'
+      ? (sec as Record<string, unknown>)[kind === 'attribute' ? 'attribute' : 'measure']
+      : undefined;
   return toArray<XmlNode>(items).map((f) => parseOutputField(f, kind));
 }
 
@@ -265,21 +291,30 @@ export function parseViewDefinition(xml: string, kind?: ViewKind): ViewDefinitio
   const dataSources = toArray<XmlNode>(
     (() => {
       const sec = obj['dataSources'];
-      const items = sec && typeof sec === 'object' && !Array.isArray(sec) ? (sec as Record<string, unknown>)['DataSource'] : undefined;
+      const items =
+        sec && typeof sec === 'object' && !Array.isArray(sec)
+          ? (sec as Record<string, unknown>)['DataSource']
+          : undefined;
       return items ?? obj['dataSource'] ?? sec;
     })(),
   ).map(parseDataSource);
   const nodes = toArray<XmlNode>(
     (() => {
       const sec = obj['calculationViews'];
-      const items = sec && typeof sec === 'object' && !Array.isArray(sec) ? (sec as Record<string, unknown>)['calculationView'] : undefined;
+      const items =
+        sec && typeof sec === 'object' && !Array.isArray(sec)
+          ? (sec as Record<string, unknown>)['calculationView']
+          : undefined;
       return items ?? obj['calculationView'] ?? sec;
     })(),
   ).map(parseNode);
   const variables = toArray<XmlNode>(
     (() => {
       const sec = obj['localVariables'];
-      const items = sec && typeof sec === 'object' && !Array.isArray(sec) ? (sec as Record<string, unknown>)['variable'] : undefined;
+      const items =
+        sec && typeof sec === 'object' && !Array.isArray(sec)
+          ? (sec as Record<string, unknown>)['variable']
+          : undefined;
       return items ?? obj['localVariable'] ?? sec;
     })(),
   ).map(parseVariable);

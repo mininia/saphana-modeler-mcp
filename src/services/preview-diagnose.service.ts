@@ -1,8 +1,11 @@
 import type { HanaPool } from '../core/hana-client.js';
 import { HanaBusinessError, normalizeHanaError } from '../core/errors.js';
+import { isPermissionError } from '../core/hana-errors.js';
+import { logger } from '../core/logger.js';
 import { isSchemaAllowed, qualifyName } from '../core/sql.js';
 import { viewDefinitionCache } from '../model/view-cache.js';
 import { VIEW_SUFFIXES } from './metadata.service.js';
+import { normalizeBwSchema, parseResourceUri } from './preview.derive.js';
 import type { ViewDefinition, ViewKind } from '../model/view-types.js';
 
 /**
@@ -22,6 +25,15 @@ import type { ViewDefinition, ViewKind } from '../model/view-types.js';
  */
 
 export type PreviewChannel = 'direct' | 'intermediate' | 'derived';
+
+/**
+ * 运行时探测失败的「权限不足」码集：258=insufficient privilege，2950=分析权限/授权缺失。
+ *
+ * 与 core/hana-errors 的 PERMISSION_DENIED_CODES（7/258/2950）**刻意不同**：这里回答的是
+ * 「探测失败要不要按权限不足给 BW 补授权指引」，历史判定只认 258/2950（7 是一般错误，
+ * 不改变既有结论）；与那里一样用参数化的 isPermissionError 表达口径，而不是并集合。
+ */
+const INSUFFICIENT_PRIVILEGE_CODES: ReadonlySet<string> = new Set(['258', '2950']);
 
 export interface DiagnosisCheck {
   /** 检查项（如 schema SELECT: _SYS_BIC） */
@@ -173,7 +185,9 @@ export async function diagnosePreview(
   if (opts.channel === 'direct' || opts.channel === 'intermediate') {
     viewExists = await runtimeViewExists(pool, `${packageId}/${objectName}`);
     if (viewExists === false && activation.activated) {
-      blockers.push(`运行时视图 "_SYS_BIC"."${packageId}/${objectName}" 不存在，但设计时对象已激活（激活可能失败或运行时未生成）`);
+      blockers.push(
+        `运行时视图 "_SYS_BIC"."${packageId}/${objectName}" 不存在，但设计时对象已激活（激活可能失败或运行时未生成）`,
+      );
       hints.push('用 hana_view_validate(target=runtime) 复检运行时一致性');
     }
   }
@@ -191,7 +205,9 @@ export async function diagnosePreview(
     } else {
       await checkSchemaSelect(pool, '_SYS_REPO', '读取视图设计时 XML（CDATA）', checks, blockers, hints);
       await checkSchemaSelect(pool, '_SYS_BIC', '引用外部计算视图运行时对象', checks, blockers, hints);
-      baseTables = await checkBaseTables(pool, packageId, objectName, opts.kind, checks, blockers, hints);
+      // 叶子遍历只有一个实现（collectLeafAccess）；verbose 通过渲染函数产出 checks/blockers/hints 明细
+      const traversal = await collectLeafAccess(pool, packageId, objectName, opts.kind);
+      baseTables = renderLeafTraversalVerbose(traversal, checks, blockers, hints);
     }
   }
 
@@ -206,7 +222,9 @@ export async function diagnosePreview(
         `checkAnalyticPrivileges=${analyticPrivilege.checkAnalyticPrivileges}）但当前用户未被授予任何 ANALYTICAL_PRIVILEGE（${analyticPrivilege.grantedCount} 条）。` +
         `HANA 的 schema SELECT 不能替代分析权限——这是 BW on HANA 预览失败最常见的根因`,
     );
-    hints.push('由 BW 管理员在 BW 侧分配覆盖该视图的分析权限对象（含对应 InfoProvider/Query 授权）；HANA 层 GRANT SELECT 无法替代');
+    hints.push(
+      '由 BW 管理员在 BW 侧分配覆盖该视图的分析权限对象（含对应 InfoProvider/Query 授权）；HANA 层 GRANT SELECT 无法替代',
+    );
     hints.push('若仅需排障验证，可临时让 DBA 授予该用户覆盖本视图的分析权限，或用一个已分配分析权限的账号验证');
   }
 
@@ -229,7 +247,7 @@ export async function diagnosePreview(
     needUpstreamProbe && upstreamResult ? upstreamResult.inaccessible : [];
 
   if (verbose) {
-    // verbose 模式：上游清单在第 3 步 checkBaseTables 已填，这里只从其派生不可达清单 + 写 blockers/hints
+    // verbose 模式：上游清单在第 3 步已填，这里只从其派生不可达清单 + 写 blockers/hints
     if (baseTables) {
       upstreamInaccessible = baseTables
         .filter((b) => !b.selectable)
@@ -239,10 +257,17 @@ export async function diagnosePreview(
       blockers.push(
         `运行时对象实测不可访问：SELECT 探测失败${runtimeProbe.code ? `（错误码 ${runtimeProbe.code}）` : ''}：${runtimeProbe.message ?? '未知错误'}`,
       );
-      // 错误码 258/2950 = insufficient privilege，结合分析权限结果给出针对性指引
-      if (runtimeProbe.code === '258' || runtimeProbe.code === '2950' || /not authorized|insufficient privilege/i.test(runtimeProbe.message ?? '')) {
+      // 258/2950 = insufficient privilege（见 INSUFFICIENT_PRIVILEGE_CODES），结合分析权限结果给出针对性指引
+      if (
+        isPermissionError(
+          { code: runtimeProbe.code, message: runtimeProbe.message ?? '' },
+          INSUFFICIENT_PRIVILEGE_CODES,
+        )
+      ) {
         if (analyticPrivilege?.protectedByAnalyticPrivilege) {
-          hints.push('错误码 258/2950 + 视图受分析权限保护 → 确认为分析权限缺失（非 schema SELECT 问题），需在 BW 侧补分析权限授权');
+          hints.push(
+            '错误码 258/2950 + 视图受分析权限保护 → 确认为分析权限缺失（非 schema SELECT 问题），需在 BW 侧补分析权限授权',
+          );
         } else {
           hints.push('错误码 258/2950 通常为权限不足：检查 _SYS_BIC SELECT、分析权限、以及上游对象的可访问性');
         }
@@ -258,7 +283,8 @@ export async function diagnosePreview(
   // 组装 brief（精简结论）：上游不可达 + 分析权限 + 运行时可达 + canPreview
   const runtimeOk = runtimeProbe?.accessible === true;
   const upstreamBlocked = upstreamInaccessible.length > 0;
-  const apBlocked = analyticPrivilege?.protectedByAnalyticPrivilege === true && (analyticPrivilege?.grantedCount ?? 0) === 0;
+  const apBlocked =
+    analyticPrivilege?.protectedByAnalyticPrivilege === true && (analyticPrivilege?.grantedCount ?? 0) === 0;
   const brief: DiagnosisBrief = {
     object: { packageId, objectName, kind: opts.kind },
     channel: opts.channel,
@@ -317,7 +343,9 @@ async function checkViewActivation(
       return { exists: true, activated: false, objectSuffix: inactive[0].OBJECT_SUFFIX };
     }
     return { exists: false, activated: false };
-  } catch {
+  } catch (e) {
+    // 诊断降级：读不到 _SYS_REPO 时激活状态不可判定（结论里以 detail 如实回报，不阻断）
+    logger.warn({ packageId, objectName, err: e }, '无法读取 _SYS_REPO，视图激活状态不可判定');
     return { exists: false, activated: false, detail: '无法读取 _SYS_REPO（可能缺少 _SYS_REPO 的 SELECT 权限）' };
   }
 }
@@ -333,7 +361,9 @@ export async function runtimeViewExists(pool: HanaPool, viewName: string): Promi
       [viewName],
     );
     return (rows[0]?.C ?? 0) > 0;
-  } catch {
+  } catch (e) {
+    // 诊断降级：SYS 目录读不到时按「不存在」处理（与既有行为一致），留痕便于排障
+    logger.warn({ viewName, err: e }, '查询 SYS.VIEWS 失败，运行时视图存在性不可判定（按不存在处理）');
     return false;
   }
 }
@@ -370,7 +400,42 @@ async function checkSchemaSelect(
   }
 }
 
-/** 检查 SYS 下过程 EXECUTE 并记录 */
+/**
+ * 当前用户对过程的 EXECUTE 权限判定 —— 预览前置检查与诊断通道的**唯一**实现。
+ *
+ * 两种匹配口径都沿用既有实现，SQL 与判定逐字保留：合成单一查询必然改动其中一条链路的口径
+ * （属 HANA 侧行为变更，而两条链路的结论用途不同），故口径显式参数化而非取并集：
+ * - 'exact'（默认）：OBJECT_NAME 精确 + SCHEMA_NAME='SYS'。诊断通道逐过程核对，
+ *   未通过时给出该过程的 GRANT 文案；
+ * - 'family'：OBJECT_NAME 前缀（CREATE_/DROP_ 两族）一次问全。预览前置检查只关心
+ *   「中间视图这套过程能不能用」——过程名在不同版本可能带 _DEV 等后缀，故用前缀，且不做逐过程结论
+ *   （任一族的授权缺失都意味着节点预览不可用，直接返回「不支持」）。
+ *
+ * @param procName 'exact' 口径的过程名；'family' 口径按固定前缀两族查询，不使用该参数
+ */
+export async function hasExecutePrivilege(
+  pool: HanaPool,
+  procName: string,
+  match: 'exact' | 'family' = 'exact',
+): Promise<boolean> {
+  if (match === 'family') {
+    // 前缀族口径：固定查 CREATE_/DROP_ 两族，不用 procName（调用方给的具体过程名可能带 _DEV 后缀）
+    const rows = await pool.query<{ C: number }>(
+      `SELECT COUNT(*) AS C FROM SYS.EFFECTIVE_PRIVILEGES
+       WHERE USER_NAME = CURRENT_USER AND PRIVILEGE = 'EXECUTE'
+       AND (OBJECT_NAME LIKE 'CREATE_INTERMEDIATE_CALCULATION_VIEW%' OR OBJECT_NAME LIKE 'DROP_INTERMEDIATE_CALCULATION_VIEW%')`,
+    );
+    return (rows[0]?.C ?? 0) > 0;
+  }
+  const rows = await pool.query<{ C: number }>(
+    `SELECT COUNT(*) AS C FROM SYS.EFFECTIVE_PRIVILEGES
+     WHERE USER_NAME = CURRENT_USER AND PRIVILEGE = 'EXECUTE' AND SCHEMA_NAME = 'SYS' AND OBJECT_NAME = ?`,
+    [procName],
+  );
+  return (rows[0]?.C ?? 0) > 0;
+}
+
+/** 检查 SYS 下过程 EXECUTE 并记录（诊断渲染；判定委托 hasExecutePrivilege 单点） */
 async function checkProcedureExecute(
   pool: HanaPool,
   procName: string,
@@ -378,12 +443,7 @@ async function checkProcedureExecute(
   blockers: string[],
   hints: string[],
 ): Promise<void> {
-  const rows = await pool.query<{ C: number }>(
-    `SELECT COUNT(*) AS C FROM SYS.EFFECTIVE_PRIVILEGES
-     WHERE USER_NAME = CURRENT_USER AND PRIVILEGE = 'EXECUTE' AND SCHEMA_NAME = 'SYS' AND OBJECT_NAME = ?`,
-    [procName],
-  );
-  const ok = (rows[0]?.C ?? 0) > 0;
+  const ok = await hasExecutePrivilege(pool, procName);
   checks.push({
     item: `EXECUTE: SYS.${procName}`,
     required: `SYS.${procName} 的 EXECUTE`,
@@ -396,144 +456,202 @@ async function checkProcedureExecute(
   }
 }
 
-/** derived 通道：解析视图 XML，追溯全部叶子数据源并逐个校验访问性 */
-async function checkBaseTables(
+/** 叶子数据源的可达性事实（结构化结果：判定只做一次，verbose/brief 只决定怎么渲染） */
+type LeafAccess =
+  | {
+      type: 'DATA_BASE_TABLE';
+      schema: string;
+      table: string;
+      /** schema 是否在白名单内（false 时不查询 SELECT，判定就是不可访问） */
+      allowed: boolean;
+      /** 白名单内是否有 SELECT（allowed=false 时恒 false） */
+      granted: boolean;
+    }
+  | {
+      type: 'CALCULATION_VIEW';
+      schema: string;
+      table: string;
+      /** SELECT 1 实测结果（唯一可达判据） */
+      probe: RuntimeProbe;
+    };
+
+/** 叶子遍历结果：ok=false 只有原因（verbose 渲染成 blocker，brief 静默按空处理） */
+type LeafTraversal =
+  | { ok: true; sourceCount: number; leaves: LeafAccess[] }
+  | { ok: false; kind: 'xml_error'; message: string }
+  | { ok: false; kind: 'no_cdata' };
+
+/** 该叶子是否可访问（唯一判定）：基表=白名单内且有 SELECT；CV=实测可达 */
+function isLeafAccessible(leaf: LeafAccess): boolean {
+  return leaf.type === 'DATA_BASE_TABLE' ? leaf.allowed && leaf.granted : leaf.probe.accessible;
+}
+
+/**
+ * derived 通道：解析视图 XML → 追溯全部叶子数据源 → 逐个探测可达性（**唯一实现**）。
+ *
+ * 原先 verbose（checkBaseTables）与 brief（probeUpstream）各写一份遍历，两份的判定/去重规则
+ * 容易漂移；现合并为结构化事实 + 两个纯渲染函数，verbose 只决定渲染内容。
+ * 返回的 leaves 与 XML 中的出现**一一对应**（不在这里去重）：渲染层保持既有行为
+ * （verbose 对重复出现逐个报 blocker；baseTables/brief 清单按首次出现去重）。
+ * 探测并行（Promise.all）：上游数可达十几个，串行往返会成倍拖慢；连接池满时自动排队复用。
+ */
+async function collectLeafAccess(
   pool: HanaPool,
   packageId: string,
   objectName: string,
   kind: ViewKind | undefined,
-  checks: DiagnosisCheck[],
-  blockers: string[],
-  hints: string[],
-): Promise<BaseTableAccess[]> {
+): Promise<LeafTraversal> {
   let def: ViewDefinition | undefined;
   try {
     const result = await viewDefinitionCache.get(pool, packageId, objectName, { kind });
     def = result.definition;
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    checks.push({ item: '解析视图 XML', required: '读取并解析 _SYS_REPO 设计时 XML', passed: false, detail: `失败：${msg}` });
-    blockers.push(`无法读取/解析视图 XML，derived 通道无法追溯基表：${msg}`);
-    hints.push('确认 _SYS_REPO 读权限与视图已激活；脚本节点（SqlScriptView）derived 通道本就不支持');
-    return [];
+    const message = e instanceof Error ? e.message : String(e);
+    // 诊断降级：读不到设计时 XML 就无法追溯上游（verbose 会把这个原因渲染成 blocker，brief 静默按空处理）
+    logger.warn({ packageId, objectName, err: e }, '诊断无法读取视图设计时 XML，上游追溯降级');
+    return { ok: false, kind: 'xml_error', message };
   }
-  if (!def) {
-    checks.push({ item: '解析视图 XML', required: '视图存在 CDATA', passed: false, detail: '视图无 CDATA' });
-    blockers.push('视图无 CDATA（设计时 XML 为空），derived 通道无法追溯基表');
+  if (!def) return { ok: false, kind: 'no_cdata' };
+
+  const probed = await Promise.all(
+    collectLeafDataSources(def).map(async (ds): Promise<LeafAccess | null> => {
+      if (ds.type === 'DATA_BASE_TABLE' && ds.schemaName && ds.columnObjectName) {
+        // BW on HANA：XML 中 schemaName="ABAP" 是源系统名，真实表在 SAPABAP1（与 preview.derive.normalizeBwSchema 同源）
+        const schema = normalizeBwSchema(ds.schemaName);
+        const allowed = isSchemaAllowed(schema);
+        const granted = allowed && (await hasSchemaSelect(pool, schema));
+        return { type: 'DATA_BASE_TABLE', schema, table: ds.columnObjectName, allowed, granted };
+      }
+      if (ds.type === 'CALCULATION_VIEW' && ds.resourceUri) {
+        // resourceUri 形如 /包路径/calculationviews/对象名 → _SYS_BIC."包路径/对象名"（与 preview.derive.parseResourceUri 同源）
+        const parsed = parseResourceUri(ds.resourceUri);
+        if (!parsed) return null; // 解析不出即跳过（与既有行为一致：诊断不报这条）
+        const probe = await probeRuntimeAccess(pool, parsed.pkg, parsed.name);
+        return { type: 'CALCULATION_VIEW', schema: '_SYS_BIC', table: `${parsed.pkg}/${parsed.name}`, probe };
+      }
+      return null;
+    }),
+  );
+
+  return { ok: true, sourceCount: def.dataSources.length, leaves: probed.filter((l): l is LeafAccess => l !== null) };
+}
+
+/** verbose 渲染：写 checks/blockers/hints 明细并返回去重后的 baseTables（文案与合并前逐字一致） */
+function renderLeafTraversalVerbose(
+  traversal: LeafTraversal,
+  checks: DiagnosisCheck[],
+  blockers: string[],
+  hints: string[],
+): BaseTableAccess[] {
+  if (!traversal.ok) {
+    if (traversal.kind === 'xml_error') {
+      checks.push({
+        item: '解析视图 XML',
+        required: '读取并解析 _SYS_REPO 设计时 XML',
+        passed: false,
+        detail: `失败：${traversal.message}`,
+      });
+      blockers.push(`无法读取/解析视图 XML，derived 通道无法追溯基表：${traversal.message}`);
+      hints.push('确认 _SYS_REPO 读权限与视图已激活；脚本节点（SqlScriptView）derived 通道本就不支持');
+    } else {
+      checks.push({ item: '解析视图 XML', required: '视图存在 CDATA', passed: false, detail: '视图无 CDATA' });
+      blockers.push('视图无 CDATA（设计时 XML 为空），derived 通道无法追溯基表');
+    }
     return [];
   }
   checks.push({
     item: '解析视图 XML',
     required: '读取并解析 _SYS_REPO 设计时 XML',
     passed: true,
-    detail: `解析成功（${def.dataSources.length} 个数据源）`,
+    detail: `解析成功（${traversal.sourceCount} 个数据源）`,
   });
 
-  const leaves = collectLeafDataSources(def);
   const result: BaseTableAccess[] = [];
-  for (const ds of leaves) {
-    if (ds.type === 'DATA_BASE_TABLE' && ds.schemaName && ds.columnObjectName) {
-      // BW on HANA：XML 中 schemaName="ABAP" 是源系统名，真实表在 SAPABAP1（与 preview.derive.leafSql 一致）
-      const schema = ds.schemaName === 'ABAP' ? 'SAPABAP1' : ds.schemaName;
-      const allowed = isSchemaAllowed(schema);
-      let selectable = false;
+  for (const leaf of traversal.leaves) {
+    if (leaf.type === 'DATA_BASE_TABLE') {
       let detail: string;
-      if (!allowed) {
-        detail = `schema ${schema} 不在白名单（系统 schema 或 HANA_SCHEMA_ALLOW 配置）`;
-        blockers.push(`基表 ${schema}.${ds.columnObjectName} 不可访问：${detail}`);
-        hints.push(`在 .env / mcp.json 设置 HANA_SCHEMA_ALLOW=${schema} 追加允许的 schema`);
+      if (!leaf.allowed) {
+        detail = `schema ${leaf.schema} 不在白名单（系统 schema 或 HANA_SCHEMA_ALLOW 配置）`;
+        blockers.push(`基表 ${leaf.schema}.${leaf.table} 不可访问：${detail}`);
+        hints.push(`在 .env / mcp.json 设置 HANA_SCHEMA_ALLOW=${leaf.schema} 追加允许的 schema`);
+      } else if (!leaf.granted) {
+        detail = '缺失';
+        blockers.push(`基表 ${leaf.schema}.${leaf.table} 缺少 SELECT 权限`);
+        hints.push(`GRANT SELECT ON ${leaf.schema}.${leaf.table} TO "<user>";`);
       } else {
-        selectable = await hasSchemaSelect(pool, schema);
-        detail = selectable ? '已授予' : '缺失';
-        if (!selectable) {
-          blockers.push(`基表 ${schema}.${ds.columnObjectName} 缺少 SELECT 权限`);
-          hints.push(`GRANT SELECT ON ${schema}.${ds.columnObjectName} TO "<user>";`);
-        }
+        detail = '已授予';
       }
-      pushBaseTable(result, { schema, table: ds.columnObjectName, type: 'DATA_BASE_TABLE', selectable: selectable && allowed, detail });
-    } else if (ds.type === 'CALCULATION_VIEW' && ds.resourceUri) {
-      // resourceUri 形如 /包路径/calculationviews/对象名 → _SYS_BIC."包路径/对象名"（与 preview.derive.leafSql 一致）
-      const m = /^\/(.+)\/calculationviews\/([^/]+)$/.exec(ds.resourceUri);
-      if (m) {
-        const pkg = m[1];
-        const name = m[2];
-        // 实测可达性优先于 schema SELECT 名义检查：BW Query 等受分析权限保护的对象，
-        // schema SELECT 通过但仍可能不可查。直接探测 SELECT 1 才是金标准。
-        const probe = await probeRuntimeAccess(pool, pkg, name);
-        const selectable = probe.accessible;
-        const detail = selectable ? '实测可达' : `实测不可达${probe.code ? `(${probe.code})` : ''}：${probe.message ?? ''}`;
-        if (!selectable) {
-          blockers.push(`引用的上游对象 ${pkg}/${name} 实测不可访问：${probe.message ?? '未知错误'}${probe.code ? `（错误码 ${probe.code}）` : ''}`);
-          hints.push(`上游对象不可访问多为分析权限缺失（BW Query/受保护 CV）；检查该对象是否受分析权限保护并补授权，或排查其上游链`);
-        }
-        pushBaseTable(result, {
-          schema: '_SYS_BIC', table: `${pkg}/${name}`, type: 'CALCULATION_VIEW', selectable, detail,
-          code: selectable ? undefined : probe.code, message: selectable ? undefined : probe.message,
-        });
+      pushBaseTable(result, {
+        schema: leaf.schema,
+        table: leaf.table,
+        type: 'DATA_BASE_TABLE',
+        selectable: isLeafAccessible(leaf),
+        detail,
+      });
+    } else {
+      const { probe } = leaf;
+      const detail = probe.accessible
+        ? '实测可达'
+        : `实测不可达${probe.code ? `(${probe.code})` : ''}：${probe.message ?? ''}`;
+      if (!probe.accessible) {
+        blockers.push(
+          `引用的上游对象 ${leaf.schema}/${leaf.table} 实测不可访问：${probe.message ?? '未知错误'}${probe.code ? `（错误码 ${probe.code}）` : ''}`,
+        );
+        hints.push(
+          `上游对象不可访问多为分析权限缺失（BW Query/受保护 CV）；检查该对象是否受分析权限保护并补授权，或排查其上游链`,
+        );
       }
+      pushBaseTable(result, {
+        schema: leaf.schema,
+        table: leaf.table,
+        type: 'CALCULATION_VIEW',
+        selectable: probe.accessible,
+        detail,
+        code: probe.accessible ? undefined : probe.code,
+        message: probe.accessible ? undefined : probe.message,
+      });
     }
   }
   return result;
 }
 
 /**
- * 上游实测（精简模式）：解析视图 XML 叶子数据源并实测每个上游对象可达性，
- * 仅返回可达性清单 + 不可达清单（不写 checks/blockers/hints 明细，那些是 verbose 产物）。
- * 基表（DATA_BASE_TABLE）按 schema 白名单 + SELECT 名义检查；外部 CV（CALCULATION_VIEW）实测 SELECT 1。
- * 探测并行（Promise.all）：上游数可达十几个，串行往返会成倍拖慢；连接池满时自动排队复用。
+ * brief 渲染：去重后的 baseTables + 不可达清单（不写 checks/blockers/hints 明细，那些是 verbose 产物）。
+ * 基表按 schema 白名单 + SELECT 名义检查；外部 CV 以 SELECT 1 实测为准。
  */
-async function probeUpstream(
-  pool: HanaPool,
-  packageId: string,
-  objectName: string,
-  kind: ViewKind | undefined,
-): Promise<{ baseTables: BaseTableAccess[]; inaccessible: DiagnosisBrief['upstreamInaccessible'] }> {
-  let def: ViewDefinition | undefined;
-  try {
-    const result = await viewDefinitionCache.get(pool, packageId, objectName, { kind });
-    def = result.definition;
-  } catch {
-    return { baseTables: [], inaccessible: [] };
-  }
-  if (!def) return { baseTables: [], inaccessible: [] };
-
-  const leaves = collectLeafDataSources(def);
-  // 并行探测所有叶子（连接池满时自动排队复用，远快于串行往返）
-  const probed = await Promise.all(
-    leaves.map(async (ds): Promise<BaseTableAccess | null> => {
-      if (ds.type === 'DATA_BASE_TABLE' && ds.schemaName && ds.columnObjectName) {
-        const schema = ds.schemaName === 'ABAP' ? 'SAPABAP1' : ds.schemaName;
-        const allowed = isSchemaAllowed(schema);
-        const selectable = allowed && (await hasSchemaSelect(pool, schema));
-        return {
-          schema, table: ds.columnObjectName, type: 'DATA_BASE_TABLE', selectable,
-          detail: selectable ? '已授予' : allowed ? 'SELECT 缺失' : `schema ${schema} 不在白名单`,
-        };
-      }
-      if (ds.type === 'CALCULATION_VIEW' && ds.resourceUri) {
-        const m = /^\/(.+)\/calculationviews\/([^/]+)$/.exec(ds.resourceUri);
-        if (m) {
-          const pkg = m[1];
-          const name = m[2];
-          const probe = await probeRuntimeAccess(pool, pkg, name);
-          return {
-            schema: '_SYS_BIC', table: `${pkg}/${name}`, type: 'CALCULATION_VIEW', selectable: probe.accessible,
-            detail: probe.accessible ? '实测可达' : `实测不可达${probe.code ? `(${probe.code})` : ''}`,
-            code: probe.accessible ? undefined : probe.code, message: probe.accessible ? undefined : probe.message,
-          };
-        }
-      }
-      return null;
-    }),
-  );
+function renderLeafTraversalBrief(traversal: LeafTraversal): {
+  baseTables: BaseTableAccess[];
+  inaccessible: DiagnosisBrief['upstreamInaccessible'];
+} {
+  if (!traversal.ok) return { baseTables: [], inaccessible: [] };
 
   // 按原叶子顺序组装（去重），保证结果稳定
   const baseTables: BaseTableAccess[] = [];
   const inaccessible: DiagnosisBrief['upstreamInaccessible'] = [];
-  for (const item of probed) {
-    if (!item) continue;
-    const existed = baseTables.some((x) => `${x.schema}.${x.table}` === `${item.schema}.${item.table}`);
-    if (existed) continue;
+  for (const leaf of traversal.leaves) {
+    if (baseTables.some((x) => `${x.schema}.${x.table}` === `${leaf.schema}.${leaf.table}`)) continue;
+    const item: BaseTableAccess =
+      leaf.type === 'DATA_BASE_TABLE'
+        ? {
+            schema: leaf.schema,
+            table: leaf.table,
+            type: 'DATA_BASE_TABLE',
+            selectable: isLeafAccessible(leaf),
+            detail: isLeafAccessible(leaf)
+              ? '已授予'
+              : leaf.allowed
+                ? 'SELECT 缺失'
+                : `schema ${leaf.schema} 不在白名单`,
+          }
+        : {
+            schema: leaf.schema,
+            table: leaf.table,
+            type: 'CALCULATION_VIEW',
+            selectable: leaf.probe.accessible,
+            detail: leaf.probe.accessible ? '实测可达' : `实测不可达${leaf.probe.code ? `(${leaf.probe.code})` : ''}`,
+            code: leaf.probe.accessible ? undefined : leaf.probe.code,
+            message: leaf.probe.accessible ? undefined : leaf.probe.message,
+          };
     baseTables.push(item);
     if (!item.selectable) {
       inaccessible.push({ table: item.table, type: item.type, code: item.code, message: item.message });
@@ -542,8 +660,20 @@ async function probeUpstream(
   return { baseTables, inaccessible };
 }
 
+/** 精简模式的上游实测：遍历（collectLeafAccess）→ brief 渲染，形状与既有实现一致 */
+async function probeUpstream(
+  pool: HanaPool,
+  packageId: string,
+  objectName: string,
+  kind: ViewKind | undefined,
+): Promise<{ baseTables: BaseTableAccess[]; inaccessible: DiagnosisBrief['upstreamInaccessible'] }> {
+  return renderLeafTraversalBrief(await collectLeafAccess(pool, packageId, objectName, kind));
+}
+
 /** 视图叶子数据源（基表 + 外部计算视图） */
-function collectLeafDataSources(def: ViewDefinition): { type: string; schemaName?: string; columnObjectName?: string; resourceUri?: string }[] {
+function collectLeafDataSources(
+  def: ViewDefinition,
+): { type: string; schemaName?: string; columnObjectName?: string; resourceUri?: string }[] {
   return def.dataSources.filter((d) => d.type === 'DATA_BASE_TABLE' || d.type === 'CALCULATION_VIEW');
 }
 
@@ -621,8 +751,9 @@ async function checkAnalyticPrivilege(
        WHERE USER_NAME = CURRENT_USER AND PRIVILEGE = 'ANALYTICAL_PRIVILEGE'`,
     );
     grantedCount = rows[0]?.C ?? 0;
-  } catch {
-    // 查不到授权信息时无法判定，不阻断（运行时探测兜底）
+  } catch (e) {
+    // 查不到授权信息时无法判定，不阻断（运行时探测兜底）；诊断降级留痕
+    logger.warn({ packageId, objectName, err: e }, '无法查询 ANALYTICAL_PRIVILEGE 授权数（降级为运行时探测兜底）');
     detail = '受分析权限保护，但无法查询授权情况（运行时探测兜底判定）';
     checks.push({ item: '分析权限', required: 'ANALYTICAL_PRIVILEGE 授权', passed: true, detail });
     return {

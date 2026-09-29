@@ -2,9 +2,7 @@
   "mcpServers": {
     "saphana-modeler-mcp": {
       "command": "node",
-      "args": [
-        "dist/index.js"
-      ],
+      "args": ["dist/index.js"],
       "env": {
         "HANA_HOST": "hana-host.example",
         "HANA_INSTANCE": "00",

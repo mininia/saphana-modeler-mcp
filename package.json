@@ -22,6 +22,9 @@
     "build": "tsc -p tsconfig.json && node -e \"require('fs').chmodSync('dist/index.js',0o755)\"",
     "prepare": "npm run build",
     "typecheck": "tsc --noEmit -p tsconfig.json",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "check": "npm run typecheck && npm test",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
     "test": "node --import tsx --test tests/unit/*.test.ts",
@@ -50,6 +53,7 @@
   },
   "devDependencies": {
     "@types/node": "^26.3.0",
+    "prettier": "^3.9.9",
     "tsx": "^4.23.12"
   },
   "optionalDependencies": {

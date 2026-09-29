@@ -2,7 +2,7 @@
 import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
 import { loadConfig } from './config/config.js';
 import { HanaPool } from './core/hana-client.js';
-import { logger } from './core/logger.js';
+import { applyLoggerConfig, logger } from './core/logger.js';
 import { checkNodeVersion } from './core/node-version.js';
 import { configureExtraSchemas } from './core/sql.js';
 import { configureWritePackages } from './services/repository.service.js';
@@ -23,6 +23,9 @@ async function main(): Promise<void> {
   }
 
   const config = loadConfig();
+  // 日志配置换成**已校验**的取值（此前 logger 用 env 兜底：它必须早于配置可用）。
+  // 级别与时区与其余模块同源读 config，避免 logger 直读 process.env 造成判定值 ≠ 运行值。
+  applyLoggerConfig({ level: config.logLevel, timezone: config.timezone });
   // 连接目标/凭据跨来源混用（如 shell 残留 HANA_USER + .env 提供其余项）→ 可能连到另一套环境，必须显式告警。
   // 只输出「哪个变量来自哪里」，不含任何值（连接信息/账号名一律不落日志）。
   if (config.connectionSourceMixed) {

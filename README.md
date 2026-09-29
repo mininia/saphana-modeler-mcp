@@ -79,7 +79,7 @@ MCP 接入：将 `mcp.json.example` 复制为 `mcp.json` 并填入真实连接�
 | `HANA_DB_NAME` | 可选 | 租户数据库名（MDC 必填） | `SYSTEMDB` / 业务租户名 |
 | `HANA_TLS` | 可选 | TLS 加密，默认 `true`（fail-closed；仅可信链路显式 `false`） | `true` |
 | `HANA_SSL_VALIDATE` | 可选 | TLS 下校验证书，默认 `true`；自签证书环境显式 `false` | `true` |
-| `HANA_TIMEZONE` | 可选 | 会话时区，默认 `Asia/Shanghai` | `Asia/Shanghai` |
+| `HANA_TIMEZONE` | 可选 | 进程时区（设置 `TZ`，影响日志时间戳与本地时间语义）；**不下发 HANA 会话**。默认 `Asia/Shanghai` | `Asia/Shanghai` |
 | `HANA_SCHEMA_ALLOW` | 可选 | 追加允许查询的 schema（逗号分隔，追加到内置白名单） | `SAPABAP1,OTHER_SCHEMA` |
 | `HANA_WRITE_PACKAGES` | 可选 | 允许写操作的仓库包前缀（逗号分隔，含子包）。**空=不限制（全部可写）**；填写后仅允许配置包及其下级子包写操作 | `ZDEMO1,ZDEMO2.ZDEMO_SD` |
 | `HANA_XS_PORT` | 可选 | XS Classic 设计时 REST 端口（写路径）；省略按实例号推导 `80<instance>` | `8010` |
@@ -90,10 +90,10 @@ MCP 接入：将 `mcp.json.example` 复制为 `mcp.json` 并填入真实连接�
 | `LOG_LEVEL` | 可选 | 日志级别，默认 `info` | `debug` |
 | `MCP_HTTP_PORT` | 可选 | Streamable HTTP 端口；设置后以 HTTP 模式启动（端点 `/mcp`），未设置 = stdio（默认）。`0` = 随机端口 | `3000` |
 | `MCP_HTTP_HOST` | 可选 | HTTP 监听地址，默认 `127.0.0.1`（仅本机，fail-closed）；对外暴露需显式配置（如 `0.0.0.0`） | `127.0.0.1` |
-| `MCP_HTTP_TOKEN` | 可选 | HTTP Bearer Token（≥16 字符）：设置后所有请求须带 `Authorization: Bearer <token>`（timing-safe 比较），缺失/不匹配 → 401；对外暴露时强烈建议配置。单一 Token 无法区分调用方，所有请求归为身份 `shared` | — |
+| `MCP_HTTP_TOKEN` | **已废弃** | 保留仅为向后兼容，等价于 `MCP_HTTP_TOKENS=shared:<token>`（读入同一张 Token→身份表，401 语义与归因不变）；计划在下一个大版本删除。新部署请直接用 `MCP_HTTP_TOKENS` | — |
 | `MCP_HTTP_TOKENS` | 可选 | **多客户端 Token → 身份映射**（逗号分隔 `name:token`）：每个 Token 对应一个 `clientId`，进 `envelope.clientId` 与审计日志（多客户端共享同一 HANA 账号时的唯一归属来源）。`name` 限 `[A-Za-z0-9_.-]{1,32}`，`token` ≥16 字符；重复/非法则启动失败。可与 `MCP_HTTP_TOKEN` 并存 | `alice:<token>,bob:<token>` |
 | `MCP_HTTP_ALLOWED_HOSTS` | 可选 | 允许的 Host 头主机名（DNS rebinding 防护；逗号分隔，不含端口，IPv6 带方括号），默认仅本机名 | `localhost,myhost.corp` |
-| `MCP_HTTP_ALLOWED_ORIGINS` | 可选 | 允许的 Origin 主机名（逗号分隔，不含 scheme/端口；无 Origin 头的请求放行），默认仅本机名 | `localhost` |
+| `MCP_HTTP_ALLOWED_ORIGINS` | 可选 | 允许的 Origin 主机名（逗号分隔，不含 scheme/端口；无 Origin 头的请求放行）。**未设置时继承 `MCP_HTTP_ALLOWED_HOSTS`**，显式置空 = 拒绝一切带 Origin 的请求 | `localhost` |
 | `MCP_HTTP_ALLOW_ANONYMOUS` | 可选 | 显式承认「对外监听且不配置任何 Bearer Token」的风险（默认 `false`）。**非回环监听 + 无 Token 时默认拒绝启动**（该姿态下写边界/工具分组/schema 白名单全部形同虚设）；确实需要（如已置于带认证的反向代理之后）再显式置 `true` | `false` |
 
 ## 传输方式
@@ -134,7 +134,7 @@ MCP_HTTP_PORT=3000 MCP_HTTP_TOKEN='your-long-random-token' node dist/index.js
 
 ## 工具分组与可见性控制
 
-24 个工具按功能划分为三组，可经 mcp.json / .env 的环境变量控制哪些工具对 MCP 客户端可见（不注册即不出现在 `tools/list`、不可被调用）。配置全空 = 全部启用（向后兼容默认）。
+28 个工具按功能划分为三组，可经 mcp.json / .env 的环境变量控制哪些工具对 MCP 客户端可见（不注册即不出现在 `tools/list`、不可被调用）。配置全空 = 全部启用（向后兼容默认）。
 
 ### 三类分组
 
@@ -162,7 +162,7 @@ MCP_HTTP_PORT=3000 MCP_HTTP_TOKEN='your-long-random-token' node dist/index.js
 
 **典型部署形态：**
 
-- **只读分析师**：`HANA_TOOL_GROUPS=read` —— 只暴露 16 个只读工具，全部写/校验工具不可见。
+- **只读分析师**：`HANA_TOOL_GROUPS=read` —— 只暴露 20 个只读工具，全部写/校验工具不可见。
 - **建模开发者**：`HANA_TOOL_GROUPS=read,write` —— 暴露读取与写操作（默认形态，等价于全空）。
 - **关闭特定工具**：`HANA_TOOL_DENY=hana_view_delete` —— 仅禁用删除，其余不受影响。
 
@@ -294,7 +294,9 @@ MCP_HTTP_PORT=3000 MCP_HTTP_TOKEN='your-long-random-token' node dist/index.js
 | `npm test` | 单元测试（node --test + tsx；测试文件本地保留，未入库） |
 | `npm run smoke` | 构建 + stdio 冒烟测试 |
 | `npm run smoke:http` | 构建 + Streamable HTTP 冒烟测试（握手/工具注册/Host 防护，无需真实 HANA） |
-| `npm run typecheck` | 仅类型检查 |
+| `npm run typecheck` | 仅类型检查（同时承担死代码检测：`noUnusedLocals` 会拦下未使用的导入与变量） |
+| `npm run format` | Prettier 格式化（`format:check` 只检查不写） |
+| `npm run check` | `typecheck` + `test`（提交前跑这个） |
 | `npm run verify:system` | 构建 + 真实 HANA 系统工具验收 |
 | `npm run verify:p1-5` | 构建 + 读路径/预览/字段逻辑黑盒验收 |
 | `npm run verify:lifecycle` | 构建 + 写路径全生命周期验收（create→validate→activate→preview→update冲突→delete→import；脚本在本地 `test-verification/`，不入库） |
@@ -310,7 +312,8 @@ src/
   server.ts           McpServer（server instructions 领域上下文）+ 全部工具注册
   config/             zod 环境变量校验（连接/TLS/时区/白名单/可写包）
   core/               HANA 连接池（有界排队+等待超时）、SQL 转义与白名单、错误 envelope、日志脱敏、
-                      请求身份上下文（HTTP 多客户端归因）、写临界区 keyed lock、XML 工具、XS REST 客户端
+                      请求身份上下文（HTTP 多客户端归因）、写临界区 keyed lock、XML 工具、XS REST 客户端、
+                      数值/文本/错误码判定的公共实现（num/text/hana-errors）、时区与时间格式化
   model/              视图 TS 类型、XML 双向解析、最小 CV 的 XML 构造
   services/
     metadata.service        只读：包/对象搜索/字段/血缘/表目录
@@ -330,6 +333,8 @@ scripts/               通用冒烟脚本（smoke-stdio）；实机验收/探针
 ```
 
 > `tests/` 与 `docs/` 不入库（含环境标识/探测记录，本地保留供开发）；克隆后按需自备测试与文档。
+>
+> 分层与依赖方向、错误处理约定、公共实现该放哪、"哪些看起来一样但语义不同不能合并"——见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 每个工具统一返回信封 `{ success, data?, messages[], raw? }`（HTTP 模式下另带 `clientId` = 由 `MCP_HTTP_TOKENS` 解析出的调用方身份）：硬错误（参数非法/对象不存在）通过 MCP
 `isError` 返回并附恢复提示；HANA 业务失败（如激活报错明细）走 `success:false`。

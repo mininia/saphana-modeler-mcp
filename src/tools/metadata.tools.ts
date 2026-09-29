@@ -1,11 +1,26 @@
+/**
+ * 元数据读取工具（分组 **read**）：视图定义/字段/字段逻辑/血缘、对象搜索、表清单与表结构。
+ *
+ * 注册的工具：hana_metadata_get_view、hana_metadata_search_objects、hana_metadata_list_fields、
+ * hana_metadata_get_field_logic、hana_metadata_where_used、hana_table_list、hana_table_columns。
+ * 全部只读（不写仓库、不写任何表），经 registerVisibleTool 注册，不经写预检。
+ */
+
 import type { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import { withErrorEnvelope } from '../core/errors.js';
-import { getTableColumns, getViewDefinition, getViewFieldList, getViewFieldLogic, listTables, searchObjects, whereUsed } from '../services/metadata.service.js';
+import {
+  getTableColumns,
+  getViewDefinition,
+  getViewFieldList,
+  getViewFieldLogic,
+  listTables,
+  searchObjects,
+  whereUsed,
+} from '../services/metadata.service.js';
 import { registerVisibleTool, type ToolContext } from './index.js';
+import { VIEW_KIND, toToolResult, zObjectName, zPackageId } from './common.js';
 import type { Envelope } from '../types/hana.js';
-
-const VIEW_KIND = z.enum(['calculationview', 'attributeview', 'analyticview']);
 
 export function registerMetadataTools(server: McpServer, ctx: ToolContext): void {
   const reg = registerVisibleTool(server, ctx);
@@ -22,8 +37,8 @@ export function registerMetadataTools(server: McpServer, ctx: ToolContext): void
         '只看字段清单用 hana_metadata_list_fields；只看某字段计算逻辑用 hana_metadata_get_field_logic；' +
         '按名称片段定位完整包名/对象名用 hana_metadata_search_objects',
       inputSchema: z.object({
-        packageId: z.string().regex(/^[A-Za-z0-9_.\-]+$/).describe('包名，层级用 . 分隔，如 ZDEMO.ZDEMO_MGF'),
-        objectName: z.string().regex(/^[A-Za-z0-9_.\-]+$/).describe('视图对象名，如 ZDEMO02_CV008'),
+        packageId: zPackageId('包名，层级用 . 分隔，如 ZDEMO.ZDEMO_MGF'),
+        objectName: zObjectName('视图对象名，如 ZDEMO02_CV008'),
         kind: VIEW_KIND.optional().describe('视图类型；省略时自动匹配三种类型'),
         format: z.enum(['json', 'xml']).default('json').describe('返回格式：json=结构化定义；xml=仓库原始设计时 XML'),
       }),
@@ -33,10 +48,7 @@ export function registerMetadataTools(server: McpServer, ctx: ToolContext): void
       const envelope: Envelope = await withErrorEnvelope(() =>
         getViewDefinition(ctx.pool, packageId, objectName, { kind, format }),
       );
-      return {
-        content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }],
-        structuredContent: envelope,
-      };
+      return toToolResult(envelope);
     },
   );
 
@@ -47,7 +59,7 @@ export function registerMetadataTools(server: McpServer, ctx: ToolContext): void
       description:
         '在 _SYS_REPO.ACTIVE_OBJECT 中按视图对象名片段模糊搜索（大小写不敏感），返回包名/对象名/类型/版本/激活信息，' +
         '用于定位视图的完整包名与对象名。默认只搜三种视图类型（排除 UI5 仓库资源）；kind 可限定类型；带截断并返回总命中数。' +
-        '典型场景：hana_metadata_list_fields / hana_metadata_get_field_logic 报"未找到视图"时，先用本工具按片段定位，' +
+        '典型场景：hana_metadata_list_fields / hana_metadata_get_field_logic 报「未找到视图」时，先用本工具按片段定位，' +
         '再把完整包名/对象名传给对应工具',
       inputSchema: z.object({
         pattern: z.string().min(1).max(100).describe('视图对象名片段，如 ZDEMO02 或 CV008；大小写不敏感'),
@@ -58,10 +70,7 @@ export function registerMetadataTools(server: McpServer, ctx: ToolContext): void
     },
     async ({ pattern, kind, limit }) => {
       const envelope: Envelope = await withErrorEnvelope(() => searchObjects(ctx.pool, { pattern, kind, limit }));
-      return {
-        content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }],
-        structuredContent: envelope,
-      };
+      return toToolResult(envelope);
     },
   );
 
@@ -72,15 +81,18 @@ export function registerMetadataTools(server: McpServer, ctx: ToolContext): void
       description:
         '梳理视图的字段清单：字段 ID、中文描述、类型（属性/度量）、聚合方式、来源（节点.列）、是否带计算逻辑。' +
         '默认只列输出字段（视图对外暴露的字段）；pattern 按字段 ID 片段模糊过滤，exact=true 精确匹配。' +
-        '回答"某视图有哪些字段/梳理字段/有没有某字段"用本工具；' +
+        '回答「某视图有哪些字段/梳理字段/有没有某字段」用本工具；' +
         '拿到字段 ID 后用 hana_metadata_get_field_logic 看该字段的完整计算逻辑',
       inputSchema: z.object({
-        packageId: z.string().regex(/^[A-Za-z0-9_.\-]+$/).describe('包名，层级用 . 分隔，如 ZDEMO.ZDEMO_SD'),
-        objectName: z.string().regex(/^[A-Za-z0-9_.\-]+$/).describe('视图对象名，如 ZDEMO008_CV001'),
+        packageId: zPackageId('包名，层级用 . 分隔，如 ZDEMO.ZDEMO_SD'),
+        objectName: zObjectName('视图对象名，如 ZDEMO008_CV001'),
         pattern: z.string().optional().describe('字段 ID 过滤片段（如 ZDEMO_FLD）；省略=全部字段'),
         exact: z.boolean().default(false).describe('true=按字段 ID 精确匹配（pattern 必填）'),
         kind: VIEW_KIND.optional().describe('视图类型；省略时自动匹配三种类型'),
-        includeNodeCalculated: z.boolean().default(false).describe('true=附带节点内部的计算列（不进输出的中间计算字段）'),
+        includeNodeCalculated: z
+          .boolean()
+          .default(false)
+          .describe('true=附带节点内部的计算列（不进输出的中间计算字段）'),
       }),
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
@@ -88,10 +100,7 @@ export function registerMetadataTools(server: McpServer, ctx: ToolContext): void
       const envelope: Envelope = await withErrorEnvelope(() =>
         getViewFieldList(ctx.pool, packageId, objectName, { kind, pattern, exact, includeNodeCalculated }),
       );
-      return {
-        content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }],
-        structuredContent: envelope,
-      };
+      return toToolResult(envelope);
     },
   );
 
@@ -102,14 +111,17 @@ export function registerMetadataTools(server: McpServer, ctx: ToolContext): void
       description:
         '获取视图中指定字段的计算逻辑：公式原文（SQL/COLUMN_ENGINE）、公式引用的源字段、源字段沿节点映射的溯源、' +
         '字段元数据（中文描述/类型/长度）。SqlScriptView（SQL 脚本）节点返回脚本源码（script），脚本即该字段的逻辑来源。' +
-        '回答"某视图某字段什么逻辑/公式怎么写的/怎么算出来的"用本工具，一次调用即可，' +
+        '回答「某视图某字段什么逻辑/公式怎么写的/怎么算出来的」用本工具，一次调用即可，' +
         '不返回整份视图定义，结果精准聚焦单字段。' +
         '功能边界：字段的来源映射（节点.列）看 hana_metadata_list_fields 的 source，视图的上游/下游依赖看 hana_metadata_where_used；' +
         '字段 ID 不确定时先用 hana_metadata_list_fields 按名称片段模糊搜索',
       inputSchema: z.object({
-        packageId: z.string().regex(/^[A-Za-z0-9_.\-]+$/).describe('包名，层级用 . 分隔，如 ZDEMO.ZDEMO_SD'),
-        objectName: z.string().regex(/^[A-Za-z0-9_.\-]+$/).describe('视图对象名，如 ZDEMO008_CV001'),
-        fieldId: z.string().min(1).describe('字段 ID（精确），如 ZDEMO_FLD_NEW；不确定时先 hana_metadata_list_fields 搜索'),
+        packageId: zPackageId('包名，层级用 . 分隔，如 ZDEMO.ZDEMO_SD'),
+        objectName: zObjectName('视图对象名，如 ZDEMO008_CV001'),
+        fieldId: z
+          .string()
+          .min(1)
+          .describe('字段 ID（精确），如 ZDEMO_FLD_NEW；不确定时先 hana_metadata_list_fields 搜索'),
         kind: VIEW_KIND.optional().describe('视图类型；省略时自动匹配三种类型'),
       }),
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
@@ -118,10 +130,7 @@ export function registerMetadataTools(server: McpServer, ctx: ToolContext): void
       const envelope: Envelope = await withErrorEnvelope(() =>
         getViewFieldLogic(ctx.pool, packageId, objectName, fieldId, { kind }),
       );
-      return {
-        content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }],
-        structuredContent: envelope,
-      };
+      return toToolResult(envelope);
     },
   );
 
@@ -135,19 +144,21 @@ export function registerMetadataTools(server: McpServer, ctx: ToolContext): void
         'downstream 中 isRuntime=true 表示激活后的运行时对象（_SYS_BIC）对仓库视图的引用。' +
         '修改/删除视图前用本工具评估影响面',
       inputSchema: z.object({
-        packageId: z.string().regex(/^[A-Za-z0-9_.\-]+$/).describe('包名，层级用 . 分隔，如 ZDEMO.ZDEMO_MKC'),
-        objectName: z.string().regex(/^[A-Za-z0-9_.\-]+$/).describe('视图对象名'),
+        packageId: zPackageId('包名，层级用 . 分隔，如 ZDEMO.ZDEMO_MKC'),
+        objectName: zObjectName('视图对象名'),
         kind: VIEW_KIND.optional().describe('视图类型；省略时匹配三种类型'),
-        direction: z.enum(['upstream', 'downstream', 'both']).default('both').describe('血缘方向：upstream=依赖谁，downstream=谁依赖'),
+        direction: z
+          .enum(['upstream', 'downstream', 'both'])
+          .default('both')
+          .describe('血缘方向：upstream=依赖谁，downstream=谁依赖'),
       }),
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ packageId, objectName, kind, direction }) => {
-      const envelope: Envelope = await withErrorEnvelope(() => whereUsed(ctx.pool, packageId, objectName, { kind, direction }));
-      return {
-        content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }],
-        structuredContent: envelope,
-      };
+      const envelope: Envelope = await withErrorEnvelope(() =>
+        whereUsed(ctx.pool, packageId, objectName, { kind, direction }),
+      );
+      return toToolResult(envelope);
     },
   );
 
@@ -167,10 +178,7 @@ export function registerMetadataTools(server: McpServer, ctx: ToolContext): void
     },
     async ({ schema, pattern, limit }) => {
       const envelope: Envelope = await withErrorEnvelope(() => listTables(ctx.pool, { schema, pattern, limit }));
-      return {
-        content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }],
-        structuredContent: envelope,
-      };
+      return toToolResult(envelope);
     },
   );
 
@@ -190,10 +198,7 @@ export function registerMetadataTools(server: McpServer, ctx: ToolContext): void
     },
     async ({ schema, table, limit }) => {
       const envelope: Envelope = await withErrorEnvelope(() => getTableColumns(ctx.pool, schema, table, { limit }));
-      return {
-        content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }],
-        structuredContent: envelope,
-      };
+      return toToolResult(envelope);
     },
   );
 }

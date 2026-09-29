@@ -17,6 +17,7 @@
  */
 
 import { HanaBusinessError } from '../core/errors.js';
+import { hanaErrorMessage } from '../core/hana-errors.js';
 import { assertSchemaAllowed } from '../core/sql.js';
 import { hasUnqualifiedTableRef } from '../write-plan.js';
 
@@ -46,9 +47,12 @@ export async function assertSqlReadScopes(
   if (schema === '') return;
   try {
     assertSchemaAllowed(schema);
-  } catch {
+  } catch (e) {
+    // 保留 catch（**确有改写文案的理由**）：调用方从未写过这个 schema —— 它来自会话默认值，
+    // 直接上抛 core 的「schema "X" 不在允许列表」会让调用方无从对应；改写时保留 core 的原因描述，
+    // 使白名单枚举/配置指引始终与 core 同源（不在这里手抄一份）。
     throw new HanaBusinessError(
-      `${noun}含未限定 schema 的表名，按${schemaLabel} "${schema}" 解析，而它不在服务端允许读取的范围内。` +
+      `${noun}含未限定 schema 的表名，按${schemaLabel} "${schema}" 解析，而它不在服务端允许读取的范围内 —— ${hanaErrorMessage(e)}。` +
         '请把表名写成全限定名（SCHEMA."表"），或由部署方调整可读 schema 配置',
     );
   }

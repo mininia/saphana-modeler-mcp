@@ -11,7 +11,9 @@
  */
 
 import { randomBytes } from 'node:crypto';
+import { US_PER_SECOND } from '../core/num.js';
 import { quoteLiteral } from '../core/sql.js';
+import { truncateWithNote } from '../core/text.js';
 import { stripSqlLiteralsAndComments } from '../write-plan.js';
 
 /** 允许**解释**的语句首 token（HANA 的 EXPLAIN PLAN 支持 DML，我们只放行查询类） */
@@ -28,7 +30,11 @@ const EXECUTABLE_TOKEN = 'SELECT';
 export const DEFAULT_OPERATOR_LIMIT = 200;
 export const MAX_OPERATOR_LIMIT = 1000;
 
-/** 回读硬上限：无论 limit 多大都不超过（防超大计划撑爆响应） */
+/**
+ * 回读硬上限：无论 limit 多大都不超过（防超大计划撑爆响应）。
+ * **只在回读路径（sql-analyze.service 的 readPlanBack）截一次**：结论、渲染、计数必须来自同一份行，
+ * 两处各截一次会出现"统计说 6000 个算子、算子表里只有 5000"。
+ */
 export const HARD_OPERATOR_CAP = 5000;
 
 /**
@@ -202,7 +208,12 @@ export function validateLabel(v: unknown): RequestProblem | undefined {
       hint: '它只作为输出标签，缩短即可',
     };
   }
-  if ([...v].some((ch) => { const c = ch.charCodeAt(0); return c < 0x20 || c === 0x7f; })) {
+  if (
+    [...v].some((ch) => {
+      const c = ch.charCodeAt(0);
+      return c < 0x20 || c === 0x7f;
+    })
+  ) {
     return { message: 'statementName 含控制字符', hint: '请使用可打印字符' };
   }
   return undefined;
@@ -236,10 +247,7 @@ export function fallbackStatementName(primary: string): string {
  * 只能内联。因此 statementName 由服务端生成（纯字母数字下划线）+ quoteLiteral 二次转义；
  * planId 必须已验证为安全整数。
  */
-export function buildExplainStatement(
-  statementName: string,
-  target: { sql: string } | { planId: number },
-): string {
+export function buildExplainStatement(statementName: string, target: { sql: string } | { planId: number }): string {
   const label = quoteLiteral(statementName);
   const entry = 'sql' in target ? target.sql : `SQL PLAN CACHE ENTRY ${target.planId}`;
   return `EXPLAIN PLAN SET STATEMENT_NAME = ${label} FOR ${entry}`;
@@ -301,23 +309,81 @@ function isRoot(row: PlanRow): boolean {
   return parent == null || parent === 0 || parent === row.OPERATOR_ID;
 }
 
-/** 计划行 → 可读产物（硬上限截断在前，limit 截断在后） */
-export function renderPlan(rows: PlanRow[], limit: number): PlanRender {
-  const all = rows.slice(0, HARD_OPERATOR_CAP);
-  const ids = new Set(all.map((r) => r.OPERATOR_ID));
-  const rootCount = all.filter(isRoot).length;
-  const orphanCount = all.filter((r) => !isRoot(r) && !ids.has(r.PARENT_OPERATOR_ID)).length;
+/**
+ * 计划结构统计（根 / 孤儿）——EXPLAIN 通道的**唯一**实现。
+ *
+ * 同一份行在渲染（renderPlan）与结论（analyzePlan）里各要算一次，口径必须完全一致：
+ * 否则会出现"结论说结构不完整（根 2 个）"而响应里的 rootCount 是 1 这种自相矛盾。
+ *
+ * 口径（**与 PlanViz 侧的"从根走不到"不同，刻意不合并**）：根=父为 NULL/0/自引用；
+ * 孤儿=非根但父不在本次结果集内（父链断裂）。PlanViz 侧没有 PARENT 列，只能按引用关系
+ * 反推且用可达性判孤儿（见 planviz.rules 的 parsePlanVizXml），两者对畸形计划的计数本就会不同，
+ * 强行统一 = 静默改变某条通道报出的数字。
+ */
+export function analyzePlanStructure(rows: PlanRow[]): { rootCount: number; orphanCount: number } {
+  const ids = new Set(rows.map((r) => r.OPERATOR_ID));
+  return {
+    rootCount: rows.filter(isRoot).length,
+    orphanCount: rows.filter((r) => !isRoot(r) && !ids.has(r.PARENT_OPERATOR_ID)).length,
+  };
+}
 
-  const shown = all.slice(0, limit);
-  const operators = shown.map(toOperator);
+/** 缩进文本树的一行：**层深由调用方给**（两条通道的父子口径与行序不同），这里只管缩进与截断 */
+export interface TreeLine {
+  depth: number;
+  text: string;
+}
+
+/**
+ * 缩进文本树的公共渲染：把"缩进用两空格 × 深度"与"**被截断必须说明**"两件事收在一处。
+ *
+ * 行序与层深仍由调用方给：EXPLAIN 通道按回读顺序 + LEVEL 缩进（算子表与文本树顺序必须一致），
+ * PlanViz 通道从根 DFS——把两者的遍历也强行统一会改变已验证的输出，收益却是负的。
+ */
+export function renderTree(lines: TreeLine[], limit: number, truncatedNote?: string): string {
+  const shown = lines.slice(0, Math.max(0, limit));
+  const text = shown.map((l) => `${'  '.repeat(Math.max(0, l.depth))}${l.text}`).join('\n');
+  return truncatedNote !== undefined && lines.length > shown.length ? `${text}\n${truncatedNote}` : text;
+}
+
+/**
+ * 只在有值时展开字段（避免响应里出现一堆 null）。
+ *
+ * **通用版**：value 可以是任何类型（算子/统计里的可选字段既有数字也有字符串）。
+ * 服务层曾另有一份 number-only 的副本，已并入这里——"缺省字段不出现"是本工具全部输出的统一口径。
+ */
+export function withDefined<K extends string, V>(key: K, value: V | undefined): Partial<Record<K, V>> {
+  return value === undefined ? {} : ({ [key]: value } as Record<K, V>);
+}
+
+/** 计划行 → 可读产物（`limit` 限量；**硬上限由回读路径一次性截断**，见下） */
+export function renderPlan(rows: PlanRow[], limit: number): PlanRender {
+  // 这里**不再**截 HARD_OPERATOR_CAP：回读路径（sql-analyze.service 的 readPlanBack）已截过一次，
+  // 而结论、渲染、计数必须来自同一份行——两处各截一次会让"统计说 6000 个算子、算子表里只有 5000"。
+  const { rootCount, orphanCount } = analyzePlanStructure(rows);
+  const operators = rows.slice(0, limit).map(toOperator);
   return {
     operators,
-    planText: operators.map(renderLine).join('\n'),
-    operatorCount: all.length,
-    truncated: shown.length < all.length,
+    planText: renderTree(operators.map(toTreeLine), limit),
+    operatorCount: rows.length,
+    truncated: operators.length < rows.length,
     rootCount,
     orphanCount,
   };
+}
+
+/** 算子行 → 文本树的一行（缩进由 renderTree 统一处理） */
+function toTreeLine(op: PlanOperator): TreeLine {
+  const parts = [op.operator];
+  if (op.table) {
+    const qualified = op.schema ? `${op.schema}.${op.table}` : op.table;
+    parts.push(`→ ${qualified}${op.tableType ? `（${op.tableType}）` : ''}`);
+  }
+  // HEX 是 SQL 引擎的常态（每行都打是噪声）；其余引擎（COLUMN/ROW/OLAP/ESX）恰恰是要看的"引擎切换"
+  if (op.engine && op.engine !== 'HEX') parts.push(`[${op.engine}]`);
+  if (op.cost && op.cost > 0) parts.push(`cost=${op.cost}`);
+  if (op.details) parts.push(`(${op.details})`);
+  return { depth: Math.max(0, op.level - 1), text: parts.join(' ') };
 }
 
 function toOperator(row: PlanRow): PlanOperator {
@@ -339,20 +405,6 @@ function toOperator(row: PlanRow): PlanOperator {
   if (row.OPERATOR_DETAILS) op.details = row.OPERATOR_DETAILS;
   if (row.OPERATOR_PROPERTIES) op.properties = row.OPERATOR_PROPERTIES;
   return op;
-}
-
-function renderLine(op: PlanOperator): string {
-  const indent = '  '.repeat(Math.max(0, op.level - 1));
-  const parts = [op.operator];
-  if (op.table) {
-    const qualified = op.schema ? `${op.schema}.${op.table}` : op.table;
-    parts.push(`→ ${qualified}${op.tableType ? `（${op.tableType}）` : ''}`);
-  }
-  // HEX 是 SQL 引擎的常态（每行都打是噪声）；其余引擎（COLUMN/ROW/OLAP/ESX）恰恰是要看的"引擎切换"
-  if (op.engine && op.engine !== 'HEX') parts.push(`[${op.engine}]`);
-  if (op.cost && op.cost > 0) parts.push(`cost=${op.cost}`);
-  if (op.details) parts.push(`(${op.details})`);
-  return `${indent}${parts.join(' ')}`;
 }
 
 // ── 分析结论（**默认输出**：把算子计划翻译成人能读懂的结论）────────
@@ -430,6 +482,22 @@ const SCAN_RE = /(TABLE SCAN|INDEX SEARCH|COLUMN SEARCH|ROW SEARCH|FULL SCAN)/i;
 const JOIN_RE = /\bJOIN\b/i;
 const NESTED_LOOP_RE = /NESTED\s*LOOP/i;
 const AGGREGATION_RE = /(AGGREGATION|GROUP BY)/i;
+
+/**
+ * PlanViz 通道的算子识别口径（与上面 EXPLAIN 口径**刻意不合并**）。
+ *
+ * 两条通道的算子名来源不同，命名习惯也不同：
+ * - EXPLAIN 的名字来自 `OPERATOR_NAME`，**空格分词**（"COLUMN TABLE SCAN" / "NESTED LOOP JOIN" / "GROUP BY"）；
+ * - PlanViz 的名字来自算子 `TypeName`，**下划线分词**（"GROUP_BY" / "HASH_JOIN"）——
+ *   `\bJOIN\b` 在 "HASH_JOIN" 上**不匹配**（下划线是单词字符），拿 EXPLAIN 的 JOIN_RE 去数 PlanViz
+ *   会少数；GROUP BY 那边同理（`/(AGGREGATION|GROUP BY)/` 匹配不到 "GROUP_BY"）。
+ * - PlanViz 的**表访问**更不能靠名字认：它的表访问算子 TypeName 是 "TABLE"/"TREX_SEARCH" 之类，
+ *   口径是"算子带对象名"，见 planviz.rules 的 planVizStatistics（有注释说明）。
+ *
+ * 合并它们 = 静默改变某一条通道的统计数字；差异留在常量名与这段注释里显式可见。
+ */
+export const PLANVIZ_JOIN_RE = /JOIN/i;
+export const PLANVIZ_AGGREGATION_RE = /GROUP_BY|AGGREGAT/i;
 
 export interface PlanAnalysisContext {
   /** 被分析的语句（用于"有没有过滤条件"这类文本启发的判定，会标注为启发式） */
@@ -594,9 +662,10 @@ export function analyzePlan(rows: PlanRow[], ctx: PlanAnalysisContext): PlanConc
       level: 'warn',
       title: `计划跨越多个执行引擎（${engines.join(' → ')}），存在引擎切换开销`,
       evidence: `算子的 EXECUTION_ENGINE 取值：${engines.join(', ')}`,
-      advice: switchable.length > 0
-        ? `重点看 ${switchable.join('/')} 与其它引擎的衔接处：行表/计算视图混用时切换代价明显，必要时统一存储类型或拆开计算`
-        : '切换到列/行引擎的边界通常在大表读取处，可结合上面的表规模一起看',
+      advice:
+        switchable.length > 0
+          ? `重点看 ${switchable.join('/')} 与其它引擎的衔接处：行表/计算视图混用时切换代价明显，必要时统一存储类型或拆开计算`
+          : '切换到列/行引擎的边界通常在大表读取处，可结合上面的表规模一起看',
     });
   }
 
@@ -609,31 +678,36 @@ export function analyzePlan(rows: PlanRow[], ctx: PlanAnalysisContext): PlanConc
         for (const d of descendants(rows, n.OPERATOR_ID)) {
           if (SCAN_RE.test(d.OPERATOR_NAME ?? '') && d.TABLE_NAME) {
             const size = d.TABLE_SIZE;
-            involved.add(`${d.SCHEMA_NAME ? `${d.SCHEMA_NAME}.` : ''}${d.TABLE_NAME}${size != null ? `(${formatRows(size)} 行)` : ''}`);
+            involved.add(
+              `${d.SCHEMA_NAME ? `${d.SCHEMA_NAME}.` : ''}${d.TABLE_NAME}${size != null ? `(${formatRows(size)} 行)` : ''}`,
+            );
           }
         }
       }
       findings.push({
         level: 'warn',
         title: `存在嵌套循环连接（${nested.length} 处），大表上代价高`,
-        evidence: involved.size > 0
-          ? `嵌套循环下游的表：${[...involved].join('、')}`
-          : `算子：${nested.map((n) => (n.OPERATOR_NAME ?? '').trim()).join('、')}`,
+        evidence:
+          involved.size > 0
+            ? `嵌套循环下游的表：${[...involved].join('、')}`
+            : `算子：${nested.map((n) => (n.OPERATOR_NAME ?? '').trim()).join('、')}`,
         advice: '确认连接键两侧是否都有过滤/索引；数据量大时哈希连接通常更合适，可交由 DBA 评估',
       });
     } else {
       findings.push({
         level: 'info',
         title: `使用连接算子 ${joins} 处`,
-        evidence: rows.filter((r) => JOIN_RE.test(r.OPERATOR_NAME ?? '')).map((r) => (r.OPERATOR_NAME ?? '').trim()).join('、'),
+        evidence: rows
+          .filter((r) => JOIN_RE.test(r.OPERATOR_NAME ?? ''))
+          .map((r) => (r.OPERATOR_NAME ?? '').trim())
+          .join('、'),
       });
     }
   }
 
   // ── 4. 计划结构异常 ──
-  const rootCount = rows.filter(isRoot).length;
-  const ids = new Set(rows.map((r) => r.OPERATOR_ID));
-  const orphanCount = rows.filter((r) => !isRoot(r) && !ids.has(r.PARENT_OPERATOR_ID)).length;
+  // 与渲染路径共用同一份统计（否则会出现"结论说结构不完整、响应里的 rootCount 却是 1"）
+  const { rootCount, orphanCount } = analyzePlanStructure(rows);
   if (rootCount !== 1 || orphanCount > 0) {
     findings.push({
       level: 'warn',
@@ -648,10 +722,10 @@ export function analyzePlan(rows: PlanRow[], ctx: PlanAnalysisContext): PlanConc
   if (rt && (rt.executionCount != null || rt.avgExecutionTime != null)) {
     const avg = rt.avgExecutionTime;
     const execCount = rt.executionCount ?? 0;
-    if (avg != null && avg >= 1_000_000) {
+    if (avg != null && avg >= US_PER_SECOND) {
       findings.push({
         level: 'warn',
-        title: `已执行 ${execCount} 次，平均耗时约 ${(avg / 1_000_000).toFixed(1)} 秒（HANA 列定义单位为微秒）`,
+        title: `已执行 ${execCount} 次，平均耗时约 ${(avg / US_PER_SECOND).toFixed(1)} 秒（HANA 列定义单位为微秒）`,
         evidence: `M_SQL_PLAN_CACHE：EXECUTION_COUNT=${execCount}，AVG_EXECUTION_TIME=${avg}`,
         advice: '这是热点语句；结合上面的扫描/连接结论定位瓶颈，或先用 hana_data_preview 核对数据量级',
       });
@@ -705,11 +779,17 @@ function buildSummary(stats: PlanStatistics, findings: Finding[]): string {
 
 const LEVEL_LABEL: Record<FindingLevel, string> = { risk: '风险', warn: '关注', info: '信息' };
 
+/**
+ * 结论文本里回显的语句长度上限（与错误信息里的 statementHead 是**同一个实现、不同阈值**：
+ * 错误信息要短，结论开头的"语句：…"要能看出是哪条，故这里放宽）。
+ */
+const CONCLUSION_STATEMENT_MAX_CHARS = 200;
+
 /** 结论 → 整段可读文本 */
 export function renderConclusionText(conclusion: PlanConclusion, statement: string): string {
   const lines: string[] = [];
   const oneLine = statement.replace(/\s+/g, ' ').trim();
-  lines.push(`语句：${oneLine.length > 200 ? `${oneLine.slice(0, 200)}…` : oneLine}`);
+  lines.push(`语句：${truncateWithNote(oneLine, CONCLUSION_STATEMENT_MAX_CHARS, 'none')}`);
   lines.push(`结论：${conclusion.summary}`);
   if (conclusion.findings.length > 0) {
     lines.push('发现：');

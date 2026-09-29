@@ -4,14 +4,13 @@ import { scanSqlSchemaRefs, scanXmlPackageRefs, hasUnqualifiedTableRef, type Wri
  * 写工具预规划器（单一事实源）：工具名 → 入参 → WritePlan。
  *
  * 每个写工具在此登记一份规划器，说明「这次调用最终会读写什么」。判定不在这里做——
- * 由预检层按生效权限配置判定（见 src/config/preflight.ts），本模块只负责把"将要发生什么"算清楚。
+ * 由预检层按生效权限配置判定（见 src/config/preflight.ts），本模块只负责把「将要发生什么」算清楚。
  *
  * 约定：新增写工具时必须同时登记规划器——否则落到 fallback，只按参数表面判定，
- * 并在计划里显式标注"未规划其内部实际触碰"，不静默假装已规划。
+ * 并在计划里显式标注「未规划其内部实际触碰」，不静默假装已规划。
  */
 
-const asStr = (v: unknown): string | undefined =>
-  typeof v === 'string' && v.trim() !== '' ? v : undefined;
+const asStr = (v: unknown): string | undefined => (typeof v === 'string' && v.trim() !== '' ? v : undefined);
 
 function emptyPlan(tool: string): WritePlan {
   return { tool, steps: [], writePackages: [], readSchemas: [], readPackages: [], uncertain: [] };
@@ -74,7 +73,7 @@ function planViewCreate(args: Record<string, unknown>): WritePlan {
 
 /**
  * hana_view_update：写入目标包；**operations 模式下的 join 源在另一个包**（跨包只读引用）。
- * 这是"只看 packageId 参数会漏掉"的典型——join 源写在同一调用的另一个字段里。
+ * 这是「只看 packageId 参数会漏掉」的典型——join 源写在同一调用的另一个字段里。
  */
 function planViewUpdate(args: Record<string, unknown>): WritePlan {
   const p = emptyPlan('hana_view_update');
@@ -92,8 +91,12 @@ function planViewUpdate(args: Record<string, unknown>): WritePlan {
       // 替换脚本：只改当前视图自身（无跨包读取），但脚本内的 schema 限定名属于读取范围
       const script = asStr(op?.script);
       if (script) add(p.readSchemas, ...scanSqlSchemaRefs(script));
-      p.steps.push(`应用操作 ${i + 1}（set_script）：替换 SQL 模式视图的脚本与输出列（重建 definition/viewAttributes/logicalModel 输出）`);
-      p.uncertain.push(`操作 ${i + 1}（set_script）：脚本内的 schema 引用按启发式扫描，未限定 schema 的表名不在本计划内`);
+      p.steps.push(
+        `应用操作 ${i + 1}（set_script）：替换 SQL 模式视图的脚本与输出列（重建 definition/viewAttributes/logicalModel 输出）`,
+      );
+      p.uncertain.push(
+        `操作 ${i + 1}（set_script）：脚本内的 schema 引用按启发式扫描，未限定 schema 的表名不在本计划内`,
+      );
     } else if (sp) {
       add(p.readPackages, sp);
       p.steps.push(`应用操作 ${i + 1}（${kind}）：join 源 ${sp}/${so ?? '?'} —— 跨包只读引用`);
@@ -132,8 +135,8 @@ function planViewActivate(args: Record<string, unknown>): WritePlan {
 }
 
 /**
- * hana_view_validate：**参数看着是"校验"，design 模式实际会写一个 _CHKTMP 临时对象**
- * （写后即删）——正是"只看工具名/描述会误判为只读"的典型；runtime 模式才是纯只读。
+ * hana_view_validate：**参数看着是「校验」，design 模式实际会写一个 _CHKTMP 临时对象**
+ * （写后即删）——正是「只看工具名/描述会误判为只读」的典型；runtime 模式才是纯只读。
  */
 function planViewValidate(args: Record<string, unknown>): WritePlan {
   const p = emptyPlan('hana_view_validate');
@@ -221,7 +224,13 @@ function planSqlAnalyze(args: Record<string, unknown>): WritePlan {
   return p;
 }
 
-/** 未登记专用规划器的工具：按入参约定提取，并显式标注"未规划内部实际触碰" */
+/**
+ * 未登记专用规划器的工具：按入参约定提取，并显式标注「未规划内部实际触碰」。
+ *
+ * **防御性分支**（当前不可达）：现有写工具都已登记专用规划器（见 PLANNED_WRITE_TOOLS），
+ * 只有新增写工具却忘了同步登记时才命中。保留它是为了让「漏登记」表现为一条显式的
+ * 「未规划」结论（进拦截报告与日志），而不是静默按参数表面判定后放行。
+ */
 function planFallback(toolName: string, args: Record<string, unknown>): WritePlan {
   const p = emptyPlan(toolName);
   const pkg = asStr(args.packageId) ?? asStr(args.targetPackageId);
@@ -244,7 +253,7 @@ const PLANNERS: Record<string, (args: Record<string, unknown>) => WritePlan> = {
   hana_sql_analyze: planSqlAnalyze,
 };
 
-/** 已登记专用规划器的工具（测试据此断言"写工具都登记了"） */
+/** 已登记专用规划器的工具（测试据此断言「写工具都登记了」） */
 export const PLANNED_WRITE_TOOLS: readonly string[] = Object.keys(PLANNERS);
 
 /** 为一次写调用产出计划（纯只读分析，无副作用） */

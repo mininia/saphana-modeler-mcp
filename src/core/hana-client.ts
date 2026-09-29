@@ -85,6 +85,8 @@ export interface HanaPoolOptions {
  * - 池满时请求排队等待，但有**队列上限与等待超时**（HTTP 多客户端下，无界排队会让一个客户端的
  *   慢查询把其他客户端全部挂死；有界排队把「挂死」变成可解释的失败）
  * - 暴露 query/execute/withConnection/execOn 入口，service 层只用这几个
+ *   （另有**已持有连接**上的执行原语 execStreamingOn / execPreparedOn，见文件末尾：
+ *   真执行任意语句、限量取行与超时都在那里落地，服务层同样不得自己碰驱动）
  *
  * ⚠ **本池不做连接存活检查**（acquire 直接从空闲队列取、release 无条件放回）：连接在服务端被
  * 掐断后仍会被下一位取到，其第一条语句失败、连接又被放回，如此循环到进程重启。
@@ -190,11 +192,7 @@ export class HanaPool {
    * ⚠️ 持有 conn 期间**只能**走本方法，不可再调 query/execute：那会二次 acquire
    * （并发下互相等池位直至 acquireTimeout 失败）。
    */
-  async execOn<T = Record<string, unknown>>(
-    conn: Connection,
-    sql: string,
-    params?: HanaParameterList,
-  ): Promise<T> {
+  async execOn<T = Record<string, unknown>>(conn: Connection, sql: string, params?: HanaParameterList): Promise<T> {
     return execAsync<T>(conn, sql, params);
   }
 
@@ -209,11 +207,7 @@ export class HanaPool {
    *
    * 说明：hana-client 没有暴露 stmt 对象到 withConnection 之外，这里单独建连接完成调用。
    */
-  async callProcedure(
-    sql: string,
-    inParams: HanaParameterList | undefined,
-    outParamCount: number,
-  ): Promise<unknown[]> {
+  async callProcedure(sql: string, inParams: HanaParameterList | undefined, outParamCount: number): Promise<unknown[]> {
     const conn = await this.acquire();
     try {
       return await new Promise<unknown[]>((resolve, reject) => {
@@ -283,5 +277,163 @@ export class HanaPool {
   /** 池状态（调试/测试用） */
   stats(): { idle: number; inUse: number; max: number; waiting: number } {
     return { idle: this.idle.length, inUse: this.inUse, max: this.max, waiting: this.waiters.length };
+  }
+}
+
+// ── 已持有连接上的执行原语 ────────────────────────────────────────
+//
+// 为什么这两个函数**必须**在这里（而不是各服务自己写）：Statement/ResultSet 是驱动原语，
+// 文件头已约定「驱动交互集中在本模块」。此前 sql-analyze.service 为了"真执行一条语句 + 限量取行"
+// 直接调 conn.prepare / stmt.setTimeout / stmt.execQuery / rs.next / rs.close ——
+// 那条路径（接受任意 SQL 文本并真执行）恰恰是最危险的一条，却绕过了本模块的全部护栏，
+// 且 close/drop 的清理只存在于那个调用点的 finally 里（另一处调用就漏一套）。
+// 收进本模块后：**护栏与驱动原语在同一处**，调用方只能整份拿走，拿不走半份。
+
+/**
+ * 流式执行的护栏参数。**两个字段都必填**：真执行一条任意语句必须有时间上限与取行上限，
+ * 做成可选就等于把"跑飞"变成"可配置地跑飞"。
+ */
+export interface ExecStreamingOptions {
+  /** 语句超时 ms（驱动 Statement.setTimeout）；控制面元数据调用请另给更小的值，不跟执行一起放宽 */
+  timeoutMs: number;
+  /** 最多拉取多少行即停止，并**立刻关闭结果集** */
+  maxRows: number;
+}
+
+/** 流式执行的结果统计（**不含数据行**：本入口只计数，行内容一律不读不放） */
+export interface ExecStreamingStats {
+  /** 墙钟耗时（含 prepare 与取行） */
+  wallClockMs: number;
+  rowsFetched: number;
+  /** 本次生效的取行上限（回显，便于调用方如实回报） */
+  maxRows: number;
+  /** 本次生效的语句超时（回显） */
+  timeoutMs: number;
+  /** 以下三个是服务端统计；驱动/服务端不给时**字段缺省**（不报 null） */
+  serverProcessingTime?: number;
+  serverCpuTime?: number;
+  serverMemoryUsage?: number;
+}
+
+/**
+ * 在**已持有的连接**上流式执行一条语句（配合 withConnection 使用，与 execOn 同为"已持有连接"用法）。
+ *
+ * 本方法自己保证的护栏（调用方**无法**绕过）：
+ * - **超时**：opts.timeoutMs 经 stmt.setTimeout 生效（不设超时的执行会一直占着池位）；
+ * - **取行上限**：最多 next 到 opts.maxRows 行即停止拉取，**提前关闭结果集**——
+ *   一条没有 LIMIT 的 SELECT 足以把进程打爆，而调用方往往**不能**改写语句（改写就不是同一条语句了）；
+ * - **不返回数据行**：行只计数、内容不读不放（要取数请走取数通道，本入口不成为数据出口）；
+ * - **清理**：无论成功/失败/超时，finally 里 rs.close() + stmt.drop()，不留结果集与语句。
+ *
+ * 用 ResultSet 流式取行而不是 conn.exec：后者把全部结果一次拉回内存。
+ * prepare（语法/对象/权限）与 next 的错误都经 normalizeHanaError 归一后抛出。
+ */
+export async function execStreamingOn(
+  conn: Connection,
+  sql: string,
+  opts: ExecStreamingOptions,
+): Promise<ExecStreamingStats> {
+  const startedAt = Date.now();
+  let stmt: HanaStatement | undefined;
+  let rs: HanaResultSet | undefined;
+  try {
+    // prepare 就会解析对象与权限：语法错误 / 表不存在 / 无权限都在这里**同步**抛出。
+    // 不放在 try 里会被调用方当成"未知错误"包装掉（只看到"内部错误"），与"失败一次给全"的约定相反。
+    stmt = conn.prepare(sql);
+    stmt.setTimeout(opts.timeoutMs);
+    const statement = stmt;
+    rs = await new Promise<HanaResultSet>((resolve, reject) => {
+      // 参数显式标注：execQuery 有一个 `options: {[key: string]: any}` 重载，
+      // 函数实参同时也匹配它，不标注就推断不出回调参数类型
+      const onResult = (err: Error | null, resultSet?: HanaResultSet): void => {
+        if (err) reject(normalizeHanaError(err));
+        else if (!resultSet) reject(new HanaBusinessError('执行语句未返回结果集'));
+        else resolve(resultSet);
+      };
+      statement.execQuery(onResult);
+    });
+    let rowsFetched = 0;
+    const resultSet = rs;
+    while (rowsFetched < opts.maxRows) {
+      const hasNext = await new Promise<boolean>((resolve, reject) => {
+        resultSet.next((err: Error | null, more?: boolean) =>
+          err ? reject(normalizeHanaError(err)) : resolve(more === true),
+        );
+      });
+      if (!hasNext) break;
+      rowsFetched++; // 行数据丢弃：本入口只回报统计
+    }
+    const stat = (read: () => number): number | undefined => {
+      try {
+        const v = read();
+        return typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+      } catch {
+        return undefined;
+      }
+    };
+    const out: ExecStreamingStats = {
+      wallClockMs: Date.now() - startedAt,
+      rowsFetched,
+      maxRows: opts.maxRows,
+      timeoutMs: opts.timeoutMs,
+    };
+    const processing = stat(() => rs!.getServerProcessingTime());
+    if (processing !== undefined) out.serverProcessingTime = processing;
+    const cpu = stat(() => rs!.getServerCPUTime());
+    if (cpu !== undefined) out.serverCpuTime = cpu;
+    const memory = stat(() => rs!.getServerMemoryUsage());
+    if (memory !== undefined) out.serverMemoryUsage = memory;
+    return out;
+  } catch (e) {
+    // prepare / next 的同步或异步错误统一归一化（已归一化的原样返回）
+    throw normalizeHanaError(e);
+  } finally {
+    try {
+      rs?.close();
+    } catch {
+      /* 结果集关闭失败不掩盖原始错误 */
+    }
+    try {
+      stmt?.drop();
+    } catch {
+      /* 同上 */
+    }
+  }
+}
+
+/**
+ * 在**已持有的连接**上准备并执行一条语句，整体取回结果行（`{CALL ...}` 之类的控制面调用）。
+ *
+ * 与 execOn 的分工：execOn 走 conn.exec（一条语句一次往返、无超时设置）；
+ * 本方法走 prepare/exec（可带绑定参数、可设语句超时），并在 finally 里 drop 语句——
+ * 控制面调用一挂住就会占着池位（池上限 4），几个这样的请求足以让全部工具调用排队超时。
+ */
+export async function execPreparedOn<T = Record<string, unknown>>(
+  conn: Connection,
+  sql: string,
+  params: HanaParameterList,
+  opts: { timeoutMs: number },
+): Promise<T[]> {
+  const stmt = conn.prepare(sql);
+  try {
+    return await new Promise<T[]>((resolve, reject) => {
+      const onDone = (err: Error | null, rows?: T[]): void => {
+        if (err) reject(normalizeHanaError(err));
+        else resolve(rows ?? []);
+      };
+      try {
+        stmt.setTimeout(opts.timeoutMs);
+        stmt.exec<T[]>(params, onDone);
+      } catch (e) {
+        // 同步抛错也要归一化后 reject（不能让它穿透 Promise 执行器变成未捕获异常）
+        reject(normalizeHanaError(e));
+      }
+    });
+  } finally {
+    try {
+      stmt.drop();
+    } catch {
+      /* 释放语句失败无关结果 */
+    }
   }
 }

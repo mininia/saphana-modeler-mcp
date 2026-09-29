@@ -1,13 +1,17 @@
 import { readFileSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
-import { tryLoadDotEnv, type HanaConfig } from './config.js';
+import { hasValue, isEnvTrue, tryLoadDotEnv, type HanaConfig } from './config.js';
 import {
+  DEFAULT_HTTP_HOST,
+  DEFAULT_SSL_VALIDATE,
+  DEFAULT_TLS,
   checkDeploymentInvariants,
   type DeploymentInvariant,
   type DeploymentPosture,
 } from './deployment.js';
-import { isPackageAllowed, isValidPackagePrefix, formatWriteBoundaryReport, describeWriteBoundary } from './write-boundary.js';
+import { isPackageAllowed, isValidPackagePrefix } from './write-boundary.js';
 import { isSchemaAllowedWith } from '../core/sql.js';
+import { splitList } from '../core/text.js';
 import { parseToolFilter, shouldRegisterTool, TOOL_GROUPS, type ToolFilterConfig } from '../tools/groups.js';
 
 /**
@@ -74,14 +78,16 @@ export interface Policy {
   source: string;
 }
 
-/** 缺省部署姿态：stdio、仅本机、加密且校验证书（即无任何部署级风险） */
+/** 缺省部署姿态：stdio、仅本机、加密且校验证书（即无任何部署级风险）。
+ *  三个安全默认值取自 deployment.ts 的常量（与 config 的 zod 默认值同一份，
+ *  保证"判定用的默认值 = 运行用的默认值"）。 */
 export const SAFE_DEPLOYMENT_POSTURE: DeploymentPosture = {
   httpPort: undefined,
-  httpHost: '127.0.0.1',
+  httpHost: DEFAULT_HTTP_HOST,
   tokenConfigured: false,
   allowAnonymous: false,
-  tls: true,
-  sslValidate: true,
+  tls: DEFAULT_TLS,
+  sslValidate: DEFAULT_SSL_VALIDATE,
 };
 
 /** 策略来源：三种互斥取法 */
@@ -141,14 +147,6 @@ export interface Verdict {
 
 // ── 二、来源解析 ──────────────────────────────────────────────
 
-/** 逗号分隔 → 去空白 → 去空串 */
-function splitList(raw: unknown): string[] {
-  return String(raw ?? '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
-}
-
 /**
  * 拆分写包白名单（大写）。
  * 三条来源路径都经此归一，避免"resolved 不做空串过滤、env/file 做"这类不一致。
@@ -157,21 +155,26 @@ function splitPackages(raw: unknown): string[] {
   return splitList(raw).map((s) => s.toUpperCase());
 }
 
-/** 从一组原始 env 值构造部署姿态（与能力/资源同源，保证判定与运行期一致） */
+/**
+ * 从一组原始 env 值构造部署姿态（与能力/资源同源，保证判定与运行期一致）。
+ *
+ * 与 config.ts 的 boolSchema 共用同一套**真值集合**（ENV_TRUE_VALUES + isEnvTrue），
+ * 但强度不同，且这里的强度**刻意更低**：boolSchema 走 zod 枚举，取值既非真值也非假值时
+ * 启动即失败；本函数读的是 mcp.json / 原生 env 的原始值（拿不到 zod 校验），非真值一律按假处理
+ * （不在此处报错，也不静默当成真）。两边共享同一常量，保证真值口径不分叉；
+ * 默认值同样取自 deployment.ts 的单一常量。
+ */
 function deploymentFromEnvValues(env: Record<string, unknown>): DeploymentPosture {
   const port = env.MCP_HTTP_PORT;
-  const hasToken =
-    String(env.MCP_HTTP_TOKEN ?? '').trim() !== '' || String(env.MCP_HTTP_TOKENS ?? '').trim() !== '';
-  // 布尔项与 config.ts 的 boolSchema 同义：'true'/'1'/'TRUE' 为真，其余为假
-  const isTrue = (v: unknown): boolean => v === 'true' || v === '1' || v === 'TRUE';
+  const hasToken = hasValue(env.MCP_HTTP_TOKEN) || hasValue(env.MCP_HTTP_TOKENS);
   return {
-    httpPort: port == null || String(port).trim() === '' ? undefined : Number(port),
-    httpHost: String(env.MCP_HTTP_HOST ?? '127.0.0.1'),
+    httpPort: hasValue(port) ? Number(port) : undefined,
+    httpHost: String(env.MCP_HTTP_HOST ?? DEFAULT_HTTP_HOST),
     tokenConfigured: hasToken,
-    allowAnonymous: isTrue(env.MCP_HTTP_ALLOW_ANONYMOUS),
-    // HANA_TLS / HANA_SSL_VALIDATE 默认 true（fail-closed），仅显式假值才算关闭
-    tls: env.HANA_TLS === undefined ? true : isTrue(env.HANA_TLS),
-    sslValidate: env.HANA_SSL_VALIDATE === undefined ? true : isTrue(env.HANA_SSL_VALIDATE),
+    allowAnonymous: isEnvTrue(env.MCP_HTTP_ALLOW_ANONYMOUS),
+    // HANA_TLS / HANA_SSL_VALIDATE 默认 true（fail-closed），仅显式给了值才按真值判定
+    tls: env.HANA_TLS === undefined ? DEFAULT_TLS : isEnvTrue(env.HANA_TLS),
+    sslValidate: env.HANA_SSL_VALIDATE === undefined ? DEFAULT_SSL_VALIDATE : isEnvTrue(env.HANA_SSL_VALIDATE),
   };
 }
 
@@ -340,8 +343,7 @@ export function checkCapability(policy: Policy, tools: readonly string[]): Grant
         subject: tool,
         code: 'tool_not_exposed',
         severity: 'block',
-        message:
-          `${BLOCKED_PREFIX}：工具 "${tool}" 当前未对客户端暴露（工具可见性配置未启用它），调用会被直接拒绝。`,
+        message: `${BLOCKED_PREFIX}：工具 "${tool}" 当前未对客户端暴露（工具可见性配置未启用它），调用会被直接拒绝。`,
       });
     }
   }
@@ -479,9 +481,7 @@ function formatCapability(c: ToolFilterConfig): string {
 
 function formatResource(r: Policy['resource']): string {
   return (
-    (r.writePackages.length > 0
-      ? `仅白名单及其子包可写 → ${r.writePackages.join(', ')}`
-      : '未启用（所有包可写）') +
+    (r.writePackages.length > 0 ? `仅白名单及其子包可写 → ${r.writePackages.join(', ')}` : '未启用（所有包可写）') +
     `；schema 追加 ${r.schemaAllow.length > 0 ? r.schemaAllow.join(', ') : '(无，仅系统 schema)'}`
   );
 }
@@ -495,18 +495,21 @@ function formatResource(r: Policy['resource']): string {
 export function runPreflight(opts: { source: PolicySource; request: PolicyRequest }): Verdict {
   const policy = resolvePolicy(opts.source);
   const request = opts.request;
-  const declared =
-    (request.tools?.length ?? 0) + (request.writePackages?.length ?? 0) + (request.schemas?.length ?? 0);
+  const declared = (request.tools?.length ?? 0) + (request.writePackages?.length ?? 0) + (request.schemas?.length ?? 0);
   if (declared === 0) {
-    return assemble(policy, [
-      {
-        dimension: 'resource',
-        subject: '(未声明请求)',
-        code: 'no_request',
-        severity: 'block',
-        message: '未声明本次需要什么权限（工具 / 可写包 / schema）——无从判定，拒绝在未知目标下放行',
-      },
-    ], []);
+    return assemble(
+      policy,
+      [
+        {
+          dimension: 'resource',
+          subject: '(未声明请求)',
+          code: 'no_request',
+          severity: 'block',
+          message: '未声明本次需要什么权限（工具 / 可写包 / schema）——无从判定，拒绝在未知目标下放行',
+        },
+      ],
+      [],
+    );
   }
   const grants = [
     ...checkCapability(policy, request.tools ?? []),
@@ -530,12 +533,16 @@ export function runPreflight(opts: { source: PolicySource; request: PolicyReques
  */
 export function describePolicy(source: PolicySource): Verdict {
   const policy = resolvePolicy(source);
-  const verdict = assemble(policy, [...checkPolicySelf(policy), ...checkDeployment(policy)], [
-    `部署姿态：${policy.deployment.httpPort == null ? 'stdio（不对外监听）' : `HTTP :${policy.deployment.httpPort} @ ${policy.deployment.httpHost}`}` +
-      `；Bearer 认证 ${policy.deployment.tokenConfigured ? '已配置' : '未配置'}` +
-      `；连接加密 ${policy.deployment.tls ? '开' : '关'}` +
-      `；证书校验 ${policy.deployment.sslValidate ? '开' : '关'}`,
-  ]);
+  const verdict = assemble(
+    policy,
+    [...checkPolicySelf(policy), ...checkDeployment(policy)],
+    [
+      `部署姿态：${policy.deployment.httpPort == null ? 'stdio（不对外监听）' : `HTTP :${policy.deployment.httpPort} @ ${policy.deployment.httpHost}`}` +
+        `；Bearer 认证 ${policy.deployment.tokenConfigured ? '已配置' : '未配置'}` +
+        `；连接加密 ${policy.deployment.tls ? '开' : '关'}` +
+        `；证书校验 ${policy.deployment.sslValidate ? '开' : '关'}`,
+    ],
+  );
   const remedies = checkDeploymentInvariants(policy.deployment)
     .filter((inv) => inv.remedy || inv.override)
     .map(
@@ -545,6 +552,3 @@ export function describePolicy(source: PolicySource): Verdict {
     );
   return remedies.length > 0 ? { ...verdict, text: `${verdict.text}\n${remedies.join('\n')}` } : verdict;
 }
-
-/** 写边界报告（保留给需要原始结构/文本的调用方，如启动日志的历史格式） */
-export { formatWriteBoundaryReport, describeWriteBoundary };

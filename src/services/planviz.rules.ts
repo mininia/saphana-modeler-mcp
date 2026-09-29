@@ -1,10 +1,16 @@
+import { US_PER_SECOND, formatMicros } from '../core/num.js';
 import {
+  PLANVIZ_AGGREGATION_RE,
+  PLANVIZ_JOIN_RE,
   formatRows,
   renderConclusionText,
+  renderTree,
+  withDefined,
   type Finding,
   type PlanConclusion,
   type PlanStatistics,
   type PlanTableRef,
+  type TreeLine,
 } from './sql-analyze.rules.js';
 
 /**
@@ -200,7 +206,7 @@ function timeUs(body: string, name: string): number | undefined {
     case 'ms':
       return v * 1000;
     case 's':
-      return v * 1_000_000;
+      return v * US_PER_SECOND;
     default:
       return v;
   }
@@ -380,6 +386,10 @@ export function parsePlanVizXml(xml: string): PlanVizPlan {
 
   // 层深与根：按 <Child ID> 关系推（根=没有被任何算子引用的那些）。
   // 在**全部算子**上算：子计划里的热点也要能被走到（只看主计划树会漏掉真正的瓶颈）。
+  //
+  // 口径**不与 EXPLAIN 版的 analyzePlanStructure 合并**（刻意）：那边没有引用关系、只有 PARENT 列，
+  // 根=父为 NULL/0/自引用、孤儿=父不在结果集内；这里有 <Child ID> 边，根=无人引用、
+  // 孤儿=从根走不到。畸形计划（父链断裂 vs 环）下两者的计数本就会不同，合并等于静默改数字。
   const byId = new Map(operators.map((o) => [o.id, o]));
   const childSet = new Set(operators.flatMap((o) => o.childIds));
   const rootIds = operators.filter((o) => !childSet.has(o.id)).map((o) => o.id);
@@ -448,9 +458,6 @@ function collectThreads(raw: string | undefined, into: Set<number>): void {
 
 // ── 六栏组装 ─────────────────────────────────────────────────
 
-const usToMs = (us: number | undefined): string =>
-  us === undefined ? '-' : `${(us / 1000).toFixed(us < 10_000 ? 2 : 0)} ms`;
-
 /**
  * 整体执行时间（微秒）。
  *
@@ -503,15 +510,22 @@ export function buildPlanVizPanels(plan: PlanVizPlan, opts: { tree?: boolean } =
   const sorted = [...plan.operators].sort(compareOperators);
   const byOperator = new Map<string, number>();
   for (const o of plan.operators) byOperator.set(o.operator, (byOperator.get(o.operator) ?? 0) + 1);
-  const edgeCount = plan.operators.reduce((n, o) => n + o.childIds.filter((c) => plan.operators.some((x) => x.id === c)).length, 0);
+  const edgeCount = plan.operators.reduce(
+    (n, o) => n + o.childIds.filter((c) => plan.operators.some((x) => x.id === c)).length,
+    0,
+  );
 
-  const span = plan.timelineStartUs !== undefined && plan.timelineEndUs !== undefined
-    ? plan.timelineEndUs - plan.timelineStartUs
-    : undefined;
+  const span =
+    plan.timelineStartUs !== undefined && plan.timelineEndUs !== undefined
+      ? plan.timelineEndUs - plan.timelineStartUs
+      : undefined;
   const withSpan = plan.operators.filter((o) => o.startUs !== undefined && o.endUs !== undefined);
-  const slowestSpan = withSpan.length > 0
-    ? withSpan.reduce((a, b) => ((b.endUs as number) - (b.startUs as number) > (a.endUs as number) - (a.startUs as number) ? b : a))
-    : undefined;
+  const slowestSpan =
+    withSpan.length > 0
+      ? withSpan.reduce((a, b) =>
+          (b.endUs as number) - (b.startUs as number) > (a.endUs as number) - (a.startUs as number) ? b : a,
+        )
+      : undefined;
 
   return {
     planGraph: {
@@ -564,9 +578,10 @@ function compareOperators(a: PlanVizOperator, b: PlanVizOperator): number {
 }
 
 function toSummary(o: PlanVizOperator, total: number | undefined): PlanVizOperatorSummary {
-  const share = o.exclusiveUs !== undefined && total !== undefined && total > 0
-    ? Math.round((o.exclusiveUs / total) * 1000) / 10
-    : undefined;
+  const share =
+    o.exclusiveUs !== undefined && total !== undefined && total > 0
+      ? Math.round((o.exclusiveUs / total) * 1000) / 10
+      : undefined;
   return {
     operatorId: o.id,
     operator: o.operator,
@@ -581,31 +596,36 @@ function toSummary(o: PlanVizOperator, total: number | undefined): PlanVizOperat
   };
 }
 
-/** 缩进文本树（只画主计划；超限截断并标注，绝不静默丢算子） */
-export function renderPlanVizTree(plan: PlanVizPlan, limit: number): string {
+/** 文本树被截断时的说明（**绝不静默丢算子**） */
+const TREE_TRUNCATED_NOTE = '…（树已截断，完整算子见 raw=true）';
+
+/** 缩进文本树（只画主计划；超限截断并标注，绝不静默丢算子）。仅经 buildPlanVizPanels 使用 */
+function renderPlanVizTree(plan: PlanVizPlan, limit: number): string {
   const byId = new Map(plan.operators.map((o) => [o.id, o]));
-  const lines: string[] = [];
-  let count = 0;
-  let truncated = false;
+  const lines: TreeLine[] = [];
+  // `seen` 防畸形计划里的环/重复引用：递归渲染在环上会无限展开（缩进由公共 renderTree 负责）
+  const seen = new Set<string>();
   const walk = (id: string, depth: number): void => {
-    if (count >= limit) {
-      truncated = true;
-      return;
-    }
+    if (seen.has(id)) return;
+    seen.add(id);
     const op = byId.get(id);
     if (!op) return;
-    count++;
-    const time = op.inclusiveUs !== undefined ? ` [含子 ${usToMs(op.inclusiveUs)}]` : '';
+    const time = op.inclusiveUs !== undefined ? ` [含子 ${formatMicros(op.inclusiveUs)}]` : '';
     const card = op.actualCardinality !== undefined ? ` [${formatRows(op.actualCardinality)} 行]` : '';
-    lines.push(`${'  '.repeat(depth)}${op.operator}${op.object ? ` ${op.schema ?? '?'}.${op.object}` : ''}${time}${card}`);
+    lines.push({
+      depth,
+      text: `${op.operator}${op.object ? ` ${op.schema ?? '?'}.${op.object}` : ''}${time}${card}`,
+    });
     for (const c of op.childIds) walk(c, depth + 1);
   };
   for (const r of plan.rootIds) walk(r, 0);
   // 关系缺失导致根判不出来时兜底平铺，而不是给一棵空树
   if (lines.length === 0) {
-    for (const op of plan.operators.slice(0, limit)) lines.push(`${op.operator}${op.object ? ` ${op.object}` : ''}`);
+    for (const op of plan.operators)
+      lines.push({ depth: 0, text: `${op.operator}${op.object ? ` ${op.object}` : ''}` });
   }
-  return truncated ? `${lines.join('\n')}\n…（树已截断，完整算子见 raw=true）` : lines.join('\n');
+  // 截断说明由公共 renderTree 统一给出（EXPLAIN 侧的文本树不传说明：它只在 raw=true 出现，自指说不通）
+  return renderTree(lines, limit, TREE_TRUNCATED_NOTE);
 }
 
 // ── 实测结论 ─────────────────────────────────────────────────
@@ -644,11 +664,13 @@ export function analyzePlanVizPlan(plan: PlanVizPlan, ctx: PlanVizAnalysisContex
   const objects = aggregateObjects(plan);
   const dominantObject = objects[0];
 
-  const opShare = dominant?.exclusiveUs !== undefined && total !== undefined && total > 0 ? dominant.exclusiveUs / total : 0;
+  const opShare =
+    dominant?.exclusiveUs !== undefined && total !== undefined && total > 0 ? dominant.exclusiveUs / total : 0;
   // 对象含子耗时会按访问次数累加，可能超过整体；封顶 100%，不制造"占 140%"这种数字
-  const objShare = dominantObject?.inclusiveUs !== undefined && total !== undefined && total > 0
-    ? Math.min(dominantObject.inclusiveUs / total, 1)
-    : 0;
+  const objShare =
+    dominantObject?.inclusiveUs !== undefined && total !== undefined && total > 0
+      ? Math.min(dominantObject.inclusiveUs / total, 1)
+      : 0;
   const bottleneck = pickBottleneck(dominant, dominantObject, opShare, objShare);
 
   // ① 瓶颈：**对象级含子耗时**与**算子级独占耗时**两条口径都要看，而且它们会背离——
@@ -662,9 +684,10 @@ export function analyzePlanVizPlan(plan: PlanVizPlan, ctx: PlanVizAnalysisContex
       const internal = /^[?.]|#_SYS_/i.test(o.object);
       findings.push({
         level: bottleneck.share >= DOMINANT_SHARE ? 'risk' : 'info',
-        title: `${internal ? '耗时集中在引擎内部中间结果' : '耗时集中在对象'} ${o.object}（含子 ${usToMs(o.inclusiveUs)}，占整体 ${(bottleneck.share * 100).toFixed(1)}%）`,
-        evidence: `${o.objectType ?? '对象'}，本次被访问 ${o.accesses} 次` +
-          `${o.rows !== undefined ? `，累计输出 ${formatRows(o.rows)} 行` : ''}；整体执行 ${usToMs(total)}`,
+        title: `${internal ? '耗时集中在引擎内部中间结果' : '耗时集中在对象'} ${o.object}（含子 ${formatMicros(bottleneck.inclusiveUs)}，占整体 ${(bottleneck.share * 100).toFixed(1)}%）`,
+        evidence:
+          `${o.objectType ?? '对象'}，本次被访问 ${o.accesses} 次` +
+          `${o.rows !== undefined ? `，累计输出 ${formatRows(o.rows)} 行` : ''}；整体执行 ${formatMicros(total)}`,
         advice: internal
           ? '这是引擎为中间结果分配的临时对象（不是业务表）：说明时间花在把中间结果落下来/再读回去，方向是减少中间结果规模（更早过滤、聚合下推、避免重复子查询）'
           : '优化点在这个对象的定义/过滤条件/下推能力上，而不是 SQL 里某个算子的写法',
@@ -672,10 +695,11 @@ export function analyzePlanVizPlan(plan: PlanVizPlan, ctx: PlanVizAnalysisContex
     } else if (bottleneck?.kind === 'operator' && dominant !== undefined) {
       findings.push({
         level: bottleneck.share >= DOMINANT_SHARE ? 'risk' : 'info',
-        title: `最慢算子：${dominant.name ?? dominant.operator}（独占 ${usToMs(dominant.exclusiveUs)}，占整体 ${(bottleneck.share * 100).toFixed(1)}%）`,
-        evidence: `算子 #${dominant.id}（${dominant.operator}${dominant.engine ? `，${dominant.engine} 引擎` : ''}）` +
+        title: `最慢算子：${dominant.name ?? dominant.operator}（独占 ${formatMicros(bottleneck.exclusiveUs)}，占整体 ${(bottleneck.share * 100).toFixed(1)}%）`,
+        evidence:
+          `算子 #${dominant.id}（${dominant.operator}${dominant.engine ? `，${dominant.engine} 引擎` : ''}）` +
           `${dominant.actualCardinality !== undefined ? `，实际输出 ${formatRows(dominant.actualCardinality)} 行` : ''}；` +
-          `整体执行 ${usToMs(total)}`,
+          `整体执行 ${formatMicros(total)}`,
         ...(bottleneck.share >= DOMINANT_SHARE
           ? { advice: '耗时高度集中在这一个算子上：优先看它的过滤条件与连接方式，改动能直接体现到总时长' }
           : { advice: '耗时较分散，单点优化收益有限；可对照下面几条逐项看' }),
@@ -688,8 +712,9 @@ export function analyzePlanVizPlan(plan: PlanVizPlan, ctx: PlanVizAnalysisContex
       findings.push({
         level: 'info',
         title: `全部算子的独占耗时合计只占整体的 ${((exclusiveSum / total) * 100).toFixed(1)}%`,
-        evidence: `独占合计 ${usToMs(exclusiveSum)}，整体 ${usToMs(total)}，相差 ${usToMs(total - exclusiveSum)}`,
-        advice: '时间不在算子自身的计算上（在等待、取数、下推引擎或并行分支上）：先把上面的对象级耗时与引擎切换看清楚，再决定动不动 SQL',
+        evidence: `独占合计 ${formatMicros(exclusiveSum)}，整体 ${formatMicros(total)}，相差 ${formatMicros(total - exclusiveSum)}`,
+        advice:
+          '时间不在算子自身的计算上（在等待、取数、下推引擎或并行分支上）：先把上面的对象级耗时与引擎切换看清楚，再决定动不动 SQL',
       });
     }
   }
@@ -699,14 +724,20 @@ export function analyzePlanVizPlan(plan: PlanVizPlan, ctx: PlanVizAnalysisContex
       level: 'info',
       title: '本计划是**估计版**，没有逐算子实测耗时',
       evidence: `${plan.operators.length} 个算子全部没有 ExecutionTime（Type="${plan.type}"）`,
-      advice: '要看真实耗时/实际行数/时间轴，用 analyze=true 让它真执行一次（执行受硬护栏：只允许 SELECT、单次执行最多 5 分钟、最多取 100 行、不返回数据行）',
+      advice:
+        '要看真实耗时/实际行数/时间轴，用 analyze=true 让它真执行一次（执行受硬护栏：只允许 SELECT、单次执行最多 5 分钟、最多取 100 行、不返回数据行）',
     });
   }
 
   // ② 统计信息陈旧：估计行数与实际行数严重偏离（只有执行过才知道）
   const skewed = plan.operators
-    .filter((o) => o.actualCardinality !== undefined && o.estimatedCardinality !== undefined
-      && o.estimatedCardinality > 0 && o.actualCardinality > 0)
+    .filter(
+      (o) =>
+        o.actualCardinality !== undefined &&
+        o.estimatedCardinality !== undefined &&
+        o.estimatedCardinality > 0 &&
+        o.actualCardinality > 0,
+    )
     .map((o) => ({ op: o, ratio: (o.actualCardinality as number) / (o.estimatedCardinality as number) }))
     .filter((x) => x.ratio >= CARDINALITY_SKEW || x.ratio <= 1 / CARDINALITY_SKEW)
     .sort((a, b) => Math.max(b.ratio, 1 / b.ratio) - Math.max(a.ratio, 1 / a.ratio))
@@ -739,7 +770,7 @@ export function analyzePlanVizPlan(plan: PlanVizPlan, ctx: PlanVizAnalysisContex
     findings.push({
       level: 'warn',
       title: `中间结果 ${op.name ?? op.operator} 物化了 ${formatRows(op.actualCardinality as number)} 行`,
-      evidence: `算子 #${op.id}（${op.operator}）${op.inclusiveUs !== undefined ? `，含子耗时 ${usToMs(op.inclusiveUs)}` : ''}`,
+      evidence: `算子 #${op.id}（${op.operator}）${op.inclusiveUs !== undefined ? `，含子耗时 ${formatMicros(op.inclusiveUs)}` : ''}`,
       advice: '中间结果过大通常意味着过滤/聚合下推不足；检查是否能在更早的算子（扫描或连接）就减少行数',
     });
   }
@@ -750,13 +781,15 @@ export function analyzePlanVizPlan(plan: PlanVizPlan, ctx: PlanVizAnalysisContex
     findings.push({
       level: 'warn',
       title: `对象 ${t.object} 被访问 ${t.accesses} 次`,
-      evidence: `${t.objectType ?? '对象'}${t.inclusiveUs !== undefined ? `，累计含子耗时 ${usToMs(t.inclusiveUs)}` : ''}`,
+      evidence: `${t.objectType ?? '对象'}${t.inclusiveUs !== undefined ? `，累计含子耗时 ${formatMicros(t.inclusiveUs)}` : ''}`,
       advice: '重复扫描通常意味着多次读同一份数据；可考虑合并为一次读取或调整连接顺序',
     });
   }
 
   // ⑥ 算子状态异常（正常终止态是 "Finished"，只有 ERROR/FAIL 类才算异常）
-  const badStatus = plan.operators.filter((o) => o.status !== undefined && ABNORMAL_STATUS_RE.test(o.status)).slice(0, 3);
+  const badStatus = plan.operators
+    .filter((o) => o.status !== undefined && ABNORMAL_STATUS_RE.test(o.status))
+    .slice(0, 3);
   for (const op of badStatus) {
     findings.push({
       level: 'risk',
@@ -780,10 +813,14 @@ export function analyzePlanVizPlan(plan: PlanVizPlan, ctx: PlanVizAnalysisContex
   return { ...conclusion, text: renderConclusionText(conclusion, ctx.statement) };
 }
 
-/** 瓶颈判定结果（summary 与 findings 共用，避免"第一句话与正文打架"） */
+/**
+ * 瓶颈判定结果（summary 与 findings 共用，避免"第一句话与正文打架"）。
+ * 判定所依据的**那个数**（对象含子耗时 / 算子独占耗时）随结果一起带出：调用方渲染时不必再对
+ * 同一个可选字段判一次 undefined——那种写法迟早退化成 `!`，把"没有实测值"渲染成 NaN 或占位符。
+ */
 type Bottleneck =
-  | { kind: 'object'; share: number; object: PlanVizObjectAccess }
-  | { kind: 'operator'; share: number; operator: PlanVizOperator };
+  | { kind: 'object'; share: number; object: PlanVizObjectAccess; inclusiveUs: number }
+  | { kind: 'operator'; share: number; operator: PlanVizOperator; exclusiveUs: number };
 
 /**
  * 挑瓶颈。两条口径都要够显著才有资格被叫作瓶颈，否则返回 undefined——
@@ -796,12 +833,16 @@ function pickBottleneck(
   opShare: number,
   objShare: number,
 ): Bottleneck | undefined {
-  if (dominantObject !== undefined && dominantObject.inclusiveUs !== undefined
-    && objShare >= OBJECT_DOMINANT_SHARE && objShare >= opShare) {
-    return { kind: 'object', share: objShare, object: dominantObject };
+  if (
+    dominantObject !== undefined &&
+    dominantObject.inclusiveUs !== undefined &&
+    objShare >= OBJECT_DOMINANT_SHARE &&
+    objShare >= opShare
+  ) {
+    return { kind: 'object', share: objShare, object: dominantObject, inclusiveUs: dominantObject.inclusiveUs };
   }
   if (dominant !== undefined && dominant.exclusiveUs !== undefined && opShare >= OBJECT_DOMINANT_SHARE) {
-    return { kind: 'operator', share: opShare, operator: dominant };
+    return { kind: 'operator', share: opShare, operator: dominant, exclusiveUs: dominant.exclusiveUs };
   }
   return undefined;
 }
@@ -812,9 +853,12 @@ function summarize(
   measured: boolean,
   bottleneck: Bottleneck | undefined,
 ): string {
-  const head = measured
-    ? `${plan.type === 'Executed' ? '实测' : '估计'}计划：${plan.operators.length} 个算子，整体执行 ${usToMs(total)}`
-    : `估计计划：${plan.operators.length} 个算子（未执行，无实测耗时）`;
+  // measured 为真 ⇒ total 必有值（totalInclusiveUs 的口径：至少一个算子带实测耗时才有 measured）：
+  // 把这个不变式写成显式判断，格式函数就不必接受 undefined（否则得硬凑一个占位符进结论）
+  const head =
+    measured && total !== undefined
+      ? `${plan.type === 'Executed' ? '实测' : '估计'}计划：${plan.operators.length} 个算子，整体执行 ${formatMicros(total)}`
+      : `估计计划：${plan.operators.length} 个算子（未执行，无实测耗时）`;
   const engines = [...new Set(plan.operators.map((o) => o.engine).filter((e): e is string => e !== undefined))];
   const parts = [head];
   if (engines.length > 0) parts.push(`引擎 ${engines.join('/')}`);
@@ -860,19 +904,9 @@ export function planVizStatistics(plan: PlanVizPlan, objects: PlanVizObjectAcces
     // 口径要对上 PlanViz 的 TypeName：表访问算子的特征是有 object（TABLE/TREX_SEARCH 之类都算），
     // 用 EXPLAIN 的 /SCAN|SEARCH/ 去匹配会数到搜索包装算子头上、GROUP_BY（下划线）又匹配不到 /GROUP BY/
     scans: plan.operators.filter((o) => o.object !== undefined).length,
-    joins: plan.operators.filter((o) => /JOIN/i.test(o.operator)).length,
-    aggregations: plan.operators.filter((o) => /GROUP_BY|AGGREGAT/i.test(o.operator)).length,
+    joins: plan.operators.filter((o) => PLANVIZ_JOIN_RE.test(o.operator)).length,
+    aggregations: plan.operators.filter((o) => PLANVIZ_AGGREGATION_RE.test(o.operator)).length,
     ...(rootOp?.estimatedCardinality !== undefined ? { estimatedRows: rootOp.estimatedCardinality } : {}),
     ...(rootOp ? { rootOperator: rootOp.operator } : {}),
   };
-}
-
-/** 微秒 → 毫秒文本（结论文本里用；导出让 service 层的文本渲染复用同一口径） */
-export function formatMicros(us: number | undefined): string {
-  return usToMs(us);
-}
-
-/** 通用版（EXPLAIN 版那个只收 number）：计划里可选字段多，字符串/数组也要按同法省略 undefined */
-function withDefined<K extends string, V>(key: K, value: V | undefined): Partial<Record<K, V>> {
-  return value === undefined ? {} : ({ [key]: value } as Record<K, V>);
 }
