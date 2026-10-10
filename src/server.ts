@@ -1,5 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/server';
 import { registerAllTools, type ToolContext } from './tools/index.js';
+import { computeSurface } from './tools/surface.js';
+import { currentIdentity } from './core/request-context.js';
 import { SERVER_NAME, SERVER_VERSION } from './version.js';
 
 /**
@@ -8,38 +10,28 @@ import { SERVER_NAME, SERVER_VERSION } from './version.js';
  *
  * 写法：**一行一个数组元素、join('\n')**（而不是一整块模板串）——超长单行在源码里
  * 无法审阅也无法 diff；按句拆行后仍由 '\n' 连接，正文内容与顺序保持不变。
+ *
+ * **P9 瘦身（SSD §9）**：这里只留每次会话都必须知道的骨架（服务是什么/对象与引用约定/
+ * 工具族/写操作一句话/envelope/规则库指针）。方言、边界、通道、回执、预览与分析的
+ * 解释性段落**已逐句搬进规则库**（src/rules/*.rules.ts），需要时经
+ * hana_system_get_info(rules=…) 按需查询——砍下的每一句都能在对应规则的 detail 里找到原文。
+ * 字数硬指标见 tests/unit/instructions-budget.test.ts（instructions + 描述 top5 ≤ 6251）。
  */
 export const SERVER_INSTRUCTIONS = [
-  'saphana-modeler-mcp：SAP HANA 经典 Modeler（HANA 2.0 本地部署，仓库建模）的 MCP 服务器。',
+  'saphana-modeler-mcp：SAP HANA 经典 Modeler（HANA 2.0 本地部署，仓库建模）的 MCP 服务。',
   '',
-  '背景：设计时对象（信息视图/权限/过程）以 XML 存储于 _SYS_REPO 仓库（Package 组织）；激活后生成运行时列视图到 _SYS_BIC schema；元数据可查 _SYS_BI.BIMC_* 与 SYS.OBJECT_DEPENDENCIES。',
+  '对象类型：calculationview / attributeview / analyticview（后两者已废弃，仅存量支持）、analyticprivilege、procedure 等；设计时对象存 _SYS_REPO 仓库（Package 组织），激活后生成 _SYS_BIC 下的运行时列视图。',
+  '命名与引用：包名/对象名区分大小写；运行时引用已激活视图写 "_SYS_BIC"."包/视图名"（包层级用 . 分隔）。',
   '',
-  '对象类型：',
-  '- calculationview（Calculation View，图形化节点模型，HANA 2.0 推荐）',
-  '- attributeview / analyticview（Attribute/Analytic View，主数据维度/星型模型；HANA 2.0 已标记废弃，仅存量支持）',
-  '- analyticprivilege（Analytic Privilege，数据访问权限）',
-  '- procedure（SQLScript 过程）、virtualtable、decisiontable',
+  '工具是**两层**：常驻的只有六个分类门面（hana_system / hana_discovery / hana_data / hana_insights / hana_modeling / hana_diagnostics），其余能力默认隐藏。',
+  '用法：**不带参数**调门面 → 返回本类能力索引（id / 一句话摘要 / 参数名），据此挑具体能力；**带 capability + args** 调门面 → 直接调用该能力。',
+  '调门面还会把**该分类的能力提升进工具面**：此后它们是 tools/list 里的一等工具（带完整参数 schema、可按工具名平铺调用）。未用到的分类不会占上下文。',
+  '能力族：hana_system_*（系统信息，含规则库）、hana_metadata_* 与 hana_table_*（只读元数据与血缘）、hana_package_* / hana_repo_*（包与传输）、hana_data_preview*（数据预览/基表勘察）、hana_view_*（建模写操作）、hana_system_health / hana_system_activity / hana_system_trend / hana_table_storage（稳定性诊断）、hana_sql_analyze（SQL 分析）。',
   '',
-  '命名与引用约定：',
-  '- 包名与对象名区分大小写；引用已激活视图用 "_SYS_BIC"."包/视图名"（包层级用 . 分隔）',
-  '- 写操作（hana_view_*）必须先 validate 再 activate；删除/更新会波及依赖方，依赖关系用 hana_metadata_where_used 查询',
+  '写操作（hana_view_*）：先 validate 再 activate；改/删前先用 hana_metadata_where_used 查依赖。',
+  '统一返回 envelope：{ success, data?, messages[], raw? }（HTTP 模式下额外带 clientId = 本次调用的客户端身份，见 MCP_HTTP_TOKENS）；硬错误返回 isError 并附恢复提示。',
   '',
-  '工具命名：hana_system_*（系统信息）、hana_metadata_*（只读元数据：字段清单/单字段逻辑/血缘/表）、hana_package_*（包）、hana_data_preview（数据预览）、hana_view_*（建模写操作）。',
-  '',
-  '建模写操作（hana_view_*）约定：写操作的可写包范围由 mcp.json 的 HANA_WRITE_PACKAGES 配置（**非空=仅配置包及其下级子包可写**，如配置 ZDEMO 则允许 ZDEMO、ZDEMO.SUB，拒绝其他；**留空=未配置边界，此时写工具会被运行期闸门以 boundary_off 直接拒绝**——要写就必须显式配置）；先检查对象不存在（防覆盖），写操作支持三个通道（transport 参数）：xs_rest=XS Classic 设计时 REST 官方写路径（**默认，推荐**）；repo_rest=走 SYS.REPOSITORY_REST 的 Studio 同款通道（部分环境写会 40106）；inactive_object=直写 _SYS_REPO.INACTIVE_OBJECT 兜底（激活需用户在 Studio 手工完成）。',
-  '新建 Calculation View（hana_view_create）两种形态：mode=projection（图形化最小形态：单 Projection + 单源表全列透传）；**mode=sql（SQL 模式，Scripted Calculation View：单 SqlScriptView 承载整段 SQL）——凡「按 SQL 建视图」一律用这个**，服务端按本环境方言生成 XML，模型零 XML，只需给 script + scriptColumns（输出列清单，datatype 必填：**它决定 HANA 为输出变量 VAR_OUT 生成的表类型，缺类型即生成空表类型、激活必失败**）。SQL 写法约定：表名写全限定名 SCHEMA."表"；输出列别名与 scriptColumns[].name 一致；**正文写普通查询即可（服务端自动包成 BEGIN VAR_OUT = 查询; END 过程体，裸 SELECT 不是合法过程体）**；至少一个数值列标 isMeasure=true（激活要求 ≥1 度量）。改 SQL 模式视图的脚本用 hana_view_update 的 op=set_script（同样零 XML）。',
-  '写后回执自带校验信号：activationErrors + activationDetail（**激活失败的完整明细含 DDL 全文，无需再调 hana_view_validate 拿全错误**）；probeRows（默认 10）在激活成功后回探测前 N 行，**0 行会附带排查提示**——「激活成功 ≠ 逻辑正确」。',
-  '跨表建模前的数据核对（强烈建议先做）：hana_data_preview 的**基表勘察模式**（schema + table [+ columns]）直接对源表采样并逐列画像（去重值样例 / 长度区间 / 含前导零样例 / NULL 数），用于确认 ①数据在哪张表或分区（BW 变更日志表 vs 活动数据表）②关联键补零格式是否一致（15 位零填充 vs 不补零是跨表关联的头号隐性杀手）③号码列语义（编号可能在 /BIC/Z* 客户字段而非 *NUM 标准字段）。统计基于采样行（sampleRows，默认 200），不跑全表 COUNT。',
-  '',
-  '数据预览（hana_data_preview 的视图预览模式）约定：支持范围有限，不支持即直接返回「不支持」，不做其他尝试。默认对已激活视图整体预览（_SYS_BIC 直查），无筛选默认 10 行、有筛选默认 100 行，VIRTUAL 视图用 parameters 传输入参数；仅当用户明确要求看某视图的某个节点时才传 node——走 HANA 原生中间视图机制（CREATE_INTERMEDIATE_CALCULATION_VIEW_DEV，Studio 同款，任意节点类型支持；中间视图名固定为「包/对象/dp/节点」，已存在即复用，查询后仅在本进程无占用且由本服务创建时才 DROP），需要 EXECUTE 权限，缺权限直接返回不支持；只读 XML 推导模式（forceDerive=true，Projection/Join/Aggregation/Union/Rank）需显式启用。权限类失败（缺 EXECUTE/SELECT、_SYS_BIC 对象不可见的 258/259）会自动附带权限诊断报告（envelope.raw.diagnosis），无需额外调用即可定位阻塞点；hana_data_preview_diagnose 可手动前置排查或区分「权限缺失」与「对象未激活」。',
-  '',
-  'SQL 分析（hana_sql_analyze）约定：**默认输出是一段可读的分析结论**（conclusion：一句话结论 + 逐条发现[risk/warn/info，每条带依据与建议] + 统计[引擎/表与规模/扫描次数/连接次数/预计输出行数]，并附 conclusion.text 整段文本），**默认不返回原始执行计划**——要算子明细才传 raw=true（verbose=true 再加算子细节）。',
-  '结论覆盖：全表扫描与表规模（大表、占位估计值）、是否缺过滤条件、跨执行引擎切换、嵌套循环连接、计划结构异常；planId/analyze 模式另带运行时统计（次数/平均耗时/内存）。',
-  '三种取数方式（sql 与 planId 二选一）：sql（只编译不执行）；planId（分析计划缓存里已执行过的语句，编号取自 SYS.M_SQL_PLAN_CACHE.PLAN_ID，需 OPTIMIZER ADMIN）；sql + analyze=true（先真执行，**默认走 PlanViz 通道**——与官方 Executed Plan/F8 同一条路：产出 panels 六栏[Plan Graph/Physical Plan/Execution Time/Timeline/Table Access/Logical Plan]，含逐算子独占与含子耗时、实际输出行数、时间轴跨度与线程数、表访问次数，结论据实测给出瓶颈算子或瓶颈对象、实际与估计行数的偏离、真实并行度、大中间结果物化；通道不可用时降级为「执行后按语句文本关联计划缓存条目」，**此时才是** EXPLAIN 估计值 + 语句级聚合统计，notes 会写明降级原因，source 相应为 sqlExecuted；执行受硬护栏：只允许 SELECT、单次执行最多 5 分钟（PlanViz 控制面调用 30 秒）、最多取 100 行即关闭结果集、**不返回数据行**）。',
-  '语句内 schema 须落在服务端允许范围内（未限定表名按当前用户默认 schema 判定）；只接受单条 SELECT/WITH：多语句、绑定占位符（? 或 :name）、DML/DDL/过程调用一律拒绝。',
-  '该工具归 **admin** 组，只启用 read/write 的部署看不到它。',
-  '',
-  '统一返回 envelope：{ success, data?, messages[], raw? }（HTTP 模式下额外带 clientId = 本次调用的客户端身份，见 MCP_HTTP_TOKENS）。硬错误（参数非法/对象不存在）返回 isError 并附恢复提示。',
+  '细则（SQL 方言、写边界与通道、回执与冲突、预览、分析、血缘、稳定性口径等）一律以规则库为准：调用 hana_system_get_info(rules=…)，不传 rules 得规则目录（id+title），传 all 或规则 id（逗号分隔）得全文。',
 ].join('\n');
 
 /**
@@ -49,11 +41,13 @@ export const SERVER_INSTRUCTIONS = [
  * 只做纯构建 —— 一次性启动日志（工具过滤摘要等）由入口负责。
  */
 export function createServer(ctx: ToolContext): McpServer {
+  // 面（P10-e）：**每次构建钉住一份**——HTTP 按请求构建，于是每个身份看到自己的面（门面 ∩ 授权）；
+  // stdio 单实例。纯函数，不含跨调用状态。见 tools/surface.ts。
   const server = new McpServer(
     // 版本号取自 package.json（src/version.ts），不在此硬编码：发版时不会漏改而报旧版本
     { name: SERVER_NAME, version: SERVER_VERSION },
     { instructions: SERVER_INSTRUCTIONS },
   );
-  registerAllTools(server, ctx);
+  registerAllTools(server, ctx.surface ? ctx : { ...ctx, surface: computeSurface(ctx, currentIdentity()) });
   return server;
 }

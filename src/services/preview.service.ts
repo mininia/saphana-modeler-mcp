@@ -10,7 +10,9 @@ import { deriveNodeSql } from './preview.derive.js';
 import {
   diagnosePreview,
   hasExecutePrivilege,
+  readIntermediateFreshness,
   runtimeViewExists,
+  type IntermediateFreshness,
   type PreviewChannel,
 } from './preview-diagnose.service.js';
 
@@ -139,6 +141,13 @@ export interface IntermediateViewInfo {
   dropped: boolean;
   /** dropped=false 时说明保留原因 */
   keptBecause?: string;
+  /**
+   * 新鲜度回报（D1，**仅复用时有**）：复用到的中间视图建于何时、源对象最近激活于何时。
+   * 服务端**不据此改变行为**（复用策略是用户明确口径：存在即复用、不校验新鲜度）——
+   * 只把差异摆出来，`stale=true` 时由调用方决定删视图 / 改 forceDerive / 接受旧数据。
+   * 新建路径没有该字段：刚由当前定义生成，新鲜度是构造性成立的。
+   */
+  freshness?: IntermediateFreshness;
 }
 
 const MAX_LIMIT = 1000;
@@ -337,9 +346,12 @@ async function previewNodeViaIntermediate(
 
   // 取用：已存在（并发刚建的 / 上次残留 / 他人建的）则跳过创建，直接复用
   let reused = false;
+  /** D1：仅复用路径回报新鲜度；新鲜度查询在锁内做——此刻视图必然还在（锁外读会撞上并发 DROP 的窗口） */
+  let freshness: IntermediateFreshness | undefined;
   await withKeyedLock(intermediateLockKey(viewName), async () => {
     if (await runtimeViewExists(pool, viewName)) {
       reused = true;
+      freshness = await readIntermediateFreshness(pool, viewName, packageId, objectName);
     } else {
       await pool.execute(`CALL SYS.CREATE_INTERMEDIATE_CALCULATION_VIEW_DEV(?, ?, ?, ?, ?)`, [
         INTERMEDIATE_SCHEMA,
@@ -361,8 +373,23 @@ async function previewNodeViaIntermediate(
     sql = `SELECT * FROM ${qualifyName(INTERMEDIATE_SCHEMA, viewName)}${where.clause} LIMIT ?`;
     rows = await pool.query<Record<string, unknown>>(sql, [...where.params, limit + 1]);
   } finally {
-    // 无论成败都解除占用（失败路径下由释放策略决定是否清理）
-    release = await releaseIntermediateView(pool, viewName);
+    // 无论成败都解除占用（失败路径下由释放策略决定是否清理）。
+    // 释放做成 **best-effort**：锁等待超时（keyed lock 的排队上限）或锁内异常都不得让整个预览请求失败
+    // （那不是「预览失败」，是一次假失败）；但**占用计数必须递减**——它才是泄漏源：只增不减会让该视图
+    // 从此不再被 DROP（且每次都用一次假失败换来一次泄漏）。锁体里的递减位于**任何可失败操作之前**
+    // （纯 Map 操作不可能抛），故锁体一旦开始执行就必然完成递减；下面的兜底只覆盖「锁体根本没跑」
+    // （锁等待超时被跳过 / 获取失败）的情形，不会双扣。兜底递减在锁外做（此时锁体没跑，没有并发方
+    // 在改这个计数；计数只是 DROP 的尽力而为门槛，不是正确性依赖），并如实保留「视图未释放」。
+    try {
+      release = await releaseIntermediateView(pool, viewName);
+    } catch (e) {
+      decrementIntermediateInUse(viewName);
+      logger.warn(
+        { viewName, err: e },
+        '中间视图释放未完成（锁等待超时或锁内异常）：占用计数已兜底递减，视图保留供后续复用',
+      );
+      release = { dropped: false, reason: '释放未完成（锁等待超时或异常）：视图保留供后续复用，占用计数已兜底递减' };
+    }
   }
   const { rows: sliced, truncated } = slicePage(rows, limit);
   return {
@@ -379,8 +406,20 @@ async function previewNodeViaIntermediate(
       reused,
       dropped: release.dropped,
       ...(release.dropped ? {} : { keptBecause: release.reason }),
+      ...(freshness ? { freshness } : {}),
     },
   };
+}
+
+/**
+ * 占用计数递减（单点实现：锁体与兜底路径共用同一套算术，避免两处各写一遍导致口径漂移）。
+ * ≤0 时移除条目；返回剩余计数。
+ */
+function decrementIntermediateInUse(viewName: string): number {
+  const remaining = (intermediateInUse.get(viewName) ?? 1) - 1;
+  if (remaining > 0) intermediateInUse.set(viewName, remaining);
+  else intermediateInUse.delete(viewName);
+  return remaining;
 }
 
 /**
@@ -390,18 +429,19 @@ async function previewNodeViaIntermediate(
  * - 视图非本服务创建（他人 / 上一次进程的残留）→ 误删他人对象风险，宁可留着
  * - DROP 失败：本进程之外的会话（如 HANA Studio）正在读该视图而占用锁 → 交由下次调用复用
  * 与取用共用同一把锁：保证不会在「刚判定无人占用」之后、DROP 之前被新调用复用。
+ * 计数递减放在锁体**最前**（任何可失败操作之前）：调用方（previewNodeViaIntermediate 的 finally）
+ * 在锁等待超时等情形会做兜底递减，锁体外无并发方在改这个计数，故不会双扣；反之，锁体一旦开始
+ * 执行就必然完成递减——"递减无论如何都要发生"是调用方的硬要求（它是泄漏源）。
  */
 async function releaseIntermediateView(
   pool: HanaPool,
   viewName: string,
 ): Promise<{ dropped: boolean; reason?: string }> {
   return withKeyedLock(intermediateLockKey(viewName), async () => {
-    const remaining = (intermediateInUse.get(viewName) ?? 1) - 1;
+    const remaining = decrementIntermediateInUse(viewName);
     if (remaining > 0) {
-      intermediateInUse.set(viewName, remaining);
       return { dropped: false, reason: `仍有 ${remaining} 个预览调用在使用该视图` };
     }
-    intermediateInUse.delete(viewName);
     if (!intermediateOwned.has(viewName)) {
       return { dropped: false, reason: '视图非本服务创建（他人或历史残留），不主动删除' };
     }

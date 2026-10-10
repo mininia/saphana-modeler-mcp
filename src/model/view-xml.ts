@@ -190,8 +190,21 @@ function parseNode(node: XmlNode): ViewNode {
       }
     };
     walk(aobj['filter']);
-    return { id: str(a, '@_id') ?? '', aggregationType: str(a, '@_aggregationType'), filters };
+    // datatype/length 一并留住：BW/HANA Studio 方言把列类型写在 viewAttribute 上
+    // （set_script 写出的类型声明也是这个位置），丢弃后节点级类型变更在 diff 里不可见。
+    return {
+      id: str(a, '@_id') ?? '',
+      aggregationType: str(a, '@_aggregationType'),
+      datatype: str(a, '@_datatype'),
+      length: str(a, '@_length'),
+      filters,
+    };
   });
+  // 只在确有类型声明时才产出 attributeTypes：恒为空数组会掩盖「未声明」语义，
+  // 也给 diff 制造噪音（空段 ≡ 缺段，见 SSD §5.2 归一化规则）。
+  const attributeTypes = viewAttrs
+    .filter((a) => a.datatype !== undefined || a.length !== undefined)
+    .map((a) => ({ id: a.id, datatype: a.datatype, length: a.length }));
   // SqlScriptView 的 SQLScript 源码存于 <definition> 元素（含 &quot; 实体，text() 解码）
   const scriptText = text(child('definition'));
   // Rank 节点：windowFunction（partitionViewAttributeName 文本 + `<order byViewAttributeName direction>` 怪标签 + rankThreshold）
@@ -210,6 +223,7 @@ function parseNode(node: XmlNode): ViewNode {
       .filter((a) => a.aggregationType)
       .map((a) => ({ id: a.id, aggregationType: a.aggregationType! })),
     attributeFilters: viewAttrs.filter((a) => a.filters.length > 0).map((a) => ({ id: a.id, filters: a.filters })),
+    ...(attributeTypes.length > 0 ? { attributeTypes } : {}),
     rank,
     script: scriptText,
     inputs,
@@ -244,14 +258,18 @@ function parseOutputField(field: XmlNode, kind: 'attribute' | 'measure'): ViewOu
     description: defaultDescription(field),
     sourceColumn: str(m, '@_columnName'),
     sourceObject: str(m, '@_columnObjectName'),
+    // 类型/公式不只度量有：逻辑层 calculatedAttributes 里的属性列同样带
+    // datatype/length/expressionLanguage/formula（它们就是「带公式的属性列」）。
+    // 此前只在度量分支填充 ⇒ 属性列的类型/公式变更在结构化模型里不可见（P6 判定表有洞）。
+    // 两条路径统一填充，纯增量：度量分支的取值与键集原样不动。
+    datatype: str(field, '@_datatype'),
+    length: str(field, '@_length'),
+    expressionLanguage: str(field, '@_expressionLanguage'),
+    formula: text(obj['formula']),
     ...(kind === 'measure'
       ? {
           aggregationType: str(field, '@_aggregationType'),
           measureType: str(field, '@_measureType'),
-          datatype: str(field, '@_datatype'),
-          length: str(field, '@_length'),
-          expressionLanguage: str(field, '@_expressionLanguage'),
-          formula: text(obj['formula']),
         }
       : {}),
   };
@@ -259,11 +277,19 @@ function parseOutputField(field: XmlNode, kind: 'attribute' | 'measure'): ViewOu
 
 function parseOutputList(root: XmlNode, section: string, kind: 'attribute' | 'measure'): ViewOutputField[] {
   const sec = root && typeof root === 'object' ? (root as Record<string, unknown>)[section] : undefined;
-  const items =
-    sec && typeof sec === 'object'
-      ? (sec as Record<string, unknown>)[kind === 'attribute' ? 'attribute' : 'measure']
-      : undefined;
-  return toArray<XmlNode>(items).map((f) => parseOutputField(f, kind));
+  // 条目名兼容（P6 修复批，评审 #5）：本仓既有语料与 fixture 用 kind 名当条目元素（<attribute>/<measure>），
+  // 真实方言也可能用 section 名的单数（<calculatedAttribute>/<calculatedMeasure>/<restrictedMeasure>）。
+  // 只认一种名字时，另一种方言的整张列表恒为空 ⇒ 其字段增删/改名/类型变更对 diff 与判定完全不可见。
+  // 两种名字都收；名字相同时去重（attributes 列表的 section 单数恰好等于 kind 名，不去重会把同一批
+  // 元素读两遍）。本仓无真实语料可证伪单数名假设，这是防御性兼容；顺序固定（单数名先、kind 名后）保确定性。
+  const kindName = kind === 'attribute' ? 'attribute' : 'measure';
+  const names = section.endsWith('s') ? [section.slice(0, -1), kindName] : [kindName];
+  const out: ViewOutputField[] = [];
+  for (const name of new Set(names)) {
+    const items = sec && typeof sec === 'object' ? (sec as Record<string, unknown>)[name] : undefined;
+    out.push(...toArray<XmlNode>(items).map((f) => parseOutputField(f, kind)));
+  }
+  return out;
 }
 
 /** 根节点名 → ViewKind（宽容匹配：根名可能带/不带命名空间前缀） */

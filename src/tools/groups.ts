@@ -1,8 +1,9 @@
 /**
- * 工具功能分组与可见性过滤（单一事实源）。
+ * 工具功能分组与可见性过滤。
  *
- * 本模块为纯叶子模块（除 core/text 的列表解析外无依赖：不 import config/services/logger），
- * 可被 config 与 tools 双向引用而无环。
+ * **分组的单一事实源已上移到能力清单**（`src/capabilities/manifest.ts` 的 `kind` 字段）：
+ * 本模块不再自己维护工具→分组映射，而是从清单**派生** `TOOL_GROUPS`，
+ * 只保留"可见性怎么算"（解析 env、glob 匹配、优先级）这部分纯逻辑。
  *
  * 三类分组：
  * - read  数据读取：只读访问 HANA 数据/元数据/系统信息/审计/导出（GET 类，不改动仓库）
@@ -10,13 +11,16 @@
  * - admin 管理操作：高权限/管理类（生命周期/审计/权限管理，以及接受任意 SQL 的高权限分析）
  *
  * 可见性由 mcp.json / .env 的三个变量控制（详见 README「工具分组与可见性控制」）：
- * - HANA_TOOL_GROUPS  启用的分组（逗号分隔）；空=全启用（默认，向后兼容）
- * - HANA_TOOL_ALLOW   强制启用的工具名 glob（即便其分组未启用也注册）
- * - HANA_TOOL_DENY    强制禁用的工具名 glob（优先级最高，覆盖 allow 与分组）
+ * - MCP_TOOL_GROUPS  启用的分组（逗号分隔）；空=全启用（默认，向后兼容）
+ * - MCP_TOOL_ALLOW   强制启用的工具名 glob（即便其分组未启用也注册）
+ * - MCP_TOOL_DENY    强制禁用的工具名 glob（优先级最高，覆盖 allow 与分组）
  * 优先级：deny > allow > 分组开关。
+ *
+ * 依赖方向：本模块 import 能力清单（清单不 import 本模块），故没有环。
  */
 
 import { splitList } from '../core/text.js';
+import { CAPABILITY_LIST, findCapability, membersOfCategory } from '../capabilities/manifest.js';
 
 /** 工具功能分组 */
 export type ToolGroup = 'read' | 'write' | 'admin';
@@ -32,61 +36,11 @@ export const GROUP_LABELS: Record<ToolGroup, string> = {
 };
 
 /**
- * 工具→分组映射（单一事实源）。
- * 新增工具时必须在此登记其分组（测试会断言映射与实际注册一致，防漏配）。
- * 未登记的工具按 'read' 兜底（仅当 read 分组启用时注册），属编程错误，应由测试拦截。
+ * 工具→分组映射（**由能力清单派生**，保持单一事实源）。
+ * 新增能力时在清单的 `defs/<分类>.ts` 里登记 `kind`——只加注册代码而不登记清单，
+ * 该能力既不注册也不可见（未登记 = 不暴露，fail-closed），并由 manifest 完整性测试拦下。
  */
-export const TOOL_GROUPS: Record<string, ToolGroup> = {
-  // —— 数据读取（read）——
-  hana_system_get_info: 'read',
-  hana_check_privileges: 'read',
-  hana_package_list: 'read',
-  hana_package_list_objects: 'read',
-  hana_metadata_get_view: 'read',
-  hana_metadata_search_objects: 'read',
-  hana_metadata_list_fields: 'read',
-  hana_metadata_get_field_logic: 'read',
-  hana_metadata_where_used: 'read',
-  hana_table_list: 'read',
-  hana_table_columns: 'read',
-  hana_data_preview: 'read',
-  hana_data_preview_diagnose: 'read',
-  hana_view_check_actions: 'read',
-  hana_repo_export: 'read',
-  hana_repo_changelist: 'read',
-
-  // 稳定性诊断四件套：仅 SELECT 系统视图（SYS.M_* / _SYS_STATISTICS.*），零副作用。
-  // 归 read 而非 admin：它们不接受任意 SQL、不写任何东西，与 hana_sql_analyze 的暴露面不同。
-  // 需要收敛时用 HANA_TOOL_DENY="hana_system_health,hana_system_activity,hana_table_storage,hana_system_trend"。
-  hana_system_health: 'read',
-  hana_system_activity: 'read',
-  hana_table_storage: 'read',
-  hana_system_trend: 'read',
-
-  // —— 写操作（write）——
-  // hana_view_validate 的 design 模式会短暂写入临时校验对象 _CHKTMP，故整工具归 write；
-  // 不按 design/runtime 模式做混合划分，只读部署不暴露此工具。
-  hana_package_create: 'write',
-  hana_repo_import: 'write',
-  hana_view_create: 'write',
-  hana_view_activate: 'write',
-  hana_view_update: 'write',
-  hana_view_delete: 'write',
-  hana_view_validate: 'write',
-
-  // —— 管理操作（admin）——
-  // hana_sql_analyze：接受任意 SQL 文本（analyze=true 时**真实执行**），且 plan_id 模式需要
-  // OPTIMIZER ADMIN。它不写业务数据、不碰仓库——归 admin 是**暴露面控制**（最严的一组），
-  // 不是因为它有副作用。后续若新增 hana_privilege_create 等管理类工具，继续登记于此
-  // （当前**未注册**，不要在本文件或文档里把它写成已存在）。
-  hana_sql_analyze: 'admin',
-
-  // —— 占位工具 ——
-  // 可见性配置把所有业务工具都关掉时，registerAllTools 会注册它，避免 SDK 不声明 tools 能力
-  // （tools/list 可达性所需）。它是只读的（不做任何事，只回一条提示），故归 read。
-  // 登记在这里而不是绕过分组机制：测试据 TOOL_GROUPS 断言语义，未登记的工具属编程错误。
-  hana_no_tools_available: 'read',
-};
+export const TOOL_GROUPS: Record<string, ToolGroup> = Object.fromEntries(CAPABILITY_LIST.map((c) => [c.id, c.kind]));
 
 /** 工具过滤配置（来自环境变量，启动时解析一次） */
 export interface ToolFilterConfig {
@@ -153,7 +107,7 @@ export function parseToolFilter(rawGroups: string, rawAllow: string, rawDeny: st
   if (groups.length > 0) {
     const invalid = groups.filter((g) => !ALL_TOOL_GROUPS.includes(g as ToolGroup));
     if (invalid.length > 0) {
-      throw new Error(`HANA_TOOL_GROUPS 含未知分组：${invalid.join(', ')}；合法值：${ALL_TOOL_GROUPS.join(', ')}`);
+      throw new Error(`MCP_TOOL_GROUPS 含未知分组：${invalid.join(', ')}；合法值：${ALL_TOOL_GROUPS.join(', ')}`);
     }
   }
   return {
@@ -164,22 +118,46 @@ export function parseToolFilter(rawGroups: string, rawAllow: string, rawDeny: st
 }
 
 /**
- * 判定单个工具是否应注册（是否对 MCP 客户端可见）。
+ * 非门面能力的可见性判定（deny 已在调用方先行扣除）：allow 优先，其次分组开关。
+ * 门面不走这里——入口不参与分组过滤（见 `shouldRegisterTool` 的「门面层不做限制」）。
+ */
+function registerableByName(name: string, filter: ToolFilterConfig): boolean {
+  const group = TOOL_GROUPS[name];
+  if (group === undefined) return false; // 未登记 = 不暴露（fail-closed）
+  if (matchGlob(name, filter.allowPatterns)) return true;
+  if (filter.enabledGroups.size === 0) return true;
+  return filter.enabledGroups.has(group);
+}
+
+/**
+ * 判定单个能力是否应注册（是否对 MCP 客户端可见）。
  * 优先级：deny（强制禁用）> allow（强制启用）> 分组开关。
  * 默认（全空配置）= 全部启用，行为与未引入该机制前完全一致（向后兼容）。
  *
- * @param name 工具名
+ * **门面层不做限制（2026-10-09 定稿）**：权限只有**一层 group（能力层）**——门面（`hana_<分类>`）
+ * 是**入口**，不参与分组开关过滤。六个入口常驻注册面，谁的能力可用由分组开关在**能力层**决定
+ * （索引/路由/提升/调用一律按目标能力的 kind 判）。所以只读部署仍看得到 `hana_modeling` /
+ * `hana_diagnostics`，只是它们的索引为空（入口在、里面没有你可用的能力）——那是**可用性收窄**，
+ * 不是自锁死：反过来也成立（只启用 write 时 `hana_diagnostics` 索引里有 `hana_sql_analyze`）。
+ * deny 仍然最高优先级：命中门面 id、或 deny 掉它**全部**成员，门面才消失（显式移除 ≠ 分层限制）。
+ *
+ * **未登记 = 不暴露**（fail-closed）：名字不在能力清单里时返回 false。
+ * 此前是"按 read 兜底"（fail-open）——那意味着一个漏登记的写工具会在只读部署里被注册出来。
+ * 未登记的能力本来就没有注册代码、不可调用，这里只是让"不可见"与"不可调用"一致。
+ *
+ * @param name 能力 id（工具级 = 工具名）
  * @param filter 过滤配置
  * @returns true=注册（客户端可见）/ false=跳过（不出现在 tools/list、不可调用）
  */
 export function shouldRegisterTool(name: string, filter: ToolFilterConfig): boolean {
   // 1) deny 最高优先级：命中即不注册
   if (matchGlob(name, filter.denyPatterns)) return false;
-  // 2) allow 次之：命中即强制注册（即便其分组未启用）
-  if (matchGlob(name, filter.allowPatterns)) return true;
-  // 3) 分组开关：未登记分组的工具按 read 兜底
-  const group = TOOL_GROUPS[name] ?? 'read';
-  // enabledGroups 为空 = 不限制（全部分组启用）
-  if (filter.enabledGroups.size === 0) return true;
-  return filter.enabledGroups.has(group);
+  const cap = findCapability(name);
+  if (cap === undefined) return false; // 未登记 = 不暴露（fail-closed）
+  // 2) 门面：入口不参与分组过滤（门面层不做限制）；只有"全部成员被 deny"才让它消失
+  if (cap.facadeOf !== undefined) {
+    return membersOfCategory(cap.facadeOf).some((m) => !matchGlob(m.id, filter.denyPatterns));
+  }
+  // 3) 具体能力：allow 优先，其次分组开关
+  return registerableByName(name, filter);
 }

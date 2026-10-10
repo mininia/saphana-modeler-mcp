@@ -1,136 +1,116 @@
 /**
  * 建模写工具（分组 **write**）：视图的新建/更新/激活/删除/校验与校验动作查询。
  *
- * 写工具一律经 registerWriteTool 注册（handler 之前先过预检闸门）；只读的
- * hana_view_check_actions 走 registerVisibleTool。可写包范围由 HANA_WRITE_PACKAGES 决定。
+ * 各工具经 capabilityRegistrar 按能力清单（capabilities/defs/modeling.ts）注册：写工具
+ * gate=preflight（handler 之前先过预检闸门），只读的 hana_view_check_actions gate=none。
+ * 可写包范围由 HANA_WRITE_PACKAGES 决定。
  */
 
 import type { McpServer } from '@modelcontextprotocol/server';
-import { z } from 'zod';
-import { mcpErrorText, withErrorEnvelope } from '../core/errors.js';
+import { conflictOf, mcpErrorText, withErrorEnvelope } from '../core/errors.js';
+import { logger } from '../core/logger.js';
+import { submitChangesetTask } from '../services/async-task.service.js';
+import { VIEW_OPS } from '../services/view-ops.rules.js';
 import {
+  DEFAULT_PROBE_ROWS,
   activateCalculationView,
+  applyChangeset,
+  changesetPartialError,
   checkCalculationViewDesignTime,
   createCalculationView,
   deleteCalculationView,
   updateCalculationView,
 } from '../services/repository.service.js';
+import { CHANGESET_MAX_ACTIONS } from '../services/changeset.plan.js';
 import { getCheckActions, validateCalculationView } from '../services/validation.service.js';
-import { registerVisibleTool, registerWriteTool, type ToolContext } from './index.js';
-import { toToolResult, zObjectName, zPackageId } from './common.js';
+import { MIGRATION_DECLARATIONS } from '../services/migrate.rules.js';
+import { findCapability } from '../capabilities/manifest.js';
+import { capabilityRegistrar, type CapabilityHandler, type ToolContext } from './index.js';
+import { toToolResult } from './common.js';
+import { surfaceKeyOf } from './surface.js';
+import { currentIdentity } from '../core/request-context.js';
+import { CAP } from '../capabilities/manifest.js';
+import { DELETE_MIGRATION_DECLARATIONS } from '../capabilities/defs/modeling.js';
 import type { Envelope } from '../types/hana.js';
-import { DEFAULT_PROBE_ROWS, MAX_PROBE_ROWS } from '../services/repository.service.js';
+
+/** 把工具面的 set_script 载荷归一成内部 spec 形状（见调用点注释） */
+function normalizeSetScriptOp(op: { op: 'set_script'; script: string; scriptColumns: ScriptColumnSpec[] }) {
+  return { op: op.op, script: op.script, columns: op.scriptColumns };
+}
 
 /**
- * SQL 模式输出列的 zod 片段（create 的 scriptColumns 与 update 的 set_script.columns **共用一份**）：
- * 各写一份时，任一侧改约束（上限/新增字段）都会让同一份列清单在 create 能过、在 update 被拒。
+ * `migration.strategy` 的 handler 入口校验与类型收窄（SSD §1.6 枚举契约的落地处）：
+ * schema 刻意是宽松的 `z.string()`——任何取值都能到达 handler，由这里给**中文硬错误**并列出合法值；
+ * 用 z.enum 时非法值会落到 SDK 协议层（英文报错、合法值也不可见）。同款先例：health 的 checks/sections。
+ * 合法值常量来自 migrate.rules（单一事实源）；delete 通道的子集由 defs/modeling 从全集派生。
+ * @returns error=非法值的中文硬错误文案；value=收窄后的声明（未给 migration 时为 undefined）。
  */
-const SCRIPT_COLUMN_SCHEMA = z.object({
-  name: z.string().min(1).max(128).describe('输出列别名（与脚本 SELECT 的别名一致）'),
-  dataType: z
-    .string()
-    .min(1)
-    .max(60)
-    .describe('HANA 数据类型，如 NVARCHAR / DECIMAL(15,2) / INTEGER / DATE（精度写在类型内）'),
-  length: z
-    .number()
-    .int()
-    .min(1)
-    .max(2147483647)
-    .optional()
-    .describe('字符型长度（NVARCHAR/VARCHAR/ALPHANUM/CHAR 必填：该声明会用于生成输出类型，缺了会激活失败）'),
-  isMeasure: z.boolean().optional().describe('true=度量列（进 baseMeasures 聚合）；缺省=属性列'),
-  aggregationType: z.string().max(30).optional().describe('度量聚合方式（默认 sum，如 sum/count/min/max）'),
-  description: z.string().max(200).optional().describe('中文描述（缺省取列名）'),
-});
+function normalizeMigrationStrategy<T extends string>(
+  migration: { strategy: string; note?: string } | undefined,
+  allowed: readonly T[],
+  channel: string,
+): { error: string } | { value: { strategy: T; note?: string } | undefined } {
+  if (!migration) return { value: undefined };
+  if (!(allowed as readonly string[]).includes(migration.strategy)) {
+    return {
+      error: `${channel} 的 migration.strategy "${migration.strategy}" 不是合法取值；合法值：${allowed.join(' / ')}`,
+    };
+  }
+  // 收窄点：合法性刚在这里判定（= 放宽 schema 的代价所在），T 由常量数组推断并与服务层声明类型同源
+  return {
+    value: { strategy: migration.strategy as T, ...(migration.note !== undefined ? { note: migration.note } : {}) },
+  };
+}
+
+/** 工具面 set_script 的输出列（与清单 schema 同形；此处只做结构搬运） */
+type ScriptColumnSpec = {
+  name: string;
+  dataType: string;
+  length?: number;
+  isMeasure?: boolean;
+  aggregationType?: string;
+  description?: string;
+};
+
+/**
+ * changeset 动作的 migration 合法值**随 action 类别走**（与各单对象通道同一张表）：
+ * update=字段级策略∪显式承担（MIGRATION_DECLARATIONS）；delete=仅显式承担（DELETE_MIGRATION_DECLARATIONS）；
+ * create 无破坏面（新建对象没有下游可断），不接受该声明——给了就是调用方误解，点名拒绝。
+ * 非法值中文硬错误（SSD §1.6：schema 刻意宽松，合法值在调用时列出）；收窄点在这里，服务层只记声明。
+ * @returns 命中时返回中文硬错误文案（点名第几项与合法值）；全部合法返回 undefined。
+ */
+function changesetMigrationDeclarationError(
+  actions: ReadonlyArray<{ action: 'update' | 'create' | 'delete'; migration?: { strategy: string } }>,
+): string | undefined {
+  for (let i = 0; i < actions.length; i++) {
+    const { action, migration } = actions[i];
+    if (!migration) continue;
+    if (action === 'create') {
+      return (
+        `变更集第 ${i} 项（从 0 数）的 action=create 不接受 migration 声明：` +
+        '新建对象没有下游破坏面，该声明只对 update / delete 动作有意义'
+      );
+    }
+    const allowed = action === 'update' ? MIGRATION_DECLARATIONS : DELETE_MIGRATION_DECLARATIONS;
+    if (!(allowed as readonly string[]).includes(migration.strategy)) {
+      return (
+        `变更集第 ${i} 项（从 0 数）action=${action} 的 migration.strategy "${migration.strategy}" 不是合法取值；` +
+        `合法值：${allowed.join(' / ')}`
+      );
+    }
+  }
+  return undefined;
+}
 
 export function registerModelingTools(server: McpServer, ctx: ToolContext): void {
-  const reg = registerVisibleTool(server, ctx);
   // 写工具一律经预检闸门注册：判定不通过时在 handler 之前拦截，不进 service（见 tools/index.ts）
-  const regWrite = registerWriteTool(server, ctx);
-  regWrite(
-    'hana_view_create',
-    {
-      title: '新建 Calculation View（计算视图）',
-      description:
-        '在仓库中新建一个 Calculation View（计算视图）。两种形态（mode 二选一）：\n' +
-        '① mode=projection（默认）：图形化最小形态 = 单个 Projection 节点 + 单个表/视图数据源（全列透传）；\n' +
-        '② mode=sql：**SQL 模式**（Scripted Calculation View）= 单个 SqlScriptView 节点承载整段 SQL。**推荐用于任何「按 SQL 建视图」的需求**' +
-        '——服务端按本环境方言（SCRIPT_BASED + <definition> + viewAttribute 显式 datatype/length）生成正确 XML，模型**零 XML**；' +
-        '只需给 script（写普通查询即可，服务端自动包成 `BEGIN VAR_OUT = <查询>; END` 过程体；也可直接给完整 BEGIN…END 过程体）与 ' +
-        'scriptColumns（输出列清单，含类型——**它决定 HANA 为输出变量 VAR_OUT 生成的表类型**，缺 datatype/length 会生成空表类型而激活失败，故必填）。\n' +
-        'SQL 约定（避免常见坑）：① 表名写**全限定名**（SCHEMA."表"），不要依赖默认 schema；② 输出列的 name 必须与脚本 SELECT 的列别名一致；' +
-        '③ 至少一个数值列标 isMeasure=true（本环境激活要求 ≥1 度量，否则 40117）；④ 脚本里建议用 CAST(... AS <类型>) 把输出列类型钉死，' +
-        '与 scriptColumns 的 dataType/length 保持一致（声明类型与脚本实际类型不一致会激活失败）；⑤ Oracle 的 CONNECT BY 层级查询改写为 HANA 泛型 ' +
-        'HIERARCHY(...) 时：SOURCE 列别名取 NODE_ID/PARENT_ID，START WHERE 用**原始列名**，输出列用 **SOURCE 别名**（不是 HIERARCHY_NODE_ID），' +
-        '标量子查询取反向边要包 MAX() 防多行。\n' +
-        '安全约束：写操作的可写包范围由 mcp.json 的 HANA_WRITE_PACKAGES 配置（仅配置包及其子包可写；**留空=未配置边界，写工具会被闸门拒绝**）；同名对象已存在时拒绝覆盖' +
-        '（并发同名创建在服务端按对象串行化，后到者显式报并发冲突，不会静默覆盖前者）。\n' +
-        '流程：校验包名/对象名 → 检查对象不存在 → 取源列或校验脚本列 → 生成设计时 XML → 写入仓库（XS REST PUT）→（可选）显式激活 →（可选）行探测。\n' +
-        '实测边界（SPS08）：①激活要求视图至少 1 个度量 → 默认 SUM_NUMERIC（数值列聚合 sum），ALL_ATTRIBUTES（无度量）激活会被 40117 拒绝；' +
-        '②本服务器对合法模型「写入即激活」，activate=false 不保证 inactive——返回的 activated 为写入后实测状态' +
-        '（激活失败的对象才是 inactive，错误明细在 activationErrors，完整明细见 activationDetail：无需再调 validate 即可看到 DDL 全文）。' +
-        '③probeRows（默认 10）在激活成功后回探测前 N 行：**0 行会附带排查提示**，避免「激活成功 = 逻辑正确」的误判（0 行常见根因是键值补零格式、' +
-        '号码列选错、数据在另一个表/分区）。\n' +
-        '写后可用 hana_view_validate(target=design) 做无副作用激活前校验、hana_data_preview 预览（含基表勘察模式）、hana_metadata_* 查看字段。' +
-        'transports：xs_rest=XS REST 官方写路径（默认，推荐）；repo_rest=走 SYS.REPOSITORY_REST（Studio 同款，部分环境写会 40106）；inactive_object=直写 _SYS_REPO.INACTIVE_OBJECT（兜底，需 Studio 手工激活，非官方支持）。',
-      inputSchema: z.object({
-        packageId: zPackageId('目标包名；须在 HANA_WRITE_PACKAGES 配置的可写范围内（如 ZDEMO 或 ZDEMO.SUB）'),
-        objectName: zObjectName('新视图对象名（不含包名），如 ZDEMO_CV_TEST001'),
-        description: z.string().max(200).optional().describe('视图描述（默认取对象名）'),
-        mode: z
-          .enum(['projection', 'sql'])
-          .default('projection')
-          .describe(
-            '视图形态：projection=图形化最小形态（单 Projection + 单源表，需 sourceSchema/sourceName）；sql=SQL 模式（单 SqlScriptView，需 script + scriptColumns）',
-          ),
-        sourceSchema: z
-          .string()
-          .optional()
-          .describe('mode=projection：源表/视图所在 schema，如 SAPABAP1（须在白名单内）'),
-        sourceName: z.string().optional().describe('mode=projection：源表/视图名，如某可访问的表'),
-        script: z
-          .string()
-          .min(1)
-          .max(100000)
-          .optional()
-          .describe('mode=sql：SQL 脚本正文（表名写全限定名 SCHEMA."表"；输出列别名须与 scriptColumns 的 name 一致）'),
-        scriptColumns: z
-          .array(SCRIPT_COLUMN_SCHEMA)
-          .max(600)
-          .optional()
-          .describe('mode=sql：输出列清单（顺序即输出顺序；datatype 必填——无法从 SQL 文本推断）'),
-        measureMode: z
-          .enum(['SUM_NUMERIC', 'ALL_ATTRIBUTES'])
-          .default('SUM_NUMERIC')
-          .describe(
-            'mode=projection 的度量策略：SUM_NUMERIC=数值列进 baseMeasures 聚合 sum（默认，本环境激活要求 ≥1 度量）；ALL_ATTRIBUTES=全部列当属性（无度量，仅能保存 inactive，激活会被拒绝）',
-          ),
-        activate: z
-          .boolean()
-          .default(false)
-          .describe('true=写入后立即尝试激活（repo_rest 通道）；false=仅写设计时对象'),
-        transport: z
-          .enum(['repo_rest', 'xs_rest', 'inactive_object'])
-          .default('xs_rest')
-          .describe(
-            '传输通道：xs_rest=XS REST 官方写路径（默认，推荐）；repo_rest=裸 SYS.REPOSITORY_REST（部分环境写会 40106）；inactive_object=直写 _SYS_REPO.INACTIVE_OBJECT（兜底，需手工激活）',
-          ),
-        columns: z
-          .array(z.string())
-          .max(600)
-          .optional()
-          .describe('mode=projection：要映射的列名清单；省略=源表全列（自动按类型区分属性/度量）'),
-        probeRows: z
-          .number()
-          .int()
-          .min(0)
-          .max(MAX_PROBE_ROWS)
-          .default(DEFAULT_PROBE_ROWS)
-          .describe('激活成功后探测的行数上限（0=不探测）：让「0 行」当场可见，返回 rowProbe（含 emptyHint 排查提示）'),
-      }),
-      annotations: { readOnlyHint: false, idempotentHint: false, openWorldHint: false, destructiveHint: false },
-    },
+  const registrar = capabilityRegistrar(server, ctx);
+  const regCap = registrar;
+  /** 操作级别名专用注册入口（只登记原始 handler、不注册工具；fail-closed 校验 routeOnly 标记） */
+  const regCapAlias = registrar.routeOnly;
+
+  regCap(
+    CAP.hana_view_create,
     async ({
       packageId,
       objectName,
@@ -184,261 +164,231 @@ export function registerModelingTools(server: McpServer, ctx: ToolContext): void
     },
   );
 
-  regWrite(
-    'hana_view_validate',
-    {
-      title: '校验计算视图一致性',
-      description:
-        '双模式校验：target=design（默认）对可写包内**设计时对象**做「激活前校验」——把内容写到临时副本 _CHKTMP ' +
-        '以触发服务端激活检查（CheckResult 带编译明细）后删除副本，**原对象的激活状态不受影响**；' +
-        'target=runtime 对**已激活的运行时计算视图**做一致性校验（SYS.CHECK_CALCULATION_VIEW，需 schema+viewName，如 「_SYS_BIC」 + 「ZDEMO.ZDEMO_MKC/ZDEMO03_CV003」）。' +
-        '激活前建议先 design 校验，激活后可用 runtime 校验复检；支持的动作清单用 hana_view_check_actions 查询。',
-      inputSchema: z.object({
-        target: z
-          .enum(['design', 'runtime'])
-          .default('design')
-          .describe(
-            'design=设计时对象激活前校验（packageId+objectName）；runtime=运行时视图一致性校验（schema+viewName）',
-          ),
-        packageId: zPackageId('design 模式：目标包名；须在 HANA_WRITE_PACKAGES 配置的可写范围内').optional(),
-        objectName: zObjectName('design 模式：视图对象名（不含包名）').optional(),
-        schema: z.string().default('_SYS_BIC').describe('runtime 模式：运行时 schema，默认 _SYS_BIC（须在白名单内）'),
-        viewName: z
-          .string()
-          .optional()
-          .describe('runtime 模式：运行时视图名，形如 "ZDEMO.ZDEMO_MKC/ZDEMO03_CV003"（包路径/对象名）'),
-        action: z
-          .enum(['CHECK_CONSISTENCY'])
-          .default('CHECK_CONSISTENCY')
-          .describe('runtime 模式：校验动作（calculationview 仅支持 CHECK_CONSISTENCY）'),
-      }),
-      // design 模式会短暂写入临时校验对象（写后即删），不能标 readOnly
-      annotations: { readOnlyHint: false, idempotentHint: true, openWorldHint: false, destructiveHint: false },
-    },
-    async ({ target, packageId, objectName, schema, viewName, action }) => {
-      if (target === 'design') {
-        if (!packageId || !objectName) {
-          return mcpErrorText(
-            'design 模式需要 packageId 与 objectName（设计时对象激活前校验）。',
-            '要校验运行时视图请改传 target=runtime 并给 schema + viewName',
-          );
-        }
-        const envelope: Envelope = await withErrorEnvelope(() =>
-          checkCalculationViewDesignTime(ctx.config, packageId, objectName),
+  regCap(CAP.hana_view_validate, async ({ target, packageId, objectName, schema, viewName, action }) => {
+    if (target === 'design') {
+      if (!packageId || !objectName) {
+        return mcpErrorText(
+          'design 模式需要 packageId 与 objectName（设计时对象激活前校验）。',
+          '要校验运行时视图请改传 target=runtime 并给 schema + viewName',
+        );
+      }
+      const envelope: Envelope = await withErrorEnvelope(() =>
+        checkCalculationViewDesignTime(ctx.config, packageId, objectName),
+      );
+      return toToolResult(envelope);
+    }
+    if (!viewName) {
+      return mcpErrorText(
+        'runtime 模式需要 viewName（形如 「ZDEMO.ZDEMO_MKC/ZDEMO03_CV003」）。',
+        '要校验设计时对象请改传 target=design 并给 packageId + objectName',
+      );
+    }
+    const envelope: Envelope = await withErrorEnvelope(() =>
+      validateCalculationView(ctx.pool, schema, viewName, action),
+    );
+    return toToolResult(envelope);
+  });
+
+  regCap(CAP.hana_view_check_actions, async ({ checkProcedureName }) => {
+    const envelope: Envelope = await withErrorEnvelope(() => getCheckActions(ctx.pool, checkProcedureName));
+    return toToolResult(envelope);
+  });
+
+  regCap(CAP.hana_view_activate, async ({ packageId, objectName }) => {
+    const envelope: Envelope = await withErrorEnvelope(() =>
+      activateCalculationView(ctx.config, ctx.pool, packageId, objectName, 'xs_rest'),
+    );
+    return toToolResult(envelope);
+  });
+
+  // 具名 handler：操作级别名（hana_view_update#<op>）要复用它——同一套校验/闸门/归一，别名只是入口形状
+  const handleViewUpdate: CapabilityHandler<typeof CAP.hana_view_update.inputSchema> = async ({
+    packageId,
+    objectName,
+    xml,
+    operations,
+    changeset,
+    ifMatch,
+    activate,
+    probeRows,
+    dryRun,
+    migration,
+    async: runAsync,
+  }) => {
+    // 三选一（P7）：xml / operations / changeset 恰好一个。此前 xml 与 operations 同给要到服务层才被拒
+    // （回执形状不同、且已经读了一次定义）；changeset 与任一单对象方式同给 = 调用方语义不明，同样入口即拒。
+    // 服务层那条 xml/operations 断言保留为纵深防御（脚本/内部调用不经过工具层）。
+    const provided = [
+      xml !== undefined ? 'xml' : undefined,
+      operations && operations.length > 0 ? 'operations' : undefined,
+      changeset !== undefined ? 'changeset' : undefined,
+    ].filter((x): x is string => x !== undefined);
+    if (provided.length > 1) {
+      return mcpErrorText(
+        `xml / operations / changeset 三选一，请勿同时提供（本次同时收到：${provided.join(' + ')}）`,
+        '单对象改造用 operations（推荐）或 xml；多对象批次用 changeset（单次调用内闭合，失败逆序补偿）',
+      );
+    }
+    if (provided.length === 0) {
+      return mcpErrorText(
+        '需要提供 xml（全量 XML 更新）、operations（声明式操作补丁，推荐）或 changeset（多对象变更集）之一',
+        `单对象用 operations 免读写 XML（加 join / 改 SQL）；多对象批次用 changeset（actions 上限 ${CHANGESET_MAX_ACTIONS}）`,
+      );
+    }
+    // async 只与 changeset 组合（单对象通道的一次 PUT 不值得异步；静默忽略 async 会制造
+    // "我提交了任务"的错觉——显式拒绝并指路）
+    if (runAsync === true && changeset === undefined) {
+      return mcpErrorText(
+        'async=true 仅与 changeset 组合（单对象通道请直接同步调用）',
+        '长批次用 changeset + async=true：立即返回 taskId，用 hana_task_get 轮询、hana_task_cancel 取消',
+      );
+    }
+    if (changeset) {
+      // changeset 模式与单对象通道的旋钮不组合（显式提供即拒）：批内每项各自取锁内基线并完成激活，
+      // ifMatch/activate/probeRows/dryRun/顶层 migration 没有落点。先例：hana_data_preview 的
+      // 「勘察模式不使用这些参数」（P10-c c2）——静默忽略比报错更难查；dryRun 尤其致命：
+      // 被静默忽略 = "承诺零写入、实际逐项写"，安全承诺直接反转。默认值参数按"非默认"判定（probeRows）。
+      const inapplicable = [
+        ifMatch !== undefined ? 'ifMatch' : undefined,
+        activate === true ? 'activate=true' : undefined,
+        // 默认值参数按"非默认"判定（param-guards 既有口径）；undefined 也要放行——
+        // 经门面路由进来的 args 可能没跑过默认值填充，不能把"没给"当成"给了非默认值"。
+        probeRows !== undefined && probeRows !== DEFAULT_PROBE_ROWS ? 'probeRows' : undefined,
+        dryRun === true ? 'dryRun=true' : undefined,
+        migration !== undefined ? 'migration' : undefined,
+      ].filter((x): x is string => x !== undefined);
+      if (inapplicable.length > 0) {
+        return mcpErrorText(
+          `changeset 模式与单对象通道参数（${inapplicable.join(' / ')}）不组合`,
+          '批内每项各自取锁内基线并完成激活、不发起行探测；破坏性动作的 migration 声明放在各自的 action 上',
+        );
+      }
+      if (changeset.actions.length === 0) {
+        return mcpErrorText(
+          'changeset.actions 不能为空（空批次会返回一次什么都没做的"成功"）',
+          `给出 1~${CHANGESET_MAX_ACTIONS} 个动作，或改用 xml/operations 的单对象通道`,
+        );
+      }
+      // migration 声明的合法性（SSD §1.6 的中文硬错误口径）按 action 类别在入口收窄——工具层不做
+      // 相交/破坏性判定（I3），只做"取的值是否可能是合法声明"这一层。
+      const migrationError = changesetMigrationDeclarationError(changeset.actions);
+      if (migrationError) return mcpErrorText(migrationError);
+      // set_script 的命名归一与单对象通道**同一处理**（工具面 scriptColumns → 内部 columns）：
+      // 批次复用 applyChangeset → updateCalculationView，归一必须在这一个边界处做完（I3）。
+      // 同步与异步两条通道共用这份归一（在进入服务前完成，异步任务体不再重复做工具层判定）。
+      const normalizedActions = changeset.actions.map((action) =>
+        action.action === 'update' && action.operations
+          ? {
+              ...action,
+              operations: action.operations.map((op) => (op.op === 'set_script' ? normalizeSetScriptOp(op) : op)),
+            }
+          : action,
+      );
+      // 异步任务通道（工具化任务 API，2026-10-10）：立即返回 taskId；批次的全部 HANA 交互
+      // （整体预检 → 逐项执行 → 逆序补偿）在任务体内跑——预检仍在任何写入之前，"整批拒绝、零写入"
+      // 的语义不变。提交失败（运行上限）在此抛中文硬错误，尚未发生任何写。
+      if (runAsync === true) {
+        const envelope: Envelope = await withErrorEnvelope(async () =>
+          submitChangesetTask(ctx.config, ctx.pool, normalizedActions, surfaceKeyOf(currentIdentity())),
         );
         return toToolResult(envelope);
       }
-      if (!viewName) {
-        return mcpErrorText(
-          'runtime 模式需要 viewName（形如 「ZDEMO.ZDEMO_MKC/ZDEMO03_CV003」）。',
-          '要校验设计时对象请改传 target=design 并给 packageId + objectName',
-        );
-      }
-      const envelope: Envelope = await withErrorEnvelope(() =>
-        validateCalculationView(ctx.pool, schema, viewName, action),
+      const envelope: Envelope = await withErrorEnvelope(async () => {
+        const report = await applyChangeset(ctx.config, ctx.pool, { actions: normalizedActions });
+        // I2：有任何非 ok 的项（failed/compensated/compensation_failed/conflict_external）绝不允许
+        // 包装成 success——转业务失败信封（raw.code=changeset_partial），报告原样进 raw.errorDetail.report。
+        // 转换实现是单点（changesetPartialError）：异步任务通道的终态结算共用同一份。
+        if (report.partial) throw changesetPartialError(report);
+        return report;
+      });
+      return toToolResult(envelope);
+    }
+    // 单对象通道要求顶层 packageId/objectName 必填（schema 的 superRefine 已强制；changeset 模式下它们可选且不被消费）。
+    // 这里再收窄一次：让类型与运行时都确定，并给绕过 schema 的调用（脚本/内部）留中文硬错误而不是静默。
+    if (!packageId || !objectName) {
+      return mcpErrorText(
+        '单对象模式需要 packageId 与 objectName（changeset 模式下这两个字段被忽略）。',
+        '要一次改多个对象请改用 changeset: { actions: [...] }',
       );
-      return toToolResult(envelope);
-    },
-  );
-
-  reg(
-    'hana_view_check_actions',
-    {
-      title: '查询校验过程支持的动作清单',
-      description:
-        '查询 SYS 下某 CHECK 过程支持的 ACTION 全集及说明（来源：SYS.GET_CHECK_ACTIONS）。' +
-        '用于在调用 hana_view_validate 前确认可用的动作名，或了解 HANA 提供的表/目录一致性检查能力。' +
-        '默认列出计算视图相关（CHECK_CALCULATION_VIEW）。',
-      inputSchema: z.object({
-        checkProcedureName: z
-          .enum([
-            'CHECK_CALCULATION_VIEW',
-            'CHECK_CALCULATION_MODEL',
-            'CHECK_ANALYTICAL_MODEL',
-            'CHECK_CALCENGINE',
-            'CHECK_CATALOG',
-            'CHECK_TABLE_CONSISTENCY',
-            'CHECK_TOPOLOGY_TREE',
-            'CHECK_ES',
-          ])
-          .default('CHECK_CALCULATION_VIEW')
-          .describe('CHECK 过程名（默认 CHECK_CALCULATION_VIEW）'),
-      }),
-      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
-    },
-    async ({ checkProcedureName }) => {
-      const envelope: Envelope = await withErrorEnvelope(() => getCheckActions(ctx.pool, checkProcedureName));
-      return toToolResult(envelope);
-    },
-  );
-
-  regWrite(
-    'hana_view_activate',
-    {
-      title: '激活 Calculation View（设计时对象）',
-      description:
-        '将可写包下的 Calculation View 设计时对象激活为运行时列视图（XS REST：PUT + SapBackPack {"Activate":true}）。' +
-        '激活前建议先用 hana_view_validate 校验；激活后可用 hana_metadata_get_view 读取定义、hana_data_preview 预览数据。' +
-        '失败会透传编译错误明细（不误报成功）。安全约束：写操作包范围由 HANA_WRITE_PACKAGES 配置。',
-      inputSchema: z.object({
-        packageId: zPackageId('目标包名；须在 HANA_WRITE_PACKAGES 配置的可写范围内'),
-        objectName: zObjectName('视图对象名（不含包名）'),
-      }),
-      annotations: { readOnlyHint: false, idempotentHint: false, openWorldHint: false, destructiveHint: false },
-    },
-    async ({ packageId, objectName }) => {
-      const envelope: Envelope = await withErrorEnvelope(() =>
-        activateCalculationView(ctx.config, ctx.pool, packageId, objectName, 'xs_rest'),
+    }
+    // migration.strategy 的枚举契约在 handler 落地（SSD §1.6）：schema 放宽成 z.string() 后，
+    // 非法值必须在这里以中文硬错误列出合法值——入口即拒，一条写都不发生。
+    const mig = normalizeMigrationStrategy(migration, MIGRATION_DECLARATIONS, 'hana_view_update');
+    if ('error' in mig) return mcpErrorText(mig.error);
+    const envelope: Envelope = await withErrorEnvelope(() =>
+      updateCalculationView(
+        ctx.config,
+        ctx.pool,
+        packageId,
+        objectName,
+        // 命名归一（P10-c c2）：工具面统一叫 scriptColumns（与 hana_view_create 同名同义），
+        // 内部 view-edit 的 spec 仍叫 columns——差异只在这一个边界处，不扩散到模型层。
+        { xml, operations: operations?.map((op) => (op.op === 'set_script' ? normalizeSetScriptOp(op) : op)) },
+        // P6：dryRun=只读预演，migration=破坏性变更的显式声明位。判定一律在服务层（I3）——
+        // 工具层只透传，若在此预判会造出与 view-diff/migrate.rules 漂移的第二份判定。
+        // （strategy 的**合法性**校验是例外：schema 为宽松 z.string()，由上面的 normalizeMigrationStrategy 收窄。）
+        { ifMatch, activate, probeRows, dryRun, migration: mig.value },
+      ),
+    );
+    // 乐观锁冲突（If-Match 不匹配的 412）不再转硬错误散文：withErrorEnvelope 产出的业务失败信封
+    // 原样回给调用方，raw.conflict 带 currentETag/currentVersion，可重读后重放（SSD §1.2 / §4.2）。
+    // 判定走共享读取件 conflictOf（I3）——本模块不自解析 raw.code，命中时只记一条服务端日志。
+    const conflict = conflictOf(envelope);
+    if (conflict) {
+      logger.warn(
+        { packageId, objectName, code: conflict.code, currentETag: conflict.conflict?.currentETag },
+        '视图更新冲突：已按业务失败信封返回（调用方从 raw.conflict 取机读载荷）',
       );
-      return toToolResult(envelope);
-    },
-  );
+    }
+    return toToolResult(envelope);
+  };
+  regCap(CAP.hana_view_update, handleViewUpdate);
 
-  regWrite(
-    'hana_view_update',
-    {
-      title: '更新 Calculation View（声明式 operations 或全量 XML）',
-      description:
-        '更新已有 Calculation View，两种方式二选一（修改 CV 可零 XML）：' +
-        '① operations（推荐）：声明式操作补丁，服务端读取当前定义并确定性变换后走原 PUT 更新路径——**无需读取也不生成任何 XML**。' +
-        '支持两类操作（可混用，按序应用）：' +
-        'op=add_join（追加一个 join：左侧=当前输出节点，右侧=源视图新 Projection；条件字段左右可不同名，' +
-        '自动按 BW 同款「join 输入映射重命名」接线，如左 0MATERIAL = 右 ZDEMO_MAT；fields 缺省自动带出源视图可见新增字段；仅支持单输出链状视图）；' +
-        'op=set_script（替换 **SQL 模式视图**的脚本正文与输出列清单：脚本改写、增删输出列都走这条，服务端重建 <definition>、' +
-        '节点的 viewAttributes（含 datatype/length）与 logicalModel 输出段；非 SQL 模式视图会明确报错）。' +
-        '返回每条操作的应用明细（新增节点/字段、脚本字节数变化）与实测激活状态。' +
-        '② xml：传入完整新设计时 XML 全量覆盖（复杂改造用；可先用 hana_metadata_get_view(format=xml) 读取再改，最小 diff）。' +
-        'xml 方式写入前有服务端护栏（XML 可解析、根 scenario id 与对象名一致、logicalModel 指向真实节点——手工改 XML 两大高频事故激活前拦下），' +
-        '通过后返回 xmlVerification 摘要（输出节点/字段数）供免回读自检。' +
-        '两种方式都走 XS REST PUT + If-Match ETag 乐观锁：ETag 基线统一在**请求入口**捕获（读时取），' +
-        '到写入之间的任何并发写入都会使基线失效，冲突以 HTTP 412 显式返回（isError + 重读提示），不会静默覆盖他人改动；' +
-        '需要跨调用强一致（例如基于更早一次读取的内容）时显式传 ifMatch。' +
-        '实测边界：本服务器对合法模型「写入即激活」，返回的 activated 为写入后实测状态；新内容编译失败时对象保持旧激活版本，' +
-        '明细在 activationErrors，**完整明细（含 DDL 全文）在 activationDetail——无需再调 hana_view_validate 拿全错误**。' +
-        'probeRows（默认 10）在激活成功后回探测前 N 行，0 行会附带排查提示（键值补零 / 号码列语义 / 数据所在表与分区）。' +
-        '安全约束：写操作包范围由 HANA_WRITE_PACKAGES 配置。',
-      inputSchema: z.object({
-        packageId: zPackageId('目标包名；须在 HANA_WRITE_PACKAGES 配置的可写范围内'),
-        objectName: zObjectName('视图对象名（不含包名）'),
-        xml: z
-          .string()
-          .min(1)
-          .optional()
-          .describe(
-            '方式一：新的完整设计时 XML 全量覆盖（与 operations 二选一；常规加 join / 改 SQL 优先用 operations）',
-          ),
-        operations: z
-          .array(
-            z.discriminatedUnion('op', [
-              z.object({
-                op: z.literal('add_join').describe('操作类型：追加一个 join'),
-                sourcePackageId: zPackageId(
-                  'join 源视图的包名（只读即可，无需可写），如 system-local.bw.bw2hana.query.zdemo01r014',
-                ),
-                sourceObjectName: zObjectName('join 源视图对象名（不含包名），如 ZDEMO01R014_Q017'),
-                joinType: z
-                  .enum(['inner', 'leftOuter', 'rightOuter', 'fullOuter'])
-                  .default('leftOuter')
-                  .describe('join 类型，默认 leftOuter'),
-                conditions: z
-                  .array(
-                    z.object({
-                      leftField: z.string().min(1).describe('当前视图输出节点上的字段（必须已存在）'),
-                      rightField: z.string().min(1).describe('源视图上的字段（可与左侧不同名，自动重命名接线）'),
-                    }),
-                  )
-                  .min(1)
-                  .max(10)
-                  .describe('join 条件（1~10 组）；例：[{leftField:"0MATERIAL", rightField:"ZDEMO_MAT"}]'),
-                fields: z
-                  .array(z.string())
-                  .max(100)
-                  .optional()
-                  .describe('要透出到输出的源视图字段；缺省=自动带出全部可见新增属性（推荐省略）'),
-              }),
-              z.object({
-                op: z.literal('set_script').describe('操作类型：替换 SQL 模式视图（SqlScriptView）的脚本与输出列'),
-                script: z
-                  .string()
-                  .min(1)
-                  .max(100000)
-                  .describe(
-                    '新 SQL 查询（表名写全限定名 SCHEMA."表"；输出列别名须与 columns 的 name 一致）。服务端自动包成 BEGIN VAR_OUT = <查询>; END 过程体；也可直接给完整 BEGIN…END 过程体',
-                  ),
-                columns: z
-                  .array(SCRIPT_COLUMN_SCHEMA)
-                  .min(1)
-                  .max(600)
-                  .describe(
-                    '新的输出列清单（**整体替换**旧输出：脚本一换输出列集合通常也变，逐列增补会留下旧列导致激活失败）',
-                  ),
-              }),
-            ]),
-          )
-          .min(1)
-          .max(10)
-          .optional()
-          .describe('方式二（推荐）：声明式操作补丁（与 xml 二选一）；服务端确定性变换，模型零 XML'),
-        ifMatch: z.string().optional().describe('乐观锁 ETag；省略=自动取当前版本的 ETag'),
-        activate: z.boolean().default(false).describe('true=更新后立即激活；false=仅更新设计时对象'),
-        probeRows: z
-          .number()
-          .int()
-          .min(0)
-          .max(MAX_PROBE_ROWS)
-          .default(DEFAULT_PROBE_ROWS)
-          .describe('激活成功后探测的行数上限（0=不探测）：让「0 行」当场可见（返回 rowProbe 含 emptyHint 排查提示）'),
-      }),
-      annotations: { readOnlyHint: false, idempotentHint: false, openWorldHint: false, destructiveHint: true },
-    },
-    async ({ packageId, objectName, xml, operations, ifMatch, activate, probeRows }) => {
-      if (!xml && !(operations && operations.length > 0)) {
-        return mcpErrorText(
-          '需要提供 xml（全量 XML 更新）或 operations（声明式操作补丁，推荐）之一。',
-          '两种方式任选其一：operations 免读写 XML（加 join / 改 SQL），xml 用于复杂改造',
-        );
-      }
-      const envelope: Envelope = await withErrorEnvelope(() =>
-        updateCalculationView(
-          ctx.config,
-          ctx.pool,
+  // 操作级条目（`hana_view_update#<op>`，routeOnly）：只登记原始 handler、不注册工具。
+  // 别名把入参还原成父工具的一次 operations 调用——与直调父工具完全等价（同一 handler、同一闸门）。
+  for (const decl of VIEW_OPS) {
+    const opId = `hana_view_update#${decl.id}`;
+    // 运行期取条目（清单构建期已保证别名存在；此处 fail-closed 防手工漂移——声明了却不可达是最坏的静默）
+    const opCap = findCapability(opId);
+    if (!opCap) throw new Error(`清单里缺操作级条目 ${opId}（VIEW_OPS 与 manifest 漂移）`);
+    regCapAlias(opCap, async (args, serverCtx) => {
+      const { packageId, objectName, ifMatch, dryRun, migration, ...payload } = args as Record<string, unknown>;
+      return handleViewUpdate(
+        {
           packageId,
           objectName,
-          { xml, operations },
-          { ifMatch, activate, probeRows },
-        ),
+          operations: [{ op: decl.id, ...payload }],
+          ifMatch,
+          dryRun: dryRun === true,
+          migration,
+          activate: false,
+          probeRows: DEFAULT_PROBE_ROWS,
+          async: false,
+        } as Parameters<typeof handleViewUpdate>[0],
+        serverCtx,
       );
-      // 乐观锁冲突（显式 If-Match 与服务端不符）：硬错误 isError + 重读提示
-      const rawCode = (envelope.raw as { code?: string } | undefined)?.code;
-      if (envelope.success === false && rawCode === '412') {
-        return mcpErrorText(
-          '更新冲突：对象已被他人修改（版本乐观锁 If-Match 不匹配）。',
-          '请先用 hana_metadata_get_view(packageId, objectName, format=xml) 重读最新内容，基于新版本修改后重试',
-        );
-      }
-      return toToolResult(envelope);
-    },
-  );
+    });
+  }
 
-  regWrite(
-    'hana_view_delete',
-    {
-      title: '删除 Calculation View（设计时对象）',
-      description:
-        '删除可写包下的 Calculation View 设计时对象（XS REST：DELETE）。删除前建议用 hana_metadata_where_used 查看被谁引用，' +
-        '删除会造成依赖方失效。删除后对象从 hana_metadata_search_objects / hana_package_list_objects 消失。' +
-        '安全约束：写操作包范围由 HANA_WRITE_PACKAGES 配置。',
-      inputSchema: z.object({
-        packageId: zPackageId('目标包名；须在 HANA_WRITE_PACKAGES 配置的可写范围内'),
-        objectName: zObjectName('视图对象名（不含包名）'),
-      }),
-      annotations: { readOnlyHint: false, idempotentHint: false, openWorldHint: false, destructiveHint: true },
-    },
-    async ({ packageId, objectName }) => {
-      const envelope: Envelope = await withErrorEnvelope(() =>
-        deleteCalculationView(ctx.config, packageId, objectName),
+  regCap(CAP.hana_view_delete, async ({ packageId, objectName, migration }) => {
+    // migration.strategy 的枚举契约在 handler 落地（SSD §1.6）：delete 通道只有 acknowledge_dependents，
+    // 非法值（含 update 通道的字段级策略）入口即拒、列出合法值。
+    const mig = normalizeMigrationStrategy(migration, DELETE_MIGRATION_DECLARATIONS, 'hana_view_delete');
+    if ('error' in mig) return mcpErrorText(mig.error);
+    // P6：pool 供服务层查影响半径（直接下游单跳）做破坏性判定；migration 是破坏性变更的显式承担声明。
+    // 判定与拒绝都在服务层（I3），工具层只透传——未声明且有下游引用时服务层拒绝且不删除。
+    const envelope: Envelope = await withErrorEnvelope(() =>
+      deleteCalculationView(ctx.config, ctx.pool, packageId, objectName, { migration: mig.value }),
+    );
+    // 与 update 同一审计口径（I3）：命中 412 / OBJECT_NOT_FOUND 机读冲突码时记一条服务端日志；
+    // 冲突载荷本身照常由信封透出（不在此转换形状）。
+    const conflict = conflictOf(envelope);
+    if (conflict) {
+      logger.warn(
+        { packageId, objectName, code: conflict.code, currentETag: conflict.conflict?.currentETag },
+        '视图删除冲突：已按业务失败信封返回（调用方从 raw.conflict 取机读载荷）',
       );
-      return toToolResult(envelope);
-    },
-  );
+    }
+    return toToolResult(envelope);
+  });
 }

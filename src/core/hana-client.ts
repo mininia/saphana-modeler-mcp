@@ -3,6 +3,12 @@
 import hanaClient from '@sap/hana-client';
 import type { HanaConfig } from '../config/config.js';
 import { HanaBusinessError, normalizeHanaError } from './errors.js';
+import {
+  POOL_ACQUIRE_TIMEOUT_MS_DEFAULT,
+  POOL_MAX_DEFAULT,
+  POOL_MAX_WAITERS_DEFAULT,
+  SQL_TIMEOUT_MS_DEFAULT,
+} from './limits.js';
 
 type Connection = hanaClient.Connection;
 type ConnectionOptions = hanaClient.ConnectionOptions;
@@ -69,14 +75,36 @@ interface Waiter {
   timer?: NodeJS.Timeout;
 }
 
+/**
+ * 「调用方给出的语句超时」判定：只有**有限正数**才启用带超时的执行路径。
+ * 其余取值（undefined / 0 / 负数 / NaN / Infinity）一律按未给处理，保持既有 conn.exec 行为——
+ * 把非法值当"超时 0ms"之类的静默改义会直接打断正常调用。
+ */
+function positiveTimeoutMs(opts?: { timeoutMs?: number }): number | undefined {
+  const t = opts?.timeoutMs;
+  return typeof t === 'number' && Number.isFinite(t) && t > 0 ? t : undefined;
+}
+
 /** 连接池可调参数（默认值面向「一个 MCP 服务实例服务多个 HTTP 客户端」的场景） */
 export interface HanaPoolOptions {
-  /** 连接并发上限（默认 4） */
+  /** 连接并发上限（默认 POOL_MAX_DEFAULT=4；HANA_POOL_MAX） */
   max?: number;
-  /** 池满时的排队上限（默认 64）：超出立即失败，防单客户端打满池后请求无限堆积 */
+  /**
+   * 池满时的排队上限（默认 POOL_MAX_WAITERS_DEFAULT=64；HANA_POOL_MAX_WAITERS）：
+   * 超出立即失败，防单客户端打满池后请求无限堆积
+   */
   maxWaiters?: number;
-  /** 排队等待超时 ms（默认 30s）：到时仍未获得连接即失败，防单个慢查询把全部调用方无限期挂住 */
+  /**
+   * 排队等待超时 ms（默认 POOL_ACQUIRE_TIMEOUT_MS_DEFAULT=30s；HANA_POOL_WAIT_MS）：
+   * 到时仍未获得连接即失败，防单个慢查询把全部调用方无限期挂住
+   */
   acquireTimeoutMs?: number;
+  /**
+   * 写路径语句超时 ms（默认 SQL_TIMEOUT_MS_DEFAULT=60s；HANA_SQL_TIMEOUT_MS）。
+   * **不**作为全局默认：hana_sql_analyze（最长 5 分钟）与元数据搜索（5–30s）是合法长语句，
+   * 全局设限会误杀它们——需要上限的调用点经 query/execute/execOn/callProcedure 的 opts 逐处传入。
+   */
+  statementTimeoutMs?: number;
 }
 
 /**
@@ -100,15 +128,18 @@ export class HanaPool {
   private readonly max: number;
   private readonly maxWaiters: number;
   private readonly acquireTimeoutMs: number;
+  /** 写路径语句超时的默认来源（HANA_SQL_TIMEOUT_MS）；调用方也可经各入口的 opts.timeoutMs 逐条覆盖 */
+  readonly statementTimeoutMs: number;
   private idle: Connection[] = [];
   private inUse = 0;
   private readonly waiters: Waiter[] = [];
 
   constructor(config: HanaConfig, opts: HanaPoolOptions = {}) {
     this.options = buildConnectionOptions(config);
-    this.max = opts.max ?? 4;
-    this.maxWaiters = opts.maxWaiters ?? 64;
-    this.acquireTimeoutMs = opts.acquireTimeoutMs ?? 30_000;
+    this.max = opts.max ?? POOL_MAX_DEFAULT;
+    this.maxWaiters = opts.maxWaiters ?? POOL_MAX_WAITERS_DEFAULT;
+    this.acquireTimeoutMs = opts.acquireTimeoutMs ?? POOL_ACQUIRE_TIMEOUT_MS_DEFAULT;
+    this.statementTimeoutMs = opts.statementTimeoutMs ?? SQL_TIMEOUT_MS_DEFAULT;
   }
 
   /** 获取一个可用连接（池满则排队；队列满或等待超时以 HanaBusinessError 失败） */
@@ -172,13 +203,33 @@ export class HanaPool {
     }
   }
 
-  /** 执行查询并整体返回行（SELECT 语义；行数上限由调用方 SQL 保证） */
-  async query<T = Record<string, unknown>>(sql: string, params?: HanaParameterList): Promise<T[]> {
+  /**
+   * 执行查询并整体返回行（SELECT 语义；行数上限由调用方 SQL 保证）。
+   * opts.timeoutMs 给出有限正数时改走 execPreparedOn（prepare/exec + stmt.setTimeout + drop），
+   * 否则保持既有的 conn.exec 一次往返——**存量调用点不传第三参，行为与签名向后兼容**。
+   */
+  async query<T = Record<string, unknown>>(
+    sql: string,
+    params?: HanaParameterList,
+    opts?: { timeoutMs?: number },
+  ): Promise<T[]> {
+    const timeoutMs = positiveTimeoutMs(opts);
+    if (timeoutMs !== undefined) {
+      return this.withConnection((conn) => execPreparedOn<T>(conn, sql, params ?? [], { timeoutMs }));
+    }
     return this.withConnection((conn) => execAsync<T[]>(conn, sql, params));
   }
 
-  /** 执行 DDL/DML（返回驱动结果对象，如 execReturnType） */
-  async execute(sql: string, params?: HanaParameterList): Promise<unknown> {
+  /**
+   * 执行 DDL/DML（非超时路径返回驱动结果对象，如 execReturnType）。
+   * ⚠ 走超时路径（opts.timeoutMs）时返回的是 **T[]**——DDL/INSERT 得到空数组（execPreparedOn 的行数组形状）；
+   * 两种形状对既有调用点无影响（它们都不使用返回值）。
+   */
+  async execute(sql: string, params?: HanaParameterList, opts?: { timeoutMs?: number }): Promise<unknown> {
+    const timeoutMs = positiveTimeoutMs(opts);
+    if (timeoutMs !== undefined) {
+      return this.withConnection((conn) => execPreparedOn(conn, sql, params ?? [], { timeoutMs }));
+    }
     return this.withConnection((conn) => execAsync(conn, sql, params));
   }
 
@@ -189,10 +240,23 @@ export class HanaPool {
    * 按语句名回读、用完再按名删除）。query/execute 各自 acquire 一条连接，多步之间可能被别的请求
    * 插入，也可能落到不同连接上，语义就不连贯了。
    *
+   * 带 opts.timeoutMs（有限正数）时改走 execPreparedOn：语句超时落到 stmt.setTimeout 且结束即 drop；
+   * 否则保持既有 conn.exec 行为。两种路径的运行时结果都是「行数组」（T 按既有调用点声明成行数组类型）。
+   *
    * ⚠️ 持有 conn 期间**只能**走本方法，不可再调 query/execute：那会二次 acquire
    * （并发下互相等池位直至 acquireTimeout 失败）。
    */
-  async execOn<T = Record<string, unknown>>(conn: Connection, sql: string, params?: HanaParameterList): Promise<T> {
+  async execOn<T = Record<string, unknown>>(
+    conn: Connection,
+    sql: string,
+    params?: HanaParameterList,
+    opts?: { timeoutMs?: number },
+  ): Promise<T> {
+    const timeoutMs = positiveTimeoutMs(opts);
+    if (timeoutMs !== undefined) {
+      // 既有调用点按「行数组」声明 T（execOn<PlanRow[]>）；execPreparedOn 的返回值正是行数组，按声明收窄
+      return (await execPreparedOn(conn, sql, params ?? [], { timeoutMs })) as T;
+    }
     return execAsync<T>(conn, sql, params);
   }
 
@@ -205,9 +269,18 @@ export class HanaPool {
    * - 执行成功后用 stmt.getParameterValue(i)（i 从 0 起）读回输出参数。
    * 适配 HANA 内置过程（如 SYS.REPOSITORY_REST(IN BLOB, OUT BLOB)）。
    *
+   * opts.timeoutMs（有限正数）会设到语句上：REPOSITORY_REST 这类控制面调用一挂住就占着池位
+   * （池上限 4），几个这样的请求就足以让全部工具调用排队超时，必须可设上限。
+   *
    * 说明：hana-client 没有暴露 stmt 对象到 withConnection 之外，这里单独建连接完成调用。
    */
-  async callProcedure(sql: string, inParams: HanaParameterList | undefined, outParamCount: number): Promise<unknown[]> {
+  async callProcedure(
+    sql: string,
+    inParams: HanaParameterList | undefined,
+    outParamCount: number,
+    opts?: { timeoutMs?: number },
+  ): Promise<unknown[]> {
+    const timeoutMs = positiveTimeoutMs(opts);
     const conn = await this.acquire();
     try {
       return await new Promise<unknown[]>((resolve, reject) => {
@@ -226,6 +299,15 @@ export class HanaPool {
           }
         };
         const inCount = Array.isArray(inParams) ? inParams.length : inParams ? 1 : 0;
+        if (timeoutMs !== undefined) {
+          try {
+            stmt.setTimeout(timeoutMs);
+          } catch (e) {
+            // 同步抛错也要归一化（与 execPreparedOn 同口径），连接由外层 finally 归还
+            reject(normalizeHanaError(e));
+            return;
+          }
+        }
         if (inParams === undefined || inParams === null) stmt.exec([], cb);
         else stmt.exec(inParams as Array<string | number | boolean | Buffer | null>, cb);
       });

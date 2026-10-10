@@ -1,9 +1,33 @@
 import { ProtocolError, SdkError, SdkErrorCode, SdkHttpError } from '@modelcontextprotocol/server';
 import type { Envelope, HanaMessage } from '../types/hana.js';
 import { logger, redactSensitive } from './logger.js';
-import { currentClientId } from './request-context.js';
+import { currentAgentLabel, currentClientId } from './request-context.js';
 
 export { ProtocolError, SdkError, SdkErrorCode, SdkHttpError };
+
+/**
+ * 乐观锁冲突（412）/ 目标缺失（404）的机读载荷，经 withErrorEnvelope 进 envelope.raw.conflict。
+ *
+ * 关于 currentETag：它是**冲突时点的补读值**（捕获 412 后立刻再读一次 fileMeta），
+ * **不是**本次写的新基线——实测 412 响应不带 ETag 头（P5 §4.9#B），只能补读；
+ * 这一次额外往返不可省，且补读结果不许被当成"最新基线"回写或重试。
+ * 补读本身失败（如对象已被并发删除）时原因写进 currentUnavailable——
+ * 不许把补读失败静默成 undefined（"查不到"与"没去查"必须可区分）。
+ */
+export interface ConflictInfo {
+  /** 原始 HTTP 状态：412 或 404 */
+  httpStatus: number;
+  /** 调用方提交的基线（If-Match），用于自我诊断 */
+  providedEtag?: string;
+  /** 冲突时点补读 fileMeta 所得的当前 ETag（不是本次写的新基线！） */
+  currentETag?: string;
+  /** 冲突时点的 SapBackPack.Version */
+  currentVersion?: number;
+  /** 冲突时点的 SapBackPack.ActivatedAt */
+  activatedAt?: number;
+  /** 补读失败时的原因（如对象已被删除）——不许把补读失败静默成 undefined */
+  currentUnavailable?: string;
+}
 
 /**
  * HANA 业务错误：驱动/SQL 层错误归一化载体（对齐 bw7.5 的 SapBusinessError）。
@@ -13,6 +37,12 @@ export { ProtocolError, SdkError, SdkErrorCode, SdkHttpError };
  * - diagnosis：可选的排障报告（如数据预览权限诊断），经 withErrorEnvelope 进 envelope.raw.diagnosis
  */
 export class HanaBusinessError extends Error {
+  /**
+   * 冲突载荷（P5 §4.2）：412/404 的机读形状，经 withErrorEnvelope 进 envelope.raw.conflict。
+   * 非 readonly（可写）：由 withConflict 工厂在构造后赋值，构造器保持原签名不变。
+   */
+  conflict?: ConflictInfo;
+
   constructor(
     message: string,
     public readonly code?: string,
@@ -39,6 +69,19 @@ export class HanaBusinessError extends Error {
    */
   static withRawDetail(message: string, code: string | undefined, rawDetail: unknown): HanaBusinessError {
     return new HanaBusinessError(message, code, undefined, [], undefined, rawDetail);
+  }
+
+  /**
+   * 便捷构造：只带「冲突载荷」（→ envelope.raw.conflict）。
+   *
+   * 冲突错误实际只有 message/code/conflict 三个有值，其余槽位（sqlState/messages/diagnosis/rawDetail）
+   * 与本场景无关——与 withRawDetail 同理，只暴露有值的字段，避免 `undefined, []` 占位噪声。
+   * code 收敛为两个机读值（412=乐观锁冲突、OBJECT_NOT_FOUND=对象不存在），工具层按码分流。
+   */
+  static withConflict(message: string, code: '412' | 'OBJECT_NOT_FOUND', conflict: ConflictInfo): HanaBusinessError {
+    const err = new HanaBusinessError(message, code);
+    err.conflict = conflict;
+    return err;
   }
 }
 
@@ -73,9 +116,15 @@ export function wrapUnknownError(_e: unknown): SdkError {
  * 信封统一附带当前客户端身份（HTTP 模式；stdio 无身份上下文则不带该字段）。
  */
 export async function withErrorEnvelope<T>(fn: () => Promise<T>): Promise<Envelope> {
-  // 身份在请求上下文中读取（工具 handler 运行在 HTTP 请求的 AsyncLocalStorage 上下文内）
+  // 身份/归因在请求上下文中读取（工具 handler 运行在 HTTP 请求的 AsyncLocalStorage 上下文内；
+  // agentLabel 是进程级的，stdio 下同样有值）
   const clientId = currentClientId();
-  const withIdentity = (e: Envelope): Envelope => (clientId ? { ...e, clientId } : e);
+  const agentLabel = currentAgentLabel();
+  const withIdentity = (e: Envelope): Envelope => ({
+    ...e,
+    ...(clientId ? { clientId } : {}),
+    ...(agentLabel ? { agentLabel } : {}),
+  });
   try {
     const data = await fn();
     return withIdentity({ success: true, data, messages: [] });
@@ -87,6 +136,8 @@ export async function withErrorEnvelope<T>(fn: () => Promise<T>): Promise<Envelo
       const extra = {
         ...(e.diagnosis != null ? { diagnosis: e.diagnosis } : {}),
         ...(e.rawDetail != null ? { errorDetail: e.rawDetail } : {}),
+        // 冲突载荷（412/404 的机读形状，P5 §4.2）与 code 同一层显式并入——不许落在 errorDetail 里反推
+        ...(e.conflict ? { conflict: e.conflict } : {}),
       };
       const rawWithDiagnosis = Object.keys(extra).length > 0 ? { ...(raw ?? {}), ...extra } : raw;
       return withIdentity({
@@ -104,6 +155,38 @@ export async function withErrorEnvelope<T>(fn: () => Promise<T>): Promise<Envelo
     logger.error({ err: e }, '工具调用发生未知错误');
     throw wrapUnknownError(e);
   }
+}
+
+/**
+ * 从失败信封读取冲突码（工具层与测试共用的**唯一**读取实现，I3）。
+ *
+ * 业务失败信封里只有 raw.code 是机读码；conflict 是 P5 新增的**显式字段**
+ * （withErrorEnvelope 只产出 raw.code / diagnosis / errorDetail / conflict 这一层，
+ * 不会从 errorDetail 里反推）——故这里直接读 raw.code / raw.conflict，不做散文匹配。
+ * 语义：success !== false → undefined；raw.code 不是 '412'/'OBJECT_NOT_FOUND' → undefined；
+ * 命中 → { code, conflict }（raw.conflict 缺失/形状不对时只回 code，调用方仍可按码分流）。
+ */
+export function conflictOf(
+  envelope: Envelope,
+): { code: '412' | 'OBJECT_NOT_FOUND'; conflict?: ConflictInfo } | undefined {
+  if (envelope.success !== false) return undefined;
+  const raw = asRecord(envelope.raw);
+  if (!raw) return undefined;
+  const code = raw['code'];
+  if (code !== '412' && code !== 'OBJECT_NOT_FOUND') return undefined;
+  const conflict = raw['conflict'];
+  return isConflictInfo(conflict) ? { code, conflict } : { code };
+}
+
+/** Envelope.raw 是 unknown：读出对象视图（局部小工具，仅本文件使用；数组同样以对象处理，字段读不到即自然落空） */
+function asRecord(v: unknown): Record<string, unknown> | undefined {
+  return v !== null && typeof v === 'object' ? (v as Record<string, unknown>) : undefined;
+}
+
+/** ConflictInfo 的最小形状校验（httpStatus 必须是数字）：raw 是透传数据，不信任其形状 */
+function isConflictInfo(v: unknown): v is ConflictInfo {
+  const rec = asRecord(v);
+  return rec !== undefined && typeof rec['httpStatus'] === 'number';
 }
 
 /**

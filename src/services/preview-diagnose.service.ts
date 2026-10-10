@@ -368,6 +368,68 @@ export async function runtimeViewExists(pool: HanaPool, viewName: string): Promi
   }
 }
 
+/**
+ * 节点预览中间视图的**新鲜度信息回报**（D1）：复用到的视图建于何时、源 CV 最近一次激活于何时。
+ *
+ * 为什么只回报不改行为：复用策略是用户明确口径（存在即复用、**不校验新鲜度**，见 preview.service
+ * 头注与 rules=preview）。本函数只提供**判据**——`stale=true`（中间视图创建时间早于源 CV 最近激活）
+ * 时调用方自行决定「先删该视图 / 改 forceDerive / 接受旧数据」，服务端不替它做选择。
+ *
+ * 全部时间戳比较**在 SQL 里做**（`A.LAST_ACT > V.CREATE_TIME`）：两列出自不同口径的系统表，
+ * 驱动回传的字符串格式不保证一致，拉回 JS 再 parse 是自找口径分叉（这属于 I3：一条规则一份实现）。
+ *
+ * fail-open：任何失败（SYS.VIEWS/_SYS_REPO 不可读、视图刚被并发删掉）都只回 `detail`，
+ * **绝不让信息回报把预览本身打挂**——它不是预览结果的一部分，只是附注。
+ */
+export interface IntermediateFreshness {
+  /** 中间视图创建时间（SYS.VIEWS.CREATE_TIME，原样文本） */
+  createdAt?: string;
+  /** 源对象最近一次激活时间（_SYS_REPO.ACTIVE_OBJECT 的 MAX(ACTIVATED_AT)） */
+  activatedAt?: string;
+  /** true = 中间视图创建于源对象最近激活**之前** ⇒ 复用到的是旧定义（预览数据可能落后） */
+  stale?: boolean;
+  /** 无法判定时的原因（读不到时间戳等；此时 createdAt/activatedAt/stale 均缺省） */
+  detail?: string;
+}
+
+export async function readIntermediateFreshness(
+  pool: HanaPool,
+  viewName: string,
+  packageId: string,
+  objectName: string,
+): Promise<IntermediateFreshness> {
+  try {
+    // CROSS JOIN 的右侧是聚合子查询（恒一行）；CASE 在 SQL 内比较两个 TIMESTAMP，避免跨格式 parse。
+    // 源对象按 (包, 名) 取 MAX(ACTIVATED_AT)：同名多后缀（CV/AV）时取"最近一次激活"，语义上更保守
+    // ——它只会把复用判成"可能旧"，不会把旧定义误判成新。
+    const rows = await pool.query<{ CREATED_AT: unknown; ACTIVATED_AT: unknown; STALE: unknown }>(
+      `SELECT V.CREATE_TIME AS CREATED_AT, A.LAST_ACT AS ACTIVATED_AT,
+              CASE WHEN A.LAST_ACT > V.CREATE_TIME THEN 1 ELSE 0 END AS STALE
+         FROM SYS.VIEWS V
+         CROSS JOIN (SELECT MAX(ACTIVATED_AT) AS LAST_ACT FROM _SYS_REPO.ACTIVE_OBJECT
+                      WHERE PACKAGE_ID = ? AND OBJECT_NAME = ?) A
+        WHERE V.SCHEMA_NAME = '_SYS_BIC' AND V.VIEW_NAME = ?`,
+      [packageId, objectName, viewName],
+    );
+    const row = rows[0];
+    const createdAt = timestampText(row?.CREATED_AT);
+    const activatedAt = timestampText(row?.ACTIVATED_AT);
+    if (createdAt === undefined || activatedAt === undefined) {
+      return { detail: '时间戳不可读（中间视图刚被移除或源对象无激活记录），新鲜度无法判定' };
+    }
+    return { createdAt, activatedAt, stale: Number(row?.STALE ?? 0) === 1 };
+  } catch (e) {
+    logger.warn({ viewName, packageId, objectName, err: e }, '中间视图新鲜度读取失败（不影响预览结果）');
+    return { detail: '新鲜度时间戳读取失败（不影响预览结果）' };
+  }
+}
+
+/** TIMESTAMP 列归一为文本：驱动可能回 string 或 Date，两种都收敛成可直接展示的字符串 */
+function timestampText(v: unknown): string | undefined {
+  if (v === null || v === undefined) return undefined;
+  return v instanceof Date ? v.toISOString() : String(v);
+}
+
 /** 当前用户对某 schema 是否有 SELECT（EFFECTIVE_PRIVILEGES） */
 async function hasSchemaSelect(pool: HanaPool, schema: string): Promise<boolean> {
   const rows = await pool.query<{ C: number }>(

@@ -59,8 +59,8 @@ export interface DeploymentInvariant {
   severity: 'block' | 'warn';
   /**
    * 事实陈述：哪里不自洽、后果是什么。
-   * **不得包含补救指引**——本字段可能随请求响应返回给调用方（通常是模型），
-   * 写明"改哪项配置可放行"等于把绕过方法交给被拦的一方。
+   * **不得包含配置标识符（变量名）与补救指引**——本字段可能随请求响应返回给调用方（通常是模型），
+   * 写明"改哪项配置可放行"等于把绕过方法交给被拦的一方；标识符与处置建议一律进 remedy/override。
    */
   message: string;
   /** 补救指引：**只面向运维**（服务启动自检 / README），不得进入请求响应 */
@@ -102,16 +102,19 @@ export function checkDeploymentInvariants(posture: DeploymentPosture): Deploymen
     out.push({
       code: 'tls_plaintext',
       severity: 'warn',
-      message: 'HANA_TLS=false：连接未加密，凭据与查询数据以明文传输。',
-      remedy: '仅在确认链路可信（如本机/隔离网）时使用',
+      // message = 纯事实句（可能随拦截回执返回给调用方），**不得出现配置标识符**——那等于把
+      // 「改哪项配置可放行」交给被拦的一方；标识符统一进 remedy（只在 describePolicy 的运维出口追加）
+      message: '连接未加密：凭据与查询数据以明文传输。',
+      remedy: '连接未加密来自 HANA_TLS=false；仅在确认链路可信（如本机/隔离网）时使用',
     });
   } else if (!posture.sslValidate) {
     // 加密但不校验证书 = 可被中间人替换证书，加密了但没认证对端
     out.push({
       code: 'encrypted_but_unauthenticated',
       severity: 'warn',
-      message: 'HANA_SSL_VALIDATE=false：连接已加密但未校验服务器证书，无法防中间人替换证书。',
-      remedy: '仅应在内网自签证书环境使用',
+      // 同上：事实句不含标识符，HANA_SSL_VALIDATE=false 只在运维出口（remedy）出现
+      message: '连接已加密但未校验服务器证书：无法防中间人替换证书。',
+      remedy: '校验证书被关闭来自 HANA_SSL_VALIDATE=false；仅应在内网自签证书环境使用',
     });
   }
 

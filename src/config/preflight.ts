@@ -12,7 +12,16 @@ import {
 import { isPackageAllowed, isValidPackagePrefix } from './write-boundary.js';
 import { isSchemaAllowedWith } from '../core/sql.js';
 import { splitList } from '../core/text.js';
-import { parseToolFilter, shouldRegisterTool, TOOL_GROUPS, type ToolFilterConfig } from '../tools/groups.js';
+import {
+  ALL_TOOL_GROUPS,
+  parseToolFilter,
+  shouldRegisterTool,
+  TOOL_GROUPS,
+  type ToolFilterConfig,
+} from '../tools/groups.js';
+import { CONCRETE_CAPABILITY_IDS } from '../capabilities/manifest.js';
+import { describeProfiles, matchedCapabilities, type CallerProfile } from './profiles.js';
+import { resolveEnvAliases } from './config.js';
 
 /**
  * 权限策略层 —— 能力级 + 资源级两类权限的唯一判定入口。
@@ -21,7 +30,7 @@ import { parseToolFilter, shouldRegisterTool, TOOL_GROUPS, type ToolFilterConfig
  *
  * | 维度 | 管什么 | 配置项 | 参考 |
  * |---|---|---|---|
- * | **能力级** | 哪些工具对外暴露 | HANA_TOOL_GROUPS / ALLOW / DENY | tableau 的 INCLUDE/EXCLUDE_TOOLS（组展开）；dataworks 的 TOOL_CATEGORIES/NAMES |
+ * | **能力级** | 哪些工具对外暴露 | MCP_TOOL_GROUPS / ALLOW / DENY | tableau 的 INCLUDE/EXCLUDE_TOOLS（组展开）；dataworks 的 TOOL_CATEGORIES/NAMES |
  * | **资源级** | 能操作哪些资源 | HANA_WRITE_PACKAGES（可写包）/ HANA_SCHEMA_ALLOW（可读 schema） | tableau 的 BoundedContext；dataworks 交给平台 |
  * | （部署级） | 连接侧约束，非任务级 | HANA_TLS / MCP_HTTP_* | —— 两家的 Config 构造期 fail-closed |
  *
@@ -67,13 +76,21 @@ export interface Policy {
   capability: ToolFilterConfig;
   /** 资源级：能操作哪些资源 */
   resource: {
-    /** 可写包前缀（大写；空数组 = 不限制。空 = unrestricted，非空 = restricted） */
+    /**
+     * 可写包前缀（大写；空数组 = 写边界未启用——声明写包的写请求会被闸门以 boundary_off 拒绝，
+     * 只有服务层 assertWritePackageAllowed 那一层是 fail-open，见 checkResource）
+     */
     writePackages: string[];
     /** 可读 schema 的追加项（系统 schema 恒可读，不在此列） */
     schemaAllow: string[];
   };
   /** 部署姿态：连接侧约束（非任务级，见 checkDeployment） */
   deployment: DeploymentPosture;
+  /**
+   * 调用方档案表（P10-c；仅服务进程路径有值，脚本/CLI 的 env 路径为 undefined）。
+   * 只参与**配置自检**（checkProfiles）与调用期授权（authorize.ts），不改注册期可见性。
+   */
+  profiles?: ReadonlyMap<string, CallerProfile>;
   /** 这份策略的来源（人类可读，供日志/报告归因） */
   source: string;
 }
@@ -117,7 +134,7 @@ export interface PolicyRequest {
 }
 
 /** 判定维度 */
-export type Dimension = 'capability' | 'resource' | 'deployment';
+export type Dimension = 'capability' | 'resource' | 'deployment' | 'profile';
 
 /** 单条判定结论 */
 export interface Grant {
@@ -180,11 +197,13 @@ function deploymentFromEnvValues(env: Record<string, unknown>): DeploymentPostur
 
 /** 从一组原始 env 值构造策略（三条来源路径共用） */
 function policyFromEnvValues(env: Record<string, unknown>, source: string): Policy {
+  // 旧名归一（HANA_TOOL_* → MCP_TOOL_*）：与 loadConfig 同一实现，避免两条解析路径分叉
+  const e = resolveEnvAliases(env);
   return {
     capability: parseToolFilter(
-      String(env.HANA_TOOL_GROUPS ?? ''),
-      String(env.HANA_TOOL_ALLOW ?? ''),
-      String(env.HANA_TOOL_DENY ?? ''),
+      String(e.MCP_TOOL_GROUPS ?? ''),
+      String(e.MCP_TOOL_ALLOW ?? ''),
+      String(e.MCP_TOOL_DENY ?? ''),
     ),
     resource: {
       writePackages: splitPackages(env.HANA_WRITE_PACKAGES),
@@ -284,6 +303,7 @@ export function resolvePolicy(source: PolicySource): Policy {
         schemaAllow: splitList(source.policy.resource.schemaAllow.join(',')),
       },
       deployment: source.policy.deployment ?? SAFE_DEPLOYMENT_POSTURE,
+      ...(source.policy.profiles ? { profiles: source.policy.profiles } : {}),
       source: source.policy.source ?? '已解析配置（服务已加载）',
     };
   }
@@ -309,6 +329,7 @@ export function policyFromConfig(config: HanaConfig, capability: ToolFilterConfi
       writePackages: config.writePackages,
       schemaAllow: config.schemaAllow,
     },
+    profiles: config.profiles,
     deployment: {
       httpPort: config.httpPort,
       httpHost: config.httpHost,
@@ -323,10 +344,16 @@ export function policyFromConfig(config: HanaConfig, capability: ToolFilterConfi
 
 // ── 三、判定器（每个权限维度一个纯函数）──────────────────────
 
-/** 写工具是否真的对客户端可达：无写工具的部署下，写边界不影响实际行为（不产生误导性告警） */
+/**
+ * 写工具是否真的对客户端可达：无写工具的部署下，写边界不影响实际行为（不产生误导性告警）。
+ *
+ * 只看**具体能力**（`CONCRETE_CAPABILITY_IDS`），不看门面：门面的 kind 是成员摘要，
+ * `hana_modeling` 是 admin 却也含 write 档成员——拿它当"写能力可达"的证据会给每一次
+ * describePolicy 都刷出假的 boundary_off。
+ */
 function writeToolsExposed(policy: Policy): boolean {
-  return Object.entries(TOOL_GROUPS).some(
-    ([name, group]) => group === 'write' && shouldRegisterTool(name, policy.capability),
+  return CONCRETE_CAPABILITY_IDS.some(
+    (name) => TOOL_GROUPS[name] === 'write' && shouldRegisterTool(name, policy.capability),
   );
 }
 
@@ -362,7 +389,8 @@ export function checkResource(policy: Policy, request: PolicyRequest): Grant[] {
   const exposed = writeToolsExposed(policy);
 
   if (targets.length > 0) {
-    // 边界为空 = 不限制（fail-open，配置未填时的默认）：依赖边界生效的写请求在此不成立，必须拦
+    // 边界为空 = 写边界未启用（服务层 assertWritePackageAllowed 那层是 fail-open，但本闸门必须拦）：
+    // 依赖边界生效的写请求在此不成立，放行等于给出错误的安全保证
     if (policy.resource.writePackages.length === 0 && exposed) {
       out.push({
         dimension: 'resource',
@@ -370,8 +398,9 @@ export function checkResource(policy: Policy, request: PolicyRequest): Grant[] {
         code: 'boundary_off',
         severity: 'block',
         message:
-          `${BLOCKED_PREFIX}：服务端未启用写操作包边界（可写包白名单为空 = 所有包均可写），` +
-          '本请求依赖边界生效，因此被拒绝。',
+          // 拦截文案不含补救：**不得**出现变量名/「请配置」这类改法（调用方看到的就是模型，
+          // 写明改哪项配置等于教它绕过）。补救只出现在运维入口 describePolicy 与启动自检。
+          `${BLOCKED_PREFIX}：服务端未启用写操作包边界（可写包白名单为空），` + '本请求依赖边界生效，因此被拒绝。',
       });
     }
     for (const target of targets) {
@@ -433,7 +462,9 @@ export function checkDeployment(policy: Policy): Grant[] {
 
 /** 策略自检：与具体请求无关的、关于"这份策略本身"的结论 */
 function checkPolicySelf(policy: Policy): Grant[] {
-  // 写工具可达但写边界未启用 —— 这是策略级事实，不需要有写请求就该被告知
+  // 写工具可达但写边界未启用 —— 这是策略级事实，不需要有写请求就该被告知。
+  // 口径必须与 checkResource 一致：空白名单不是「不限制」，而是「声明写包的写请求会被硬拦」——
+  // 写工具已暴露时等于写不可用（只有服务层 assertWritePackageAllowed 那层是 fail-open）。
   if (writeToolsExposed(policy) && policy.resource.writePackages.length === 0) {
     return [
       {
@@ -442,8 +473,8 @@ function checkPolicySelf(policy: Policy): Grant[] {
         code: 'boundary_off',
         severity: 'warn',
         message:
-          'HANA_WRITE_PACKAGES 为空 = 写操作不限制（所有包可写），但写类工具已对客户端暴露。' +
-          '若部署依赖写边界，请先在当前启动来源中配置可写包前缀后重启服务。',
+          '可写包白名单为空（HANA_WRITE_PACKAGES 未配置）：写工具虽已对客户端暴露，但对任何声明写包的调用，' +
+          '运行期闸门都会以 boundary_off 拒绝（等于写不可用）。需要写入请在当前启动来源中配置可写包前缀后重启服务。',
       },
     ];
   }
@@ -451,6 +482,14 @@ function checkPolicySelf(policy: Policy): Grant[] {
 }
 
 // ── 四、入口 ──────────────────────────────────────────────────
+
+/**
+ * 判定结果组装：分类 + 生成报告文本。**报告构造只此一处**——
+ * 调用期闸门（`authorize.ts`）在"目标能力未登记"时也用它，保证两种拒绝的回执同形（不变量 D）。
+ */
+export function assembleVerdict(policy: Policy, grants: Grant[], requestLines: readonly string[]): Verdict {
+  return assemble(policy, grants, [...requestLines]);
+}
 
 /** 判定结果组装：分类 + 生成报告文本 */
 function assemble(policy: Policy, grants: Grant[], requestLines: string[]): Verdict {
@@ -481,7 +520,9 @@ function formatCapability(c: ToolFilterConfig): string {
 
 function formatResource(r: Policy['resource']): string {
   return (
-    (r.writePackages.length > 0 ? `仅白名单及其子包可写 → ${r.writePackages.join(', ')}` : '未启用（所有包可写）') +
+    (r.writePackages.length > 0
+      ? `仅白名单及其子包可写 → ${r.writePackages.join(', ')}`
+      : '未启用（空白名单：声明写包的调用会被 boundary_off 拒绝）') +
     `；schema 追加 ${r.schemaAllow.length > 0 ? r.schemaAllow.join(', ') : '(无，仅系统 schema)'}`
   );
 }
@@ -491,8 +532,17 @@ function formatResource(r: Policy['resource']): string {
  *
  * 未声明任何请求时一律拦截（不在未知目标下放行）。只读、纯本地：
  * 不写文件、不连 HANA、不发起任何操作。
+ *
+ * `extraLines` 供调用期闸门（`authorize.ts`）把"本次调用的资源计划"补进同一份报告——
+ * 报告构造只有这一处（`assemble`），新增入口只加行、不另写一套（I3）。
  */
-export function runPreflight(opts: { source: PolicySource; request: PolicyRequest }): Verdict {
+export function runPreflight(opts: {
+  source: PolicySource;
+  request: PolicyRequest;
+  extraLines?: readonly string[];
+  /** 调用方档案等**请求级附加维度**的结论（与各 check* 的结论合并后统一分类/成文） */
+  extraGrants?: readonly Grant[];
+}): Verdict {
   const policy = resolvePolicy(opts.source);
   const request = opts.request;
   const declared = (request.tools?.length ?? 0) + (request.writePackages?.length ?? 0) + (request.schemas?.length ?? 0);
@@ -515,13 +565,83 @@ export function runPreflight(opts: { source: PolicySource; request: PolicyReques
     ...checkCapability(policy, request.tools ?? []),
     ...checkResource(policy, request),
     ...checkDeployment(policy),
+    ...(opts.extraGrants ?? []),
   ];
   const requestLines = [
     `本次声明：工具 ${request.tools?.length ? request.tools.join(', ') : '(无)'}` +
       `；可写包 ${request.writePackages?.length ? request.writePackages.join(', ') : '(无)'}` +
       `；schema ${request.schemas?.length ? request.schemas.join(', ') : '(无)'}`,
+    ...(opts.extraLines ?? []),
   ];
   return assemble(policy, grants, requestLines);
+}
+
+/**
+ * 档案自检（P10-c）：**档案只能收紧，不能放宽**（不变量 A）。
+ *
+ * 判定口径（两条，方向不同、严重度不同）：
+ * - **block**：档案声明允许某个 kind，而该 kind 在部署面上**一个能力都不可见**
+ *   （分组未启用、或被 deny 全关掉）。这是"运维以为的权限"与"实际权限"的直接矛盾——
+ *   天花板仍在（不是漏洞），但必须显式纠偏，否则运维会按错误的认知排查问题。
+ * - **warn**：档案的能力 glob 有部分落在部署已隐藏的面上（或与自身 allowKinds 不匹配）。
+ *   宽 glob（如 `hana_*`）几乎必然命中一些被隐藏的能力，若一律 block 会让档案无法使用；
+ *   实际效果仍由天花板决定，故只提示。
+ *
+ * 只在**配置自检**路径（describePolicy）里跑，不进 runPreflight——
+ * 它是"关于配置本身"的结论，与具体请求无关，每调用一次都重算是噪音。
+ */
+export function checkProfiles(policy: Policy): Grant[] {
+  const profiles = policy.profiles;
+  if (!profiles || profiles.size === 0) return [];
+  const out: Grant[] = [];
+  const capabilityIds = Object.keys(TOOL_GROUPS);
+  // 各 kind 在部署面上是否还有可见能力（把 deny / 分组 / 未登记 一并算进去）。
+  // **只数具体能力**：门面的 kind 是成员摘要，把它算进来会让"只读部署 + dev 档案声称允许 write"
+  // 这类真矛盾漏报（门面可见 ≠ 其成员全部可触达）。
+  const exposedKinds = ALL_TOOL_GROUPS.filter((k) =>
+    CONCRETE_CAPABILITY_IDS.some((name) => TOOL_GROUPS[name] === k && shouldRegisterTool(name, policy.capability)),
+  );
+  for (const profile of profiles.values()) {
+    const kindsOutside = profile.allowKinds.filter((k) => !exposedKinds.includes(k));
+    if (kindsOutside.length > 0) {
+      out.push({
+        dimension: 'profile',
+        subject: profile.id,
+        code: 'profile_kind_not_in_policy',
+        severity: 'block',
+        message:
+          `${BLOCKED_PREFIX}：档案 "${profile.id}" 声明允许 ${kindsOutside.join('/')} 类能力，` +
+          `但部署策略下这些分组没有任何能力可见（当前可见分组：${exposedKinds.join('/') || '(无)'}）。` +
+          '档案只能收紧不能放宽，请把该档案改成部署实际暴露的 kind。',
+      });
+    }
+    if (profile.allowCapabilities) {
+      const hit = matchedCapabilities(profile, capabilityIds);
+      if (hit.length === 0) {
+        out.push({
+          dimension: 'profile',
+          subject: profile.id,
+          code: 'profile_glob_matches_nothing',
+          severity: 'warn',
+          message: `档案 "${profile.id}" 的能力 glob（${profile.allowCapabilities.join('|')}）没有命中任何已登记能力（拼写错误？）`,
+        });
+      } else {
+        const hidden = hit.filter((id) => !shouldRegisterTool(id, policy.capability));
+        if (hidden.length > 0) {
+          out.push({
+            dimension: 'profile',
+            subject: profile.id,
+            code: 'profile_glob_partly_hidden',
+            severity: 'warn',
+            message:
+              `档案 "${profile.id}" 的能力 glob 命中了 ${hidden.length} 个部署已隐藏的能力（${hidden.slice(0, 5).join(', ')}…）：` +
+              '这些能力不会因档案而可见（天花板不变），本提示仅用于核对 glob 是否符合预期。',
+          });
+        }
+      }
+    }
+  }
+  return out;
 }
 
 /**
@@ -535,12 +655,13 @@ export function describePolicy(source: PolicySource): Verdict {
   const policy = resolvePolicy(source);
   const verdict = assemble(
     policy,
-    [...checkPolicySelf(policy), ...checkDeployment(policy)],
+    [...checkPolicySelf(policy), ...checkDeployment(policy), ...checkProfiles(policy)],
     [
       `部署姿态：${policy.deployment.httpPort == null ? 'stdio（不对外监听）' : `HTTP :${policy.deployment.httpPort} @ ${policy.deployment.httpHost}`}` +
         `；Bearer 认证 ${policy.deployment.tokenConfigured ? '已配置' : '未配置'}` +
         `；连接加密 ${policy.deployment.tls ? '开' : '关'}` +
         `；证书校验 ${policy.deployment.sslValidate ? '开' : '关'}`,
+      ...(policy.profiles ? [`调用方档案：${describeProfiles(policy.profiles)}`] : []),
     ],
   );
   const remedies = checkDeploymentInvariants(policy.deployment)

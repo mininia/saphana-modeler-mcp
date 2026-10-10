@@ -1,4 +1,8 @@
 import type { HanaPool } from '../core/hana-client.js';
+import { closure } from './catalog.service.js';
+import { nowIso } from '../core/datetime.js';
+import { viewDefinitionCache } from '../model/view-cache.js';
+import { parseResourceUri } from './preview.derive.js';
 import { HanaBusinessError } from '../core/errors.js';
 import { clampLimit } from '../core/num.js';
 import { assertSafeRuntimeName, assertSchemaAllowed, quoteIdentifier } from '../core/sql.js';
@@ -264,10 +268,18 @@ export interface CrossRefItem {
 
 export interface WhereUsedResult {
   object: { packageId: string; objectName: string; objectSuffix: string };
-  /** 该对象依赖的对象（上游，被引用方） */
+  /** 该对象依赖的对象（上游，被引用方）——**depth=1 的单跳结果**（兼容字段，形状不变） */
   upstream: CrossRefItem[];
-  /** 依赖该对象的对象（下游，引用方） */
+  /** 依赖该对象的对象（下游，引用方）——**depth=1 的单跳结果**（兼容字段，形状不变） */
   downstream: CrossRefItem[];
+  /** depth>1 时追加：按方向拆分的闭包成员（不含种子；已去重、已排序） */
+  closure?: { upstream: CrossRefItem[]; downstream: CrossRefItem[] };
+  /** 实际完整展开的层数（仅 depth>1） */
+  depthReached?: number;
+  /** 触达 maxNodes 上限被截断（仅 depth>1；不静默丢） */
+  truncated?: boolean;
+  /** 本次遍历的构建时刻（仅 depth>1；进程时区 ISO） */
+  asOf?: string;
 }
 
 /**
@@ -276,16 +288,25 @@ export interface WhereUsedResult {
  * - downstream：谁引用了该对象（TO = 本对象）
  * kind 省略时匹配三种视图类型。
  * 说明：downstream 中 isRuntime=true 表示激活后的运行时目录视图（_SYS_BIC）对本仓库对象的引用。
+ *
+ * P4 扩展：`depth`（跳数，默认 1 = 原语义）——depth>1 时在单跳结果之外追加 `closure`
+ * （多跳闭包，按方向拆分；visited-set 环防护；maxNodes 截断并置 truncated）；`asOf` 为构建时刻。
  */
 export async function whereUsed(
   pool: HanaPool,
   packageId: string,
   objectName: string,
-  opts: { kind?: ViewKind; direction?: 'upstream' | 'downstream' | 'both' } = {},
+  opts: {
+    kind?: ViewKind;
+    direction?: 'upstream' | 'downstream' | 'both';
+    depth?: number | 'all';
+    maxNodes?: number;
+  } = {},
 ): Promise<WhereUsedResult> {
   const suffixes = suffixesOf(opts.kind);
   const suffixIn = suffixInClause(suffixes);
   const direction = opts.direction ?? 'both';
+  const depth = opts.depth ?? 1;
 
   const mapRow = (r: {
     PACKAGE_ID: string;
@@ -322,11 +343,48 @@ export async function whereUsed(
         )
       : [];
 
-  return {
-    object: { packageId, objectName, objectSuffix: opts.kind ?? '?' },
+  // 种子真实后缀（P4 修 '?' 占位）：VIEW_SUFFIXES 是**全等映射**——kind 给定时它本身就是真实值；
+  // 省略 kind 时补一次轻量查询；对象不存在时回退 '?'（保持旧行为，不额外抛错）。
+  let seedSuffix = opts.kind ?? '?';
+  if (!opts.kind) {
+    const seedRows = await pool.query<{ OBJECT_SUFFIX: string }>(
+      `SELECT OBJECT_SUFFIX FROM "_SYS_REPO"."ACTIVE_OBJECT"
+       WHERE PACKAGE_ID = ? AND OBJECT_NAME = ? AND OBJECT_SUFFIX IN ${suffixIn}
+       ORDER BY VERSION_ID DESC LIMIT 1`,
+      [packageId, objectName, ...suffixes],
+    );
+    seedSuffix = seedRows[0]?.OBJECT_SUFFIX ?? '?';
+  }
+
+  const result: WhereUsedResult = {
+    object: { packageId, objectName, objectSuffix: seedSuffix },
     upstream: upstream.map(mapRow),
     downstream: downstream.map(mapRow),
   };
+
+  if (depth !== 1) {
+    const c = await closure(
+      pool,
+      { packageId, objectName, objectSuffix: seedSuffix },
+      { direction, depth, ...(opts.maxNodes !== undefined ? { maxNodes: opts.maxNodes } : {}) },
+    );
+    const toItem = (e: (typeof c.nodes)[number]): CrossRefItem => ({
+      packageId: e.packageId,
+      objectName: e.objectName,
+      objectSuffix: e.objectSuffix,
+      refType: e.refType,
+      isRuntime: e.isRuntime,
+    });
+    result.closure = {
+      upstream: c.nodes.filter((n) => n.via === 'upstream').map(toItem),
+      downstream: c.nodes.filter((n) => n.via === 'downstream').map(toItem),
+    };
+    result.depthReached = c.depthReached;
+    result.truncated = c.truncated;
+    result.asOf = c.asOf;
+  }
+
+  return result;
 }
 
 /**
@@ -789,6 +847,264 @@ export async function searchObjects(
       }));
     },
   });
+}
+
+/** by=field 搜索的字段命中条目 */
+export interface FieldSearchMatch {
+  fieldId: string;
+  location: 'output' | 'node';
+  nodeId?: string;
+  fieldType: FieldMatch['fieldType'];
+}
+
+/** by=field 搜索的视图条目 */
+export interface FieldSearchItem {
+  packageId: string;
+  objectName: string;
+  objectSuffix: string;
+  versionId: number;
+  activatedAt?: string;
+  activatedBy?: string;
+  matchedFields: FieldSearchMatch[];
+}
+
+/**
+ * by=field 搜索的回执。**口径（诚实性，I2）**：
+ * - `count` = **本次扫到的命中视图数**（不是全库总数——字段级没有索引，无法只靠 COUNT 求出）；
+ * - `truncated` = 命中结果达到 `limit` **或** 候选被 `maxCandidates` 截断（两者任一都置真）；
+ * - `candidatesScanned/maxCandidates` 明示候选口径，调用方可据此调 `pattern` 收窄。
+ */
+export interface FieldSearchResult {
+  count: number;
+  limit: number;
+  truncated: boolean;
+  candidatesScanned: number;
+  maxCandidates: number;
+  asOf: string;
+  objects: FieldSearchItem[];
+}
+
+/** by=field 的候选上限默认值（解析成本护栏：每个候选都要 parse 设计时 XML） */
+export const DEFAULT_MAX_FIELD_CANDIDATES = 100;
+
+/**
+ * 按字段搜索视图（P4）："谁的输出里含匹配字段"。
+ * 实现口径：对候选视图**按需 parse** 设计时 XML（不做全量索引——SSD §3.2/§4.1 决策），
+ * 复用 `searchFields`（= list_fields 的同一实现，I3）。候选集 = `ACTIVE_OBJECT` 按 kind 过滤
+ * （可选 `pattern` 收窄对象名），按 (PACKAGE_ID, OBJECT_NAME) 排序取前 `maxCandidates` 条。
+ */
+export async function searchObjectsByField(
+  pool: HanaPool,
+  opts: { field: string; pattern?: string; kind?: ViewKind; limit?: number; maxCandidates?: number },
+): Promise<FieldSearchResult> {
+  const limit = clampLimit(opts.limit, 20, 1, 100);
+  const maxCandidates = clampLimit(opts.maxCandidates, DEFAULT_MAX_FIELD_CANDIDATES, 1, 500);
+  const suffixes = suffixesOf(opts.kind);
+  const suffixIn = suffixInClause(suffixes);
+  const nameFilter = opts.pattern ? 'AND UPPER(OBJECT_NAME) LIKE UPPER(?)' : '';
+
+  const rows = await pool.query<{
+    PACKAGE_ID: string;
+    OBJECT_NAME: string;
+    OBJECT_SUFFIX: string;
+    VERSION_ID: number;
+    ACTIVATED_AT: string | null;
+    ACTIVATED_BY: string | null;
+    CDATA: string | null;
+  }>(
+    `SELECT PACKAGE_ID, OBJECT_NAME, OBJECT_SUFFIX, VERSION_ID, ACTIVATED_AT, ACTIVATED_BY, CDATA
+     FROM "_SYS_REPO"."ACTIVE_OBJECT"
+     WHERE OBJECT_SUFFIX IN ${suffixIn} ${nameFilter}
+     ORDER BY PACKAGE_ID, OBJECT_NAME LIMIT ?`,
+    opts.pattern ? [`%${opts.pattern}%`, ...suffixes, maxCandidates] : [...suffixes, maxCandidates],
+  );
+
+  const objects: FieldSearchItem[] = [];
+  for (const r of rows) {
+    const cdata = typeof r.CDATA === 'string' ? r.CDATA : '';
+    if (!cdata) continue; // 无设计时 XML → 无可解析的字段面，跳过
+    let def: ViewDefinition;
+    try {
+      def = parseViewDefinition(cdata, r.OBJECT_SUFFIX as ViewKind);
+    } catch {
+      continue; // 宽容：单个候选解析失败不拖垮整次搜索（与 getViewDefinition 的宽容解析同源）
+    }
+    const matches = searchFields(def, opts.field);
+    if (matches.length === 0) continue;
+    objects.push({
+      packageId: r.PACKAGE_ID,
+      objectName: r.OBJECT_NAME,
+      objectSuffix: r.OBJECT_SUFFIX,
+      versionId: r.VERSION_ID,
+      activatedAt: r.ACTIVATED_AT ?? undefined,
+      activatedBy: r.ACTIVATED_BY ?? undefined,
+      matchedFields: matches.map((m) => ({
+        fieldId: m.field.id,
+        location: m.location,
+        ...(m.nodeId !== undefined ? { nodeId: m.nodeId } : {}),
+        fieldType: m.fieldType,
+      })),
+    });
+    if (objects.length >= limit) break;
+  }
+
+  return {
+    count: objects.length,
+    limit,
+    truncated: objects.length >= limit || rows.length >= maxCandidates,
+    candidatesScanned: rows.length,
+    maxCandidates,
+    asOf: nowIso(),
+    objects,
+  };
+}
+
+/** 字段消费方（跨对象下游）：谁在哪个节点、用哪个列引用了被查字段 */
+export interface FieldConsumer {
+  packageId: string;
+  objectName: string;
+  objectSuffix: string;
+  /** 消费方节点 id */
+  nodeId: string;
+  /** 消费方节点里的目标列（mapping.target） */
+  targetColumn: string;
+  /** 引用到的源列（= 被查视图的输出列名，mapping.source） */
+  sourceColumn: string;
+}
+
+/** 字段级血缘回执（P4）：upstream=本视图内的字段逻辑；downstream=跨对象消费方 */
+export interface FieldLineageResult {
+  object: ViewDefinitionResult['object'];
+  fieldId: string;
+  direction: 'upstream' | 'downstream' | 'both';
+  /** 上游：复用 getFieldLogic 的口径（字段不存在/无 CDATA 时抛业务错误，与 get_view 一致） */
+  upstream?: FieldLogic;
+  /** 下游：逐列归因的消费方（跨对象；按需 parse + view-cache 缓存） */
+  downstream: FieldConsumer[];
+  /** 通过"无映射输入"（Union 列名对齐）引用本视图的节点——**无法逐列归因，如实另列**，不混入 downstream */
+  nameAlignedConsumers: Array<{ packageId: string; objectName: string; nodeId: string }>;
+  /** 扫描口径（诚实性 I2）：扫了多少下游候选视图、上限多少；truncated = 闭包被截断或候选超上限 */
+  viewsScanned: number;
+  maxViews: number;
+  truncated: boolean;
+  asOf: string;
+}
+
+/** 字段级下游扫描的候选视图上限默认值（每个候选都要 parse 设计时 XML，护栏同 by=field） */
+export const DEFAULT_MAX_LINEAGE_VIEWS = 50;
+
+/**
+ * 字段级血缘（P4）：
+ * - **downstream（主打）**：沿对象图下游闭包找候选视图（`ACTIVE_OBJECTCROSSREF`），逐个按需 parse
+ *   （走 `viewDefinitionCache`），在节点的输入映射里找 `mapping.source` == 被查字段的引用——
+ *   回答"**谁用了这个字段**"；
+ * - **upstream**：本视图内的字段逻辑（公式/脚本/源列/溯源），复用 `getFieldLogic` 的既有口径；
+ * - 归因不到列的输入（Union 无 mappings、列名对齐）**另列** `nameAlignedConsumers`，不假装逐列命中。
+ */
+export async function fieldLineage(
+  pool: HanaPool,
+  packageId: string,
+  objectName: string,
+  fieldId: string,
+  opts: { direction?: 'upstream' | 'downstream' | 'both'; maxViews?: number; maxNodes?: number } = {},
+): Promise<FieldLineageResult> {
+  const direction = opts.direction ?? 'both';
+  const maxViews = clampLimit(opts.maxViews, DEFAULT_MAX_LINEAGE_VIEWS, 1, 200);
+
+  const seed = await getViewDefinition(pool, packageId, objectName, { format: 'json' });
+  const seedSuffix = seed.object.objectSuffix;
+
+  let upstream: FieldLogic | undefined;
+  if (direction !== 'downstream') {
+    if (!seed.definition) {
+      throw new HanaBusinessError(`视图 ${packageId}/${objectName} 无 CDATA，无法解析字段逻辑`);
+    }
+    upstream = getFieldLogic(seed.definition, fieldId);
+    if (!upstream) {
+      throw new HanaBusinessError(
+        `视图 ${packageId}/${objectName} 中未找到字段 ${fieldId}。可先用 hana_metadata_list_fields 按名称片段模糊搜索确认字段 ID`,
+      );
+    }
+  }
+
+  const downstream: FieldConsumer[] = [];
+  const nameAlignedConsumers: Array<{ packageId: string; objectName: string; nodeId: string }> = [];
+  let viewsScanned = 0;
+  let truncated = false;
+
+  if (direction !== 'upstream') {
+    const c = await closure(
+      pool,
+      { packageId, objectName, objectSuffix: seedSuffix },
+      { direction: 'downstream', depth: 'all', ...(opts.maxNodes !== undefined ? { maxNodes: opts.maxNodes } : {}) },
+    );
+    const viewSuffixes = new Set(Object.values(VIEW_SUFFIXES));
+    // 候选按**层优先**（最近的消费方先扫）再按名字稳定排序——按字母序会把"层级近但名字靠后"的真实消费方挤出上限
+    const candidates = c.nodes
+      .filter((n) => viewSuffixes.has(n.objectSuffix))
+      .sort(
+        (a, b) =>
+          a.level - b.level || a.packageId.localeCompare(b.packageId) || a.objectName.localeCompare(b.objectName),
+      );
+    truncated = c.truncated || candidates.length > maxViews;
+
+    const seedPkg = packageId.toLowerCase();
+    const seedName = objectName.toLowerCase();
+    for (const cand of candidates.slice(0, maxViews)) {
+      const def = await viewDefinitionCache.get(pool, cand.packageId, cand.objectName);
+      if (!def.definition) continue;
+      viewsScanned++;
+
+      // 指向被查视图的数据源（resourceUri 为 /包/calculationviews/对象 形态；包路径用 . 归一后比较）
+      const dsIds = new Set(
+        def.definition.dataSources
+          .filter((ds) => {
+            if (!ds.resourceUri) return false;
+            const r = parseResourceUri(ds.resourceUri);
+            return !!r && r.pkg.replace(/\//g, '.').toLowerCase() === seedPkg && r.name.toLowerCase() === seedName;
+          })
+          .map((ds) => ds.id),
+      );
+      if (dsIds.size === 0) continue;
+
+      for (const node of def.definition.nodes) {
+        for (const input of node.inputs) {
+          const refId = input.node.startsWith('#') ? input.node.slice(1) : input.node;
+          if (!dsIds.has(refId)) continue;
+          if (input.mappings.length === 0) {
+            // Union 等按列名对齐的输入：无法逐列归因，如实另列
+            nameAlignedConsumers.push({ packageId: cand.packageId, objectName: cand.objectName, nodeId: node.id });
+            continue;
+          }
+          for (const m of input.mappings) {
+            if (m.source.toLowerCase() === fieldId.toLowerCase()) {
+              downstream.push({
+                packageId: cand.packageId,
+                objectName: cand.objectName,
+                objectSuffix: cand.objectSuffix,
+                nodeId: node.id,
+                targetColumn: m.target,
+                sourceColumn: m.source,
+              });
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return {
+    object: seed.object,
+    fieldId,
+    direction,
+    ...(upstream !== undefined ? { upstream } : {}),
+    downstream,
+    nameAlignedConsumers,
+    viewsScanned,
+    maxViews,
+    truncated,
+    asOf: nowIso(),
+  };
 }
 
 /** 包清单条目（_SYS_REPO.PACKAGE_CATALOG） */

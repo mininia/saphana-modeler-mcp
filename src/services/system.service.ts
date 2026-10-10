@@ -1,6 +1,32 @@
 import type { HanaPool } from '../core/hana-client.js';
 import { HanaBusinessError } from '../core/errors.js';
 import { logger } from '../core/logger.js';
+import { getEnvironmentProfile, type EnvironmentProfile } from '../config/profile.js';
+import { RULES, RULE_IDS, getRules, type RuleId, type RuleObject } from '../rules/index.js';
+
+/** 规则目录条目（省 token 的索引：只给 id + title；要看全文再传 rules=<id>） */
+export interface RuleCatalogEntry {
+  id: RuleId;
+  title: string;
+}
+
+/** hana_system_get_info 的规则查询结果（rules 参数省略时是目录，传了则是命中规则的全文） */
+export interface RuleQueryResult {
+  /** 'catalog' = 未指定 rules（只给目录）；'full' = 命中了 all/规则 id（给出全文） */
+  mode: 'catalog' | 'full';
+  /** 规则目录：mode='catalog' 时的内容（id + title，省 token） */
+  catalog?: RuleCatalogEntry[];
+  /** 命中规则的全文（id/title/detail/errorCodes/tools）：mode='full' 时的内容，不重复列目录 */
+  items?: RuleObject[];
+}
+
+/** getSystemInfo 的可选项（工具层的 params 原样透传；均可省略） */
+export interface SystemInfoOptions {
+  /** 规则查询：`'all'` 或规则 id（逗号分隔多个）；省略 = 只给目录（省 token） */
+  rules?: string;
+  /** 强制重探环境档案（默认走进程内缓存） */
+  refreshProfile?: boolean;
+}
 
 /** hana_system_get_info 返回的系统信息 */
 export interface SystemInfo {
@@ -14,6 +40,37 @@ export interface SystemInfo {
   hostInfo: Record<string, string>;
   currentUser: string;
   currentSchema: string;
+  /** 环境档案（P9）：首次调用时探测一次并进程内缓存；探测失败 fail-open（detected:false + note），不影响其余信息 */
+  profile: EnvironmentProfile;
+  /** 规则库（P9）：省略 rules = 目录（id+title）；传 all 或规则 id = 命中规则全文 */
+  rules: RuleQueryResult;
+}
+
+/** 宽松 schema 的合法值提示（SSD §1.6：schema 只用 z.string()，合法值在此以中文列全，单一事实源 = RULE_IDS） */
+function rulesValueHint(): string {
+  return `合法值：all（全部规则的全文），或用逗号分隔的规则 id：${RULE_IDS.join(', ')}`;
+}
+
+/**
+ * `rules` 参数 → 目录/全文（工具面宽松 schema 契约，SSD §1.6）。
+ *
+ * - 省略 → 目录（id + title，省 token）；
+ * - `'all'` → 全部规则的全文（与 id 混写时按 all 处理）；
+ * - 逗号分隔的 id → 命中规则的全文；未知 id 由 `getRules` 抛中文硬错误并列出合法 id（与规则模块同一实现）。
+ *
+ * 空串/纯逗号**明确报错**而不是给空列表——空列表会被读成"没有规则"，而真实原因是参数写空了。
+ */
+export function resolveRules(raw?: string): RuleQueryResult {
+  if (raw === undefined) {
+    return { mode: 'catalog', catalog: RULES.map((r) => ({ id: r.id, title: r.title })) };
+  }
+  const ids = raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s !== '');
+  if (ids.length === 0) throw new HanaBusinessError(`rules 参数为空。${rulesValueHint()}`);
+  if (ids.includes('all')) return { mode: 'full', items: getRules() };
+  return { mode: 'full', items: getRules(ids) };
 }
 
 /** hana_check_privileges 返回的权限报告 */
@@ -35,8 +92,14 @@ export interface PrivilegeReport {
   };
 }
 
-/** 系统信息（SYS.M_DATABASE + M_HOST_INFORMATION + 会话） */
-export async function getSystemInfo(pool: HanaPool): Promise<SystemInfo> {
+/**
+ * 系统信息（SYS.M_DATABASE + M_HOST_INFORMATION + 会话）+ 环境档案（P9）+ 规则库（P9）。
+ *
+ * 规则参数**先校验**（写错立即硬错误，不白探一遍档案）；档案在主体信息取到之后才探——
+ * 它可能连库（探测失败时 fail-open 不抛错），不该让它的开销或故障抢在主体信息之前。
+ */
+export async function getSystemInfo(pool: HanaPool, opts?: SystemInfoOptions): Promise<SystemInfo> {
+  const rules = resolveRules(opts?.rules);
   const db = await pool.query<{
     SYSTEM_ID: string;
     DATABASE_NAME: string;
@@ -65,6 +128,9 @@ export async function getSystemInfo(pool: HanaPool): Promise<SystemInfo> {
   const hostInfo: Record<string, string> = {};
   for (const h of hostRows) hostInfo[h.KEY] = h.VALUE;
 
+  // 环境档案：进程内缓存；刷新只影响档案本身，主体信息每次现查
+  const profile = await getEnvironmentProfile(pool, { refresh: opts?.refreshProfile });
+
   return {
     sid: row.SYSTEM_ID,
     database: row.DATABASE_NAME,
@@ -75,6 +141,8 @@ export async function getSystemInfo(pool: HanaPool): Promise<SystemInfo> {
     hostInfo,
     currentUser: sess[0]?.CURRENT_USER ?? '',
     currentSchema: sess[0]?.CURRENT_SCHEMA ?? '',
+    profile,
+    rules,
   };
 }
 

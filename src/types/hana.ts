@@ -29,4 +29,9 @@ export interface Envelope {
    * 用途：多客户端共享同一 HANA 技术账号时，让调用方/审计侧知道「这次是谁发的」。
    */
   clientId?: string;
+  /**
+   * 进程级归因标签（`MCP_AGENT_LABEL`，P10-c）：标的是**服务端进程**（哪套部署 / 哪个代理实例），
+   * 与调用方身份（clientId）正交。未配置时该字段缺省——不产生恒为空的噪音字段。
+   */
+  agentLabel?: string;
 }

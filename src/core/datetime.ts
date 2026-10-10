@@ -35,3 +35,11 @@ export function toIsoInTimezone(date: Date, timezone: string): string {
 export function toHanaDateTime(date: Date, timezone: string = DEFAULT_TIMEZONE): string {
   return toIsoInTimezone(date, timezone).replace('T', ' ');
 }
+
+/**
+ * 「现在」的进程时区 ISO 串（秒级）：**读数新鲜度（asOf）的单一实现**。
+ * 时区口径与日志一致（`process.env.TZ`，由 loadConfig 统一设置；未设置时回落默认时区）。
+ */
+export function nowIso(): string {
+  return toIsoInTimezone(new Date(), process.env.TZ ?? DEFAULT_TIMEZONE);
+}

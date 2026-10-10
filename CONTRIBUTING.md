@@ -56,7 +56,10 @@ types ← core ← model ← services ← tools ← server ← index
 | 时间格式化、默认时区 | `core/datetime.ts` |
 | 视图数值类型表、`isNumericType` | `model/view-types.ts` |
 | 仓库写边界判定 | `config/write-boundary.ts`（纯叶子） |
-| 工具分组登记表 | `tools/groups.ts`（单一事实源） |
+| 工具分组登记表 | `capabilities/defs/*.ts`（能力清单，**唯一事实源**；`tools/groups.ts` 从它派生） |
+| 工具入参 schema 片段（包名/对象名/视图类型） | `capabilities/schemas.ts` |
+| 写调用规划器（会读写什么） | `capabilities/planners.ts`（在清单条目里以 `effects.plan` 声明） |
+| 调用期授权闸门 | `config/authorize.ts`（**所有能力**过同一个闸门；资源维度由清单的 `effects.plan` 决定） |
 
 **注意"看起来一样但语义不同"的情况，不要合并**。例如 `core/num.ts` 的 `num`（空值→0）与 `sql-analyze.service` 的 `num`（非数→`undefined`，用于区分"没有值"和"值为 0"）语义不同，合并会引入静默的 `NaN`/`0` 变化。同理 `core/hana-errors.ts` 里几个错误码集**刻意不统一**：不同调用点的码集差异是策略差异，用参数化暴露出来，而不是合并成一个大集合悄悄改变行为。这类"不可合并"的地方都在代码里写了理由。
 
@@ -82,4 +85,17 @@ types ← core ← model ← services ← tools ← server ← index
 
 ## 涉及 HANA 写路径时
 
-写路径（`hana_view_*` / `hana_package_create` / `hana_repo_import` 等）已有实机验证与硬边界。改动前先跑 `hana-write-preflight` 预检（按 `HANA_WRITE_PACKAGES` / `HANA_TOOL_GROUPS` / `HANA_SCHEMA_ALLOW` 判定），不要绕过。
+写路径（`hana_view_*` / `hana_package_create` / `hana_repo_import` 等）已有实机验证与硬边界。改动前先跑 `hana-write-preflight` 预检（按 `HANA_WRITE_PACKAGES` / `MCP_TOOL_GROUPS` / `HANA_SCHEMA_ALLOW` 判定），不要绕过。
+
+## 新增一个能力时（三件"税"）
+
+1. **清单**：在 `src/capabilities/defs/<分类>.ts` 加一条（`id` / `category` / `kind` / `effects` / `title` / `description` / `inputSchema` / `annotations`；`facadeOf` 只给六个分类门面）。
+   **资源形参要用带角色的构造器**：写目标包 `zWritePackageId(...)`、只读引用的包 `zReadPackageId(...)`、
+   只读 schema `tagResource(z.string()…, 'readSchema')`（**必须包在最外层**——`.optional()`/`.describe()` 会换掉对象）。
+   资源维度由此**自动成立**；`effects.plan` 只用来补参数声明表达不了的东西：分支叙述、`uncertain`、嵌套结构（`operations[]`）
+   与文本扫描（SQL/XML/脚本）。会写仓库包的能力**必须**有其中之一（测试强制）；
+   混合模式的参数（如 `hana_view_validate.packageId`：design 写、runtime 不写）**不要打无条件标签**，交给规划器按模式声明。
+   **忘了登记 = 能力不暴露也不可调用**（fail-closed），`tests/unit/capability-manifest.test.ts` 会拦。
+2. **注册**：在对应 `src/tools/<模块>.tools.ts` 里 `regCap(CAP.<id>, handler)`——注册名、schema、描述、注解都从清单取，模块里只写 handler。
+3. **闸门**：不需要做任何事。所有能力都经 `capabilityRegistrar` → `config/authorize.ts` 的 `authorizeCall`；
+   **不要在工具模块里自己判权限**（那会绕开「多入口、单闸门」这条不变量）。判定结果由策略层出，报告由 `preflight.ts` 出一份。

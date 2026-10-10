@@ -2,7 +2,7 @@
  * SQL 读取范围的最后一道校验（**服务层**，与工具层预检分工不同）。
  *
  * 分工：
- * - 工具层预检（src/tools/write-plans.ts 的规划器 + config/preflight.ts）负责**限定名**：
+ * - 工具层预检（src/capabilities/planners.ts 的规划器 + config/preflight.ts）负责**限定名**：
  *   扫描 `SCHEMA."表"` 后按 HANA_SCHEMA_ALLOW 判定，并把扫描盲区写进计划；
  * - 本模块负责**未限定表名**（`FROM MARA`）：它由 HANA 按当前用户的默认 schema 解析，
  *   扫描器无从得知，只能查 CURRENT_SCHEMA 再判。没有这一步时 `SELECT * FROM MARA`

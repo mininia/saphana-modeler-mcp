@@ -48,6 +48,34 @@ export function isNumericType(dataTypeName?: string): boolean {
   return NUMERIC_TYPES.has((dataTypeName ?? '').toUpperCase());
 }
 
+/** Aggregation 分组列（格式 A=aggregateBy；格式 B=无聚合函数的 viewAttribute）；导出供 view-diff 做方言归一 */
+export function aggGroupBy(node: ViewNode): string[] {
+  const formatA = node.aggregateBy.length > 0 || node.measures.length > 0;
+  return formatA
+    ? node.aggregateBy
+    : node.attributes.filter((a) => !node.attributeAggregations.some((m) => m.id === a));
+}
+
+/** Aggregation 度量（格式 A=measureMapping；格式 B=带 aggregationType 的 viewAttribute）；导出供 view-diff 做方言归一 */
+export function aggMeasures(node: ViewNode): ViewNodeMeasure[] {
+  const formatA = node.aggregateBy.length > 0 || node.measures.length > 0;
+  return formatA
+    ? node.measures
+    : node.attributeAggregations.map((m) => ({ column: m.id, aggregationType: m.aggregationType }));
+}
+
+/**
+ * BW on HANA：设计时 XML 中 schemaName="ABAP" 是**源系统名**而非数据库 schema，真实表在 SAPABAP1。
+ *
+ * 单点定义的原因（与 aggGroupBy/aggMeasures 同款上移到 model 层）：XML 推导（preview.derive 的
+ * leafSql）、诊断追溯（preview-diagnose 的基表可达性）与结构 diff（view-diff 规则 7）三方必须用
+ * 同一映射，各存一份必然漂移——漂移的表现是同一张表「推导能查、诊断报不可访问」，或「diff 说没变、
+ * 实际换了源」。放 model 层是因为 view-diff（model）也消费它，而 model 不得 import services。
+ */
+export function normalizeBwSchema(schemaName: string): string {
+  return schemaName === 'ABAP' ? 'SAPABAP1' : schemaName;
+}
+
 /** 数据源：计算视图引用 / 数据库表 / 数据库视图 */
 export interface ViewDataSource {
   id: string;
@@ -136,6 +164,8 @@ export interface ViewNode {
   attributeAggregations: Array<{ id: string; aggregationType: string }>;
   /** 属性级过滤器（viewAttribute 上的 filter，如排除删除标记）；推导时生成 WHERE 条件 */
   attributeFilters: Array<{ id: string; filters: ViewAttributeFilter[] }>;
+  /** 节点内 viewAttribute 自带的类型声明（BW/Studio 方言；缺省 = 未声明）。P6 的 diff 据此判定节点级类型变更。 */
+  attributeTypes?: Array<{ id: string; datatype?: string; length?: string }>;
   /** Rank 节点定义（windowFunction）；非 Rank 节点为 undefined */
   rank?: ViewRankDefinition;
   /** SQLScript 源码（SqlScriptView 节点，来自 definition 元素，已解码 XML 实体） */

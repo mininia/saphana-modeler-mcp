@@ -71,6 +71,30 @@ export class ViewDefinitionCache {
     return result;
   }
 
+  /**
+   * 按 (包/对象) 前缀失效（写路径成功后调用）。返回被删除的条目数（供调用方/测试断言）。
+   *
+   * key 形如「包名/对象名/后缀列表」（用斜杠连接，见 get() 的 key 构造），这里把前缀为
+   * `包名/对象名/` 的条目全部删除（后缀维度不同 = 同对象的另一种视图类型，一并失效）。
+   * 缓存本身已有 VERSION_ID 命中校验 + TTL 自愈：失效只是把「最多 60s 后自愈」变成「立即」，
+   * 不是正确性必需。**未激活的设计时写入不改变 ACTIVE_OBJECT**（严格说不必失效），
+   * 但写路径一律失效更简单——不用在每条写路径上判断「这次写会不会改变 ACTIVE_OBJECT」——
+   * 代价只是一次重取。
+   * 调用方传入的 (packageId, objectName) 须与 get() 的 key 维度一致；不一致只是前缀不命中，
+   * 退回 TTL/版本自愈，不会误删别的对象。
+   */
+  invalidate(packageId: string, objectName: string): number {
+    const prefix = `${packageId}/${objectName}/`;
+    let removed = 0;
+    for (const key of this.entries.keys()) {
+      if (key.startsWith(prefix)) {
+        this.entries.delete(key);
+        removed += 1;
+      }
+    }
+    return removed;
+  }
+
   /** 清空缓存（测试/配置变更用） */
   clear(): void {
     this.entries.clear();

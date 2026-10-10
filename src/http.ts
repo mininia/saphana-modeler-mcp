@@ -58,6 +58,8 @@ function bearerTokenGuard(clients: HttpClientIdentity[]): RequestGuard {
   // sha256 摘要定长后 timingSafeEqual，防时序侧信道；摘要不回泄 token；token 原文不驻留在比对结构中
   const digests = clients.map((c) => ({
     clientId: c.clientId,
+    // 令牌只在这里比对；档案名（第三段）随身份进上下文，供调用期授权使用（P10-c）
+    ...(c.profileId ? { profileId: c.profileId } : {}),
     digest: createHash('sha256').update(c.token).digest(),
   }));
   return (req, res) => {
@@ -65,18 +67,19 @@ function bearerTokenGuard(clients: HttpClientIdentity[]): RequestGuard {
     const provided =
       typeof header === 'string' && /^Bearer /i.test(header) ? header.slice('Bearer '.length).trim() : '';
     const providedDigest = createHash('sha256').update(provided).digest();
-    let matched: string | undefined;
+    let matched: (typeof digests)[number] | undefined;
     // 不提前 break：比较次数与配置条目数一致，不泄露「命中的是第几个身份」
     for (const c of digests) {
-      if (timingSafeEqual(c.digest, providedDigest)) matched = c.clientId;
+      if (timingSafeEqual(c.digest, providedDigest)) matched = c;
     }
     if (matched !== undefined) {
       // 凭据不回存：token 字段填掩码（本进程此后不再需要原文，避免经 authInfo 流入日志/错误/下游）
       (req as AuthedRequest).auth = {
         token: '****',
-        clientId: matched,
+        clientId: matched.clientId,
         scopes: [],
-        extra: { transport: 'http' },
+        // extra 是 AuthInfo 的透传口袋：档案名随身份一路进请求上下文（P10-c）
+        extra: { transport: 'http', ...(matched.profileId ? { profileId: matched.profileId } : {}) },
       };
       return true;
     }
@@ -131,8 +134,12 @@ export async function startHttpServer(
     if (!bodySizeGuard(req, res)) return;
     // 身份上下文：贯穿本次请求的全部异步续体（工具层/服务层/审计日志/envelope 均据此归因）
     const clientId = (req as AuthedRequest).auth?.clientId ?? ANONYMOUS_CLIENT_ID;
-    logger.debug({ clientId }, 'saphana-modeler-mcp HTTP 请求已归属客户端身份');
-    void runWithIdentity({ clientId, transport: 'http' }, () => nodeHandler(req, res));
+    // 档案名（Token 第三段）：随身份进 ALS，供调用期授权按调用方收紧（P10-c）
+    const profileId = (req as AuthedRequest).auth?.extra?.profileId;
+    logger.debug({ clientId, ...(profileId ? { profileId } : {}) }, 'saphana-modeler-mcp HTTP 请求已归属客户端身份');
+    void runWithIdentity({ clientId, transport: 'http', ...(typeof profileId === 'string' ? { profileId } : {}) }, () =>
+      nodeHandler(req, res),
+    );
   });
 
   await new Promise<void>((resolve, reject) => {

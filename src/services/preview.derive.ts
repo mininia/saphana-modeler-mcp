@@ -1,6 +1,7 @@
 import { HanaBusinessError } from '../core/errors.js';
 import { assertSafeRuntimeName, assertSchemaAllowed, qualifyName, quoteIdentifier, quoteLiteral } from '../core/sql.js';
-import type { ViewDataSource, ViewDefinition, ViewNode, ViewNodeMeasure } from '../model/view-types.js';
+import { aggGroupBy, aggMeasures, normalizeBwSchema } from '../model/view-types.js';
+import type { ViewDataSource, ViewDefinition, ViewNode } from '../model/view-types.js';
 
 /**
  * 节点级数据预览的 SQL 推导（方案 B：依据视图 XML 直接推导，纯只读）。
@@ -217,16 +218,6 @@ function assertSupportedNode(node: ViewNode): void {
   if (!SUPPORTED_TYPES.has(node.type)) {
     throw new HanaBusinessError(`节点 ${node.id} 类型 ${node.type} 暂不支持推导预览`);
   }
-}
-
-/**
- * BW on HANA：XML 中 schemaName="ABAP" 是**源系统名**而非数据库 schema，真实表在 SAPABAP1。
- *
- * 单点导出：XML 推导（leafSql）与诊断追溯（preview-diagnose 基表可达性）必须用同一映射，
- * 否则同一张表会出现「推导能查、诊断报不可访问」的自相矛盾结论。
- */
-export function normalizeBwSchema(schemaName: string): string {
-  return schemaName === 'ABAP' ? 'SAPABAP1' : schemaName;
 }
 
 /**
@@ -611,21 +602,12 @@ function rankSql(node: ViewNode, gen: (ref: string) => string, emit: string[]): 
   );
 }
 
-/** Aggregation 分组列（格式 A=aggregateBy；格式 B=无聚合函数的 viewAttribute） */
-function aggGroupBy(node: ViewNode): string[] {
-  const formatA = node.aggregateBy.length > 0 || node.measures.length > 0;
-  return formatA
-    ? node.aggregateBy
-    : node.attributes.filter((a) => !node.attributeAggregations.some((m) => m.id === a));
-}
-
-/** Aggregation 度量（格式 A=measureMapping；格式 B=带 aggregationType 的 viewAttribute） */
-function aggMeasures(node: ViewNode): ViewNodeMeasure[] {
-  const formatA = node.aggregateBy.length > 0 || node.measures.length > 0;
-  return formatA
-    ? node.measures
-    : node.attributeAggregations.map((m) => ({ column: m.id, aggregationType: m.aggregationType }));
-}
+/**
+ * aggGroupBy / aggMeasures / normalizeBwSchema 的实现已上移到 model/view-types.ts（分层修正：
+ * model 不得 import services，而 view-diff、节点预览推导与诊断必须共用同一份方言判定 / schema 别名映射）。
+ * 此处保留 re-export，本文件的对外导出面零变化。
+ */
+export { aggGroupBy, aggMeasures, normalizeBwSchema };
 
 /** 节点自身引用的列（filter + 计算列公式 + 属性过滤 ID，均以输出列名表示） */
 function referencedColumns(node: ViewNode): string[] {

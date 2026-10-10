@@ -13,6 +13,9 @@ import type { PolicyRequest } from './config/preflight.js';
  * 本模块只描述「会发生什么」；判定仍由预检层（config/preflight.ts）按生效权限配置做，
  * 不在这里另写一套规则。
  *
+ * P7 起把声明细化到**对象级**（`reads`/`writes`，SSD §6.2）：变更集批内相交检测不能用包级粒度
+ * （同包多对象的正常批次会因 writePackages 全相同被整批误拒），判定粒度必须是 `{packageId, objectName}`。
+ *
  * 规划只做**只读**的分析，不产生任何副作用。
  */
 export interface WritePlan {
@@ -30,10 +33,32 @@ export interface WritePlan {
    */
   readPackages: string[];
   /**
+   * 本次将读取（引用）的仓库对象（对象级；相交检测用）。解析不出的引用落 uncertain，不在这里假装确定。
+   * 可选：未做对象级声明的规划器/调用方不填（既有调用方零改动）。
+   * 未声明（undefined）与「已声明无」（`[]`）语义不同——前者表示对象级静态不可知，后者才表示确实没有。
+   */
+  reads?: ObjectRef[];
+  /** 本次将写入/创建/删除的仓库对象（对象级；相交检测用）。可选、只声明不判定，口径同 reads。 */
+  writes?: ObjectRef[];
+  /**
    * 计划无法静态确定的点。必须显式列出而不是假装确定——
    * 例如 filePath 导入的文件内容要到服务端读取时才知道。
    */
   uncertain: string[];
+}
+
+/**
+ * 仓库对象引用（对象级）——SSD §6.2 相交检测的判定粒度。
+ * 为什么必须到对象级：包级相交会把「同包多对象正常批次」整批误拒（10 个对象同包 ⇒ writePackages 全相同 ⇒ 全拒）。
+ */
+export interface ObjectRef {
+  packageId: string;
+  objectName: string;
+}
+
+/** 对象级引用判等（相交检测与去重的唯一口径；不要再各写一份字段比较） */
+export function sameObjectRef(a: ObjectRef, b: ObjectRef): boolean {
+  return a.packageId === b.packageId && a.objectName === b.objectName;
 }
 
 /** 计划 → 策略层的判定请求。只做映射，不做判定。 */
@@ -47,7 +72,9 @@ export function planToRequest(plan: WritePlan): PolicyRequest {
 
 /** 计划 → 人类可读多行文本（进拦截报告 / 执行前日志） */
 export function formatWritePlan(plan: WritePlan): string {
-  const lines = [`写操作预规划（${plan.tool}）：`];
+  // 标题用「调用预规划」而非「写操作预规划」：P10-b 起读能力也有资源计划（planRead），
+  // 同一份报告要同时服务"这次会写什么"与"这次会读什么"。
+  const lines = [`调用预规划（${plan.tool}）：`];
   plan.steps.forEach((s, i) => lines.push(`  ${i + 1}. ${s}`));
   lines.push(
     `  触碰资源：写包 ${plan.writePackages.length ? plan.writePackages.join(', ') : '(无)'}` +
@@ -58,13 +85,176 @@ export function formatWritePlan(plan: WritePlan): string {
   return lines.join('\n');
 }
 
-/** 从 XML 里扫出跨包数据源引用（resourceUri="/<包路径>/..."）。尽力而为：扫不到不影响判定 */
+/**
+ * 单份 resourceUri 扫描件：包级（`scanXmlPackageRefs`）与对象级（`scanXmlObjectRefs`）两个导出都从它派生，
+ * **不得再写第二份 URI 扫描器**——两份正则必然漂移（一处改了大小写/字符集，另一处就静默漏扫）。
+ * 这里只负责「取出引用值」，形态解析交给各自的投影（包级与对象级口径不同，见各自注释）。
+ *
+ * 两种 XML 方言形态必须都认（同一条正则的交替分支，**不是**第二份扫描器）：
+ *   - **元素形态** `<resourceUri>/…</resourceUri>`：本仓生成/存储的 CV XML 就长这样
+ *     （view-edit.ts 的 dataSourceBlock、view-xml.ts 的 parseDataSource 都按元素读，fixture-join-chain.xml 亦是）。
+ *     只认属性形态时真实载荷里的跨对象读集**恒为空** ⇒ 批内 write∩read 冲突不判、不拒（评审实测）；
+ *   - **属性形态** `resourceUri="/…"`：BW 导出样本/旧载荷的写法，既有用例保留。
+ * 元素形态允许标签与值之间存在空白（值 trim 后仍须以 / 开头，与属性形态同一口径）。
+ * 对合法闭合的值与「只认属性形态」的旧实现逐字等价；截断/未闭合引号的畸形 XML 旧实现会误报，这里直接跳过（更严）。
+ */
+function scanXmlResourceUriValues(xml: string): string[] {
+  const out: string[] = [];
+  const re = /[Rr]esourceUri="(\/[^"]*)"|<[Rr]esourceUri>\s*(\/[^<]*?)\s*<\/[Rr]esourceUri>/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(xml)) !== null) {
+    const value = (m[1] ?? m[2]).trim();
+    if (value !== '') out.push(value);
+  }
+  return out;
+}
+
+/**
+ * 从 XML 里扫出跨包数据源引用（`/…/` 形态的 resourceUri，元素与属性两种写法都认，见扫描件头注）。
+ * 尽力而为：扫不到不影响判定。
+ *
+ * 口径与既有实现一致：只取**首个路径段**（本服务生成的数据源 resourceUri 用点分包 id
+ * `/ZDEMO.ZDEMO_MKC/calculationviews/X`，首段即完整包名）。斜杠分段的旧格式这里只报首段——
+ * readPackages 是可见性信息、不参与拦截；精确到对象的解读归 `scanXmlObjectRefs`。
+ * 对合法闭合的属性值与既有实现逐字等价；截断/未闭合引号的畸形 XML 旧实现会误报，这里直接跳过（更严）。
+ */
 export function scanXmlPackageRefs(xml: string): string[] {
   const out = new Set<string>();
-  const re = /[Rr]esourceUri="\/([A-Za-z0-9_.-]+)\//g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(xml)) !== null) out.add(m[1]);
+  for (const value of scanXmlResourceUriValues(xml)) {
+    const m = /^\/([A-Za-z0-9_.-]+)\//.exec(value);
+    if (m) out.add(m[1]);
+  }
   return [...out];
+}
+
+/**
+ * 视图类目录段（与 repository.service 的 KIND_URI_SEGMENT 同源枚举）：只有这些目录段下的
+ * resourceUri 才认作视图对象引用，其他形态一律不认（不猜）。
+ */
+const VIEW_URI_SEGMENTS = new Set(['calculationviews', 'attributeviews', 'analyticviews']);
+
+/**
+ * 从 XML 里解析仓库对象引用（resourceUri → 对象级）。与包级扫描**同一个扫描件**
+ * （scanXmlResourceUriValues，元素/属性两种形态都收），不另写 URI 正则/表名扫描器。
+ *
+ * 形态：`/包路径段…/视图目录段/对象名`
+ *   - 点分包路径 `/ZDEMO.ZDEMO_MKC/calculationviews/X` → `{ packageId: 'ZDEMO.ZDEMO_MKC', objectName: 'X' }`；
+ *   - 斜杠分段包路径 `/pkg/sub/calculationviews/X` → 按 metadata.service 的「/ → .」归一口径
+ *     得 `{ packageId: 'pkg.sub', objectName: 'X' }`。
+ *
+ * 解析不出的形态（段数不足 / 目录段不是视图类 / 无前导斜杠）**跳过不猜**——
+ * 对象级引用会被批内相交检测直接消费，猜错可能把正常批次误拒，或让真实冲突漏检。
+ * 跳过不猜的引用**不在这里静默丢弃**：带降级出口的投影（scanXmlObjectRefsWithUnresolved）
+ * 把它们如实带回给调用方落 uncertain（§6.2）。
+ */
+export function scanXmlObjectRefs(xml: string): ObjectRef[] {
+  return scanXmlObjectRefsWithUnresolved(xml).refs;
+}
+
+/**
+ * `scanXmlObjectRefs` 的**带降级出口**投影（同一实现的两个视图，不是第二份扫描器）：
+ * 解析出的对象照旧（去重保序）；解析不出的 resourceUri 值**如实带回**——
+ * §6.2 要求「解析不出的引用落 uncertain」，而只看 refs 时「跳过不猜」与「根本没有引用」无从区分。
+ * unresolved 按值去重（同一个解析不出的 URI 出现多处只报一条，不制造重复噪音）。
+ */
+function scanXmlObjectRefsWithUnresolved(xml: string): { refs: ObjectRef[]; unresolved: string[] } {
+  const refs: ObjectRef[] = [];
+  const unresolved: string[] = [];
+  for (const value of scanXmlResourceUriValues(xml)) {
+    const ref = parseXmlResourceUri(value);
+    if (!ref) {
+      if (!unresolved.includes(value)) unresolved.push(value);
+      continue;
+    }
+    if (!refs.some((r) => sameObjectRef(r, ref))) refs.push(ref);
+  }
+  return { refs, unresolved };
+}
+
+/** resourceUri 值 → 对象级引用；不是「包路径…/视图目录段/对象名」形态时返回 null（跳过不猜） */
+function parseXmlResourceUri(value: string): ObjectRef | null {
+  if (!value.startsWith('/')) return null;
+  const segments = value.split('/').filter((s) => s !== '');
+  if (segments.length < 3) return null; // 至少：包段 + 视图目录段 + 对象名
+  const objectName = segments[segments.length - 1];
+  if (!VIEW_URI_SEGMENTS.has(segments[segments.length - 2])) return null;
+  const packageId = segments.slice(0, -2).join('.'); // 斜杠分段归一为点分包 id（与 metadata.service 同口径）
+  if (packageId === '' || objectName === '') return null;
+  return { packageId, objectName };
+}
+
+/** 非空字符串窄化（宽松入参 → 运行时判形；本文件不 import services 的类型——分层：本文件是运行期叶子） */
+function nonEmptyStr(v: unknown): string | undefined {
+  if (typeof v !== 'string') return undefined;
+  const t = v.trim();
+  return t === '' ? undefined : t;
+}
+
+/** 对象级引用去重（保持先到先得的次序，保证计划输出确定性） */
+function dedupeRefs(refs: ObjectRef[]): ObjectRef[] {
+  const out: ObjectRef[] = [];
+  for (const r of refs) if (!out.some((x) => sameObjectRef(x, r))) out.push(r);
+  return out;
+}
+
+/**
+ * 从一次 update 载荷（xml 或 operations）推出对象级读/写集（writes=目标对象本身）。
+ *
+ * 为什么共享在本文件：规划器与 P7 服务侧都要用它（服务层逐 action 推读写集做相交检测），
+ * 放这里双方都引它、又不产生环（本文件是运行期叶子，不 import services）。
+ *
+ * 口径：
+ * - writes = 目标对象本身；packageId/objectName 有一个为空就**不声明**（不造空引用）；
+ * - reads = xml 里 resourceUri 解析出的对象 + operations 里 add_join 的源对象；
+ *   set_script 只替换自身脚本，不产生跨对象引用；
+ * - 只有源包没有源对象名的 join 源**不猜**对象级引用（包级引用照旧由 readPackages 承担），
+ *   但**不静默**：解析不出的引用逐条落 `uncertain`（§6.2 降级口径——"不判"与"没有引用"必须可区分）。
+ */
+export function objectRefsOfUpdate(input: {
+  packageId: string;
+  objectName: string;
+  xml?: string;
+  operations?: unknown[];
+}): { reads: ObjectRef[]; writes: ObjectRef[]; uncertain: string[] } {
+  const writes: ObjectRef[] = [];
+  const reads: ObjectRef[] = [];
+  const uncertain: string[] = [];
+  const pkg = nonEmptyStr(input.packageId);
+  const objectName = nonEmptyStr(input.objectName);
+  if (pkg && objectName) writes.push({ packageId: pkg, objectName });
+  if (typeof input.xml === 'string') {
+    const scanned = scanXmlObjectRefsWithUnresolved(input.xml);
+    reads.push(...scanned.refs);
+    for (const value of scanned.unresolved) {
+      uncertain.push(
+        `XML 里的 resourceUri "${value}" 不是「包路径…/视图目录段/对象名」形态：` +
+          '无法解析为对象级引用，不参与批内相交检测（不猜）',
+      );
+    }
+  }
+  if (Array.isArray(input.operations)) {
+    input.operations.forEach((raw, i) => {
+      if (typeof raw !== 'object' || raw === null) return;
+      const op = raw as { op?: unknown; sourcePackageId?: unknown; sourceObjectName?: unknown };
+      if (op.op === 'set_script') return;
+      const sp = nonEmptyStr(op.sourcePackageId);
+      const so = nonEmptyStr(op.sourceObjectName);
+      if (sp && so) {
+        reads.push({ packageId: sp, objectName: so });
+        return;
+      }
+      // 给了源坐标的"一半"：确实声明了引用、只是对象级解析不出 ⇒ 落 uncertain（不猜另一半）。
+      // 两个字段都没给的操作不产生任何引用声明，不算"解析不出"，不在这里制造噪音。
+      if (sp || so) {
+        uncertain.push(
+          `操作 ${i + 1}（${nonEmptyStr(op.op) ?? '未知操作'}）只给出源坐标之一` +
+            `（sourcePackageId=${sp ?? '(缺)'}、sourceObjectName=${so ?? '(缺)'}）：` +
+            '无法解析为对象级引用，不参与批内相交检测（不猜）',
+        );
+      }
+    });
+  }
+  return { reads: dedupeRefs(reads), writes: dedupeRefs(writes), uncertain };
 }
 
 /**
