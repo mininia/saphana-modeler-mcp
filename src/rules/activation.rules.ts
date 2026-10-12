@@ -3,10 +3,8 @@ import type { RuleObject } from './index.js';
 /**
  * 激活要求（度量）规则。
  *
- * 来源（搬迁自，保留原文措辞）：
- * - src/server.ts 的 SERVER_INSTRUCTIONS 第 32 行（「至少一个数值列标 isMeasure=true（激活要求 ≥1 度量）」）；
- * - src/capabilities/defs/modeling.ts 的 hana_view_create.description「实测边界」第 ① 条
- *   与 measureMode 枚举的 describe（两种取值与各自后果）。
+ * 本文件是这些语义的模型可查全文：改动 view-builder 的度量判定 / measureMode 行为、
+ * 或 hana_view_create 工具描述里的对应措辞时必须同步此处。
  */
 
 export const activationRules: readonly RuleObject[] = [

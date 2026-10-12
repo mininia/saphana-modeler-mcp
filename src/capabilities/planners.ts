@@ -1,14 +1,22 @@
 import {
+  dedupeRefs,
   hasUnqualifiedTableRef,
   objectRefsOfUpdate,
-  sameObjectRef,
   scanSqlSchemaRefs,
-  scanXmlObjectRefs,
+  scanXmlObjectRefsWithUnresolved,
   scanXmlPackageRefs,
   type ObjectRef,
   type WritePlan,
 } from '../write-plan.js';
 import type { CapabilityPlanner } from './types.js';
+// analyze 护栏数字取自 core/limits（单一事实源，无依赖纯叶子）：步骤文案用插值生成，改常量会一起变
+import { ANALYZE_EXECUTION_TIMEOUT_MS, ANALYZE_MAX_ROWS } from '../core/limits.js';
+// 依赖方向：capabilities/ 允许 import 纯叶子。model/view-xml 与 model/view-types 都是**纯解析/纯映射**
+// 模块（无 I/O、不 import services 或 capabilities）——不引入 import 环（由 tests/unit/import-cycles.test.ts
+// 把关）。全量 XML 载荷的 dataSource 解析复用它们：不另写第二份方言解析（两份必然漂移，漏一处即静默失守）。
+import { normalizeBwSchema } from '../model/view-types.js';
+import { parseViewDefinition } from '../model/view-xml.js';
+import { CHECK_PROCEDURES } from '../services/validation.service.js';
 
 /**
  * 能力规划器实现：入参 → WritePlan（「这次调用最终会读写什么」）。
@@ -38,11 +46,97 @@ function add(list: string[], ...items: (string | undefined)[]): void {
   }
 }
 
-/** 对象级引用的去重追加（SSD §6.2；判等用共享件 sameObjectRef，不在这里另写字段比较） */
-function addRefs(list: ObjectRef[], ...items: ObjectRef[]): void {
-  for (const it of items) {
-    if (!list.some((x) => sameObjectRef(x, it))) list.push(it);
+/**
+ * 从一份完整设计时 XML 里扫出**静态可解析的读取面**（基表/基视图数据源 schema + SQL 模式脚本引用）。
+ *
+ * 为什么必须做：xml（hana_view_update）与 content（hana_repo_import）这两条**全量载荷**通道
+ * 只扫 resourceUri 时（readPackages 是可见性信息、不参与拦截）readSchemas 恒空 ⇒
+ * HANA_SCHEMA_ALLOW 对它们静默不生效；而载荷里的基表坐标是**静态可解析**的
+ * （真实 CV：`<DataSource …><columnObject schemaName="…" columnObjectName="…"/></DataSource>`），
+ * 服务端"写入即激活"会按该 schema 编译视图——不判等于把读取范围静默放开。
+ *
+ * 口径：
+ * - 数据源坐标复用 `model/view-xml` 的 parseViewDefinition（不在此另写第二份 columnObject 解析）；
+ * - schemaName 先过 `normalizeBwSchema`（BW on HANA 的 "ABAP" 是源系统名、真实 schema 是 SAPABAP1；
+ *   不归一会把 Studio 建的普通 BW 视图全部误拦）；
+ * - 计算视图数据源没有 schemaName（引用在 resourceUri 上），自然不在此维度；
+ * - 模型未建模的坐标载体（属性视图的 tableProxy、输出段 keyMapping）由 `collectXmlSchemaNames`
+ *   沿解析产物补收，取值与上一条去重合流；`<table>` 未带 schemaName 时坐标读不出，记入 unscanned；
+ * - SqlScriptView 的 `<definition>` 脚本（SQL 模式视图）随 `scripts` 带回：调用方按 set_script 的
+ *   同一套脚本扫描器并入——同一份脚本从哪个入口进来都必须得到同一份读取范围结论；
+ * - 解析抛错或没有根元素的载荷**不猜**：`parsed: false` 由调用方落 uncertain，如实区分"解析不出"与"没有引用"
+ *   （未闭合/错配标签等畸形不抛——fast-xml-parser 宽容解析，产物照常被扫描）；
+ * - 方向是**收紧**：引用白名单外 schema 的既有视图将无法经本服务更新。
+ *
+ * @returns schemas=可并入 readSchemas 的候选（已归一）；scripts=节点脚本正文（未扫）；
+ *          unscanned=看到了表坐标段但读不出 schema 的段描述（调用方落 uncertain）。
+ */
+function scanXmlBaseTableSchemas(xml: string): {
+  schemas: string[];
+  scripts: string[];
+  parsed: boolean;
+  unscanned: string[];
+} {
+  let def: ReturnType<typeof parseViewDefinition>;
+  try {
+    def = parseViewDefinition(xml);
+  } catch {
+    // 只有截断类畸形（未终止的标签/属性/CDATA/注释等）会抛；
+    // 未闭合/错配闭合标签不抛——宽容解析成产物后照常走下方扫描，坐标不丢
+    return { schemas: [], scripts: [], parsed: false, unscanned: [] };
   }
+  // 没有任何根元素（纯文本/被宽容解析成空对象）同样按"解析不出"处理——
+  // 否则"解析不出"会静默退化成"确实没有引用"（降级口径要求两者可区分）。
+  if (!Object.keys(def.raw as Record<string, unknown>).some((k) => !k.startsWith('?'))) {
+    return { schemas: [], scripts: [], parsed: false, unscanned: [] };
+  }
+  const schemas: string[] = [];
+  for (const ds of def.dataSources) {
+    if (!ds.schemaName) continue;
+    add(schemas, normalizeBwSchema(ds.schemaName));
+  }
+  // 模型未建模的坐标载体在解析产物上补收（与上面的 dataSources 方言去重合流）
+  const unscanned: string[] = [];
+  collectXmlSchemaNames(def.raw, schemas, unscanned);
+  // SQLScript 正文挂在节点 script 上（view-xml 已从 <definition> 取文本并解码实体）
+  const scripts = def.nodes.map((n) => n.script).filter((s): s is string => typeof s === 'string' && s.trim() !== '');
+  return { schemas, scripts, parsed: true, unscanned };
+}
+
+/**
+ * 沿解析产物递归补收 `schemaName` 属性坐标。
+ *
+ * 依据：模型 XML 里 `schemaName` 属性即「该列对象所在 schema」（columnObject / keyMapping / table
+ * 等载体同一语义）——view-xml 只把 dataSources 下的 columnObject 方言收进模型，属性视图的
+ * `<privateDataFoundation><tableProxies><tableProxy><table schemaName="…"/>` 与输出段
+ * `<keyMapping schemaName="…"/>` 都会漏下；只认一种载体时整类载荷的基表坐标静默落空。
+ * dataSources 方言仍由 parseViewDefinition 单点解析（本函数只补漏，取值经 add 去重跟它合流）。
+ * `<tableProxy>` 的表未带 schemaName：坐标读不出，记入 unscanned（"扫不出"与"没有引用"须可区分）。
+ */
+function collectXmlSchemaNames(node: unknown, schemas: string[], unscanned: string[]): void {
+  if (Array.isArray(node)) {
+    for (const child of node) collectXmlSchemaNames(child, schemas, unscanned);
+    return;
+  }
+  if (node === null || typeof node !== 'object') return;
+  const obj = node as Record<string, unknown>;
+  const schema = obj['@_schemaName'];
+  if (typeof schema === 'string' && schema.trim() !== '') add(schemas, normalizeBwSchema(schema));
+  if ('tableProxy' in obj) {
+    const proxies = obj['tableProxy'];
+    for (const proxy of Array.isArray(proxies) ? proxies : [proxies]) {
+      const tables = asObj(proxy)?.['table'];
+      for (const table of Array.isArray(tables) ? tables : [tables]) {
+        const tableObj = asObj(table);
+        if (tableObj === undefined) continue; // 空段/自闭合段没有表坐标可读，不据此报警
+        const name = tableObj['@_schemaName'];
+        if (typeof name !== 'string' || name.trim() === '') {
+          add(unscanned, '<tableProxy> 下的表坐标未带 schemaName（该表的 schema 无法判定）');
+        }
+      }
+    }
+  }
+  for (const value of Object.values(obj)) collectXmlSchemaNames(value, schemas, unscanned);
 }
 
 /** 声明式操作补丁的入参形状（结构见 hana_view_update 的 operations schema：add_join / set_script） */
@@ -52,6 +146,23 @@ interface DeclarativeOp {
   sourceObjectName?: unknown;
   /** op=set_script 的 SQL 正文 */
   script?: unknown;
+}
+
+/**
+ * 脚本里的 schema 引用扫描 → 并入 `readSchemas` 并落一条统一的 caveat；返回候选数供调用点拼 steps 行。
+ *
+ * 文案**单点**：本文件全部调用点（create/mode=sql、set_script、全量 XML 与内联内容里的 <definition>
+ * 脚本、变更集各分支）只提供场景前缀。限制口径多处各写一份时，补一条（引号/同义词/动态 SQL）就会漏改，
+ * 出现"同一判定、两种报告文本"。
+ */
+function addScriptSchemaRefs(p: WritePlan, script: string, where: string): number {
+  const refs = scanSqlSchemaRefs(script);
+  add(p.readSchemas, ...refs);
+  p.uncertain.push(
+    `${where}：脚本内 schema 引用按 FROM/JOIN 表位置（启发式）扫描（含引号/小写写法），` +
+      '未限定 schema 的表名（按当前用户默认 schema 解析）与动态 SQL 不在本计划内',
+  );
+  return refs.length;
 }
 
 /** hana_view_create：写入目标包；读取源 schema（或扫描 SQL 模式脚本里的 schema 引用）；激活会生成 _SYS_BIC 运行时视图 */
@@ -65,7 +176,8 @@ export function planViewCreate(args: Record<string, unknown>): WritePlan {
   const script = asStr(args.script);
   // 与服务层同一判定：mode 缺省即 projection（此时 script 会被忽略，计划也不该按 SQL 模式描述）
   const isSqlMode = args.mode === 'sql';
-  // 写包（packageId）与源 schema（sourceSchema）由**参数声明**派生，此处不再重复声明
+  // 写包（packageId）由**参数声明**派生，此处不再重复声明；源 schema 的读取范围见下方非 sql 分支
+  // （按模式声明——无条件打标签会让 mode=sql 的合法调用被白名单外残留值误拦）
   p.steps.push(
     isSqlMode
       ? `在包 ${pkg ?? '(未指定)'} 新建 SQL 模式设计时 Calculation View ${object}（单 SqlScriptView + <definition>）`
@@ -73,24 +185,26 @@ export function planViewCreate(args: Record<string, unknown>): WritePlan {
   );
   if (isSqlMode) {
     if (script) {
-      const refs = scanSqlSchemaRefs(script);
-      add(p.readSchemas, ...refs);
-      p.steps.push(`按脚本中出现的 schema 限定名核对读取范围（共 ${refs.length} 个候选，来自 FROM/JOIN 表位置）`);
-      p.uncertain.push(
-        'SQL 模式：脚本内 schema 引用按 FROM/JOIN 表位置扫描（含引号/小写写法），' +
-          '未限定 schema 的表名（按当前用户默认 schema 解析）与动态 SQL 不在本计划内',
-      );
+      const count = addScriptSchemaRefs(p, script, 'SQL 模式');
+      p.steps.push(`按脚本中出现的 schema 限定名核对读取范围（共 ${count} 个候选，来自 FROM/JOIN 表位置）`);
     }
     p.steps.push('按本环境方言生成设计时 XML（SCRIPT_BASED + definition + viewAttribute datatype）');
-  } else if (schema && source) {
-    p.steps.push(`读取源 ${schema}.${source} 的列定义（按类型区分属性/度量）`);
+  } else {
+    // sourceSchema 只在非 sql 模式被消费——读取范围**按模式**声明（声明层对混合模式的参数不打标签，
+    // 见 defs/modeling 的 VIEW_SOURCE_SCHEMA_FIELD）：mode=sql 时顺手填了白名单外残留值的合法调用
+    // 不该被闸门误拦。与 changeset 的 create/projection 分支同一口径；缺 sourceName 的调用会被
+    // handler 参数校验拒绝，但仍如实声明读取意图（fail-closed 方向，与既有闸门口径一致）。
+    add(p.readSchemas, schema);
+    if (schema && source) {
+      p.steps.push(`读取源 ${schema}.${source} 的列定义（按类型区分属性/度量）`);
+    }
   }
   p.steps.push('生成并写入设计时 XML（XS REST PUT）');
   if (args.activate === true) p.steps.push('写入后尝试激活 → 生成 _SYS_BIC 运行时列视图');
   if (typeof args.probeRows === 'number' && args.probeRows > 0) {
     p.steps.push(`激活后回探测前 ${args.probeRows} 行（只读 _SYS_BIC 运行时对象）`);
   }
-  // 对象级写集（SSD §6.2）：新建的即是目标对象本身。参数不全时不声明——不造空引用，也不假装确定。
+  // 对象级写集：新建的即是目标对象本身。参数不全时不声明——不造空引用，也不假装确定。
   if (pkg && objectArg) p.writes = [{ packageId: pkg, objectName: objectArg }];
   return p;
 }
@@ -104,8 +218,8 @@ export function planViewUpdate(args: Record<string, unknown>): WritePlan {
   const pkg = asStr(args.packageId);
   const objectArg = asStr(args.objectName);
   const object = objectArg ?? '(未指定)';
-  // changeset（SSD §6.1，P7）：与 xml/operations 三选一的多对象批次——不再是单个目标对象，
-  // 各动作的读写集取并集（见文件末尾），排序与相交判定由 P7 执行侧消费。
+  // changeset：与 xml/operations 三选一的多对象批次——不再是单个目标对象，
+  // 各动作的读写集取并集（见文件末尾），排序与相交判定由执行侧（services/changeset.plan）消费。
   // 包级维度同样按"批内全部动作"取并集：writePackages = 各 action 的包（预检报告与写边界判定
   // 必须覆盖整批，见下方对象级段落）；载荷里的 schema 引用同样**逐动作扫描**并入 readSchemas
   // （与单对象通道同一套扫描器，见下方逐动作段落——漏扫 = 单对象被拦的载荷换进批次就能写）。
@@ -137,12 +251,9 @@ export function planViewUpdate(args: Record<string, unknown>): WritePlan {
     } else if (kind === 'set_script') {
       // 替换脚本：只改当前视图自身（无跨包读取），但脚本内的 schema 限定名属于读取范围
       const script = asStr(op?.script);
-      if (script) add(p.readSchemas, ...scanSqlSchemaRefs(script));
+      if (script) addScriptSchemaRefs(p, script, `操作 ${i + 1}（set_script）`);
       p.steps.push(
         `应用操作 ${i + 1}（set_script）：替换 SQL 模式视图的脚本与输出列（重建 definition/viewAttributes/logicalModel 输出）`,
-      );
-      p.uncertain.push(
-        `操作 ${i + 1}（set_script）：脚本内的 schema 引用按启发式扫描，未限定 schema 的表名不在本计划内`,
       );
     } else if (sp) {
       add(p.readPackages, sp);
@@ -155,22 +266,48 @@ export function planViewUpdate(args: Record<string, unknown>): WritePlan {
   const xml = asStr(args.xml);
   if (xml) {
     add(p.readPackages, ...scanXmlPackageRefs(xml));
+    // 全量 XML 里的基表数据源 schemaName 是**静态可解析**的读取面——只扫 resourceUri 时
+    // readSchemas 恒空 ⇒ HANA_SCHEMA_ALLOW 对 xml 通道静默不生效。与 set_script 的脚本扫描
+    // 同一方向：扫出来就进读取范围核对；解析不出的落 uncertain（不假装"没有引用"）。
+    const xmlSchemas = scanXmlBaseTableSchemas(xml);
+    add(p.readSchemas, ...xmlSchemas.schemas);
+    if (xmlSchemas.schemas.length > 0) {
+      p.steps.push(`按 XML 基表数据源核对读取范围（共 ${xmlSchemas.schemas.length} 个候选，BW 源系统名已归一）`);
+    } else if (!xmlSchemas.parsed) {
+      p.uncertain.push(
+        '全量 XML 模式：XML 未能解析出数据源，其中的基表 schema 引用未纳入读取范围核对（解析不出的不猜）',
+      );
+    }
+    // SQL 模式视图（SqlScriptView 的 <definition>）做全量覆盖时，脚本里的 schema 限定名同样是读取面：
+    // 与 set_script 同一扫描器并入——不给脚本全量覆盖留一条绕过读取范围的旁路。
+    if (xmlSchemas.scripts.length > 0) {
+      const count = addScriptSchemaRefs(p, xmlSchemas.scripts.join('\n'), '全量 XML 模式');
+      p.steps.push(
+        `按 XML 内 <definition> 脚本的 schema 限定名核对读取范围（共 ${count} 个候选，来自 FROM/JOIN 表位置）`,
+      );
+    }
+    // 看到了表坐标段但读不出 schema（如 tableProxy 的表未带 schemaName）：不静默当成"没有引用"
+    if (xmlSchemas.unscanned.length > 0) {
+      p.uncertain.push(
+        `全量 XML 模式：${xmlSchemas.unscanned.join('、')}，其 schema 引用未纳入读取范围核对（解析不出的不猜）`,
+      );
+    }
     p.steps.push('以传入的完整 XML 全量覆盖当前定义');
     p.uncertain.push('全量 XML 模式：其中的跨包数据源引用按 resourceUri 扫描得出，可能不完整');
   }
 
-  // ── 对象级读/写集（SSD §6.2，P7）──
+  // ── 对象级读/写集 ──
   // 用共享件 objectRefsOfUpdate 推（不在本文件另写 URI/字段解析）：writes=目标对象；
   // reads=operations 的 join 源对象 + xml 里 resourceUri 指向的对象。
-  // changeset 模式下顶层 packageId/objectName 被忽略（schema 已改为可选、批次不消费——见 defs/modeling 的
-  // superRefine；资源声明层也不再把它并进 writePackages，见 capabilities/resources.ts），
+  // changeset 模式下顶层 packageId/objectName 被忽略（批次不消费它们——见 defs/modeling 的
+  // superRefine；资源声明层不把它们并进 writePackages，见 capabilities/resources.ts），
   // 故对象级集合**完全由 actions 并集构成**——把顶层目标也算成"将写入"会在批外对象上造出幽灵写声明。
   const outerRefs = csActions
     ? { reads: [] as ObjectRef[], writes: [] as ObjectRef[], uncertain: [] as string[] }
     : objectRefsOfUpdate({ packageId: pkg ?? '', objectName: objectArg ?? '', xml, operations: ops });
-  const writes: ObjectRef[] = [...outerRefs.writes];
-  const reads: ObjectRef[] = [...outerRefs.reads];
-  // 共享扫描件的降级出口（§6.2）：解析不出的引用（缺半边源坐标 / 非视图形态的 resourceUri）逐条进 uncertain，
+  let writes: ObjectRef[] = [...outerRefs.writes];
+  let reads: ObjectRef[] = [...outerRefs.reads];
+  // 共享扫描件的降级出口：解析不出的引用（缺半边源坐标 / 非视图形态的 resourceUri）逐条进 uncertain，
   // 保证「解析不出」与「没有引用」可区分——单对象通道的报错文案已自带操作序号，直接透传即可。
   p.uncertain.push(...outerRefs.uncertain);
   if (csActions) {
@@ -191,16 +328,16 @@ export function planViewUpdate(args: Record<string, unknown>): WritePlan {
         xml: actionXml,
         operations: actionOps,
       });
-      addRefs(writes, ...r.writes);
-      addRefs(reads, ...r.reads);
-      // 共享扫描件的降级出口（§6.2）在批内必须**点名第几项**：批是多载荷拼装，脱离定位的
+      writes = dedupeRefs([...writes, ...r.writes]);
+      reads = dedupeRefs([...reads, ...r.reads]);
+      // 共享扫描件的降级出口在批内必须**点名第几项**：批是多载荷拼装，脱离定位的
       // 「解析不出的引用」无法回指到调用方的哪个 action（报告与 conflicts 的下标口径一致，从 0 数）。
       for (const note of r.uncertain) p.uncertain.push(`变更集第 ${i} 项（从 0 数）：${note}`);
 
-      // ── 载荷 schema 扫描（SSD §1.5 登记义务③；P7 修复批）──
+      // ── 载荷 schema 扫描：批次载荷与单对象通道同源，漏扫 = 单对象被拦的载荷换进批内就能写 ──
       // 复用单对象分支**同一套扫描器**（scanSqlSchemaRefs，不写第二份）：changeset 只是把同一份载荷
-      // 装进 actions 数组，载荷里的 schema 限定引用与单对象通道逐字同源。此前这里只聚合写包与对象引用，
-      // 后果是**单对象通道会被闸门以 schema_not_allowed 拦下的载荷，换进批次就能写进去**（评审实测）：
+      // 装进 actions 数组，载荷里的 schema 限定引用与单对象通道逐字同源——漏扫的后果是
+      // **单对象通道会被闸门以 schema_not_allowed 拦下的载荷，换进批次就能写进去**：
       // 服务层 assertScriptReadScopes 只查**未限定表名**（限定名归工具层预检），批内漏扫 = 读取范围静默失守。
       // 解析不出的引用（未限定表名 / 动态 SQL）照旧落 uncertain，并点名「第几项」以便调用方定位。
       const actionKind = String(rec.action ?? '?');
@@ -210,15 +347,10 @@ export function planViewUpdate(args: Record<string, unknown>): WritePlan {
         if (mode === 'sql') {
           const script = asStr(asObj(rec.scripted)?.script);
           if (script) {
-            const refs = scanSqlSchemaRefs(script);
-            add(p.readSchemas, ...refs);
+            const count = addScriptSchemaRefs(p, script, `变更集第 ${i} 项（从 0 数，create/mode=sql）`);
             p.steps.push(
               `变更集第 ${i} 项（从 0 数，create/mode=sql）：按脚本中出现的 schema 限定名核对读取范围` +
-                `（共 ${refs.length} 个候选，来自 FROM/JOIN 表位置）`,
-            );
-            p.uncertain.push(
-              `变更集第 ${i} 项（从 0 数，create/mode=sql）：脚本内 schema 引用按 FROM/JOIN 表位置启发式扫描，` +
-                '未限定 schema 的表名（按当前用户默认 schema 解析）与动态 SQL 不在本计划内',
+                `（共 ${count} 个候选，来自 FROM/JOIN 表位置）`,
             );
           }
         } else {
@@ -233,6 +365,36 @@ export function planViewUpdate(args: Record<string, unknown>): WritePlan {
             );
           }
         }
+      } else if (actionKind === 'update' && actionXml !== undefined) {
+        // 批内 update 携带 xml 时若**整体跳过扫描**：单对象通道会被闸门以 schema_not_allowed
+        // 拦下的载荷，换进批次就能写进去（与 set_script 漏扫同一类）。
+        // 与单对象 xml 分支同一扫描件、同一口径：基表数据源与 <definition> 脚本 schema 归一后进 readSchemas。
+        const xmlSchemas = scanXmlBaseTableSchemas(actionXml);
+        add(p.readSchemas, ...xmlSchemas.schemas);
+        if (xmlSchemas.schemas.length > 0) {
+          p.steps.push(
+            `变更集第 ${i} 项（从 0 数，update）：按 XML 基表数据源核对读取范围` +
+              `（共 ${xmlSchemas.schemas.length} 个候选，BW 源系统名已归一）`,
+          );
+        } else if (!xmlSchemas.parsed) {
+          p.uncertain.push(
+            `变更集第 ${i} 项（从 0 数，update）：XML 未能解析出数据源，` +
+              '其中的基表 schema 引用未纳入读取范围核对（解析不出的不猜）',
+          );
+        }
+        if (xmlSchemas.scripts.length > 0) {
+          const count = addScriptSchemaRefs(p, xmlSchemas.scripts.join('\n'), `变更集第 ${i} 项（从 0 数，update）`);
+          p.steps.push(
+            `变更集第 ${i} 项（从 0 数，update）：按 XML 内 <definition> 脚本的 schema 限定名核对读取范围` +
+              `（共 ${count} 个候选，来自 FROM/JOIN 表位置）`,
+          );
+        }
+        if (xmlSchemas.unscanned.length > 0) {
+          p.uncertain.push(
+            `变更集第 ${i} 项（从 0 数，update）：${xmlSchemas.unscanned.join('、')}，` +
+              '其 schema 引用未纳入读取范围核对（解析不出的不猜）',
+          );
+        }
       } else if (actionKind === 'update' && actionXml === undefined && actionOps) {
         // update 的载荷二选一，口径与 changesetUpdatePayload 一致（xml 在场时 operations 不被消费）：
         // 只扫真正会被消费的那份，避免对不会被读取的载荷做过度声明。
@@ -241,15 +403,14 @@ export function planViewUpdate(args: Record<string, unknown>): WritePlan {
           if (op?.op !== 'set_script') return;
           const script = asStr(op.script);
           if (!script) return;
-          const refs = scanSqlSchemaRefs(script);
-          add(p.readSchemas, ...refs);
+          const count = addScriptSchemaRefs(
+            p,
+            script,
+            `变更集第 ${i} 项（从 0 数，update）操作 ${opIndex + 1}（set_script）`,
+          );
           p.steps.push(
             `变更集第 ${i} 项（从 0 数，update）操作 ${opIndex + 1}（set_script）：脚本内 schema 限定名纳入读取范围核对` +
-              `（共 ${refs.length} 个候选）`,
-          );
-          p.uncertain.push(
-            `变更集第 ${i} 项（从 0 数，update）操作 ${opIndex + 1}（set_script）：脚本内的 schema 引用按启发式扫描，` +
-              '未限定 schema 的表名不在本计划内',
+              `（共 ${count} 个候选）`,
           );
         });
       }
@@ -294,7 +455,7 @@ export function planViewDelete(args: Record<string, unknown>): WritePlan {
   const objectArg = asStr(args.objectName);
   // 写包由参数声明派生
   p.steps.push(`删除 ${pkg ?? '?'}/${objectArg ?? '?'} 的设计时对象`);
-  // 对象级写集（SSD §6.2）：删除的即是目标对象本身；下游依赖是 breaking 判定输入（P6 已落地），不在此展开。
+  // 对象级写集：删除的即是目标对象本身；下游依赖是 breaking 判定输入，不在此展开。
   if (pkg && objectArg) p.writes = [{ packageId: pkg, objectName: objectArg }];
   // 「下游依赖会失效」不再是模糊提醒，而是判定输入的说明：服务层删前查影响半径（_SYS_REPO.ACTIVE_OBJECTCROSSREF
   // 下游闭包），有下游引用属破坏性变更——未声明 migration.strategy=acknowledge_dependents 时拒绝且不删除（零写入）。
@@ -340,8 +501,8 @@ export function planViewValidate(args: Record<string, unknown>): WritePlan {
   add(p.writePackages, pkg);
   p.steps.push(`在包 ${pkg ?? '?'} 写入临时副本 _CHKTMP 触发服务端激活检查`);
   p.steps.push('删除临时副本（原对象的激活状态不受影响）');
-  // 对象级写集**刻意不声明**（writes 留 undefined，而不是 []）：临时副本名 = 截断基名 + **进程 nonce** + _CHKTMP
-  // （P5 §4.1），静态不可知——写进 writes 就是假装确定，而相交检测只应消费确定项（宁缺毋假）。
+  // 对象级写集**刻意不声明**（writes 留 undefined，而不是 []）：临时副本名 = 截断基名 + **进程 nonce** + _CHKTMP，
+  // 静态不可知——写进 writes 就是假装确定，而相交检测只应消费确定项（宁缺毋假）。
   // 如实落 uncertain；包级写声明保留（临时对象仍受包级写边界约束）。
   p.uncertain.push(
     'design 模式写入的临时副本名含进程 nonce（截断基名+短哈希+_CHKTMP），静态不可知：不进入对象级写集（相交检测不消费）',
@@ -370,13 +531,43 @@ export function planRepoImport(args: Record<string, unknown>): WritePlan {
   const filePath = asStr(args.filePath);
   if (content) {
     add(p.readPackages, ...scanXmlPackageRefs(content));
-    // 对象级读集（SSD §6.2）：内联内容里 resourceUri 指向的仓库对象可静态解析；
-    // filePath 模式内容要到服务端才读到，保持既有口径落 uncertain（不声明对象级读集）。
-    p.reads = scanXmlObjectRefs(content);
+    // 与 update 的 xml 通道同一处理——导入内容里的基表数据源 schemaName 是静态可解析的读取面
+    // （只扫 resourceUri 时 readSchemas 恒空 ⇒ HANA_SCHEMA_ALLOW 对此通道静默不生效）。
+    const contentSchemas = scanXmlBaseTableSchemas(content);
+    add(p.readSchemas, ...contentSchemas.schemas);
+    if (contentSchemas.schemas.length > 0) {
+      p.steps.push(
+        `按导入内容的基表数据源核对读取范围（共 ${contentSchemas.schemas.length} 个候选，BW 源系统名已归一）`,
+      );
+    } else if (!contentSchemas.parsed) {
+      p.uncertain.push('内联内容：未能解析出数据源，其中的基表 schema 引用未纳入读取范围核对（解析不出的不猜）');
+    }
+    // SQL 模式视图的内联内容：<definition> 脚本与 set_script 同一扫描器并入（服务层写入前另有同一口径的兜底）
+    if (contentSchemas.scripts.length > 0) {
+      const count = addScriptSchemaRefs(p, contentSchemas.scripts.join('\n'), '内联内容');
+      p.steps.push(
+        `按内联内容 <definition> 脚本的 schema 限定名核对读取范围（共 ${count} 个候选，来自 FROM/JOIN 表位置）`,
+      );
+    }
+    if (contentSchemas.unscanned.length > 0) {
+      p.uncertain.push(
+        `内联内容：${contentSchemas.unscanned.join('、')}，其 schema 引用未纳入读取范围核对（解析不出的不猜）`,
+      );
+    }
+    // 对象级读集：内联内容里 resourceUri 指向的仓库对象可静态解析；解析不出的照降级口径落 uncertain
+    // （只看 refs 时「解析不出」与「没有引用」无从区分）。filePath 模式内容要到服务端才读到，
+    // 不声明对象级读集（保持既有口径，落 uncertain）。
+    const scanned = scanXmlObjectRefsWithUnresolved(content);
+    p.reads = scanned.refs;
+    for (const value of scanned.unresolved) {
+      p.uncertain.push(
+        `内联内容里的 resourceUri "${value}" 不是「包路径…/视图目录段/对象名」形态：未纳入对象级读集（不猜）`,
+      );
+    }
     p.steps.push(`导入内联内容到包 ${tpkg ?? '?'}（落库即激活，实测无 inactive 暂存）`);
   } else if (filePath) {
     p.steps.push(`导入本地文件到包 ${tpkg ?? '?'}（落库即激活，实测无 inactive 暂存）`);
-    p.uncertain.push('filePath 导入：文件内容要到服务端读取时才知道，其中的跨包引用未纳入本计划');
+    p.uncertain.push('filePath 导入：文件内容要到服务端读取时才知道，其中的跨包引用与基表 schema 引用未纳入本计划');
   } else {
     p.steps.push(`导入到包 ${tpkg ?? '?'}（未提供 content/filePath，实际不会发生导入）`);
   }
@@ -406,7 +597,7 @@ export function planSqlAnalyze(args: Record<string, unknown>): WritePlan {
     add(p.readSchemas, ...refs);
     p.steps.push(
       args.analyze === true
-        ? '先实际执行该语句（单次执行最多 5 分钟 + 最多取 100 行 + **不返回数据行**），再按文本关联计划缓存条目解释其重编译计划'
+        ? `先实际执行该语句（单次执行最多 ${ANALYZE_EXECUTION_TIMEOUT_MS / 60_000} 分钟 + 最多取 ${ANALYZE_MAX_ROWS} 行 + **不返回数据行**），再按文本关联计划缓存条目解释其重编译计划`
         : '编译（**不执行**）该语句',
     );
     p.steps.push(`按语句中出现的 schema 限定名核对读取范围（共 ${refs.length} 个候选，来自 FROM/JOIN 表位置）`);
@@ -441,10 +632,10 @@ export function planFallback(toolName: string, args: Record<string, unknown>): W
   return p;
 }
 
-// ── 读能力规划器（planRead，P10-b）────────────────────────────────
+// ── 读能力规划器（planRead）────────────────────────────────
 //
 // 读能力的计划用**同一形状**：`writePackages` 恒空（读能力不写仓库包），
-// 重点在 `readSchemas`——它决定 `HANA_SCHEMA_ALLOW` 在**调用期**怎么判（此前只有服务层逐点接线）。
+// 重点在 `readSchemas`——它决定 `HANA_SCHEMA_ALLOW` 在**调用期**怎么判。
 // 只声明**能从入参静态确定**的资源；确定不了的进 `uncertain`（与写侧同一口径：不假装完整）。
 
 /** 只有叙述的计划（资源由参数声明派生，此处不声明任何资源——避免两个真值源） */
@@ -474,22 +665,42 @@ export function planReadless(tool: string): WritePlan {
  * 未给 `capability` 的索引调用同理：它只读清单，不触碰任何资源。
  */
 /**
- * 操作级条目（`<父工具>#<op>`，2026-10-10）的计划：把别名入参**还原成父工具的一次 operations 调用**，
+ * `hana_view_update` 操作级别名（`hana_view_update#<op>`）的**身份参数**清单：调用别名时这些字段
+ * 留在父工具调用外层（它们是父工具通道的旋钮），其余字段一律是 op 载荷。
+ *
+ * 三处消费点必须共用本清单（`defs/view-ops` 的别名 schema 派生、`tools/modeling.tools` 的别名
+ * handler 还原、本文件的 `planViewOpAlias`）：任何一处单独增删都会让"别名与直调父工具完全等价"
+ * 静默失守——多出的字段会被当成 op 载荷注入 operations，少掉的字段则永远到不了父工具
+ * （如 dryRun 丢失后别名无法预演）。
+ */
+export const VIEW_UPDATE_IDENTITY_FIELDS = ['packageId', 'objectName', 'ifMatch', 'dryRun', 'migration'] as const;
+
+/**
+ * 别名入参 → 父工具一次 `operations` 调用的入参：身份参数原样留外层，其余字段即 `{ op, ...载荷 }`。
+ * 父工具与别名共用同一份切分，别名不可能与直调父工具的执行/计划分叉。
+ */
+export function aliasArgsToParentCall(op: string, args: Record<string, unknown>): Record<string, unknown> {
+  const identity: Record<string, unknown> = {};
+  const payload: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(args)) {
+    if ((VIEW_UPDATE_IDENTITY_FIELDS as readonly string[]).includes(key)) identity[key] = value;
+    else payload[key] = value;
+  }
+  return { ...identity, operations: [{ op, ...payload }] };
+}
+
+/**
+ * 操作级条目（`<父工具>#<op>`）的计划：把别名入参**还原成父工具的一次 operations 调用**，
  * 交给父工具的规划器——读写集判定不另写一份（add_join 的源包照样进 readPackages、set_script 的
  * 脚本 schema 照样进 readSchemas）。
  *
- * 入参切分：父工具身份参数（packageId/objectName 与选项 ifMatch/dryRun/migration）留在外层，
- * 其余字段即该 op 的载荷。选项参数（ifMatch/dryRun/migration）不进 op 载荷——它们是父工具通道的旋钮。
+ * 身份参数（packageId/objectName 与旋钮 ifMatch/dryRun/migration）原样转发：dryRun/migration 各自会
+ * 让父规划器追加一行叙述，剥掉就会让同一次调用出现两套描述。不加任何别名专属叙述——计划文本除
+ * 报告头与归因行里的能力名（归因指向实际被调的能力）外与直调父工具逐字一致，把能力名归一后可按
+ * 字节比对（tests/unit/dynamic-surface.test.ts 的断言口径）。
  */
 export function planViewOpAlias(op: string, args: Record<string, unknown>): WritePlan {
-  const { packageId, objectName, ifMatch: _ifMatch, dryRun: _dryRun, migration: _migration, ...payload } = args;
-  // 刻意**不加**任何别名专属叙述：别名与父工具是同一个操作，计划文本必须逐字一致
-  // （拦截文案可由调用方按字节比对；多一行叙述就会让"两条路径同一条判定"不再可证）。
-  return planViewUpdate({
-    packageId,
-    objectName,
-    operations: [{ op, ...payload }],
-  });
+  return planViewUpdate(aliasArgsToParentCall(op, args));
 }
 
 /**
@@ -531,7 +742,11 @@ export function planTableList(args: Record<string, unknown>): WritePlan {
         ? `列出 schema ${schema} 下当前用户可访问的表（SYS.TABLES，按权限过滤）`
         : '列出**当前用户默认 schema** 下可访问的表（SYS.TABLES，按权限过滤）',
     ],
-    schema ? [] : ['未给 schema：默认 schema 在服务端由 CURRENT_SCHEMA 解析后判定（本计划无法静态确定，故此处不声明）'],
+    schema
+      ? []
+      : [
+          '未给 schema：默认 schema 在服务端由 CURRENT_SCHEMA 解析（只解析、不过白名单判定，范围由数据库权限约束；本计划无法静态确定，故此处不声明）',
+        ],
   );
 }
 
@@ -544,7 +759,9 @@ export function planTableColumns(args: Record<string, unknown>): WritePlan {
 
 /**
  * hana_data_preview：两种目标（与工具描述一致）。
- * - **勘察模式**（schema+table）：真实数据来自用户指定的 schema → 声明读范围；
+ * - **勘察模式**（schema+table）：真实数据来自用户指定的 schema → 该 schema 由参数角色标签并进
+ *   读取范围判定（defs/preview.ts 的 `tagResource(..., 'readSchema')` → resources 的
+ *   `deriveResourcesFromParams`）；本规划器只写叙述，不声明资源（同一件事只留一个真值源）；
  * - **视图预览模式**（packageId+objectName）：运行时 schema 恒为 `_SYS_BIC`（系统 schema，恒可读），
  *   故不声明读 schema；`node` 参数会走 HANA 原生中间视图机制在 `_SYS_BIC` 里**建/删临时视图**，
  *   如实写进 uncertain（当前没有任何边界能判定这类系统 schema 内的临时对象，只是不隐瞒）。
@@ -579,8 +796,12 @@ export function planDataPreview(args: Record<string, unknown>): WritePlan {
 }
 
 /**
- * hana_table_storage：表/列存储画像。**schema 参数此前不做任何白名单判定**（只做形状校验，
- * 省略即全库扫描）——本规划器把它纳入读范围判定的输入，是 P10-b「读范围补齐」的落点之一。
+ * hana_table_storage：表/列存储画像。
+ *
+ * 读范围判定由**参数角色标签**承担：schema 参数带 `readSchema` 角色（defs/health.ts 的
+ * `tagResource`），由 resources 的 `deriveResourcesFromParams` 并进 `readSchemas`——本规划器
+ * 只写叙述与不确定项，**不声明资源**（同一件事只留一个真值源）。schema 省略即全库扫描，
+ * 范围由数据库权限决定，静态不可确定，如实落 uncertain。
  */
 export function planTableStorage(args: Record<string, unknown>): WritePlan {
   const schema = asStr(args.schema);
@@ -626,15 +847,15 @@ export function planRepoChangelist(args: Record<string, unknown>): WritePlan {
 
 /** hana_view_check_actions：只读系统过程（SELECT SYS.GET_CHECK_ACTIONS 的动作清单）；无资源维度 */
 export function planViewCheckActions(args: Record<string, unknown>): WritePlan {
-  const proc = asStr(args.checkProcedureName) ?? 'CHECK_CALCULATION_VIEW';
+  const proc = asStr(args.checkProcedureName) ?? CHECK_PROCEDURES[0];
   return narrativePlan('hana_view_check_actions', [
     `查询 CHECK 过程 ${proc} 支持的 ACTION 全集（SELECT SYS.GET_CHECK_ACTIONS，只读）`,
   ]);
 }
 
 /**
- * 「只读系统视图」类能力的叙述型规划器工厂（稳定性诊断四件套；`hana_table_storage` 另有
- * `planTableStorage`，它还要把 schema 参数纳入读范围判定）。
+ * 「只读系统视图」类能力的叙述型规划器工厂（稳定性诊断四件套；`hana_table_storage` 不在此列——
+ * 它另有 `planTableStorage`，且 schema 参数带读范围角色标签，见 defs/health.ts）。
  *
  * 这些能力**行为只读**（仅 SELECT SYS.M_* / _SYS_STATISTICS.*），权限层级（kind）归 admin。
  * 必须显式声明：不声明会落到写兜底（按参数表面瞎猜资源）。也不声明任何资源——监视视图在系统
@@ -651,6 +872,5 @@ export function planSystemViewRead(tool: string, subject: string): CapabilityPla
 
 /**
  * 规划器实现（`effects.plan` 的落点）——**能力清单是唯一的事实源**：
- * 「哪个能力用哪个规划器」由 `capabilities/defs/*.ts` 的 `effects.plan` 声明，
- * 本文件只提供实现，不再自带 name → planner 的映射表（此前在 src/tools/write-plans.ts）。
+ * 「哪个能力用哪个规划器」由 `capabilities/defs/*.ts` 的 `effects.plan` 声明，本文件只提供实现。
  */

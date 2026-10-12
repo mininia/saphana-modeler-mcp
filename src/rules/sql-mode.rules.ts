@@ -3,10 +3,9 @@ import type { RuleObject } from './index.js';
 /**
  * SQL 模式（Scripted Calculation View）的方言规则。
  *
- * 来源（搬迁自，保留原文措辞）：
- * - src/server.ts 的 SERVER_INSTRUCTIONS 第 32 行（「新建 Calculation View 两种形态」整段）；
- * - src/capabilities/defs/modeling.ts 的 hana_view_create.description（mode=sql 一段与「SQL 约定」五条）；
- * - hana_view_update 的 op=set_script 说明与 scriptColumns 字段说明（整体替换旧输出）。
+ * 本文件是这些契约的模型可查全文：改动 view-builder / view-edit 的 SQL 模式生成与变换行为、
+ * 或 src/capabilities/defs/modeling.ts 里对应工具描述时，必须同步此处，否则规则给模型的口径
+ * 与实际行为不符。
  */
 
 export const sqlModeRules: readonly RuleObject[] = [
@@ -20,7 +19,9 @@ export const sqlModeRules: readonly RuleObject[] = [
       '（mode=projection 是图形化最小形态：单 Projection + 单源表全列透传，用于表直接透传。）',
       '',
       '正文约定：**写普通查询即可**——服务端自动包成 `BEGIN VAR_OUT = <查询>; END` 过程体',
-      '（裸 SELECT 不是合法过程体）；也可直接给完整 BEGIN…END 过程体。',
+      '（`<definition>` 被原样拼进生成的 create procedure DDL：正文必须是过程体块、输出只能赋给 OUT 形参',
+      'VAR_OUT——裸 SELECT 会报 incorrect syntax near "SELECT"，`VAR_OUT = SELECT …` 报 near "="，',
+      '`DO BEGIN … END` 报 near "BEGIN"）；也可直接给完整 BEGIN…END 过程体。',
       '',
       '输出列（scriptColumns，输出列清单）：',
       '- datatype 必填——**它决定 HANA 为输出变量 VAR_OUT 生成的表类型**：缺 datatype/length 会生成空表类型、',

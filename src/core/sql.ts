@@ -33,8 +33,12 @@ const SAFE_RUNTIME_NAME_RE = /^[A-Za-z0-9_$#./\-]+$/;
  * 包名（packageId / 对象名）的**工具入参**字符集：字母/数字/_/./-。
  * 比 SAFE_NAME_RE 严格（不含 $ # /）——这是暴露给模型与外部调用方的契约，
  * 全仓 28 处 zod schema 共用此常量，避免各写一份导致规则漂移。
+ *
+ * `(?!\.+$)` 拒绝纯点串（`.` / `..`）：点号本身是合法字符（`a.b` 允许），但纯点串不是合法包名，
+ * 且 `encodeURIComponent` 不会改写 `.`——它会被 WHATWG URL 当路径片段规范化（`/file/../X` 静默
+ * 向上走一层），使 XS REST 请求落到与名字不符的路径。入参面直接拒绝，服务侧另有一道同名判定。
  */
-export const PACKAGE_ID_RE = /^[A-Za-z0-9_.\-]+$/;
+export const PACKAGE_ID_RE = /^(?!\.+$)[A-Za-z0-9_.\-]+$/;
 
 /** schema 名与表名（工具入参口径）：不以数字开头，长度按 HANA 标识符上限 127 */
 const TOOL_SCHEMA_ID_RE = /^[A-Za-z_][A-Za-z0-9_$#]{0,126}$/;
@@ -45,11 +49,6 @@ const extraSchemas = new Set<string>();
 export function configureExtraSchemas(schemas: string[]): void {
   extraSchemas.clear();
   for (const s of schemas) extraSchemas.add(s.toUpperCase());
-}
-
-/** 当前生效的追加 schema 快照（只读；测试与诊断用，替代直接读模块状态） */
-export function extraSchemaSnapshot(): readonly string[] {
-  return [...extraSchemas];
 }
 
 /**
@@ -64,7 +63,7 @@ export function isSchemaAllowedWith(schema: string, extra: readonly string[]): b
 
 /** schema 是否在白名单内（含 configureExtraSchemas 配置的追加项） */
 export function isSchemaAllowed(schema: string): boolean {
-  return isSchemaAllowedWith(schema, extraSchemaSnapshot());
+  return isSchemaAllowedWith(schema, [...extraSchemas]);
 }
 
 /**
@@ -74,7 +73,7 @@ export function isSchemaAllowed(schema: string): boolean {
  * 调用方按报错去排查会得出"我加的 schema 明明在白名单里"这类错误结论。
  * 文案由 SYSTEM_SCHEMAS 生成后，白名单变更不可能再与文案脱节。
  */
-export function describeSchemaWhitelist(): string {
+function describeSchemaWhitelist(): string {
   return [...SYSTEM_SCHEMAS].join('/');
 }
 
@@ -106,11 +105,6 @@ export function assertSafeRuntimeName(name: string, kind = '对象'): void {
       'INVALID_OBJECT_NAME',
     );
   }
-}
-
-/** 纯判定版（不抛错）：用于需要自行组织错误文案的调用点 */
-export function isSafeObjectName(name: string): boolean {
-  return SAFE_NAME_RE.test(name);
 }
 
 /** 纯判定版（不抛错）：运行时对象名（允许 /） */

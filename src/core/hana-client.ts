@@ -85,6 +85,28 @@ function positiveTimeoutMs(opts?: { timeoutMs?: number }): number | undefined {
   return typeof t === 'number' && Number.isFinite(t) && t > 0 ? t : undefined;
 }
 
+/**
+ * 连接存活判定（同步）。
+ *
+ * 驱动 d.ts 只把 Connection.isValid 声明成回调形态（`isValid(fn?): void`），但运行期无参调用
+ * 是**同步返回布尔**的（本机实测：未连接对象返回 false）——类型面缺这个同步重载，故在此用最小
+ * 接口把运行期契约写清楚。
+ * 判定自身抛错视同失效（宁可丢一条可疑连接，也不把失效连接循环复用）；
+ * 没有 isValid 的对象（如测试替身）不做判定、按存活处理，保持既有行为。
+ */
+interface SyncValidConnection {
+  isValid(): boolean;
+}
+function connectionAlive(conn: Connection): boolean {
+  const probe = conn as unknown as SyncValidConnection;
+  if (typeof probe.isValid !== 'function') return true;
+  try {
+    return probe.isValid() === true;
+  } catch {
+    return false;
+  }
+}
+
 /** 连接池可调参数（默认值面向「一个 MCP 服务实例服务多个 HTTP 客户端」的场景） */
 export interface HanaPoolOptions {
   /** 连接并发上限（默认 POOL_MAX_DEFAULT=4；HANA_POOL_MAX） */
@@ -115,13 +137,12 @@ export interface HanaPoolOptions {
  * - 暴露 query/execute/withConnection/execOn 入口，service 层只用这几个
  *   （另有**已持有连接**上的执行原语 execStreamingOn / execPreparedOn，见文件末尾：
  *   真执行任意语句、限量取行与超时都在那里落地，服务层同样不得自己碰驱动）
- *
- * ⚠ **本池不做连接存活检查**（acquire 直接从空闲队列取、release 无条件放回）：连接在服务端被
- * 掐断后仍会被下一位取到，其第一条语句失败、连接又被放回，如此循环到进程重启。
- * 原先这里写着"连接失效时自动重建一次"，但实现里从来没有这段逻辑——已按实际情况更正。
- * 已知能造成这种连接的一条路径是 PlanViz 通道（`EXECUTE PLANVIZ STATEMENT ID` 传错 id 会被
- * HANA 直接断开，见 README 的通道记录）；该 id 现在会先过 `QUERY_ID_RE` 形状校验才拼进语句，
- * 但**根因未除**：真正要修的是在 release/acquire 时判定连接可用性并丢弃失效连接。
+ * - **连接存活检查**：acquire 命中空闲连接、release 归还连接时都经 connectionAlive
+ *   （驱动 conn.isValid）判定；失效连接 disconnect 后丢弃——不进空闲队列、也不转交等待者
+ *   （否则之后每个取到它的请求都会在第一条语句上莫名失败）。已知能造成这种连接的一条路径是
+ *   PlanViz 通道（`EXECUTE PLANVIZ STATEMENT ID` 传错 id 会被 HANA 直接断开；`QUERY_ID_RE`
+ *   会在拼接执行语句前先做形状校验）；丢弃后有等待者时改为现建一条交接，
+ *   池容量不因一条死连接被永久占掉。
  */
 export class HanaPool {
   private readonly options: ConnectionOptions;
@@ -144,8 +165,13 @@ export class HanaPool {
 
   /** 获取一个可用连接（池满则排队；队列满或等待超时以 HanaBusinessError 失败） */
   async acquire(): Promise<Connection> {
-    if (this.idle.length > 0) {
+    // 空闲连接可能已在服务端被掐断：逐条判定，失效的断开丢弃后继续找下一条（有存活者就不建连）
+    while (this.idle.length > 0) {
       const conn = this.idle.pop() as Connection;
+      if (!connectionAlive(conn)) {
+        void disconnectAsync(conn);
+        continue;
+      }
       this.inUse++;
       return conn;
     }
@@ -184,9 +210,16 @@ export class HanaPool {
     });
   }
 
-  /** 归还连接（移交给下一个存活等待者，无等待者则入空闲队列） */
+  /** 归还连接（存活检查；移交给下一个存活等待者，无等待者则入空闲队列） */
   release(conn: Connection): void {
     this.inUse--;
+    if (!connectionAlive(conn)) {
+      // 失效连接：断开后丢弃，不进空闲队列、也不转交等待者（转交只会让下一位再失败一次）
+      void disconnectAsync(conn);
+      // 丢弃使池空出一格：有等待者就现建一条交接，避免它们白等到 acquireTimeout
+      this.serveWaiterWithFreshConnection();
+      return;
+    }
     for (;;) {
       const next = this.waiters.shift();
       if (!next) {
@@ -204,6 +237,58 @@ export class HanaPool {
   }
 
   /**
+   * 丢弃失效连接后，给队首存活等待者现建一条连接（无等待者则什么都不做）。
+   * 建连失败只拒绝该等待者（其余等待者继续等后续释放/超时），排队语义不变。
+   */
+  private serveWaiterWithFreshConnection(): void {
+    let head = this.waiters.shift();
+    while (head?.settled) head = this.waiters.shift();
+    if (!head) return;
+    const waiter = head; // const 收窄：下面的回调里 waiter 恒为定义
+    this.inUse++;
+    connectAsync(hanaClient.createConnection(), this.options).then(
+      (fresh) => {
+        if (waiter.settled) {
+          // 等待者已超时退出：连接不能丢，按普通归还处理（交给下一位或入空闲队列）
+          this.release(fresh);
+          return;
+        }
+        waiter.settled = true;
+        if (waiter.timer) clearTimeout(waiter.timer);
+        waiter.resolve(fresh);
+      },
+      (e) => {
+        this.inUse--;
+        if (waiter.settled) return;
+        waiter.settled = true;
+        if (waiter.timer) clearTimeout(waiter.timer);
+        waiter.reject(e);
+      },
+    );
+  }
+
+  /**
+   * 在**已持有连接**上执行一条语句（query / execute / execOn 三条入口共用的分派）：
+   * opts.timeoutMs 为有限正数时走 execPreparedOn（prepare/exec + stmt.setTimeout，结束即 drop），
+   * 否则保持既有的 conn.exec 一次往返。
+   *
+   * 两条路径的返回形状不同（超时路径恒为行数组；非超时路径 SELECT 给行数组、DDL/DML 给驱动结果
+   * 对象），按调用方声明的 T 收窄：query 传 T[]；execOn 的既有调用点把 T 声明成行数组类型。
+   */
+  private async runOn<T>(
+    conn: Connection,
+    sql: string,
+    params: HanaParameterList | undefined,
+    opts?: { timeoutMs?: number },
+  ): Promise<T> {
+    const timeoutMs = positiveTimeoutMs(opts);
+    if (timeoutMs !== undefined) {
+      return (await execPreparedOn(conn, sql, params ?? [], { timeoutMs })) as T;
+    }
+    return execAsync<T>(conn, sql, params);
+  }
+
+  /**
    * 执行查询并整体返回行（SELECT 语义；行数上限由调用方 SQL 保证）。
    * opts.timeoutMs 给出有限正数时改走 execPreparedOn（prepare/exec + stmt.setTimeout + drop），
    * 否则保持既有的 conn.exec 一次往返——**存量调用点不传第三参，行为与签名向后兼容**。
@@ -213,11 +298,7 @@ export class HanaPool {
     params?: HanaParameterList,
     opts?: { timeoutMs?: number },
   ): Promise<T[]> {
-    const timeoutMs = positiveTimeoutMs(opts);
-    if (timeoutMs !== undefined) {
-      return this.withConnection((conn) => execPreparedOn<T>(conn, sql, params ?? [], { timeoutMs }));
-    }
-    return this.withConnection((conn) => execAsync<T[]>(conn, sql, params));
+    return this.withConnection((conn) => this.runOn<T[]>(conn, sql, params, opts));
   }
 
   /**
@@ -226,11 +307,7 @@ export class HanaPool {
    * 两种形状对既有调用点无影响（它们都不使用返回值）。
    */
   async execute(sql: string, params?: HanaParameterList, opts?: { timeoutMs?: number }): Promise<unknown> {
-    const timeoutMs = positiveTimeoutMs(opts);
-    if (timeoutMs !== undefined) {
-      return this.withConnection((conn) => execPreparedOn(conn, sql, params ?? [], { timeoutMs }));
-    }
-    return this.withConnection((conn) => execAsync(conn, sql, params));
+    return this.withConnection((conn) => this.runOn(conn, sql, params, opts));
   }
 
   /**
@@ -252,12 +329,7 @@ export class HanaPool {
     params?: HanaParameterList,
     opts?: { timeoutMs?: number },
   ): Promise<T> {
-    const timeoutMs = positiveTimeoutMs(opts);
-    if (timeoutMs !== undefined) {
-      // 既有调用点按「行数组」声明 T（execOn<PlanRow[]>）；execPreparedOn 的返回值正是行数组，按声明收窄
-      return (await execPreparedOn(conn, sql, params ?? [], { timeoutMs })) as T;
-    }
-    return execAsync<T>(conn, sql, params);
+    return this.runOn<T>(conn, sql, params, opts);
   }
 
   /**
@@ -272,7 +344,8 @@ export class HanaPool {
    * opts.timeoutMs（有限正数）会设到语句上：REPOSITORY_REST 这类控制面调用一挂住就占着池位
    * （池上限 4），几个这样的请求就足以让全部工具调用排队超时，必须可设上限。
    *
-   * 说明：hana-client 没有暴露 stmt 对象到 withConnection 之外，这里单独建连接完成调用。
+   * 说明：这里直接 prepare/exec 而不是走 conn.exec 封装——OUT 参数必须在 exec 完成后
+   * 从同一 stmt 上读回（getParameterValue），而 conn.exec 的回调只给行，拿不到语句对象。
    */
   async callProcedure(
     sql: string,
@@ -282,61 +355,53 @@ export class HanaPool {
   ): Promise<unknown[]> {
     const timeoutMs = positiveTimeoutMs(opts);
     const conn = await this.acquire();
+    let stmt: HanaStatement | undefined;
     try {
       return await new Promise<unknown[]>((resolve, reject) => {
-        const stmt = conn.prepare(sql);
-        const cb = (err: Error): void => {
-          if (err) return reject(normalizeHanaError(err));
-          try {
-            const outs: unknown[] = [];
-            for (let i = 0; i < outParamCount; i++) {
-              const v = stmt.getParameterValue(inCount + i);
-              outs.push(Buffer.isBuffer(v) ? Buffer.from(v) : v);
+        // prepare 与 exec 的**同步**抛错必须归一化：语法 / REPOSITORY_REST 不存在 / 无 EXECUTE
+        // 权限都在 prepare 阶段报，穿透出去会被工具层当成"未知错误"，调用方只看到「内部错误」，
+        // code 与消息全丢——与 execPreparedOn 同口径
+        try {
+          stmt = conn.prepare(sql);
+          const statement = stmt; // const 收窄：下面的回调里 statement 恒为定义
+          const inCount = Array.isArray(inParams) ? inParams.length : inParams ? 1 : 0;
+          const cb = (err: Error): void => {
+            if (err) return reject(normalizeHanaError(err));
+            try {
+              const outs: unknown[] = [];
+              for (let i = 0; i < outParamCount; i++) {
+                const v = statement.getParameterValue(inCount + i);
+                outs.push(Buffer.isBuffer(v) ? Buffer.from(v) : v);
+              }
+              resolve(outs);
+            } catch (e) {
+              reject(normalizeHanaError(e));
             }
-            resolve(outs);
-          } catch (e) {
-            reject(normalizeHanaError(e));
+          };
+          if (timeoutMs !== undefined) {
+            try {
+              statement.setTimeout(timeoutMs);
+            } catch (e) {
+              // 同步抛错也要归一化（与 execPreparedOn 同口径），连接由外层 finally 归还
+              reject(normalizeHanaError(e));
+              return;
+            }
           }
-        };
-        const inCount = Array.isArray(inParams) ? inParams.length : inParams ? 1 : 0;
-        if (timeoutMs !== undefined) {
-          try {
-            stmt.setTimeout(timeoutMs);
-          } catch (e) {
-            // 同步抛错也要归一化（与 execPreparedOn 同口径），连接由外层 finally 归还
-            reject(normalizeHanaError(e));
-            return;
-          }
+          if (inParams === undefined || inParams === null) statement.exec([], cb);
+          else statement.exec(inParams as Array<string | number | boolean | Buffer | null>, cb);
+        } catch (e) {
+          reject(normalizeHanaError(e));
         }
-        if (inParams === undefined || inParams === null) stmt.exec([], cb);
-        else stmt.exec(inParams as Array<string | number | boolean | Buffer | null>, cb);
       });
     } finally {
+      // 与 execPreparedOn 同清理契约：无论成功/失败/超时，语句都 drop，不把句柄留在池连接上
+      try {
+        stmt?.drop();
+      } catch {
+        /* 释放语句失败无关结果 */
+      }
       this.release(conn);
     }
-  }
-
-  /** 事务性执行：fn 内做多步操作，全部成功 commit，异常 rollback（MCP 写操作用） */
-  async withTransaction<T>(fn: (conn: Connection) => Promise<T>): Promise<T> {
-    return this.withConnection(async (conn) => {
-      conn.setAutoCommit(false);
-      try {
-        const result = await fn(conn);
-        await new Promise<void>((resolve, reject) =>
-          conn.commit((err) => (err ? reject(normalizeHanaError(err)) : resolve())),
-        );
-        return result;
-      } catch (e) {
-        try {
-          conn.rollback(() => undefined);
-        } catch {
-          /* 回滚失败不掩盖原始错误 */
-        }
-        throw e;
-      } finally {
-        conn.setAutoCommit(true);
-      }
-    });
   }
 
   /** 统一获取-执行-归还 */
@@ -486,9 +551,14 @@ export async function execStreamingOn(
 /**
  * 在**已持有的连接**上准备并执行一条语句，整体取回结果行（`{CALL ...}` 之类的控制面调用）。
  *
- * 与 execOn 的分工：execOn 走 conn.exec（一条语句一次往返、无超时设置）；
- * 本方法走 prepare/exec（可带绑定参数、可设语句超时），并在 finally 里 drop 语句——
+ * 与 execOn 的分工：execOn 缺省走 conn.exec（一条语句一次往返）；给出 opts.timeoutMs 时
+ * 与本方法同路径（prepare/exec + setTimeout）。本方法恒走 prepare/exec（可带绑定参数、可设语句超时），
+ * 并在 finally 里 drop 语句——
  * 控制面调用一挂住就会占着池位（池上限 4），几个这样的请求足以让全部工具调用排队超时。
+ *
+ * prepare（语法 / 对象不存在 / 无权限都在这一阶段同步抛出）与 exec 的同步抛错都经
+ * normalizeHanaError 归一后抛出（与 execStreamingOn 同口径）——不归一就会被调用方当成
+ * "未知错误"包装掉，调用方只看到「内部错误」，code 与消息全丢。
  */
 export async function execPreparedOn<T = Record<string, unknown>>(
   conn: Connection,
@@ -496,24 +566,31 @@ export async function execPreparedOn<T = Record<string, unknown>>(
   params: HanaParameterList,
   opts: { timeoutMs: number },
 ): Promise<T[]> {
-  const stmt = conn.prepare(sql);
+  let stmt: HanaStatement | undefined;
   try {
+    // prepare 同 execStreamingOn：语法错误 / 表不存在 / 无权限都在这里**同步**抛出，必须收进
+    // 归一范围（见函数头注），否则同一失败走 conn.exec 路径有 code、走本路径只剩「内部错误」
+    stmt = conn.prepare(sql);
+    const statement = stmt;
     return await new Promise<T[]>((resolve, reject) => {
       const onDone = (err: Error | null, rows?: T[]): void => {
         if (err) reject(normalizeHanaError(err));
         else resolve(rows ?? []);
       };
       try {
-        stmt.setTimeout(opts.timeoutMs);
-        stmt.exec<T[]>(params, onDone);
+        statement.setTimeout(opts.timeoutMs);
+        statement.exec<T[]>(params, onDone);
       } catch (e) {
         // 同步抛错也要归一化后 reject（不能让它穿透 Promise 执行器变成未捕获异常）
         reject(normalizeHanaError(e));
       }
     });
+  } catch (e) {
+    // prepare 的同步抛错与执行侧 reject 统一归一（已归一化的原样返回）
+    throw normalizeHanaError(e);
   } finally {
     try {
-      stmt.drop();
+      stmt?.drop();
     } catch {
       /* 释放语句失败无关结果 */
     }

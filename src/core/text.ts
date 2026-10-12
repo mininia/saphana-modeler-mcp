@@ -28,6 +28,21 @@ export type TruncateNote = 'chars' | 'none';
 export function truncateWithNote(text: string | null | undefined, max: number, note: TruncateNote = 'chars'): string {
   if (text == null) return '';
   if (text.length <= max) return text;
-  const head = text.slice(0, max);
+  let head = text.slice(0, max);
+  // slice 按 UTF-16 码元切：切点落在代理对（emoji 等增补平面字符）中间时，head 末尾是孤立高代理项，
+  // UTF-8 编码后渲染成"�"。回退一个码元，宁可少一格也不产出坏字符（各调用点因此自然免疫）。
+  const lastUnit = head.charCodeAt(head.length - 1);
+  if (lastUnit >= 0xd800 && lastUnit <= 0xdbff) head = head.slice(0, -1);
   return note === 'chars' ? `${head}…（已截断，共 ${text.length} 字符）` : `${head}…`;
 }
+
+/**
+ * 身份名（MCP_HTTP_TOKENS 的客户端名 / MCP_PROFILES 的档案名）允许的字符集与长度：
+ * 字母/数字/下划线/点/连字符，1–32 字符（防怪异名字进日志/审计）。
+ * 两个解析器（config.ts 的 parseHttpClients / profiles.ts 的 parseProfiles）共用这一处，
+ * 避免字符集与报错口径分叉。
+ */
+export const IDENTITY_NAME_RE = /^[A-Za-z0-9_.-]{1,32}$/;
+
+/** 身份名非法的统一说明（调用方在前面补上"第 N 项的 X 名非法："前缀） */
+export const IDENTITY_NAME_HINT = '仅允许字母/数字/下划线/点/连字符且长度 ≤32';

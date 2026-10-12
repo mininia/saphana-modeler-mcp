@@ -1,32 +1,32 @@
 /**
- * 分类门面（facade）—— 动态调用面的**唯一入口层**（2026-10-09 定稿）。
+ * 分类门面（facade）—— 动态调用面的**唯一入口层**。
  *
- * ## 它替代了什么
+ * ## 为什么不做搜索式元入口
  *
- * P10-d 曾有两条元入口：`hana_capability_search`（发现 + 提升进面）与 `hana_invoke`（按 id 路由）。
- * 那套的代价是**发现要多付一次调用**：模型得先想到"我该去搜"，而第一次搜还得先问"有哪几类"——
- * 分类目录本身要靠一次不产生任何工作的调用来交换。分类门面把这层变成白送的：**分类直接长在
- * `tools/list` 上**，模型读一遍工具列表就知道方向。
+ * 一条"搜索 / 按 id 调用"的元工具，代价是**发现要多付一次调用**：模型得先想到"我该去搜"，
+ * 而第一次搜还得先问"有哪几类"——分类目录本身要靠一次不产生任何工作的调用来交换。
+ * 分类门面把这层变成白送的：**分类直接长在 `tools/list` 上**，模型读一遍工具列表就知道方向。
  *
  * ## 三层分工（改代码前先读）
  *
  * | 层 | 内容 | 到模型的方式 |
  * |---|---|---|
- * | 门面（本文件） | `hana_<分类>`，描述只给**方向** | 常驻 tools/list，零调用 |
+ * | 门面（本文件） | `hana_<分类>`：方向句 + 主干成员的 `id：标题` 清单（注册时按本次连接的可触达上限过滤） | 常驻 tools/list，零调用 |
  * | 索引 | 该类的具体能力（id / 一句话摘要 / 参数名），从清单**派生** | 调门面（不带参数） |
  * | 调用 | 具体能力，只回 I/O | 调门面（带 capability + args） |
  *
- * **关键约束：门面的描述只放方向，不放索引。** 索引若写进描述，就是把第二层的内容塞进第一层——
- * 描述每次会话常驻，而索引只在"挑具体工具"那一刻需要。方向句从 `CAPABILITY_CATALOG` 生成，
- * 不手写（手写 = 第二份事实源，新增能力时必漂移）。
+ * **关键约束：描述 = 方向句 + 主干成员（非 routeOnly）的 `id：标题`（注册时按本次连接的可触达
+ * 上限过滤），routeOnly 别名只报数量；索引（参数名、一句话摘要、含别名全量）不进描述。** 描述每次
+ * 会话常驻，而索引只在"挑具体工具"那一刻需要——把索引写进描述就是把第二层的内容塞进第一层。
+ * 两段都从清单派生，不手写（手写 = 第二份事实源）。
  *
  * ## kind 与可见性（两个正交的决定，别混）
  *
  * - `kind` 取成员里**最严**的一档（read < write < admin），只用于日志与组名展开（`toolsOfGroup`）。
- * - 门面**自己**是否可注册不看这个 kind：**门面层不做限制**（2026-10-09 定稿）——权限只有一层
+ * - 门面**自己**是否可注册不看这个 kind：**门面层不做限制**——权限只有一层
  *   （能力层），六个入口常驻，谁的能力可用由分组开关按**目标能力**的 kind 判（见 `tools/groups.ts`
  *   的 `shouldRegisterTool`）。所以只读部署照样看得到 `hana_modeling`/`hana_diagnostics`，
- *   只是它们的索引为空——入口在、里面没有你可用的能力。
+ *   只是描述与索引里只剩 read 档成员（`hana_modeling` 剩 `hana_task_get`，`hana_diagnostics` 为空）。
  *
  * ## 依赖方向
  *
@@ -44,13 +44,6 @@ export function facadeIdOf(category: FacadeCategory): FacadeId {
 export type FacadeId = `hana_${FacadeCategory}`;
 /** 全部门面 id（顺序 = `FACADE_CATEGORIES`，即注册顺序） */
 export const FACADE_IDS = FACADE_CATEGORIES.map(facadeIdOf) as readonly FacadeId[];
-/**
- * 是否门面 id。用**正向清单**判定，不用前缀猜：
- * `hana_system_get_info` 也以 `hana_system` 开头，前缀写法会把它误判成门面。
- */
-export function isFacadeId(id: string): id is FacadeId {
-  return (FACADE_IDS as readonly string[]).includes(id);
-}
 /**
  * 门面入参（6 个门面共用同一 schema）。
  *
@@ -70,8 +63,6 @@ export const FACADE_SCHEMA = z.object({
     .default({})
     .describe('目标能力的入参对象（按目标能力的 schema 校验；省略 = 空对象）'),
 });
-/** 门面入参（handler 的参数类型） */
-export type FacadeArgs = z.infer<typeof FACADE_SCHEMA>;
 /** 六个门面（键 = 门面 id，字面量联合） */
 export type FacadeCapabilities = { [K in FacadeCategory as `hana_${K}`]: Capability<typeof FACADE_SCHEMA> };
 /** 档位严格度（read < write < admin）：门面的 kind 取成员里最大的那个 */
@@ -80,25 +71,39 @@ function strictestKind(members: readonly Capability[]): ToolKind {
   return members.reduce<ToolKind>((acc, c) => (KIND_SEVERITY[c.kind] > KIND_SEVERITY[acc] ? c.kind : acc), 'read');
 }
 /**
- * 门面描述：**方向句 + 成员清单（id：标题）**。
+ * 门面描述（**唯一生成器**，两个调用点）：
+ * - `buildFacades` 以"全可见"调用——清单常量的描述因此是**全集**版本（默认部署下的注册文本，
+ *   测试与文档按它核对）；
+ * - `tools/index.ts` 的 `registrationOf` 在注册时以**本次连接的可触达上限**（`tools/surface.ts`
+ *   的 entitlement）为谓词调用——投给客户端的文本随 deny / 分组开关 / 档案的收窄而收窄，
+ *   与门面索引、路由是同一条判定。
  *
  * 为什么是"清单"而不是一句概括：描述常驻 `tools/list`，是模型的**唯一入口**——
  * 写成"建模与仓库变更：创建/修改/校验/激活/删除设计时对象"这种抽象概括时，模型看不出里面
  * 到底有 `hana_view_update` 还是 `hana_repo_import`，只能先调一次索引才知道，那就把"零发现调用"
- * 又还回去了（这是 2026-10-09 实测暴露的问题：描述"太模糊，根本不知道里面有什么能力"）。
+ * 又还回去了。
  *
  * 为什么**只**给 id + 标题：参数名与每项的一句话摘要属于"已经选中它之后"才需要的信息，
  * 由**调门面不带参数**的索引回执给（见 tools/capability.tools.ts）。描述里塞进参数名，
  * 就是把第二层的内容搬进第一层——那份文本每次会话都注入，而索引只在挑选那一刻需要。
  *
- * 两处都从清单生成，所以"描述里有的"与"索引里给的"不可能漂移。
+ * **描述、索引、路由是同一个判定的三个视图**：描述里点名的 id 在该连接下必然可路由——无权与
+ * 不存在同形（不变量 D），三者谁也不许比其它两个更宽；描述在模块加载期生成（那里拿不到部署配置
+ * 与调用方身份，故常量是全集），注册时按连接重建。
  */
-function facadeDescription(entry: (typeof CAPABILITY_CATALOG)[number], members: readonly Capability[]): string {
+export function facadeDescription(
+  category: FacadeCategory,
+  members: readonly Capability[],
+  isVisible: (member: Capability) => boolean,
+): string {
+  const entry = CAPABILITY_CATALOG.find((c) => c.id === category);
+  if (!entry) {
+    throw new Error(`分类 "${category}" 不在 CAPABILITY_CATALOG 里：门面的方向句无从生成`);
+  }
   // 描述是**常驻文本**（每次会话都注入）：只列主干能力；routeOnly 的操作级别名（`<工具>#<op>`）
-  // 只报数量、不逐条列——它们只在"已经选中某工具之后"才需要，由**调门面取索引**给出（索引含两者）。
-  // 两处都从清单派生，所以"描述里有的"与"索引里给的"不可能漂移。
-  const primary = members.filter((m) => m.routeOnly !== true);
-  const aliases = members.filter((m) => m.routeOnly === true);
+  // 只报可见数量、不逐条列——它们只在"已经选中某工具之后"才需要，由**调门面取索引**给出（索引含两者）。
+  const primary = members.filter((m) => m.routeOnly !== true && isVisible(m));
+  const aliases = members.filter((m) => m.routeOnly === true && isVisible(m));
   return [
     `${entry.name}：${entry.description}。`,
     `本类共 ${primary.length} 项能力：`,
@@ -120,7 +125,7 @@ function facadeDescription(entry: (typeof CAPABILITY_CATALOG)[number], members: 
  * 从**基础能力清单**派生六个门面条目。
  *
  * 派生而非手写声明：门面的 title / description / kind / effects 全部是成员的函数，
- * 手写就等于把"这一类里有什么"又说了一遍——P9 的 I3（一条规则一份实现）不允许。
+ * 手写就等于把"这一类里有什么"又说了一遍——I3（一条规则一份实现）不允许。
  *
  * @param base 基础能力（不含门面自身；由 `manifest.ts` 装配后传入）
  */
@@ -149,7 +154,8 @@ export function buildFacades(base: readonly Capability[]): FacadeCapabilities {
       facadeOf: category,
       effects: { plan: planFacade(id), destructive, idempotent },
       title: entry.name,
-      description: facadeDescription(entry, members),
+      // 常量描述保存**全集**（全可见）；投给客户端的文本由 tools/index.ts 在注册时按连接重建
+      description: facadeDescription(category, members, () => true),
       inputSchema: FACADE_SCHEMA,
       annotations: {
         // 与 kind / effects 一致（测试会断言三个字段不许互相矛盾）

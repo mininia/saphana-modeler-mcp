@@ -1,5 +1,5 @@
 /**
- * 并发与超时的默认值（P5 §4.3/§4.6）：单一事实源。
+ * 并发与超时的默认值：单一事实源。
  *
  * 为什么单独一个**无依赖**的叶子模块：这些数值同时被三处引用——
  * ① config.ts 的 zod `.default(...)`（配置未填时的取值）、② 各核心模块自身的兜底
@@ -8,7 +8,7 @@
  *
  * 不做成 config.ts 的导出：core/* 反向依赖 config 会连出运行期循环
  * （config.ts 已 import core/xs-rest.js 的 XS_BASE_PATH），且会把 @sap/hana-client
- * 原生驱动拖进只读探针脚本的加载路径。本模块只放常量，不 import 任何东西。
+ * 原生驱动拖进只读探针脚本的加载路径。本模块只放常量与无依赖的纯函数（normalizeWaitMs），不 import 任何东西。
  */
 
 /** HANA 连接池并发上限（HANA_POOL_MAX）：池位 = 到数据库的连接数，N 个代理进程 = N×该值 */
@@ -23,7 +23,7 @@ export const POOL_ACQUIRE_TIMEOUT_MS_DEFAULT = 30_000;
 /**
  * 写路径 SQL 语句超时 ms（HANA_SQL_TIMEOUT_MS）。
  * **只给写路径的五条语句**（存在性检查/兜底直写/行探测/影响半径的下游查询/REPOSITORY_REST 调用）设限——
- * 不设全局默认是有意的：`hana_sql_analyze analyze=true`（最长 5 分钟）与元数据搜索（5–30s）
+ * 不设全局默认是有意的：`hana_sql_analyze analyze=true`（分钟级，取值见 ANALYZE_EXECUTION_TIMEOUT_MS）与元数据搜索（5–30s）
  * 都是合法的长语句，全局超时会把它们误杀。
  */
 export const SQL_TIMEOUT_MS_DEFAULT = 60_000;
@@ -62,6 +62,20 @@ export const LOCK_WAIT_MS_DEFAULT = 60_000;
 /** 信号量排队等待超时 ms（与 keyed lock 同形态、同量级） */
 export const SEMAPHORE_WAIT_MS_DEFAULT = 60_000;
 
+/**
+ * waitMs 入参收敛（keyed lock 与信号量共用：两模块自称同一套语义，非法值行为必须一致）：
+ * - undefined = 该项未配置 → 回落 fallback；
+ * - 显式 0 原样保留：它是合法语义（只给无需等待的调用留预算），不能当缺省处理；
+ * - NaN / Infinity / 负数回落 fallback：三者直接进 setTimeout 会被 Node 钳到 1ms（实测分别发
+ *   TimeoutNaNWarning / TimeoutOverflowWarning / TimeoutNegativeWarning），等价于偷偷写了个
+ *   1ms 超时——与「排队有上界」的承诺相反，且调用方无从察觉。
+ */
+export function normalizeWaitMs(waitMs: number | undefined, fallback: number): number {
+  if (waitMs === undefined) return fallback;
+  if (waitMs === 0) return 0;
+  return Number.isFinite(waitMs) && waitMs > 0 ? waitMs : fallback;
+}
+
 /*
  * 异步任务（工具化任务 API，2026-10-10）：进程内注册表的三个边界值。
  * 单一事实源同款：此处是唯一常量落点（task-registry 引用、单测引用，不各写一份）。
@@ -75,3 +89,28 @@ export const TASK_TTL_MS_DEFAULT = 30 * 60_000;
 
 /** 注册表容量上限（含运行中）：装满时从最旧的终态任务开始淘汰 */
 export const TASK_MAX_RETAINED_DEFAULT = 100;
+
+/*
+ * hana_sql_analyze（analyze=true）执行侧护栏：不暴露为工具参数——实际执行任意 SELECT 必须有硬边界，
+ * 参数化只会把"跑飞"变成"可配置地跑飞"。三个值同时被服务层执行守卫（services/sql-analyze.service）
+ * 与模型可见文案（capabilities 的工具描述、rules=sql_analyze 正文）引用：文案用模板插值生成，
+ * 改这里会一起变。
+ */
+
+/** analyze 模式单次执行最多回读的数据行数（取满即关闭结果集，不返回数据行） */
+export const ANALYZE_MAX_ROWS = 100;
+
+/**
+ * **实际执行**（analyze=true 真跑那条语句）的超时（毫秒）。
+ * 大 CV 本身就要 2–3 min，30s 会把合法分析直接掐断；5 min 覆盖得住这类语句，
+ * 同时把"整个调用"的墙钟压在一处：执行 5 min + PlanViz 控制面 4 次各 30s = 7 min 最坏，
+ * 调用方只要留够这个数就一定是我们先返回，而不是被对方掐断。再长的语句该去查为什么慢。
+ */
+export const ANALYZE_EXECUTION_TIMEOUT_MS = 300_000;
+
+/**
+ * **控制面调用**（PlanViz 的建会话/编译/取计划 XML/关会话）的超时（毫秒）。
+ * 都是元数据级操作，30s 足够；**不跟着执行一起放宽**——这类调用一挂住，池位（上限 4）就被占着，
+ * 放宽它等于把"一次卡死拖垮全部工具调用"的时间窗放大 10 倍。
+ */
+export const ANALYZE_CONTROL_TIMEOUT_MS = 30_000;

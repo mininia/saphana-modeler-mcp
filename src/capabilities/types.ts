@@ -9,8 +9,8 @@
  * 单靠"注册期过滤"这套是够用的；但动态调用面（门面索引 / 路由：模型按分类入口拿到索引、
  * 再按能力 id 路由调用）要在**调用期**
  * 按 `(能力, 参数, 资源, 调用方)` 判定，四处分散的事实源撑不住——没有一处能回答"这个能力是什么"。
- * 本清单把四者收敛成**一条声明**，且四者是**正交字段**：`kind`（可见性）/ `gate`（闸门）/
- * `effects`（读写与破坏性）/ `annotations`（客户端提示，不构成授权）谁也不派生谁。
+ * 本清单把四者收敛成**一条声明**，且声明的字段互不派生：`kind`（可见性）/
+ * `effects`（读写与破坏性；资源维度由 `plan` 的有无表达）/ `annotations`（客户端提示，不构成授权）。
  *
  * **依赖方向（硬约束）**：`capabilities/` **不 import `tools/`**（反向依赖会与 `tools/index.ts` ↔
  * `tools/*.tools.ts` 之间本就存在的环叠加，让 manifest 的求值顺序变得不确定）；各 `tools/*.tools.ts`
@@ -20,7 +20,7 @@
  * （如 `services/health.service` 的 `ALL_CHECKS`、`services/sql-analyze.rules` 的上限值）——
  * 这些常量同时被 schema 与服务实现使用，抄第二份就违反 I3（一条规则一份实现）。
  * 代价是 manifest 会连带求值这些服务模块；**底线是不成环**，由
- * `test-verification/check-import-cycles.mjs`（运行时 import 图遍历）实测：涉及 `capabilities/` 的环为 0。
+ * `tests/unit/import-cycles.test.ts`（运行时 import 图遍历 + 棘轮）常态化保证：涉及 `capabilities/` 的环为 0。
  * `capabilities/` 内**不得调用任何 I/O 或 service 函数**——它是声明层，只在注册与判定时被读取。
  *
  * **未登记 = 不暴露**：清单是唯一事实源，未登记的能力既不注册也不可见（fail-closed）。
@@ -80,12 +80,10 @@ export const FACADE_CATEGORIES = [
 export type FacadeCategory = (typeof FACADE_CATEGORIES)[number];
 
 /**
- * 资源计划的档位（P10-b 起**由 `effects.plan` 是否存在唯一表达**，不再有独立的 `gate` 字段）。
- *
- * P10-a 期间曾有 `gate: 'preflight' | 'none'`（= 今天"用 registerWriteTool 还是 registerVisibleTool"的选择）。
- * P10-b 把**所有**能力都挂上同一个调用期闸门（`authorizeCall`）后，那个字段描述的"有没有闸门"恒为真，
- * 留下来的唯一区别是**闸门有没有资源维度**——而这正是 `effects.plan` 的有无。两个字段表达同一件事
- * 就是第二个事实源（本仓库最要防的问题），故删除 `gate`，不做"两处必须相等"的测试来兜。
+ * 资源计划的档位**由 `effects.plan` 是否存在唯一表达**：所有能力都过同一个调用期闸门
+ * （`authorizeCall`），闸门与闸门之间唯一的区别是**有没有资源维度**——那正是 `effects.plan`
+ * 的有无。不为它再立一个字段：两个字段表达同一件事就是第二个事实源（本仓库最要防的问题），
+ * 也不靠"两处必须相等"的测试来兜。
  */
 
 /**
@@ -131,12 +129,21 @@ export interface Capability<S extends z.ZodType = z.ZodType> {
   kind: ToolKind;
   effects: CapabilityEffects;
   /**
-   * **门面归属**：声明了它 = 该能力是某分类的常驻入口（`hana_<分类>`），永远在面上、不可被隐藏。
+   * **门面归属**：声明了它 = 该能力是某分类的常驻入口（`hana_<分类>`）。
    *
-   * 为什么只有这一个暴露位（2026-10-09 定稿）：不再有"tier-1 / tier-2 / 提升"这套分层。
-   * **具体能力恒为动态调用**——它们不进 `tools/list`，模型从门面拿到索引后再经门面路由调用。
-   * 于是注册面恒等于"6 个门面 ∩ 授权"，没有进程内可变状态、没有跨调用方的提升表。
-   * 门面若也被藏掉，模型就没有任何入口（自锁死），故 `alwaysResident` 的语义并入本字段。
+   * 门面是**入口**，不参与能力层（kind / 档案）判定——权限只有一层，谁的能力可用一律按**目标能力**
+   * 判（`tools/groups.ts` 的 `shouldRegisterTool`、`config/authorize.ts` 的 `authorizeCall`）。
+   * 所以部署收窄时入口照旧常在：只读部署也看得到 `hana_modeling`/`hana_diagnostics`，只是索引里
+   * 只剩 read 档成员（`hana_modeling` 剩 `hana_task_get`，`hana_diagnostics` 为空）。只有显式 deny
+   * 才会让门面消失：命中门面 id，或把它**全部**成员 deny 掉。
+   *
+   * **具体能力默认只出现在门面索引里**（可经门面路由调用，不进 `tools/list`）；调门面会把该分类的
+   * 成员**提升**进 `tools/list`（此后可平铺直调、带完整 schema）。提升表按调用方隔离——键 = HTTP 的
+   * clientId / stdio 的 `'(stdio)'`，未配 Token 的 HTTP 部署整体关闭；进程内状态、重启即退回；
+   * 超出 `MCP_CAPABILITY_SURFACE_MAX` 时按分类 FIFO 淘汰（见 `tools/surface.ts` 头注的
+   * entitlement / promoted / surface 三层定义）。
+   *
+   * 所以本字段表达的是「门面入口」，**不**表达"具体能力不进面"：具体能力是否在面上由提升决定。
    */
   facadeOf?: FacadeCategory;
   /**

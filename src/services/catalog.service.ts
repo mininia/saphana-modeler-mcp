@@ -1,5 +1,6 @@
 import type { HanaPool } from '../core/hana-client.js';
 import { nowIso } from '../core/datetime.js';
+import { suffixInClause, suffixesOf } from '../model/view-suffixes.js';
 
 /**
  * 关系图（catalog）：对象级多跳遍历与影响半径（P4 交付，只读零风险）。
@@ -24,7 +25,7 @@ export interface GraphEdge extends GraphNode {
   refType: number;
   /** 运行时目录视图引用（OBJECT_SUFFIX 以 __RT_ 开头），与 whereUsed 的判定一致 */
   isRuntime: boolean;
-  /** 该节点是**首次从哪个方向**被纳入闭包的（both 遍历下用于按方向拆分结果） */
+  /** 该节点是沿哪个方向可达的（both 遍历下用于按方向拆分结果；两个方向都可达时两个桶各有一条） */
   via: 'upstream' | 'downstream';
   /** 距种子的跳数（1=直接依赖；按需消费方（如字段级血缘）用它做"最近优先"排序） */
   level: number;
@@ -50,9 +51,6 @@ export interface ClosureOptions {
   /** 闭包成员上限，默认 500；触达即截断并置 truncated */
   maxNodes?: number;
 }
-
-/** 与 metadata.service.VIEW_SUFFIXES 同源的三种设计时视图类型（此处硬编码会漂移，故显式声明来源） */
-const VIEW_SUFFIXES = ['calculationview', 'attributeview', 'analyticview'] as const;
 
 export const DEFAULT_MAX_NODES = 500;
 /** 单条 SQL 的 frontier 分块大小（每节点 2 个绑定参数，50 → 100 参数，远离 HANA 上限） */
@@ -93,7 +91,9 @@ export async function expandLevel(
   direction: 'upstream' | 'downstream',
 ): Promise<Array<Omit<GraphEdge, 'via' | 'level'>>> {
   if (frontier.length === 0) return [];
-  const suffixIn = `(${VIEW_SUFFIXES.map(() => '?').join(',')})`;
+  // 后缀集合与 IN 占位符走单点实现（model/view-suffixes；kind 口径与 whereUsed 逐字一致）
+  const suffixes = suffixesOf();
+  const suffixIn = suffixInClause(suffixes);
   const out: Array<Omit<GraphEdge, 'via' | 'level'>> = [];
 
   for (const part of chunk(frontier, FRONTIER_CHUNK)) {
@@ -113,7 +113,7 @@ export async function expandLevel(
     // 写路径 SQL 超时（§4.3）：P6 起本查询进了写路径（update 判定在锁内、delete 判定在锁外，每次写前各查一次），
     // 不设超时就不受 HANA_SQL_TIMEOUT_MS 约束——与 P5 写路径四处同一写法（超时值取自池）。
     // 假池/旧调用点拿到 undefined 时行为与今天一致（hana-client 的 positiveTimeoutMs 按「未给」处理）。
-    const rows = await pool.query<CrossRefRow>(sql, [...pairParams, ...VIEW_SUFFIXES], {
+    const rows = await pool.query<CrossRefRow>(sql, [...pairParams, ...suffixes], {
       timeoutMs: pool.statementTimeoutMs,
     });
     out.push(...rows.map(mapRow));
@@ -122,10 +122,18 @@ export async function expandLevel(
 }
 
 /**
- * 闭包遍历（按层 BFS）。语义承诺：
- * - `depth=1` 的结果与 whereUsed 的单跳查询**同源同序**（同一条 SQL 形状 + 同一排序键）；
+ * 闭包遍历（按层 BFS，**两个方向各跑一条**）。语义承诺：
+ * - 结果与 whereUsed 的单跳查询**同源**（同一张 ACTIVE_OBJECTCROSSREF + 同一 suffix 过滤口径），
+ *   但**顺序不承诺逐项一致**：这里统一按 (objectSuffix, packageId, objectName) 做 localeCompare 排序，
+ *   单跳 SQL 则是 ORDER BY OBJECT_SUFFIX, OBJECT_NAME（由 DB 排序，没有 packageId 这一级）；
  * - 环防护：visited-set 含种子，任一层命中已访问节点即跳过；
- * - `depth='all'` 仍受 maxNodes 约束，触达即 `truncated:true`（不静默丢）。
+ * - `depth='all'` 仍受 maxNodes 约束，触达即 `truncated:true`（不静默丢）；
+ * - **frontier 按到达方向分流**（upstream 只从 upstream 到达的节点出发，反之亦然）：
+ *   若两个方向共用 frontier，第 2 层起就会出现"从下游节点再向上游扩"的交替路径——
+ *   diamond（多个视图共享同一上游/下游）是该仓库场景常态，那样会把与种子无上下游关系的
+ *   节点混进方向桶，真·传递节点也可能被另一方向抢先标走。等价于跑两次独立 BFS，
+ *   只是按层同步执行以共享 maxNodes 预算；同一节点若两个方向都可达，会在结果里各出现一条
+ *   （两个桶都是真的，谁也不能替谁作证）。
  */
 export async function closure(pool: HanaPool, seed: GraphNode, opts: ClosureOptions = {}): Promise<ClosureResult> {
   const direction = opts.direction ?? 'both';
@@ -133,21 +141,30 @@ export async function closure(pool: HanaPool, seed: GraphNode, opts: ClosureOpti
   const maxNodes = opts.maxNodes ?? DEFAULT_MAX_NODES;
   const dirs: Array<'upstream' | 'downstream'> = direction === 'both' ? ['upstream', 'downstream'] : [direction];
 
-  const visited = new Set<string>([keyOf(seed)]);
+  const frontiers: Record<'upstream' | 'downstream', GraphNode[]> = {
+    upstream: dirs.includes('upstream') ? [seed] : [],
+    downstream: dirs.includes('downstream') ? [seed] : [],
+  };
+  const visited: Record<'upstream' | 'downstream', Set<string>> = {
+    upstream: new Set<string>([keyOf(seed)]),
+    downstream: new Set<string>([keyOf(seed)]),
+  };
   const nodes: GraphEdge[] = [];
-  let frontier: GraphNode[] = [seed];
   let depthReached = 0;
   let truncated = false;
 
-  while (frontier.length > 0) {
+  while (dirs.some((d) => frontiers[d].length > 0)) {
     if (depth !== 'all' && depthReached >= depth) break;
-    const next: GraphNode[] = [];
     for (const dir of dirs) {
+      const frontier = frontiers[dir];
+      if (frontier.length === 0) continue;
+      const seen = visited[dir];
       const edges = await expandLevel(pool, frontier, dir);
+      const next: GraphNode[] = [];
       for (const e of edges) {
         const k = keyOf(e);
-        if (visited.has(k)) continue;
-        visited.add(k);
+        if (seen.has(k)) continue;
+        seen.add(k);
         nodes.push({ ...e, via: dir, level: depthReached + 1 });
         next.push(e);
         if (nodes.length >= maxNodes) {
@@ -155,11 +172,13 @@ export async function closure(pool: HanaPool, seed: GraphNode, opts: ClosureOpti
           break;
         }
       }
+      frontiers[dir] = next;
       if (truncated) break;
     }
-    depthReached++;
     if (truncated) break;
-    frontier = next;
+    // 截断层**不计入** depthReached：它只展开了一部分（同层剩余边与后续方向从未处理），
+    // 而 depthReached 的契约是"实际完整展开的层数"（截断本身由 truncated=true 表达）
+    depthReached++;
   }
 
   nodes.sort(

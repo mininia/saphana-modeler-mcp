@@ -1,8 +1,8 @@
 /**
  * 建模域（`category: 'modeling'`）的清单条目。
  *
- * 六个入口（顺序 = 注册顺序）：视图的新建/校验/校验动作查询/激活/更新/删除。
- * 除只读的 hana_view_check_actions（gate=none）外均为写工具，gate=preflight 并声明 effects.plan；
+ * 八个入口（顺序 = 注册顺序）：六个视图工具（新建/校验/校验动作查询/激活/更新/删除，kind 均为 write，
+ * 均声明 effects.plan=调用期资源闸门）+ 两个异步任务工具（hana_task_get 为 read、hana_task_cancel 为 write）。
  * 可写包范围由 HANA_WRITE_PACKAGES 决定。
  */
 
@@ -10,7 +10,7 @@ import { z } from 'zod';
 import { cap, type Capability } from '../types.js';
 import { buildViewOpCapabilities } from './view-ops.js';
 import { zObjectName, zPackageId, zWritePackageId } from '../schemas.js';
-import { tagResource } from '../resources.js';
+import { VIEW_OPS } from '../../services/view-ops.rules.js';
 import {
   planTaskCancel,
   planViewActivate,
@@ -23,12 +23,14 @@ import {
 import { DEFAULT_PROBE_ROWS, MAX_PROBE_ROWS } from '../../services/repository.service.js';
 import { MIGRATION_DECLARATIONS } from '../../services/migrate.rules.js';
 import { CHANGESET_MAX_ACTIONS } from '../../services/changeset.plan.js';
+import { TASK_TTL_MS_DEFAULT } from '../../core/limits.js';
+import { CHECK_PROCEDURES } from '../../services/validation.service.js';
 
 /**
  * `migration.strategy` 的合法值取自**单一事实源** migrate.rules.ts（它导出运行时常量数组，
  * 头注明确要求「工具层/defs 的枚举校验从这里取，不要手抄第二份」）：schema 的 describe 与
  * tool handler 的中文硬错误引用同一份，不各存一份字面量清单。
- * 为什么是宽松 schema + handler 硬错误（SSD §1.6）：z.enum 会把非法值丢给 SDK 协议层
+ * 为什么是宽松 schema + handler 硬错误：z.enum 会把非法值丢给 SDK 协议层
  * （英文报错、合法值也不可见）——先例为 health 工具的 checks/sections。
  */
 export const DELETE_MIGRATION_DECLARATIONS = MIGRATION_DECLARATIONS.filter(
@@ -61,7 +63,7 @@ const SCRIPT_COLUMN_SCHEMA = z.object({
   description: z.string().max(200).optional().describe('中文描述（缺省取列名）'),
 });
 
-// ── create 通道的字段片段（P7 起同时供 changeset 的 create 动作用）────────────
+// ── create 通道的字段片段（hana_view_create 顶层与 changeset 的 create 动作共用）────────────
 //
 // **单点定义**：hana_view_create 的顶层 schema 与 hana_view_update 的 changeset 动作（create 专用
 // description/mode/source/scripted）都从这里取字段 schema——不在两处各写一份平行定义（改约束只改这里，
@@ -78,9 +80,20 @@ const VIEW_MODE_ENUM = z
     '视图形态：projection=图形化最小形态（单 Projection + 单源表，需 sourceSchema/sourceName）；sql=SQL 模式（单 SqlScriptView，需 script + scriptColumns）',
   );
 
-/** 源表/视图所在 schema（不含资源标签——标签由 create 顶层的使用处包在最外层） */
+/**
+ * 源表/视图所在 schema。
+ *
+ * 刻意**不在参数声明层打资源标签**（约定：只给"角色无条件"的参数打标）：该参数只在
+ * mode=projection 被服务端消费（mode=sql 忽略它），无条件打 `readSchema` 会把"SQL 模式顺手填了
+ * 白名单外残留 sourceSchema"的合法调用拦在闸门之前——读取范围改由规划器**按模式**声明
+ * （planViewCreate 的非 sql 分支 / planViewUpdate 的 changeset create 分支，两者同一口径）。
+ *
+ * `.trim()` 在**声明侧**归一（判定值必须等于服务层实际拿到的值）：zod 解析后闸门、计划、
+ * 服务层拿到同一个字符串，避免"闸门按 trim 后的值判、服务层按原值判"的双口径。JSON Schema 对外零变化。
+ */
 const VIEW_SOURCE_SCHEMA_FIELD = z
   .string()
+  .trim()
   .describe('mode=projection：源表/视图所在 schema，如 SAPABAP1（须在白名单内）');
 
 /** 源表/视图名 */
@@ -110,12 +123,14 @@ const VIEW_SCRIPT_COLUMNS_FIELD = z
 const VIEW_COLUMNS_FIELD = z
   .array(z.string())
   .max(600)
-  .describe('mode=projection：要映射的列名清单；省略=源表全列（自动按类型区分属性/度量）');
+  .describe(
+    'mode=projection：要映射的列名清单；省略=源表全列（自动按类型区分属性/度量；源表列数超过 500 时只映射前 500 列，回执 warnings 会如实标注）；显式列的类型由服务端按列名回查源表列目录补齐（列不存在且目录未截断时会报中文硬错误）',
+  );
 
 /**
- * 声明式操作补丁（add_join / set_script / set_description）的 schema 片段：hana_view_update 的单对象通道与 changeset
+ * 声明式操作补丁（`operations`）的 schema 片段：hana_view_update 的单对象通道与 changeset
  * 动作里的 update **共用同一份**——两处各写一份时，改一个 op 的约束必然漂移（单对象能过、批内被拒，
- * 或反之）；可选性与 describe 由各使用处加。
+ * 或反之）；可选性与 describe 由各使用处加。op 全集与 effect 声明见 services/view-ops.rules.ts（VIEW_OPS）。
  */
 const VIEW_UPDATE_OPERATIONS_SCHEMA = z
   .array(
@@ -155,13 +170,9 @@ const VIEW_UPDATE_OPERATIONS_SCHEMA = z
           .describe(
             '新 SQL 查询（表名写全限定名 SCHEMA."表"；输出列别名须与 scriptColumns 的 name 一致）。服务端自动包成 BEGIN VAR_OUT = <查询>; END 过程体；也可直接给完整 BEGIN…END 过程体',
           ),
-        // 与 hana_view_create 的 scriptColumns **同名同义**（P10-c c2 统一）：都是"SQL 模式的输出列清单"，
-        // 且共用同一份 SCRIPT_COLUMN_SCHEMA。曾叫 columns——与 create 路径同一概念两个名字。
-        scriptColumns: z
-          .array(SCRIPT_COLUMN_SCHEMA)
-          .min(1)
-          .max(600)
-          .describe('新的输出列清单（**整体替换**旧输出：脚本一换输出列集合通常也变，逐列增补会留下旧列导致激活失败）'),
+        // 与 hana_view_create 的 scriptColumns 同名同义（同一概念在 create/update 两个通道同名），
+        // 且共用同一份 SCRIPT_COLUMN_SCHEMA。
+        scriptColumns: z.array(SCRIPT_COLUMN_SCHEMA).min(1).max(600).describe('新的输出列清单（**整体替换**旧输出）'),
       }),
       z.object({
         op: z.literal('set_description').describe('操作类型：修改视图描述/显示名（只动展示属性，不碰结构、非破坏）'),
@@ -229,10 +240,11 @@ const VIEW_UPDATE_OPERATIONS_SCHEMA = z
     ]),
   )
   .min(1)
-  .max(10);
+  // 上限与 changeset 动作数共用同一常量（对齐由派生保证，不手抄两份数值）：改常量时两处同变
+  .max(CHANGESET_MAX_ACTIONS);
 
 /**
- * 变更集动作（P7，SSD §6.1）：形状**镜像** `src/services/changeset.plan.ts` 的 `ChangesetAction`——
+ * 变更集动作：形状**镜像** `src/services/changeset.plan.ts` 的 `ChangesetAction`——
  * 枚举值、字段名、可选性以那边为准（handler 会把解析结果直接交给 applyChangeset，形状不一致即编译不过）。
  * create 专用字段（description/mode/source/scripted）复用 hana_view_create 的字段片段，不另写平行 schema。
  * `source` 的列形状（columnName/dataTypeName 对象）与 create 顶层入参（列名字符串数组）**不同**：
@@ -252,7 +264,7 @@ const CHANGESET_ACTION_SCHEMA = z.object({
   ),
   migration: z
     .object({
-      // 与顶层通道同一口径（SSD §1.6）：宽松 z.string() + 调用时中文硬错误列合法值；
+      // 与顶层通道同一口径：宽松 z.string() + 调用时中文硬错误列合法值；
       // 合法值**随 action 而定**（update=字段级策略∪显式承担；delete=仅显式承担；create 不接受该声明）。
       strategy: z
         .string()
@@ -310,7 +322,7 @@ const baseModelingCapabilities = {
     kind: 'write',
     effects: { plan: planViewCreate, destructive: false, idempotent: false },
     title: '新建 Calculation View（计算视图）',
-    // 瘦身（P9）：SQL 方言五条、实测边界与并发解释已整体搬进规则 sql_mode / activation_measure /
+    // SQL 方言五条、实测边界与并发解释见规则 sql_mode / activation_measure /
     // write_transport / write_receipt；这里只留两种形态的参数面、安全约束一句话与回执字段。
     description:
       '在仓库中新建一个 Calculation View。两种形态（mode 二选一）：\n' +
@@ -329,7 +341,7 @@ const baseModelingCapabilities = {
       objectName: zObjectName('新视图对象名（不含包名），如 ZDEMO_CV_TEST001'),
       description: VIEW_DESCRIPTION_FIELD.optional(),
       mode: VIEW_MODE_ENUM.default('projection'),
-      sourceSchema: tagResource(VIEW_SOURCE_SCHEMA_FIELD.optional(), 'readSchema'),
+      sourceSchema: VIEW_SOURCE_SCHEMA_FIELD.optional(),
       sourceName: VIEW_SOURCE_NAME_FIELD.optional(),
       script: VIEW_SCRIPT_FIELD.optional(),
       scriptColumns: VIEW_SCRIPT_COLUMNS_FIELD.optional(),
@@ -409,17 +421,10 @@ const baseModelingCapabilities = {
       '用于在调用 hana_view_validate 前确认可用的动作名，或了解 HANA 提供的表/目录一致性检查能力。' +
       '默认列出计算视图相关（CHECK_CALCULATION_VIEW）。',
     inputSchema: z.object({
+      // 合法值 = validation.service 导出的过程名常量：枚举（JSON Schema 可见、SDK 层即拒非法值）
+      // 与调用白名单共用同一份字面量，两处手抄会在「工具面宣称支持/运行期被白名单拒绝」间漂移
       checkProcedureName: z
-        .enum([
-          'CHECK_CALCULATION_VIEW',
-          'CHECK_CALCULATION_MODEL',
-          'CHECK_ANALYTICAL_MODEL',
-          'CHECK_CALCENGINE',
-          'CHECK_CATALOG',
-          'CHECK_TABLE_CONSISTENCY',
-          'CHECK_TOPOLOGY_TREE',
-          'CHECK_ES',
-        ])
+        .enum(CHECK_PROCEDURES)
         .default('CHECK_CALCULATION_VIEW')
         .describe('CHECK 过程名（默认 CHECK_CALCULATION_VIEW）'),
     }),
@@ -450,15 +455,17 @@ const baseModelingCapabilities = {
     kind: 'write',
     effects: { plan: planViewUpdate, destructive: true, idempotent: false },
     title: '更新 Calculation View（声明式 operations / 全量 XML / 变更集）',
-    // 瘦身（P9）：设计理由、方言、补偿细节与逐字段解释已整体搬进规则 write_receipt / sql_mode /
+    // 设计理由、方言、补偿细节与逐字段解释见规则 write_receipt / sql_mode /
     // bw_dialect。硬保留（验收脚本断言）：三种方式与互斥、关键参数名、migration 四个合法值、
     // 机读码全集、回执字段名、零写入语义——这些是契约，不是解释。
     description:
       '更新已有 Calculation View，三种方式**三选一（互斥）**：\n' +
-      '① operations（推荐）：声明式操作补丁 op=add_join / op=set_script，服务端读取当前定义并确定性变换后走原 PUT ' +
+      '① operations（推荐）：声明式操作补丁 op=' +
+      VIEW_OPS.map((o) => o.id).join(' / ') +
+      '，服务端读取当前定义并确定性变换后走原 PUT ' +
       '更新路径——模型**零 XML**，返回每条操作的应用明细与实测激活状态；\n' +
       '② xml：完整新设计时 XML 全量覆盖（复杂改造用；写入前有服务端护栏，通过后返回 xmlVerification 摘要）；\n' +
-      '③ changeset：多对象变更集（动作上限 10，单次调用内闭合）——整体预检不通过则**整批拒绝、零写入**；' +
+      `③ changeset：多对象变更集（动作上限 ${CHANGESET_MAX_ACTIONS}，单次调用内闭合）——整体预检不通过则**整批拒绝、零写入**；` +
       '任一项失败即逆序补偿；partial=true 时逐项枚举状态（含 notExecuted），**绝不把部分完成包装成 success**。\n' +
       '①② 都走 XS REST PUT + If-Match ETag 乐观锁：基线读 → 内容读 → PUT 在同一锁临界区内完成（进程内按对象串行化）。\n' +
       '关键参数：ifMatch（乐观锁 ETag，省略=自动取；对基于更早读取的内容做覆盖时**必须显式传**）；activate；' +
@@ -469,7 +476,8 @@ const baseModelingCapabilities = {
       'changeset_partial / changeset_conflict / changeset_invalid。\n' +
       '回执：新基线 etag 与 etagSource、breaking、migration、rowProbe（0 行附排查提示）、changeset 的逐项 report' +
       '（etag/elapsedMs/状态）。\n' +
-      '方言与细节见 rules=write_receipt,sql_mode,bw_dialect（hana_system_get_info(rules=write_receipt,sql_mode,bw_dialect)）。',
+      '方言与细节见 rules=write_receipt,sql_mode,bw_dialect,view_ops' +
+      '（hana_system_get_info(rules=write_receipt,sql_mode,bw_dialect,view_ops)）。',
     inputSchema: z
       .object({
         // changeset 模式下这两个参数**被忽略**（批次目标由各 action 自带；applyChangeset 不消费顶层目标），
@@ -536,7 +544,7 @@ const baseModelingCapabilities = {
           .object({
             // 末尾的 acknowledge_dependents 与 hana_view_delete 同语义，是本通道的**显式承担**声明位：
             // 三种字段级策略都描述不了「整段回退/删数据源」这类变更，缺了它调用方只能声明假策略过关（污染审计记录）。
-            // 刻意用 z.string() 而非 z.enum（SSD §1.6 的枚举契约）：非法值要落到 handler 的中文硬错误
+            // 刻意用 z.string() 而非 z.enum：非法值要落到 handler 的中文硬错误
             // 并列出合法值；用 z.enum 会在 SDK 协议层被拒（英文 "Invalid option..."，合法值也不可见）。
             // 合法值常量从 migrate.rules 导入（单一事实源），handler 硬错误引用同一常量。
             strategy: z
@@ -586,7 +594,7 @@ const baseModelingCapabilities = {
       objectName: zObjectName('视图对象名（不含包名）'),
       migration: z
         .object({
-          // SSD §1.6：与 update 通道同款——z.string() 宽松 schema，非法值由 handler 中文硬错误列出合法值
+          // 与 update 通道同款：z.string() 宽松 schema，非法值由 handler 中文硬错误列出合法值
           // （用 z.enum 会落到 SDK 协议层，英文报错且合法值不可见；先例：health 的 checks/sections）。
           strategy: z
             .string()
@@ -602,7 +610,7 @@ const baseModelingCapabilities = {
   }),
 
   /*
-   * 异步任务（工具化任务 API，2026-10-10）——服务于 hana_view_update 的长批次（changeset + async=true）。
+   * 异步任务（工具化任务 API）——服务于 hana_view_update 的长批次（changeset + async=true）。
    * 为什么归 modeling：它们不是通用调度设施，只承载建模写入流程的异步执行；也正因为如此，
    * 任务的能力面与写能力同域（只读档案看得到 hana_task_get、看不到 cancel——cancel 是 write）。
    */
@@ -615,7 +623,8 @@ const baseModelingCapabilities = {
     description:
       '轮询 hana_view_update(async=true) 提交的变更集任务：返回 status（working/completed/failed/cancelled）、进度与终态 result ' +
       '（与同步调用同形的回执信封：success=true 时 raw 无；失败时 raw.errorDetail 带逐项明细）。' +
-      '只对**本调用方**的任务可见（他人任务与不存在的任务回同一句"未知任务"）；任务状态在进程内，服务重启即失效。',
+      '只对**本调用方**的任务可见（他人任务与不存在的任务回同一句"未知任务"）；任务状态在进程内，服务重启即失效——' +
+      `终态任务约保留 ${TASK_TTL_MS_DEFAULT / 60_000} 分钟（注册表饱和时最旧的终态会被提前清理），之后按「未知任务」处理。`,
     inputSchema: z.object({
       taskId: z.string().min(1).max(128).describe('任务 id（hana_view_update(async=true) 的回执里给出）'),
     }),
@@ -640,7 +649,7 @@ const baseModelingCapabilities = {
 } satisfies Record<string, Capability<z.ZodType>>;
 
 /**
- * 建模域全量条目 = 基础清单 + **操作级别名**（`hana_view_update#<op>`，2026-10-10）。
+ * 建模域全量条目 = 基础清单 + **操作级别名**（`hana_view_update#<op>`）。
  * 别名从父 schema 的 operations union 与 VIEW_OPS 派生（见 defs/view-ops.ts），标 routeOnly：
  * 有声明、可授权、可出现在门面索引里，但**永不注册为工具**（注册名 = 父工具名）——经门面路由调用。
  */

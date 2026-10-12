@@ -14,7 +14,8 @@ import type { Envelope } from '../types/hana.js';
 
 /** 包/对象浏览工具：包树 + 包内对象清单（只读） */
 export function registerPackageTools(server: McpServer, ctx: ToolContext): void {
-  // 写工具一律经预检闸门注册：判定不通过时在 handler 之前拦截，不进 service（见 tools/index.ts）
+  // 注册器把每个 handler 套上统一的调用期闸门（authorizeCall）：判定不通过会在 handler 之前拦截、
+  // 不进 service（闸门实现与判定依据见 tools/index.ts 与 config/authorize.ts）。
   const regCap = capabilityRegistrar(server, ctx);
   regCap(CAP.hana_package_list, async ({ pattern, limit }) => {
     const envelope: Envelope = await withErrorEnvelope(() => listPackages(ctx.pool, { pattern, limit }));
@@ -39,7 +40,7 @@ export function registerPackageTools(server: McpServer, ctx: ToolContext): void 
   });
 
   regCap(CAP.hana_repo_import, async ({ targetPackageId, filePath, content, fileName, overwrite }) => {
-    // 来源二选一（P10-c c2）：此前 content 优先、filePath 被**静默忽略**——
+    // 来源二选一：两者同时给出时必须拒绝——若按任一优先静默取舍，另一份来源会被静默忽略，
     // 调用方以为导入了本地文件，实际导入的是另一份内容，属最难查的一类回执。
     if (filePath && content !== undefined) {
       return mcpErrorText(
@@ -48,7 +49,7 @@ export function registerPackageTools(server: McpServer, ctx: ToolContext): void 
       );
     }
     const envelope: Envelope = await withErrorEnvelope(() =>
-      importObjectViaRest(ctx.config, { targetPackageId, filePath, content, fileName, overwrite }),
+      importObjectViaRest(ctx.config, { targetPackageId, filePath, content, fileName, overwrite }, undefined, ctx.pool),
     );
     return toToolResult(envelope);
   });

@@ -6,7 +6,7 @@
  * SSD §7.14 记过本轮不建它们的理由：手写一份「父工具身份参数 + op 载荷」的 schema = 同一份 schema
  * 再写一遍，两侧必然漂移（父工具改个参数名，别名那条静默失配）。本实现把漂移从"靠纪律"变成"结构上
  * 不可能"：
- *   - **参数面**：身份四件（packageId/objectName/ifMatch/dryRun/migration）直接取父 schema 的同名字段；
+ *   - **参数面**：身份参数（清单 = planners 的 `VIEW_UPDATE_IDENTITY_FIELDS`，当前为 packageId/objectName/ifMatch/dryRun/migration）直接取父 schema 的同名字段；
  *     载荷字段直接取父 schema 的 `operations` 判别式 union 里对应成员的对象形状（去掉判别式 `op`）。
  *     任一侧改动都会在**构建期**（buildViewOpCapabilities 的守卫）或单测里当场暴露。
  *   - **effect 面**：destructive/摘要来自 `services/view-ops.rules.ts` 的 VIEW_OPS（op 的唯一事实源）。
@@ -24,7 +24,7 @@
 
 import { z } from 'zod';
 import { cap, type Capability } from '../types.js';
-import { planViewOpAlias } from '../planners.js';
+import { VIEW_UPDATE_IDENTITY_FIELDS, planViewOpAlias } from '../planners.js';
 import { VIEW_OPS } from '../../services/view-ops.rules.js';
 
 /** 从 `operations` 的判别式 union 抽出「op 值 → 该成员的字段形状（去判别式）」 */
@@ -59,7 +59,7 @@ export function buildViewOpCapabilities(parent: Capability): Record<string, Capa
   const parentShape = (parent.inputSchema as unknown as { shape?: Record<string, z.ZodTypeAny> }).shape;
   if (!parentShape) throw new Error(`${parent.id}: inputSchema 不是对象形状，无法派生操作级条目`);
   const identity: Record<string, z.ZodTypeAny> = {};
-  for (const key of ['packageId', 'objectName', 'ifMatch', 'dryRun', 'migration']) {
+  for (const key of VIEW_UPDATE_IDENTITY_FIELDS) {
     const field = parentShape[key];
     if (field === undefined) throw new Error(`${parent.id}: 身份字段 ${key} 不在父 schema 里——操作级条目派生需要它`);
     identity[key] = field;

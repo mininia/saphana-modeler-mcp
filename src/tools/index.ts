@@ -1,19 +1,14 @@
 import type { McpServer, ServerContext, CallToolResult, InputRequiredResult } from '@modelcontextprotocol/server';
 import { z } from 'zod';
-import {
-  parseToolFilter,
-  shouldRegisterTool,
-  type ToolFilterConfig,
-  type ToolGroup,
-  ALL_TOOL_GROUPS,
-  TOOL_GROUPS,
-} from './groups.js';
+import { parseToolFilter, shouldRegisterTool, type ToolFilterConfig, ALL_TOOL_GROUPS } from './groups.js';
 import { logger } from '../core/logger.js';
 import { currentIdentity } from '../core/request-context.js';
-import { resolveProfile } from '../config/profiles.js';
+import { activeProfile } from '../config/profiles.js';
 import { policyFromConfig } from '../config/preflight.js';
 import { authorizeCall, blockedCallResult } from '../config/authorize.js';
 import { registeredNameOf, type Capability } from '../capabilities/types.js';
+import { CAPABILITY_LIST, membersOfCategory } from '../capabilities/manifest.js';
+import { facadeDescription } from '../capabilities/facades.js';
 import { computeSurface, type CallerSurface } from './surface.js';
 import {
   getRawHandler,
@@ -41,28 +36,27 @@ export interface ToolContext {
   config: HanaConfig;
   /**
    * 工具可见性过滤配置（由 mcp.json 的 MCP_TOOL_GROUPS/MCP_TOOL_ALLOW/MCP_TOOL_DENY 解析而来）。
-   * 各 register* 工具模块经 registerVisibleTool(server, ctx) 包裹后决定是否调用 server.registerTool；
-   * 未注册的工具不出现在 tools/list、不可被调用。全空配置=不过滤（全部注册，向后兼容）。
+   * 各 register* 模块经 capabilityRegistrar 按能力清单注册，注册出去的是这次连接的**面**（可触达上限（部署策略 ∩ 档案）∩（门面 ∪ 已提升分类的成员），见 surface.ts）：未进面的能力不出现在 tools/list——具体能力恒为动态调用，仍可经门面路由（判定走同一套闸门）。全空配置=不按分组/名称过滤（面的其余部分照常生效）。
    */
   toolFilter: ToolFilterConfig;
   /**
-   * 本次 server 构建使用的**面**（P10-e）：`部署策略 ∩ 档案 ∩ 门面`。
+   * 本次 server 构建使用的**面**：`(门面 ∪ 已提升分类的成员) ∩ 部署策略 ∩ 档案`。
    * HTTP 按请求构建（于是每个身份看到自己的面）；stdio 单实例。省略 = 由 `surfaceOf` 现算。
    */
   surface?: CallerSurface;
 }
 
-/** 由 mcp.json/.env 配置解析得到 ToolFilterConfig；无效分组名在此抛错（fail-closed：启动即失败） */
 /**
  * 取这次构建要用的**面**：`ctx.surface` 优先（HTTP 按请求构建、测试注入），否则现算（stdio 单实例）。
  *
  * 放在 ToolContext 上而不是逐层传参：8 个工具模块的签名不必知道"面"这件事，
  * 而 registerAllTools / capabilityRegistrar / registerVisibleTool 三处读到的**必然是同一个**面。
  */
-export function surfaceOf(ctx: ToolContext): CallerSurface {
+function surfaceOf(ctx: ToolContext): CallerSurface {
   return ctx.surface ?? computeSurface(ctx, currentIdentity());
 }
 
+/** 由 mcp.json/.env 配置解析得到 ToolFilterConfig；无效分组名在此抛错（fail-closed：启动即失败） */
 export function buildToolFilter(config: HanaConfig): ToolFilterConfig {
   return parseToolFilter(config.toolGroups, config.toolAllow.join(','), config.toolDeny.join(','));
 }
@@ -79,9 +73,9 @@ export function buildToolFilter(config: HanaConfig): ToolFilterConfig {
  * 闸门判的是"这次调用能不能成立"（见 config/authorize.ts）。写工具的闸门曾单独有一层
  * `registerWriteTool`，P10-b 起所有能力统一由 `capabilityRegistrar` 包装，故该注册器已删除。
  */
-export function registerVisibleTool(server: McpServer, ctx: ToolContext): McpServer['registerTool'] {
+function registerVisibleTool(server: McpServer, ctx: ToolContext): McpServer['registerTool'] {
   // 面：由 ctx.surface 给出（每 server 一份，见 ToolContext 的说明）；测试/脚本可直接注入。
-  // 面已经包含了可见性过滤的结果（部署策略 ∩ 档案 ∩ 门面），故此处不再单独咨询 filter。
+  // 面已经包含了可见性过滤与提升的结果，故此处不再单独咨询 filter。
   const effective = surfaceOf(ctx);
   return ((name: string, config: unknown, cb: unknown) => {
     // 名字 → 能力 id：工具级能力 id 恒等于注册名（操作级条目只经路由，不注册）
@@ -92,16 +86,22 @@ export function registerVisibleTool(server: McpServer, ctx: ToolContext): McpSer
 }
 
 /**
- * 能力清单条目 → SDK 的 registerTool 配置。
+ * 能力清单条目 → SDK 的 `registerTool` 配置。
  *
- * **注册配置的唯一副本在清单**（title/description/inputSchema/annotations），
- * 工具模块只提供 handler——这正是 P10-a 要杀死的"同一件事有四处说法"。
- * 键名与 `McpServer.registerTool` 的配置对象对应；由 `capabilityRegistrar` 转发给 SDK。
+ * title / inputSchema / annotations 取自清单（**唯一副本**，工具模块只提供 handler——同一件事
+ * 不许有第二处说法）。门面描述是成员清单的投影：注册时按 `surface`（本次连接的可触达上限）重建，
+ * 投给模型的文本因此随 deny / 分组开关 / 档案的收窄而收窄，与门面索引、路由同一条判定
+ * （清单常量保存的是全集版本，见 `capabilities/facades.ts`）。键名与 `McpServer.registerTool`
+ * 的配置对象对应；由 `capabilityRegistrar` 转发给 SDK。
  */
-export function registrationOf<S extends z.ZodType>(cap: Capability<S>) {
+function registrationOf<S extends z.ZodType>(cap: Capability<S>, surface: CallerSurface) {
+  const description =
+    cap.facadeOf !== undefined
+      ? facadeDescription(cap.facadeOf, membersOfCategory(cap.facadeOf), (m) => surface.entitlementIds.has(m.id))
+      : cap.description;
   return {
     title: cap.title,
-    description: cap.description,
+    description,
     inputSchema: cap.inputSchema,
     annotations: cap.annotations,
   };
@@ -125,15 +125,16 @@ export interface CapabilityRegistrar {
 }
 
 /**
- * 返回**按能力清单注册**的注册器：注册名、schema、描述、注解全部取自清单条目，
- * handler 由**统一的调用期闸门**（`authorizeCall`）包住。
+ * 返回**按能力清单注册**的注册器：注册名与配置取自清单条目（**门面描述**按本次连接的可触达上限
+ * 重建，见 `registrationOf`），handler 由**统一的调用期闸门**（`authorizeCall`）包住。
  *
  * P10-b 之前，这里按清单的 `gate` 字段二选一（写工具包闸门、读工具只做可见性过滤）——
  * 那是"读工具没有任何调用期判定"的根源（SSD §7.1 事实 1）。现在**所有能力都过同一个闸门**，
  * 差别只在"闸门有没有资源维度"，而那由 `effects.plan` 的有无表达（见 types.ts 的说明）。
  *
- * 注册期过滤仍保留，但 P10-e 起它算的是**这次连接的面**：
- * `部署策略 ∩ 档案 ∩ 门面`（见 surface.ts）。具体能力**不进面**——它们恒为动态调用，只经门面路由。
+ * 注册期过滤仍保留，但它算的是**这次连接的面**：
+ * `(门面 ∪ 已提升分类的成员) ∩ 部署策略 ∩ 档案`（见 surface.ts）。具体能力默认不进面——
+ * 只经门面路由调用；其分类被提升后才进 `tools/list`（带完整 schema、可平铺直调）。
  * 调用期闸门管的是"这次调用是否成立"（含经门面路由进来的那一次）。两者是"面"与"权"的关系——
  * 面是子集，不是替代（不变量 C：可见 ⇔ 可调用）。
  *
@@ -142,6 +143,7 @@ export interface CapabilityRegistrar {
  */
 export function capabilityRegistrar(server: McpServer, ctx: ToolContext): CapabilityRegistrar {
   const register = registerVisibleTool(server, ctx);
+  const surface = surfaceOf(ctx);
   const registrar = function registerCapability<S extends z.ZodType>(
     cap: Capability<S>,
     handler: CapabilityHandler<S>,
@@ -151,7 +153,7 @@ export function capabilityRegistrar(server: McpServer, ctx: ToolContext): Capabi
     // ② 可见则注册（配置来自清单，转发手法与 registerVisibleTool 内部一致）
     (register as (n: string, c: unknown, f: unknown) => unknown)(
       registeredNameOf(cap),
-      registrationOf(cap),
+      registrationOf(cap, surface),
       gatedHandler(ctx, cap, handler),
     );
   } as CapabilityRegistrar;
@@ -171,7 +173,7 @@ export function capabilityRegistrar(server: McpServer, ctx: ToolContext): Capabi
  *
  * 策略来自**服务已加载的 config**（不重新解析 env——见 policyFromConfig 的说明），
  * 每次调用现算：判定用的值必须等于此刻运行用的值。
- * 档案（P10-c）：身份里带（HTTP Token 第三段）就用它，否则落进程默认（MCP_PROFILE）。
+ * 档案：身份里带（HTTP Token 第三段）就用它，否则落进程默认（MCP_PROFILE）。
  */
 function gatedHandler<S extends z.ZodType>(
   ctx: ToolContext,
@@ -182,7 +184,7 @@ function gatedHandler<S extends z.ZodType>(
     const identity = currentIdentity();
     const auth = authorizeCall(cap, args, {
       policy: policyFromConfig(ctx.config, ctx.toolFilter),
-      profile: resolveProfile(ctx.config.profiles, identity?.profileId ?? ctx.config.profileId),
+      profile: activeProfile(ctx.config, identity),
       agentLabel: ctx.config.agentLabel,
     });
     if (!auth.allowed) return blockedCallResult(auth);
@@ -220,7 +222,7 @@ export function registerCapabilitiesDynamically(
     }
     const handle = server.registerTool(
       name,
-      registrationOf(cap),
+      registrationOf(cap, surfaceOf(ctx)),
       gatedHandler(ctx, cap, raw as CapabilityHandler<typeof cap.inputSchema>) as never,
     ) as unknown as { remove(): void };
     recordDynamicHandle(server, name, handle);
@@ -248,7 +250,10 @@ export function unregisterCapabilities(server: McpServer, toolNames: readonly st
 /**
  * 启动时打印工具可见性摘要（不泄露敏感信息）。
  * 仅在配置了过滤变量时输出，便于排查「为何某工具没注册」。
- * 若过滤后零工具可见，额外输出 warn（提示配置可能误关了全部工具）。
+ *
+ * 这里只按**工具过滤变量**（MCP_TOOL_GROUPS/ALLOW/DENY）列被关闭的条目；操作级别名（routeOnly）
+ * 不是工具（任何配置下都不注册），不列入。零工具可见的告警不在这里——那由 `registerAllTools`
+ * 按**实际构建的面**（含档案维度）发出，避免同一问题出现两套口径。
  */
 export function logToolFilterSummary(filter: ToolFilterConfig): void {
   if (filter.enabledGroups.size === 0 && filter.allowPatterns.length === 0 && filter.denyPatterns.length === 0) {
@@ -265,7 +270,7 @@ export function logToolFilterSummary(filter: ToolFilterConfig): void {
     '工具可见性过滤已启用（MCP_TOOL_GROUPS/MCP_TOOL_ALLOW/MCP_TOOL_DENY）',
   );
   // 列出被关闭的工具名（帮助确认配置符合预期）
-  const allNames = Object.keys(TOOL_GROUPS);
+  const allNames = CAPABILITY_LIST.filter((c) => c.routeOnly !== true).map((c) => c.id);
   const disabled = allNames.filter((name) => !shouldRegisterTool(name, filter));
   if (disabled.length > 0) {
     logger.info(
@@ -273,22 +278,17 @@ export function logToolFilterSummary(filter: ToolFilterConfig): void {
       '以下工具被配置关闭（不出现在 tools/list）',
     );
   }
-  // 过滤后零工具可见：提示配置可能误关了全部工具（服务会启动但不暴露 tools 能力）
-  const visibleCount = allNames.length - disabled.length;
-  if (visibleCount === 0) {
-    logger.warn(
-      { enabledGroups: groupSummary, allow: filter.allowPatterns, deny: filter.denyPatterns },
-      '当前配置导致没有任何工具被注册——MCP 客户端将看不到任何工具（tools/list 不被服务端声明）。' +
-        '若非预期，请检查 MCP_TOOL_GROUPS/MCP_TOOL_ALLOW/MCP_TOOL_DENY 配置。',
-    );
-  }
 }
 
 /**
- * 注册全部工具
- *  工具可见性由 ctx.toolFilter（来自 MCP_TOOL_GROUPS/MCP_TOOL_ALLOW/MCP_TOOL_DENY）控制，
- *  各 register* 模块经 registerVisibleTool(server, ctx) 包裹后在注册前过滤。
- *  过滤后零工具可见时强制注册一个占位工具，确保 SDK 声明 tools 能力、tools/list 可达。 */
+ * 注册全部工具。
+ *
+ * 可见性 = 本次构建的**面**（`(门面 ∪ 已提升分类的成员) ∩ 部署策略 ∩ 档案`，见 surface.ts）：
+ * 各 register* 模块经 capabilityRegistrar 按清单逐能力注册，注册名不在面内的直接跳过（不注册、不进 tools/list）。
+ * 零可见时**什么都不注册**——实测（SDK 2.3.1）此时服务端不声明 tools 能力，客户端 `tools/list` 得到
+ * -32601 Method not found；
+ * 这类误配（显式 deny 掉全部能力）由下方 warn 与 `npm run preflight` 兜底。
+ */
 export function registerAllTools(server: McpServer, ctx: ToolContext): void {
   // 面算一次、贯穿本次构建（HTTP 每请求一个 server；stdio 单实例）。
   const effective = surfaceOf(ctx);
@@ -308,17 +308,13 @@ export function registerAllTools(server: McpServer, ctx: ToolContext): void {
   registerSqlAnalyzeTools(server, ctx);
   registerHealthTools(server, ctx);
 
-  // 零工具可见时这里**什么也不注册**（曾经会注册一个占位工具 hana_no_tools_available 顶住
-  // tools/list 可达性，2026-10-09 删除）。
+  // 零工具可见时这里什么也不注册。实测（SDK 2.3.1，InMemoryTransport 探针）：零注册时
+  // `capabilities` 为空对象、不声明 tools，`tools/list` 返回 -32601 Method not found——
+  // "把所有能力都 deny 掉"的部署在客户端侧表现为**协议层报错**，而不是"没有工具"。
   //
-  // 实测代价（SDK 2.3.1，InMemoryTransport 探针）：零注册时 `capabilities` 为空对象、
-  // 不声明 tools，`tools/list` 返回 -32601 Method not found。即"把所有能力都 deny 掉"的部署
-  // 在客户端侧表现为**协议层报错**而非"没有工具"。
-  //
-  // 之所以删：那个占位项是一个**假能力**——它在清单里、在分组表里、在预算指标里、在快照里，
-  // 处处都要为它写例外（"占位能力不经 registrar"），而它唯一的作用是把一条协议错误换成
-  // 一句话。零工具只可能来自"显式 deny 掉全部能力"，那是误配不是用法；这种误配由启动日志
-  // 与 `npm run preflight` 兜底（见下方 logger.warn 与 logToolFilterSummary）。
+  // 不用占位工具顶住 tools/list 的可达性：占位项是**假能力**，会在清单、分组表、预算指标、
+  // 快照里处处需要例外，换来的只是把一条协议错误变成一句话。零工具只可能来自显式 deny 掉
+  // 全部能力（误配，不是用法），由下方 warn 与 `npm run preflight` 兜底。
   const anyVisible = effective.surfaceIds.size > 0;
   if (!anyVisible) {
     logger.warn(
@@ -327,6 +323,3 @@ export function registerAllTools(server: McpServer, ctx: ToolContext): void {
     );
   }
 }
-
-/** 导出分组元信息供文档/测试/外部使用（分组中文标签在 groups.ts，需要时直接从此处或彼处引入） */
-export { type ToolGroup, ALL_TOOL_GROUPS, TOOL_GROUPS, shouldRegisterTool };

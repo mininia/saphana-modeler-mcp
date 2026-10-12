@@ -1,11 +1,11 @@
 /**
- * 资源形参声明（P10-c）：让"哪个入参是**资源**"由**参数自己**声明，而不是靠规划器逐个手抠。
+ * 资源形参声明：让"哪个入参是**资源**"由**参数自己**声明，而不是靠规划器逐个手抠。
  *
  * ## 为什么
  *
- * P10-b 之前，规划器要自己从 args 里按名字取资源（`asStr(args.schema)`、`asStr(args.packageId)`…），
- * 于是每加一个"读某 schema"的能力，作者都必须记得写一个规划器、且名字必须恰好命中——
- * 漏了不会有任何提示，只是该能力的读范围判定**静默失效**。改成声明式后：
+ * 若由规划器自己从 args 里按名字取资源（`asStr(args.schema)`、`asStr(args.packageId)`…），
+ * 每加一个"读某 schema"的能力，作者都必须记得写一个规划器、且名字必须恰好命中——
+ * 漏了不会有任何提示，只是该能力的读范围判定**静默失效**。声明式下：
  * **资源维度随参数走**，新增能力只要用对构造器，判定自动成立（漏声明由测试拦）。
  *
  * ## 为什么不用 zod 的 `.meta()`
@@ -96,11 +96,15 @@ export function deriveResourcesFromParams(inputSchema: z.ZodType, args: Record<s
     if (changesetMode && role === 'writePackage') continue;
     const value = args[name];
     if (typeof value !== 'string') continue;
-    const v = value.trim();
-    if (v === '') continue;
+    // **不做 trim**（I3 单一口径：判定值必须等于服务层实际拿到的值）。入参归一在**声明侧**完成——
+    // readSchema 类形参的 zod schema 带 `.trim()`（defs/*.ts），经 SDK / 门面路由解析后，闸门、计划、
+    // 服务层拿到的是同一个字符串。这里若再 trim，未经 zod 解析的调用（直调 handler 等）就会出现
+    // "闸门按 trim 后的值判、服务层按原值判"的双口径——正是评审点名的"闸门放行、服务报不在白名单"。
+    // 只跳过"去掉首尾空白后为空"的值：空串/纯空白不算声明（模型偶尔用它表示"不指定"）。
+    if (value.trim() === '') continue;
     const target =
       role === 'writePackage' ? out.writePackages : role === 'readPackage' ? out.readPackages : out.readSchemas;
-    if (!target.includes(v)) target.push(v);
+    if (!target.includes(value)) target.push(value);
   }
   return out;
 }

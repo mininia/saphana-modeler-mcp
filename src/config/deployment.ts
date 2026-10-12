@@ -15,7 +15,7 @@
  */
 
 /** 回环地址判定（"仅本机可达" = 无认证时的访问边界） */
-export const LOOPBACK_HOSTS: ReadonlySet<string> = new Set(['127.0.0.1', '::1', 'localhost', '[::1]']);
+const LOOPBACK_HOSTS: ReadonlySet<string> = new Set(['127.0.0.1', '::1', 'localhost', '[::1]']);
 
 /** 监听地址是否仅本机可达 */
 export function isLoopbackHost(host: string): boolean {
@@ -50,11 +50,13 @@ export interface DeploymentPosture {
   tls: boolean;
   /** TLS 下是否校验证书（HANA_SSL_VALIDATE，默认 true） */
   sslValidate: boolean;
+  /** XS 写通道是否为明文（未配置 HANA_XS_TLS=true 时为 true）；可选，缺省不参与判定 */
+  xsPlaintext?: boolean;
 }
 
 /** 部署不变量结论 */
 export interface DeploymentInvariant {
-  code: 'http_exposed_without_auth' | 'tls_plaintext' | 'encrypted_but_unauthenticated';
+  code: 'http_exposed_without_auth' | 'tls_plaintext' | 'encrypted_but_unauthenticated' | 'xs_plaintext';
   /** block = 拒绝启动；warn = 放行但必须显式可见 */
   severity: 'block' | 'warn';
   /**
@@ -115,6 +117,18 @@ export function checkDeploymentInvariants(posture: DeploymentPosture): Deploymen
       // 同上：事实句不含标识符，HANA_SSL_VALIDATE=false 只在运维出口（remedy）出现
       message: '连接已加密但未校验服务器证书：无法防中间人替换证书。',
       remedy: '校验证书被关闭来自 HANA_SSL_VALIDATE=false；仅应在内网自签证书环境使用',
+    });
+  }
+
+  // XS 写通道没有 TLS 开关的默认态就是明文（HANA 账号密码/Cookie/CSRF 明文传输）；与 HANA_TLS=false
+  // 同级（warn 放行、启动日志可见）。message 为纯事实句（不含配置标识符），处置建议统一进 remedy。
+  if (posture.xsPlaintext === true) {
+    out.push({
+      code: 'xs_plaintext',
+      severity: 'warn',
+      message: 'XS 设计时写通道未加密：仓库写/激活/导入/导出所用的凭据与会话以明文 HTTP 传输。',
+      remedy:
+        'XS 通道缺省为明文；XS 端点支持 TLS 时置 HANA_XS_TLS=true 并把 HANA_XS_PORT 指向 HTTPS 端口，否则须以网络侧隔离（仅可信网段可达）',
     });
   }
 

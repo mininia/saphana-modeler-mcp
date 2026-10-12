@@ -17,11 +17,19 @@ export interface RequestIdentity {
   /** 传输通道（审计用：区分本地 stdio 与远程 HTTP） */
   transport: 'http' | 'stdio';
   /**
-   * 调用方档案名（P10-c）：来自 MCP_HTTP_TOKENS 第三段，或 stdio 进程的 MCP_PROFILE。
+   * 调用方档案名：来自 MCP_HTTP_TOKENS 第三段，或 stdio 进程的 MCP_PROFILE。
    * 未配 MCP_PROFILES 时缺省（= 隐式 default，不收紧任何权限）。
    */
   profileId?: string;
 }
+
+/**
+ * 未配置任何 Token 的 HTTP 部署使用的客户端身份名：HTTP 入口把无凭据请求落为该身份
+ * （http.ts），面的提升逻辑据此判定「未认证」并关闭该部署的提升（tools/surface.ts 的
+ * canPromote）。定义放在两侧都可引用的叶子模块，避免字面量分叉——一旦分叉，匿名调用
+ * 会被误判为已认证、共用同一个提升键而互相串改可见面。
+ */
+export const ANONYMOUS_CLIENT_ID = 'anonymous';
 
 const storage = new AsyncLocalStorage<RequestIdentity>();
 

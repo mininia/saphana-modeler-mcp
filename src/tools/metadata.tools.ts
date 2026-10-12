@@ -3,7 +3,9 @@
  *
  * 注册的工具：hana_metadata_get_view、hana_metadata_search_objects、hana_metadata_list_fields、
  * hana_metadata_get_field_logic、hana_metadata_where_used、hana_table_list、hana_table_columns。
- * 全部只读（不写仓库、不写任何表），经 capabilityRegistrar 按能力清单注册；该模块全部 gate=none，无调用期闸门。
+ * 全部只读（不写仓库、不写任何表），经 capabilityRegistrar 按能力清单注册——所有能力都过
+ * authorizeCall 调用期闸门，读能力与写能力的差别只在有无资源维度（effects.plan）：
+ * hana_table_list / hana_table_columns 的 schema 参数进读范围判定，其余读 _SYS_REPO 固定面不声明资源。
  */
 
 import type { McpServer } from '@modelcontextprotocol/server';
@@ -61,8 +63,8 @@ export function registerMetadataTools(server: McpServer, ctx: ToolContext): void
   regCap(
     CAP.hana_metadata_list_fields,
     async ({ packageId, objectName, pattern, exact, kind, includeNodeCalculated }) => {
-      // exact=true 必须配 pattern（P10-c c2）：此前不给 pattern 时按空串精确匹配 → **返回空清单**，
-      // 既不报错也不是全量，调用方只会以为"这个视图没有字段"。
+      // exact=true 必须配 pattern：exact 配空 pattern 会按空串精确匹配 → **返回空清单**（不报错也非全量），
+      // 调用方只会以为"这个视图没有字段"，故 handler 直接报参数错误。
       if (exact && !pattern) {
         return mcpErrorText(
           'exact=true 需要同时提供 pattern（精确匹配的字段 ID）。',
@@ -84,6 +86,8 @@ export function registerMetadataTools(server: McpServer, ctx: ToolContext): void
         if (!includeUsage) return base;
         const lineage = await fieldLineage(ctx.pool, packageId, objectName, fieldId, {
           direction: 'downstream',
+          // 复用上面已取到的种子对象：避免对同一视图再发一次 ACTIVE_OBJECT 查询
+          seedObject: base.object,
           ...(usageMaxViews !== undefined ? { maxViews: usageMaxViews } : {}),
         });
         return {
@@ -93,6 +97,7 @@ export function registerMetadataTools(server: McpServer, ctx: ToolContext): void
             nameAlignedConsumers: lineage.nameAlignedConsumers,
             viewsScanned: lineage.viewsScanned,
             maxViews: lineage.maxViews,
+            failedCandidates: lineage.failedCandidates,
             truncated: lineage.truncated,
             asOf: lineage.asOf,
           },

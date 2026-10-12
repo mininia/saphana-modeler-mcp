@@ -62,19 +62,8 @@ function str(node: XmlNode, key: string): string | undefined {
   return typeof v === 'string' ? v : undefined;
 }
 
-/** 取文本（节点可能是字符串或对象；CDATA 与普通文本都支持） */
-function text(x: unknown): string | undefined {
-  let raw: string | undefined;
-  if (typeof x === 'string') raw = x;
-  else if (x && typeof x === 'object') {
-    const o = x as Record<string, unknown>;
-    // fast-xml-parser：普通文本 → #text，CDATA（SQLScript 等）→ #cdata
-    if ('#text' in o && typeof o['#text'] === 'string') raw = o['#text'];
-    else if ('#cdata' in o && typeof o['#cdata'] === 'string') raw = o['#cdata'];
-  }
-  if (raw === undefined) return undefined;
-  // 解析器 processEntities=false（保留 CDATA 原样），这里对公式/脚本等文本节点
-  // 解码 XML 实体，还原真实 SQL/表达式（ZDEMO008_CV001 的公式含 &quot; 与 &#xD;）
+/** XML 实体解码（元素文本与属性值共用同一口径；`&amp;` 最后解，避免二次解码） */
+function decodeEntities(raw: string): string {
   return raw
     .replace(/&quot;/g, '"')
     .replace(/&apos;/g, "'")
@@ -85,6 +74,47 @@ function text(x: unknown): string | undefined {
     .replace(/&amp;/g, '&');
 }
 
+/**
+ * 取文本桶（fast-xml-parser 的 `#text` / `#cdata`）。
+ * 单段是字符串；同一元素内出现多段时该桶是数组——拼接归一（次序即解析器给出的次序），
+ * 不归一就会把数组形态整桶当作"不存在"丢掉。
+ */
+function textBucket(v: unknown): string | undefined {
+  if (typeof v === 'string') return v;
+  if (Array.isArray(v)) return v.filter((s): s is string => typeof s === 'string').join('');
+  return undefined;
+}
+
+/** 取文本（节点可能是字符串或对象；CDATA 与普通文本都支持） */
+function text(x: unknown): string | undefined {
+  let raw: string | undefined;
+  if (typeof x === 'string') raw = x;
+  else if (x && typeof x === 'object') {
+    const o = x as Record<string, unknown>;
+    // fast-xml-parser：普通文本 → #text，CDATA（SQLScript 等）→ #cdata。mixed content（文本与 CDATA
+    // 混排，手工编写/外部导入可能出现）会同时给出两者。解析器把元素内全部文本段并进 #text、全部 CDATA
+    // 段并进 #cdata（快照里两桶各自有序，交错次序丢失，preserveOrder:false 下不可还原），所以按：
+    // 空白侧视为不存在；两侧都有实质内容则拼接（#text → #cdata 的固定近似次序，见下）。
+    // - 并存时最常见的是缩进排版空白（`<definition>\n  <![CDATA[…]]>\n</definition>`）：不把纯空白当
+    //   文本，否则先判 #text 会把 CDATA 里的 SQL/公式整段丢弃、读成空白（diff 判「无变化」漏报口径变更）；
+    // - 两桶都有实质内容时丢一半才是真损害（diff 漏报该侧变更、planners 的 schema 扫描漏扫该侧 FROM/JOIN），
+    //   拼接至少保住全部内容；次序只是近似——原文件 CDATA 在前时读出次序与原文件不符，属解析层能力边界。
+    const textSide = textBucket(o['#text']);
+    const cdata = textBucket(o['#cdata']);
+    const textBlank = textSide === undefined || textSide.trim() === '';
+    const cdataBlank = cdata === undefined || cdata.trim() === '';
+    if (textBlank && cdataBlank)
+      raw = cdata ?? textSide; // 无实质内容：空白原样保留（仅缩进的既有口径不变）
+    else if (textBlank) raw = cdata;
+    else if (cdataBlank) raw = textSide;
+    else raw = textSide + cdata;
+  }
+  if (raw === undefined) return undefined;
+  // 解析器 processEntities=false（保留 CDATA 原样），这里对公式/脚本等文本节点
+  // 解码 XML 实体，还原真实 SQL/表达式（ZDEMO008_CV001 的公式含 &quot; 与 &#xD;）
+  return decodeEntities(raw);
+}
+
 /** xsi:type 的本地名：'Calculation:ProjectionView' → 'ProjectionView' */
 function localType(xsiType: unknown): string {
   const s = typeof xsiType === 'string' ? xsiType : '';
@@ -92,11 +122,14 @@ function localType(xsiType: unknown): string {
   return idx >= 0 ? s.slice(idx + 1) : s;
 }
 
-/** descriptions 元素的 defaultDescription */
+/** descriptions 元素的 defaultDescription（属性值读取也走实体解码：与写入侧的 escapeXmlAttr 对称——
+ *  不解实体时读回的 `&amp;` 成为字面实体，模型把它当描述回写会逐轮叠加转义） */
 function defaultDescription(node: XmlNode): string | undefined {
   const d = node && typeof node === 'object' ? (node as Record<string, unknown>)['descriptions'] : undefined;
-  if (Array.isArray(d)) return str(d[0] as XmlNode, '@_defaultDescription');
-  return str(d as XmlNode, '@_defaultDescription');
+  const raw = Array.isArray(d)
+    ? str(d[0] as XmlNode, '@_defaultDescription')
+    : str(d as XmlNode, '@_defaultDescription');
+  return raw === undefined ? undefined : decodeEntities(raw);
 }
 
 function parseDataSource(ds: XmlNode): ViewDataSource {
@@ -201,7 +234,7 @@ function parseNode(node: XmlNode): ViewNode {
     };
   });
   // 只在确有类型声明时才产出 attributeTypes：恒为空数组会掩盖「未声明」语义，
-  // 也给 diff 制造噪音（空段 ≡ 缺段，见 SSD §5.2 归一化规则）。
+  // 也给 diff 制造噪音（空段与缺段等价处理：diff 不因该段存在与否报增删）。
   const attributeTypes = viewAttrs
     .filter((a) => a.datatype !== undefined || a.length !== undefined)
     .map((a) => ({ id: a.id, datatype: a.datatype, length: a.length }));
@@ -260,8 +293,8 @@ function parseOutputField(field: XmlNode, kind: 'attribute' | 'measure'): ViewOu
     sourceObject: str(m, '@_columnObjectName'),
     // 类型/公式不只度量有：逻辑层 calculatedAttributes 里的属性列同样带
     // datatype/length/expressionLanguage/formula（它们就是「带公式的属性列」）。
-    // 此前只在度量分支填充 ⇒ 属性列的类型/公式变更在结构化模型里不可见（P6 判定表有洞）。
-    // 两条路径统一填充，纯增量：度量分支的取值与键集原样不动。
+    // 属性列与度量列必须同路填充：只填度量会让属性列的类型/公式变更在结构化模型里不可见，
+    // 依赖该模型的 diff 与破坏性判定随之漏报。
     datatype: str(field, '@_datatype'),
     length: str(field, '@_length'),
     expressionLanguage: str(field, '@_expressionLanguage'),
@@ -277,11 +310,11 @@ function parseOutputField(field: XmlNode, kind: 'attribute' | 'measure'): ViewOu
 
 function parseOutputList(root: XmlNode, section: string, kind: 'attribute' | 'measure'): ViewOutputField[] {
   const sec = root && typeof root === 'object' ? (root as Record<string, unknown>)[section] : undefined;
-  // 条目名兼容（P6 修复批，评审 #5）：本仓既有语料与 fixture 用 kind 名当条目元素（<attribute>/<measure>），
+  // 条目名兼容：本仓既有语料与 fixture 用 kind 名当条目元素（<attribute>/<measure>），
   // 真实方言也可能用 section 名的单数（<calculatedAttribute>/<calculatedMeasure>/<restrictedMeasure>）。
   // 只认一种名字时，另一种方言的整张列表恒为空 ⇒ 其字段增删/改名/类型变更对 diff 与判定完全不可见。
-  // 两种名字都收；名字相同时去重（attributes 列表的 section 单数恰好等于 kind 名，不去重会把同一批
-  // 元素读两遍）。本仓无真实语料可证伪单数名假设，这是防御性兼容；顺序固定（单数名先、kind 名后）保确定性。
+  // 两种名字都收（本仓无真实语料可证伪单数名假设，属防御性兼容），顺序固定（单数名先、kind 名后）保确定性；
+  // 名字相同时去重——attributes 列表的 section 单数恰好等于 kind 名，不去重会把同一批元素读两遍。
   const kindName = kind === 'attribute' ? 'attribute' : 'measure';
   const names = section.endsWith('s') ? [section.slice(0, -1), kindName] : [kindName];
   const out: ViewOutputField[] = [];

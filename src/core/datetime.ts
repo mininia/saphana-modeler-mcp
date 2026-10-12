@@ -37,9 +37,20 @@ export function toHanaDateTime(date: Date, timezone: string = DEFAULT_TIMEZONE):
 }
 
 /**
- * 「现在」的进程时区 ISO 串（秒级）：**读数新鲜度（asOf）的单一实现**。
- * 时区口径与日志一致（`process.env.TZ`，由 loadConfig 统一设置；未设置时回落默认时区）。
+ * 给定时刻的**进程时区** ISO 串（秒级）：时区口径与日志一致（`process.env.TZ`，由 loadConfig
+ * 统一设置；未设置时回落默认时区）。
+ *
+ * 单点存在理由：读数新鲜度（asOf）、报告时刻（checkedAt）等若各自拼一遍
+ * `process.env.TZ ?? DEFAULT_TIMEZONE`，任何时区回退策略的调整都会让同一进程里的两个"现在"静默分叉。
+ */
+export function toIsoInProcessTz(date: Date = new Date()): string {
+  return toIsoInTimezone(date, process.env.TZ ?? DEFAULT_TIMEZONE);
+}
+
+/**
+ * 「现在」的进程时区 ISO 串（秒级）：读数新鲜度（asOf）等场景的默认入口。
+ * 需要固定时刻（测试）时走 toIsoInProcessTz，本函数恒取当前时刻。
  */
 export function nowIso(): string {
-  return toIsoInTimezone(new Date(), process.env.TZ ?? DEFAULT_TIMEZONE);
+  return toIsoInProcessTz(new Date());
 }

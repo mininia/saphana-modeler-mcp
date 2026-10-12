@@ -11,9 +11,13 @@
  * 两者由各自模块保留；本模块的 num 一律把空值收敛为 0。
  */
 
-/** 空值安全转数：null/undefined/不可转 → 0（HANA 聚合列常返回 null） */
+/**
+ * 空值安全转数：null/undefined → 0；不可转与非有限值（如 'abc'、NaN、±Infinity）同样归 0
+ * （HANA 聚合列常返回 null；非有限值若漏进报告会经 JSON 序列化成 null，"缺值"与"值非法"不可区分）。
+ */
 export function num(v: unknown): number {
-  return v == null ? 0 : Number(v);
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
 }
 
 /** 保留 d 位小数（默认 2 位，避免 evidence 里出现 18 位浮点尾巴） */

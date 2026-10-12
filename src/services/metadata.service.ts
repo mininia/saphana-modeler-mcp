@@ -6,13 +6,12 @@ import { parseResourceUri } from './preview.derive.js';
 import { HanaBusinessError } from '../core/errors.js';
 import { clampLimit } from '../core/num.js';
 import { assertSafeRuntimeName, assertSchemaAllowed, quoteIdentifier } from '../core/sql.js';
+import { suffixInClause, suffixesOf, VIEW_SUFFIXES } from '../model/view-suffixes.js';
 import { parseViewDefinition } from '../model/view-xml.js';
 import type {
   ViewCalculatedAttribute,
   ViewDefinition,
   ViewKind,
-  ViewNode,
-  ViewNodeMapping,
   ViewOutputField,
   ViewOutputs,
 } from '../model/view-types.js';
@@ -25,28 +24,12 @@ import type {
  */
 
 /**
- * 视图类型 → ACTIVE_OBJECT.OBJECT_SUFFIX 映射（导出供视图解析缓存复用）。
- *
- * 保留理由（刻意不删）：当前三项虽是**全等映射**，但它在本模块承担「合法取值集合」职责 ——
- * `Object.values(VIEW_SUFFIXES)` 是「不指定 kind 时匹配全部三种类型」的唯一事实源；
- * 且 view-cache / preview-diagnose 两个模块按同一 key 取值（跨文件契约，改动会波及它们）。
- * 若改成直接拼 ViewKind 字面量，上述枚举点会散成多处手写数组。
+ * 视图后缀的取值集合、按 kind 推导与 `IN (?,…)` 占位符拼装的唯一实现位于 `model/view-suffixes`
+ * （叶子模块）：catalog.service 不能引用本模块——本模块依赖它导出的 closure，反向 import 会形成
+ * 循环依赖，只有不依赖任何一方的模块才能被两侧共用。这里转出三个符号以保持本模块既有 import 面，
+ * view-cache / preview-diagnose / repository.service 仍自本模块引用同一实现。
  */
-export const VIEW_SUFFIXES: Record<ViewKind, string> = {
-  calculationview: 'calculationview',
-  attributeview: 'attributeview',
-  analyticview: 'analyticview',
-};
-
-/** kind 指定时只取该类型的 suffix，省略时三种全匹配（getViewDefinition/whereUsed/searchObjects/listPackageObjects 共用） */
-function suffixesOf(kind?: ViewKind): string[] {
-  return kind ? [VIEW_SUFFIXES[kind]] : Object.values(VIEW_SUFFIXES);
-}
-
-/** `IN (?,?,…)` 占位符串：长度由 suffixes 决定，值一律走参数绑定（三处手拼曾各写一遍） */
-function suffixInClause(suffixes: readonly string[]): string {
-  return `(${suffixes.map(() => '?').join(',')})`;
-}
+export { suffixInClause, suffixesOf, VIEW_SUFFIXES } from '../model/view-suffixes.js';
 
 /**
  * 「命中总数 + 本次上限 + 截断标记」的通用分页外壳。
@@ -142,7 +125,17 @@ export async function getViewDefinition(
     result.xml = row.CDATA ?? undefined;
   }
   if (opts.format !== 'xml' && row.CDATA) {
-    result.definition = parseViewDefinition(row.CDATA, row.OBJECT_SUFFIX as ViewKind);
+    try {
+      result.definition = parseViewDefinition(row.CDATA, row.OBJECT_SUFFIX as ViewKind);
+    } catch (e) {
+      // 裸 Error 会被 withErrorEnvelope 归入笼统「内部错误」——带上包/对象/版本与解析器原因，
+      // 让调用方（含 fieldLineage 的下游候选扫描）能直接定位到是哪个视图的 CDATA 解析失败
+      throw new HanaBusinessError(
+        `视图 ${row.PACKAGE_ID}/${row.OBJECT_NAME}（v${row.VERSION_ID}）设计时 XML 解析失败：` +
+          `${e instanceof Error ? e.message : String(e)}`,
+        'CDATA_PARSE_FAILED',
+      );
+    }
   }
   return result;
 }
@@ -154,11 +147,13 @@ export interface TableInfo {
   comments?: string | null;
 }
 
-/** 表列表（SYS.TABLES 按当前用户权限过滤；schema 默认当前 schema） */
+export type TableListResult = PagedResult<TableInfo, 'tables'>;
+
+/** 表列表（SYS.TABLES 按当前用户权限过滤；schema 默认当前 schema）；回执带 count/limit/truncated，超 limit 不静默截断 */
 export async function listTables(
   pool: HanaPool,
   opts: { schema?: string; pattern?: string; limit?: number } = {},
-): Promise<TableInfo[]> {
+): Promise<TableListResult> {
   const limit = clampLimit(opts.limit, 50, 1, 200);
   const schema = opts.schema ?? (await currentSchema(pool));
   // 纵深防御：显式传入的 schema 走白名单（系统 schema + HANA_SCHEMA_ALLOW 追加），
@@ -170,23 +165,34 @@ export async function listTables(
     where.push('TABLE_NAME LIKE ?');
     params.push(`%${opts.pattern}%`);
   }
-  params.push(limit);
-  const rows = await pool.query<{
-    SCHEMA_NAME: string;
-    TABLE_NAME: string;
-    TABLE_TYPE: string;
-    COMMENTS: string | null;
-  }>(
-    `SELECT SCHEMA_NAME, TABLE_NAME, TABLE_TYPE, COMMENTS FROM SYS.TABLES
-     WHERE ${where.join(' AND ')} ORDER BY TABLE_NAME LIMIT ?`,
-    params,
-  );
-  return rows.map((r) => ({
-    schemaName: r.SCHEMA_NAME,
-    tableName: r.TABLE_NAME,
-    tableType: r.TABLE_TYPE,
-    comments: r.COMMENTS,
-  }));
+  const whereSql = where.join(' AND ');
+  return runPaged('tables', limit, {
+    count: async () => {
+      const countRow = await pool.query<{ C: number }>(
+        `SELECT COUNT(*) AS C FROM SYS.TABLES WHERE ${whereSql}`,
+        params,
+      );
+      return countRow[0]?.C ?? 0;
+    },
+    items: async () => {
+      const rows = await pool.query<{
+        SCHEMA_NAME: string;
+        TABLE_NAME: string;
+        TABLE_TYPE: string;
+        COMMENTS: string | null;
+      }>(
+        `SELECT SCHEMA_NAME, TABLE_NAME, TABLE_TYPE, COMMENTS FROM SYS.TABLES
+         WHERE ${whereSql} ORDER BY TABLE_NAME LIMIT ?`,
+        [...params, limit],
+      );
+      return rows.map((r) => ({
+        schemaName: r.SCHEMA_NAME,
+        tableName: r.TABLE_NAME,
+        tableType: r.TABLE_TYPE,
+        comments: r.COMMENTS,
+      }));
+    },
+  });
 }
 
 export interface ColumnInfo {
@@ -200,34 +206,60 @@ export interface ColumnInfo {
   comments?: string | null;
 }
 
-/** 表列结构（SYS.TABLE_COLUMNS） */
+export type TableColumnsResult = PagedResult<ColumnInfo, 'columns'>;
+
+/** getTableColumns 的列数上限（clampLimit 的 hi）；回执 truncated 与 repository.service 的自动取列共用同一数值（单点定义） */
+export const TABLE_COLUMNS_LIMIT_MAX = 500;
+
+/** 表列结构（SYS.TABLE_COLUMNS）；回执带 count/limit/truncated，超 limit 不静默截断 */
 export async function getTableColumns(
   pool: HanaPool,
   schema: string,
   table: string,
   opts: { limit?: number } = {},
-): Promise<ColumnInfo[]> {
-  const limit = clampLimit(opts.limit, 200, 1, 500);
+): Promise<TableColumnsResult> {
+  const limit = clampLimit(opts.limit, 200, 1, TABLE_COLUMNS_LIMIT_MAX);
   // 纵深防御：schema 走白名单、表名做字符集校验（值仍参数绑定，此为第二道防线）
   assertSchemaAllowed(schema);
   assertSafeRuntimeName(table, '表');
-  const rows = await pool.query<{
-    COLUMN_NAME: string;
-    POSITION: number;
-    DATA_TYPE_NAME: string;
-    LENGTH: number | null;
-    SCALE: number | null;
-    IS_NULLABLE: string;
-    DEFAULT_VALUE: string | null;
-    COMMENTS: string | null;
-  }>(
-    `SELECT COLUMN_NAME, POSITION, DATA_TYPE_NAME, LENGTH, SCALE, IS_NULLABLE, DEFAULT_VALUE, COMMENTS
-     FROM SYS.TABLE_COLUMNS
-     WHERE SCHEMA_NAME = ? AND TABLE_NAME = ?
-     ORDER BY POSITION LIMIT ?`,
-    [schema, table, limit],
-  );
-  if (rows.length === 0) {
+  const page = await runPaged('columns', limit, {
+    count: async () => {
+      const countRow = await pool.query<{ C: number }>(
+        `SELECT COUNT(*) AS C FROM SYS.TABLE_COLUMNS WHERE SCHEMA_NAME = ? AND TABLE_NAME = ?`,
+        [schema, table],
+      );
+      return countRow[0]?.C ?? 0;
+    },
+    items: async () => {
+      const rows = await pool.query<{
+        COLUMN_NAME: string;
+        POSITION: number;
+        DATA_TYPE_NAME: string;
+        LENGTH: number | null;
+        SCALE: number | null;
+        IS_NULLABLE: string;
+        DEFAULT_VALUE: string | null;
+        COMMENTS: string | null;
+      }>(
+        `SELECT COLUMN_NAME, POSITION, DATA_TYPE_NAME, LENGTH, SCALE, IS_NULLABLE, DEFAULT_VALUE, COMMENTS
+         FROM SYS.TABLE_COLUMNS
+         WHERE SCHEMA_NAME = ? AND TABLE_NAME = ?
+         ORDER BY POSITION LIMIT ?`,
+        [schema, table, limit],
+      );
+      return rows.map((r) => ({
+        columnName: r.COLUMN_NAME,
+        position: r.POSITION,
+        dataTypeName: r.DATA_TYPE_NAME,
+        length: r.LENGTH,
+        scale: r.SCALE,
+        isNullable: r.IS_NULLABLE === 'TRUE',
+        defaultValue: r.DEFAULT_VALUE,
+        comments: r.COMMENTS,
+      }));
+    },
+  });
+  if (page.columns.length === 0) {
     // 必须是 HanaBusinessError：裸 Error 会被 withErrorEnvelope 归入「内部错误」，
     // 「表不存在 / 无权限」这类**调用方可据以修正**（换 schema、换表名）的原因会被吞掉。
     throw new HanaBusinessError(
@@ -235,22 +267,13 @@ export async function getTableColumns(
       'TABLE_NOT_FOUND',
     );
   }
-  return rows.map((r) => ({
-    columnName: r.COLUMN_NAME,
-    position: r.POSITION,
-    dataTypeName: r.DATA_TYPE_NAME,
-    length: r.LENGTH,
-    scale: r.SCALE,
-    isNullable: r.IS_NULLABLE === 'TRUE',
-    defaultValue: r.DEFAULT_VALUE,
-    comments: r.COMMENTS,
-  }));
+  return page;
 }
 
 /**
  * 当前会话的默认 schema（`SELECT CURRENT_SCHEMA FROM DUMMY`）。
  * 导出供 repository.service 的脚本读取范围校验复用：未限定 schema 的表名按当前 schema 解析，
- * 两处各查一次时同一条规则会有两个实现（此前 repository.service 即内联了同一句 SQL）。
+ * 两处各查一次会让同一条规则出现两个实现，故读法只此一份。
  */
 export async function currentSchema(pool: HanaPool): Promise<string> {
   const rows = await pool.query<{ CURRENT_SCHEMA: string }>('SELECT CURRENT_SCHEMA FROM DUMMY');
@@ -289,8 +312,9 @@ export interface WhereUsedResult {
  * kind 省略时匹配三种视图类型。
  * 说明：downstream 中 isRuntime=true 表示激活后的运行时目录视图（_SYS_BIC）对本仓库对象的引用。
  *
- * P4 扩展：`depth`（跳数，默认 1 = 原语义）——depth>1 时在单跳结果之外追加 `closure`
- * （多跳闭包，按方向拆分；visited-set 环防护；maxNodes 截断并置 truncated）；`asOf` 为构建时刻。
+ * `depth`（跳数，默认 1 = 单跳，upstream/downstream 两个兼容字段的形状不变）——depth>1 时在
+ * 单跳结果之外追加 `closure`（多跳闭包，按方向拆分；visited-set 环防护；maxNodes 截断并置
+ * truncated）；`asOf` 为构建时刻。
  */
 export async function whereUsed(
   pool: HanaPool,
@@ -343,8 +367,8 @@ export async function whereUsed(
         )
       : [];
 
-  // 种子真实后缀（P4 修 '?' 占位）：VIEW_SUFFIXES 是**全等映射**——kind 给定时它本身就是真实值；
-  // 省略 kind 时补一次轻量查询；对象不存在时回退 '?'（保持旧行为，不额外抛错）。
+  // 种子真实后缀：VIEW_SUFFIXES 是**全等映射**——kind 给定时它本身就是真实值；
+  // 省略 kind 时补一次轻量查询；对象不存在时回退 '?'（不额外抛错，回执与闭包遍历都用该种子）。
   let seedSuffix = opts.kind ?? '?';
   if (!opts.kind) {
     const seedRows = await pool.query<{ OBJECT_SUFFIX: string }>(
@@ -385,31 +409,6 @@ export async function whereUsed(
   }
 
   return result;
-}
-
-/**
- * 在视图定义中查找计算属性（节点内计算列）by ID
- * 适用于类似 ZDEMO008_CV001 中查找 ZDEMO_FLD_NEW 的场景
- */
-export function findCalculatedAttribute(
-  definition: ViewDefinition,
-  attributeId: string,
-): ViewCalculatedAttribute | undefined {
-  for (const node of definition.nodes) {
-    const attr = node.calculatedAttributes.find((ca) => ca.id === attributeId);
-    if (attr) {
-      return attr;
-    }
-  }
-  // 也检查输出中的计算属性
-  return definition.outputs.calculatedAttributes.find((ca) => ca.id === attributeId);
-}
-
-/**
- * 在视图定义中查找节点 by ID
- */
-export function findNode(definition: ViewDefinition, nodeId: string): ViewNode | undefined {
-  return definition.nodes.find((node) => node.id === nodeId);
 }
 
 /**
@@ -467,35 +466,11 @@ export function searchFields(
 }
 
 /**
- * 获取视图的节点链路（数据流）
- * 从数据源到输出的节点连接关系
- */
-export interface NodeConnection {
-  from: string; // 源节点 ID
-  to: string; // 目标节点 ID
-  mappings: ViewNodeMapping[]; // 字段映射
-}
-
-export function getNodeConnections(definition: ViewDefinition): NodeConnection[] {
-  const connections: NodeConnection[] = [];
-
-  for (const node of definition.nodes) {
-    for (const input of node.inputs) {
-      connections.push({
-        from: input.node,
-        to: node.id,
-        mappings: input.mappings,
-      });
-    }
-  }
-
-  return connections;
-}
-
-/**
  * 从公式字符串中提取引用的字段
  * - 优先识别 SQL 双引号引用（"COLUMN_NAME"，ZDEMO008_CV001 的 ZDEMO_FLD_NEW 即如此）
- * - 剔除字符串字面量与关键字后，再匹配裸标识符（兼容无引号字段名的老视图）
+ * - 剔除字符串字面量、SQL 关键字、函数调用名与 CAST 类型名后，再匹配裸标识符（兼容无引号字段名的老视图）：
+ *   裸标识符与函数/类型名同形（SUM/CAST/DECIMAL…），只按有限的关键字黑名单过滤会把它们当源字段 ——
+ *   实测 `SUM("AMOUNT")+CAST("QTY" AS DECIMAL)` 会被解析出 SUM/CAST/AS/DECIMAL 等假源字段。
  */
 export function extractFormulaSourceColumns(formula: string | undefined): string[] {
   if (!formula) return [];
@@ -508,7 +483,6 @@ export function extractFormulaSourceColumns(formula: string | undefined): string
   }
   // 2. 剔除双引号引用与单引号字符串字面量后，匹配裸标识符
   const withoutLiterals = formula.replace(/"(?:[^"\\]|\\.)*"/g, '').replace(/'[^']*'/g, '');
-  const bare = /\b([A-Z_][A-Z0-9_]*)\b/g;
   const SKIP = new Set([
     'CASE',
     'WHEN',
@@ -524,11 +498,46 @@ export function extractFormulaSourceColumns(formula: string | undefined): string
     'IF',
     'IN',
     'IS',
+    // 公式中常见的其它关键字（CAST 的 AS、BETWEEN/LIKE/DISTINCT/窗口函数/子查询等）
+    'AS',
+    'BETWEEN',
+    'LIKE',
+    'ESCAPE',
+    'DISTINCT',
+    'OVER',
+    'PARTITION',
+    'BY',
+    'ORDER',
+    'ASC',
+    'DESC',
+    'SELECT',
+    'FROM',
+    'WHERE',
+    'GROUP',
+    'HAVING',
+    'UNION',
+    'ALL',
+    'EXISTS',
   ]);
+  // 2a. 函数调用名：标识符后紧跟 ( 即为函数（SUM/CAST/COALESCE/TO_DECIMAL/自定义 UDF…），不是源字段
+  const callNames = new Set<string>();
+  const call = /\b([A-Z_][A-Z0-9_]*)\s*(?=\()/g;
+  while ((m = call.exec(withoutLiterals)) !== null) {
+    callNames.add(m[1]);
+  }
+  // 2b. 裸标识符；CAST(x AS <类型名>) 的类型名位置由 isCastTypeName 单独剔除
+  const bare = /\b([A-Z_][A-Z0-9_]*)\b/g;
   while ((m = bare.exec(withoutLiterals)) !== null) {
-    if (!SKIP.has(m[1])) columns.add(m[1]);
+    const name = m[1];
+    if (SKIP.has(name) || callNames.has(name) || isCastTypeName(withoutLiterals, m.index)) continue;
+    columns.add(name);
   }
   return [...columns];
+}
+
+/** 裸标识符是否处于 CAST(x AS <类型名>) 的类型位置（前一个非空白 token 是 AS，大小写不敏感） */
+function isCastTypeName(text: string, index: number): boolean {
+  return /(?:^|\W)AS$/i.test(text.slice(0, index).trimEnd());
 }
 
 /** 字段逻辑完整信息（ZDEMO008_CV001 的 ZDEMO_FLD_NEW 一类的计算字段） */
@@ -665,12 +674,47 @@ function resolveFormulaSources(
 }
 
 /**
- * 一键查询视图字段逻辑（ZDEMO008_CV001 示例的完整管线）：
- * 1. 查询 _SYS_REPO.ACTIVE_OBJECT 取视图 XML
- * 2. 解析为结构化 ViewDefinition
- * 3. 定位字段并返回其公式 / 源字段 / 元数据
- *
- * 等价于 tmp_zdemo_fld_new.cjs 的整段手写逻辑，但无需关心 XML 细节。
+ * 取视图定义并断言设计时 XML 存在——「无 CDATA」的失败口径只此一份。
+ * purpose 说明调用方拿 XML 做什么（字段逻辑/字段清单），让报错保留操作语境。
+ */
+async function loadDesignTimeDefinition(
+  pool: HanaPool,
+  packageId: string,
+  objectName: string,
+  purpose: string,
+  opts: { kind?: ViewKind } = {},
+): Promise<{ object: ViewDefinitionResult['object']; definition: ViewDefinition }> {
+  const result = await getViewDefinition(pool, packageId, objectName, { format: 'json', kind: opts.kind });
+  if (!result.definition) {
+    throw new HanaBusinessError(`视图 ${packageId}/${objectName} 无 CDATA，${purpose}`);
+  }
+  return { object: result.object, definition: result.definition };
+}
+
+/**
+ * 「取定义 → 判 CDATA → 取字段逻辑 → 未找到抛错」的唯一装配点：
+ * hana_metadata_get_field_logic 与 fieldLineage（upstream 方向）共用，同一失败场景不再有两套文案。
+ */
+async function requireFieldLogic(
+  pool: HanaPool,
+  packageId: string,
+  objectName: string,
+  fieldId: string,
+  opts: { kind?: ViewKind } = {},
+): Promise<{ object: ViewDefinitionResult['object']; logic: FieldLogic }> {
+  const { object, definition } = await loadDesignTimeDefinition(pool, packageId, objectName, '无法解析字段逻辑', opts);
+  const logic = getFieldLogic(definition, fieldId);
+  if (!logic) {
+    throw new HanaBusinessError(
+      `视图 ${packageId}/${objectName} 中未找到字段 ${fieldId}。可先用 hana_metadata_list_fields 按名称片段模糊搜索确认字段 ID`,
+    );
+  }
+  return { object, logic };
+}
+
+/**
+ * 一键查询视图字段逻辑：取设计时 XML → 解析为结构化 ViewDefinition → 定位字段并返回
+ * 其公式 / 源字段 / 元数据。调用方只给包/对象/字段 ID，XML 细节由本模块承担。
  */
 export async function getViewFieldLogic(
   pool: HanaPool,
@@ -679,17 +723,7 @@ export async function getViewFieldLogic(
   fieldId: string,
   opts: { kind?: ViewKind } = {},
 ): Promise<{ object: ViewDefinitionResult['object']; logic: FieldLogic }> {
-  const result = await getViewDefinition(pool, packageId, objectName, { format: 'json', kind: opts.kind });
-  if (!result.definition) {
-    throw new HanaBusinessError(`视图 ${packageId}/${objectName} 无 CDATA，无法解析字段逻辑`);
-  }
-  const logic = getFieldLogic(result.definition, fieldId);
-  if (!logic) {
-    throw new HanaBusinessError(
-      `视图 ${packageId}/${objectName} 中未找到字段 ${fieldId}。可先用 hana_metadata_list_fields 按名称片段模糊搜索确认字段 ID`,
-    );
-  }
-  return { object: result.object, logic };
+  return requireFieldLogic(pool, packageId, objectName, fieldId, opts);
 }
 
 /** 字段清单条目（listFields / hana_metadata_list_fields 返回） */
@@ -779,11 +813,10 @@ export async function getViewFieldList(
     includeNodeCalculated?: boolean;
   } = {},
 ): Promise<{ object: ViewDefinitionResult['object']; list: ListFieldsResult }> {
-  const result = await getViewDefinition(pool, packageId, objectName, { format: 'json', kind: opts.kind });
-  if (!result.definition) {
-    throw new HanaBusinessError(`视图 ${packageId}/${objectName} 无 CDATA，无法解析字段清单`);
-  }
-  return { object: result.object, list: listFields(result.definition, opts) };
+  const { object, definition } = await loadDesignTimeDefinition(pool, packageId, objectName, '无法解析字段清单', {
+    kind: opts.kind,
+  });
+  return { object, list: listFields(definition, opts) };
 }
 
 /** 仓库对象搜索结果条目（ACTIVE_OBJECT 命中行） */
@@ -869,7 +902,7 @@ export interface FieldSearchItem {
 }
 
 /**
- * by=field 搜索的回执。**口径（诚实性，I2）**：
+ * by=field 搜索的回执。**口径（诚实性）**：
  * - `count` = **本次扫到的命中视图数**（不是全库总数——字段级没有索引，无法只靠 COUNT 求出）；
  * - `truncated` = 命中结果达到 `limit` **或** 候选被 `maxCandidates` 截断（两者任一都置真）；
  * - `candidatesScanned/maxCandidates` 明示候选口径，调用方可据此调 `pattern` 收窄。
@@ -885,13 +918,14 @@ export interface FieldSearchResult {
 }
 
 /** by=field 的候选上限默认值（解析成本护栏：每个候选都要 parse 设计时 XML） */
-export const DEFAULT_MAX_FIELD_CANDIDATES = 100;
+const DEFAULT_MAX_FIELD_CANDIDATES = 100;
 
 /**
- * 按字段搜索视图（P4）："谁的输出里含匹配字段"。
- * 实现口径：对候选视图**按需 parse** 设计时 XML（不做全量索引——SSD §3.2/§4.1 决策），
- * 复用 `searchFields`（= list_fields 的同一实现，I3）。候选集 = `ACTIVE_OBJECT` 按 kind 过滤
- * （可选 `pattern` 收窄对象名），按 (PACKAGE_ID, OBJECT_NAME) 排序取前 `maxCandidates` 条。
+ * 按字段搜索视图："谁的输出里含匹配字段"。
+ * 实现口径：对候选视图**按需 parse** 设计时 XML（不做全量索引——候选逐个解析，成本由
+ * maxCandidates 护栏），复用 `searchFields`（= list_fields 的同一实现）。
+ * 候选集 = `ACTIVE_OBJECT` 按 kind 过滤（可选 `pattern` 收窄对象名），
+ * 按 (PACKAGE_ID, OBJECT_NAME) 排序取前 `maxCandidates` 条。
  */
 export async function searchObjectsByField(
   pool: HanaPool,
@@ -916,7 +950,9 @@ export async function searchObjectsByField(
      FROM "_SYS_REPO"."ACTIVE_OBJECT"
      WHERE OBJECT_SUFFIX IN ${suffixIn} ${nameFilter}
      ORDER BY PACKAGE_ID, OBJECT_NAME LIMIT ?`,
-    opts.pattern ? [`%${opts.pattern}%`, ...suffixes, maxCandidates] : [...suffixes, maxCandidates],
+    // 参数顺序必须与占位符一致：IN (…) → LIKE ?（nameFilter）→ LIMIT ?；
+    // 错位（pattern 排到 suffixes 前）会让 pattern 值去比 OBJECT_SUFFIX、把某个 suffix 当成 LIKE 模式 → 候选恒空
+    opts.pattern ? [...suffixes, `%${opts.pattern}%`, maxCandidates] : [...suffixes, maxCandidates],
   );
 
   const objects: FieldSearchItem[] = [];
@@ -927,7 +963,7 @@ export async function searchObjectsByField(
     try {
       def = parseViewDefinition(cdata, r.OBJECT_SUFFIX as ViewKind);
     } catch {
-      continue; // 宽容：单个候选解析失败不拖垮整次搜索（与 getViewDefinition 的宽容解析同源）
+      continue; // 宽容：单个候选解析失败不拖垮整次搜索（与 fieldLineage 的下游扫描同策略）
     }
     const matches = searchFields(def, opts.field);
     if (matches.length === 0) continue;
@@ -972,7 +1008,7 @@ export interface FieldConsumer {
   sourceColumn: string;
 }
 
-/** 字段级血缘回执（P4）：upstream=本视图内的字段逻辑；downstream=跨对象消费方 */
+/** 字段级血缘回执：upstream=本视图内的字段逻辑；downstream=跨对象消费方 */
 export interface FieldLineageResult {
   object: ViewDefinitionResult['object'];
   fieldId: string;
@@ -983,18 +1019,20 @@ export interface FieldLineageResult {
   downstream: FieldConsumer[];
   /** 通过"无映射输入"（Union 列名对齐）引用本视图的节点——**无法逐列归因，如实另列**，不混入 downstream */
   nameAlignedConsumers: Array<{ packageId: string; objectName: string; nodeId: string }>;
-  /** 扫描口径（诚实性 I2）：扫了多少下游候选视图、上限多少；truncated = 闭包被截断或候选超上限 */
+  /** 扫描口径（诚实性）：扫了多少下游候选视图、上限多少；truncated = 闭包被截断或候选超上限 */
   viewsScanned: number;
   maxViews: number;
+  /** 读取/解析失败而跳过的候选数（CDATA 坏 / 扫描期间被并发删除）；不静默丢，如实计数 */
+  failedCandidates: number;
   truncated: boolean;
   asOf: string;
 }
 
 /** 字段级下游扫描的候选视图上限默认值（每个候选都要 parse 设计时 XML，护栏同 by=field） */
-export const DEFAULT_MAX_LINEAGE_VIEWS = 50;
+const DEFAULT_MAX_LINEAGE_VIEWS = 50;
 
 /**
- * 字段级血缘（P4）：
+ * 字段级血缘：
  * - **downstream（主打）**：沿对象图下游闭包找候选视图（`ACTIVE_OBJECTCROSSREF`），逐个按需 parse
  *   （走 `viewDefinitionCache`），在节点的输入映射里找 `mapping.source` == 被查字段的引用——
  *   回答"**谁用了这个字段**"；
@@ -1006,30 +1044,36 @@ export async function fieldLineage(
   packageId: string,
   objectName: string,
   fieldId: string,
-  opts: { direction?: 'upstream' | 'downstream' | 'both'; maxViews?: number; maxNodes?: number } = {},
+  opts: {
+    direction?: 'upstream' | 'downstream' | 'both';
+    maxViews?: number;
+    maxNodes?: number;
+    /**
+     * 已取好的种子对象信息：downstream 方向只需要种子的类型后缀，调用方（get_field_logic 的
+     * includeUsage 路径）已取过定义时传入它，可省掉对同一视图的第二次 ACTIVE_OBJECT 取数。
+     */
+    seedObject?: ViewDefinitionResult['object'];
+  } = {},
 ): Promise<FieldLineageResult> {
   const direction = opts.direction ?? 'both';
   const maxViews = clampLimit(opts.maxViews, DEFAULT_MAX_LINEAGE_VIEWS, 1, 200);
 
-  const seed = await getViewDefinition(pool, packageId, objectName, { format: 'json' });
-  const seedSuffix = seed.object.objectSuffix;
-
   let upstream: FieldLogic | undefined;
+  let seedObject: ViewDefinitionResult['object'];
   if (direction !== 'downstream') {
-    if (!seed.definition) {
-      throw new HanaBusinessError(`视图 ${packageId}/${objectName} 无 CDATA，无法解析字段逻辑`);
-    }
-    upstream = getFieldLogic(seed.definition, fieldId);
-    if (!upstream) {
-      throw new HanaBusinessError(
-        `视图 ${packageId}/${objectName} 中未找到字段 ${fieldId}。可先用 hana_metadata_list_fields 按名称片段模糊搜索确认字段 ID`,
-      );
-    }
+    // upstream 需要本视图的字段逻辑：与 hana_metadata_get_field_logic 走同一取数 + 失败口径
+    const required = await requireFieldLogic(pool, packageId, objectName, fieldId);
+    upstream = required.logic;
+    seedObject = required.object;
+  } else {
+    seedObject = opts.seedObject ?? (await getViewDefinition(pool, packageId, objectName, { format: 'json' })).object;
   }
+  const seedSuffix = seedObject.objectSuffix;
 
   const downstream: FieldConsumer[] = [];
   const nameAlignedConsumers: Array<{ packageId: string; objectName: string; nodeId: string }> = [];
   let viewsScanned = 0;
+  let failedCandidates = 0;
   let truncated = false;
 
   if (direction !== 'upstream') {
@@ -1051,7 +1095,15 @@ export async function fieldLineage(
     const seedPkg = packageId.toLowerCase();
     const seedName = objectName.toLowerCase();
     for (const cand of candidates.slice(0, maxViews)) {
-      const def = await viewDefinitionCache.get(pool, cand.packageId, cand.objectName);
+      let def: ViewDefinitionResult;
+      try {
+        def = await viewDefinitionCache.get(pool, cand.packageId, cand.objectName);
+      } catch {
+        // 单个候选不可读（CDATA 解析失败 / 扫描期间被并发删除）不拖垮整次扫描——与 by=field
+        //（searchObjectsByField）的宽容策略一致；不静默：计入 failedCandidates 如实上报
+        failedCandidates++;
+        continue;
+      }
       if (!def.definition) continue;
       viewsScanned++;
 
@@ -1094,7 +1146,7 @@ export async function fieldLineage(
   }
 
   return {
-    object: seed.object,
+    object: seedObject,
     fieldId,
     direction,
     ...(upstream !== undefined ? { upstream } : {}),
@@ -1102,6 +1154,7 @@ export async function fieldLineage(
     nameAlignedConsumers,
     viewsScanned,
     maxViews,
+    failedCandidates,
     truncated,
     asOf: nowIso(),
   };

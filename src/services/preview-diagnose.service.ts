@@ -4,15 +4,16 @@ import { isPermissionError } from '../core/hana-errors.js';
 import { logger } from '../core/logger.js';
 import { isSchemaAllowed, qualifyName } from '../core/sql.js';
 import { viewDefinitionCache } from '../model/view-cache.js';
-import { VIEW_SUFFIXES } from './metadata.service.js';
+import { suffixesOf, suffixInClause } from './metadata.service.js';
 import { normalizeBwSchema, parseResourceUri } from './preview.derive.js';
 import type { ViewDefinition, ViewKind } from '../model/view-types.js';
 
 /**
  * 数据预览权限诊断服务。
  *
- * 触发场景：hana_data_preview 失败且判定为权限类错误（not authorized / insufficient privilege /
- * HANA 错误码 7/258/2950）时，由 preview.service 自动调用本服务定位阻塞点；也可经
+ * 触发场景：hana_data_preview 失败且判定为访问类错误时，由 preview.service 自动调用本服务定位阻塞点。
+ * 访问类错误的判定单点是 core/hana-errors 的 shouldDiagnoseAccessError：错误码 10/258/259/2950，
+ * 或消息命中 not authorized / insufficient privilege / 无权限（码集口径一律以那里为准）；也可经
  * hana_data_preview_diagnose 工具手动调用做前置排查。
  *
  * 按预览通道（direct/intermediate/derived）定向检查各自所需权限：
@@ -24,7 +25,9 @@ import type { ViewDefinition, ViewKind } from '../model/view-types.js';
  * 不执行任何写/DDL。
  */
 
-export type PreviewChannel = 'direct' | 'intermediate' | 'derived';
+/** 预览通道合法值（单源）：defs 的 z.enum 从这里取，不要在别处手抄第二份；新增通道只改这一行 */
+export const PREVIEW_CHANNELS = ['direct', 'intermediate', 'derived'] as const;
+export type PreviewChannel = (typeof PREVIEW_CHANNELS)[number];
 
 /**
  * 运行时探测失败的「权限不足」码集：258=insufficient privilege，2950=分析权限/授权缺失。
@@ -76,16 +79,27 @@ export interface RuntimeProbe {
 export interface DiagnosisBrief {
   object: { packageId: string; objectName: string; kind?: ViewKind };
   channel: PreviewChannel;
-  /** 当前 CV 是否受经典分析权限保护 */
+  /**
+   * 分析权限结论。**三态**（评审 #1118）：完全不可判定时 `determined:false` 且不写 protected/grantedCount
+   * 的肯定值（读不到 XML ≠ 未受保护）；`protected` 只在判定成立时出现。
+   */
   analyticPrivilege: {
-    protected: boolean;
+    /** true = 受经典分析权限保护（checkAnalyticPrivileges=true）；determined=false 时缺省（不是 false） */
+    protected?: boolean;
     /** 设计时 applyPrivilegeType 原值（如 ANALYTIC_PRIVILEGE / NONE） */
     applyPrivilegeType?: string;
-    /** 当前用户被授予的 ANALYTICAL_PRIVILEGE 条数 */
-    grantedCount: number;
+    /**
+     * 当前用户被授予的 ANALYTICAL_PRIVILEGE 条数；**0 = 已确认没有任何授权**。
+     * 授权数查询失败等无法判定时**缺省**——不写 0，别把「未知」读成「缺失」（detail 给原因）。
+     */
+    grantedCount?: number;
+    /** false = 设计时 XML 读不到/解析不了：protected/grantedCount 均**无法判定**（非「未受保护」） */
+    determined: boolean;
+    /** 无法判定或授权数查不到时的原因（透传，排障不用再开 verbose） */
+    detail?: string;
   };
-  /** 运行时对象（当前 CV）实测是否可达 */
-  runtimeAccessible: boolean;
+  /** 运行时对象（当前 CV）SELECT 1 实测是否可达；**探测未执行**（激活状态不可判定 / 未激活）时缺省——缺省 ≠ 不可达 */
+  runtimeAccessible?: boolean;
   /** 上游数据源实测不可访问清单（仅不可达项；可达项不列出） */
   upstreamInaccessible: Array<{
     table: string;
@@ -99,14 +113,21 @@ export interface DiagnosisBrief {
 
 /** 分析权限检测结果 */
 export interface AnalyticPrivilegeStatus {
-  /** 视图是否受分析权限保护（applyPrivilegeType=ANALYTIC_PRIVILEGE 或 checkAnalyticPrivileges=true） */
+  /**
+   * 视图是否受分析权限保护。**只认 checkAnalyticPrivileges=true**（评审 #1120）：
+   * 仅声明 applyPrivilegeType=ANALYTIC_PRIVILEGE 而未启用校验时不给「受保护」级结论，
+   * 该情形由 checkAnalyticPrivilege 的结果另行如实报告（本服务自建视图恒为该形态）。
+   */
   protectedByAnalyticPrivilege: boolean;
   /** 设计时 XML 的 applyPrivilegeType 原值 */
   applyPrivilegeType?: string;
   /** 设计时 XML 的 checkAnalyticPrivileges 原值 */
   checkAnalyticPrivileges?: boolean;
-  /** 当前用户被授予的 ANALYTICAL_PRIVILEGE 条数 */
-  grantedCount: number;
+  /**
+   * 当前用户被授予的 ANALYTICAL_PRIVILEGE 条数；**授权数查询失败（无法判定）时缺省**——
+   * 不写 0，别把「未知」读成「缺失」（评审 #1118；detail 里给原因）。
+   */
+  grantedCount?: number;
   /** 是否通过（不受保护，或受保护且有授权）；无法判定时为 true（不阻断，留给运行时探测） */
   passed: boolean;
   detail: string;
@@ -125,7 +146,7 @@ export interface DiagnosisReport {
   object: { packageId: string; objectName: string; kind?: ViewKind };
   channel: PreviewChannel;
   viewActivation: ViewActivationStatus;
-  /** 运行时视图 _SYS_BIC."包/视图" 是否存在（仅 direct/intermediate 通道检查） */
+  /** 运行时视图 _SYS_BIC."包/视图" 是否存在（仅 direct/intermediate 通道检查）；SYS.VIEWS 读失败 ⇒ 不可判定、缺省（不写 false） */
   runtimeViewExists?: boolean;
   /** 运行时对象实际可达性探测（SELECT 1 ... LIMIT 1 实测，绕过 schema SELECT 的名义检查） */
   runtimeProbe?: RuntimeProbe;
@@ -181,10 +202,15 @@ export async function diagnosePreview(
   }
 
   // 2. 运行时视图存在性（direct/intermediate 依赖 _SYS_BIC 运行时对象）
+  //    三态（评审 #1121）：只有**确定不存在**（'missing'）才写 blocker；'unknown'（SYS.VIEWS 读失败/
+  //    不可见）不可判定——不把权限/瞬时问题误报成「激活失败或运行时未生成」。
   let viewExists: boolean | undefined;
   if (opts.channel === 'direct' || opts.channel === 'intermediate') {
-    viewExists = await runtimeViewExists(pool, `${packageId}/${objectName}`);
-    if (viewExists === false && activation.activated) {
+    const existence = await runtimeViewExists(pool, `${packageId}/${objectName}`);
+    if (existence === 'exists') viewExists = true;
+    else if (existence === 'missing') viewExists = false;
+    // 'unknown'：runtimeViewExists 保持缺省（不在回执里写 false 的肯定值）
+    if (existence === 'missing' && activation.activated) {
       blockers.push(
         `运行时视图 "_SYS_BIC"."${packageId}/${objectName}" 不存在，但设计时对象已激活（激活可能失败或运行时未生成）`,
       );
@@ -213,9 +239,10 @@ export async function diagnosePreview(
 
   // 4. 分析权限检测：视图受分析权限保护时，schema SELECT 通过 ≠ 可查询（BW on HANA 常见根因）。
   //    读设计时 XML 的 applyPrivilegeType/checkAnalyticPrivileges，并查当前用户被授予的 ANALYTICAL_PRIVILEGE 条数。
-  //    BW 视图几乎都 checkAnalyticPrivileges=true，故对所有通道都检测（避免漏判 direct/intermediate 的隐蔽阻塞）。
-  //    精简模式仍需检测（brief 要结论），但不写 checks 明细/blockers/hints（那些属于 verbose 产物）。
-  const analyticPrivilege = await checkAnalyticPrivilege(pool, packageId, objectName, opts.kind, verbose ? checks : []);
+  //    "受保护"只认 checkAnalyticPrivileges=true（评审 #1120）；XML 读不到 ⇒ 不可判定（评审 #1118）。
+  //    精简模式仍需检测（brief 要三态结论），但不写 checks 明细/blockers/hints（那些属于 verbose 产物）。
+  const analyticCheck = await checkAnalyticPrivilege(pool, packageId, objectName, opts.kind, verbose ? checks : []);
+  const analyticPrivilege = analyticCheck.kind === 'protected' ? analyticCheck.status : undefined;
   if (verbose && analyticPrivilege && !analyticPrivilege.passed) {
     blockers.push(
       `视图受分析权限保护（applyPrivilegeType=${analyticPrivilege.applyPrivilegeType ?? 'ANALYTIC_PRIVILEGE'}, ` +
@@ -266,7 +293,19 @@ export async function diagnosePreview(
       ) {
         if (analyticPrivilege?.protectedByAnalyticPrivilege) {
           hints.push(
-            '错误码 258/2950 + 视图受分析权限保护 → 确认为分析权限缺失（非 schema SELECT 问题），需在 BW 侧补分析权限授权',
+            '错误码 258/2950 + 视图受分析权限保护（checkAnalyticPrivileges=true）→ 确认为分析权限缺失（非 schema SELECT 问题），需在 BW 侧补分析权限授权',
+          );
+        } else if (analyticCheck.kind === 'unprotected' && analyticCheck.declaredApplyPrivilegeType) {
+          // 仅声明 applyPrivilegeType、未启用校验：不给「确认为分析权限缺失」的定论（评审 #1120）——
+          // 本服务自建视图恒为该形态（applyPrivilegeType=ANALYTIC_PRIVILEGE + checkAnalyticPrivileges=false）
+          hints.push(
+            `错误码 258/2950：视图声明了 applyPrivilegeType=${analyticCheck.declaredApplyPrivilegeType} 但未启用校验（checkAnalyticPrivileges≠true）——` +
+              '若该视图确受分析权限保护，需在 BW 侧补授权；否则按 _SYS_BIC SELECT / 上游对象权限排查',
+          );
+        } else if (analyticCheck.kind === 'undetermined') {
+          hints.push(
+            `错误码 258/2950：设计时 XML 读不到，分析权限保护与否不可判定（${analyticCheck.detail}）——` +
+              '先按 _SYS_BIC SELECT、上游对象可访问性逐项排查',
           );
         } else {
           hints.push('错误码 258/2950 通常为权限不足：检查 _SYS_BIC SELECT、分析权限、以及上游对象的可访问性');
@@ -283,21 +322,17 @@ export async function diagnosePreview(
   // 组装 brief（精简结论）：上游不可达 + 分析权限 + 运行时可达 + canPreview
   const runtimeOk = runtimeProbe?.accessible === true;
   const upstreamBlocked = upstreamInaccessible.length > 0;
-  const apBlocked =
-    analyticPrivilege?.protectedByAnalyticPrivilege === true && (analyticPrivilege?.grantedCount ?? 0) === 0;
   const brief: DiagnosisBrief = {
     object: { packageId, objectName, kind: opts.kind },
     channel: opts.channel,
-    analyticPrivilege: {
-      protected: analyticPrivilege?.protectedByAnalyticPrivilege ?? false,
-      applyPrivilegeType: analyticPrivilege?.applyPrivilegeType,
-      grantedCount: analyticPrivilege?.grantedCount ?? 0,
-    },
-    runtimeAccessible: runtimeOk,
+    analyticPrivilege: briefAnalyticPrivilege(analyticCheck),
+    // 实测未执行（激活状态不可判定 / 未激活）时缺省：不把「没测」写成「不可达」（评审 #1118 同型失配）
+    ...(runtimeProbe !== undefined ? { runtimeAccessible: runtimeProbe.accessible } : {}),
     upstreamInaccessible,
     // canPreview 判定：运行时实测可达（金标准）且无上游不可达。
-    // 分析权限「推断未授权」仅在运行时实测也不可达时才计入阻断（实测可达则以其为准，不阻断）。
-    canPreview: runtimeOk && !upstreamBlocked && !(apBlocked && !runtimeOk),
+    // 分析权限「受保护 + 0 授权」只是设计时推断出的「疑似缺权限」，实测可达即证明可查，故不参与此判定
+    // ——运行时探测不可达时 canPreview 已为假，无需再叠加推断；结论由 brief.analyticPrivilege 独立给出。
+    canPreview: runtimeOk && !upstreamBlocked,
   };
 
   return {
@@ -322,12 +357,12 @@ async function checkViewActivation(
   objectName: string,
   kind?: ViewKind,
 ): Promise<ViewActivationStatus> {
-  const suffixes = kind ? [VIEW_SUFFIXES[kind]] : Object.values(VIEW_SUFFIXES);
-  const ph = suffixes.map(() => '?').join(',');
+  const suffixes = suffixesOf(kind);
+  const ph = suffixInClause(suffixes);
   try {
     const active = await pool.query<{ OBJECT_SUFFIX: string; VERSION_ID: number }>(
       `SELECT OBJECT_SUFFIX, VERSION_ID FROM "_SYS_REPO"."ACTIVE_OBJECT"
-       WHERE PACKAGE_ID = ? AND OBJECT_NAME = ? AND OBJECT_SUFFIX IN (${ph})
+       WHERE PACKAGE_ID = ? AND OBJECT_NAME = ? AND OBJECT_SUFFIX IN ${ph}
        ORDER BY VERSION_ID DESC LIMIT 1`,
       [packageId, objectName, ...suffixes],
     );
@@ -336,7 +371,7 @@ async function checkViewActivation(
     }
     const inactive = await pool.query<{ OBJECT_SUFFIX: string }>(
       `SELECT OBJECT_SUFFIX FROM "_SYS_REPO"."INACTIVE_OBJECT"
-       WHERE PACKAGE_ID = ? AND OBJECT_NAME = ? AND OBJECT_SUFFIX IN (${ph}) LIMIT 1`,
+       WHERE PACKAGE_ID = ? AND OBJECT_NAME = ? AND OBJECT_SUFFIX IN ${ph} LIMIT 1`,
       [packageId, objectName, ...suffixes],
     );
     if (inactive[0]) {
@@ -351,32 +386,39 @@ async function checkViewActivation(
 }
 
 /**
+ * 运行时视图存在性三态（评审 #1111/#1121）：**读失败不得冒充「不存在」**——
+ * 'missing' 才是确定的「不存在」，'unknown' 的判读入口（诊断 blocker / 预览的 CREATE 回退）各自定策。
+ */
+export type RuntimeViewExistence = 'exists' | 'missing' | 'unknown';
+
+/**
  * _SYS_BIC 运行时视图是否存在（SYS.VIEWS 目录查询）。
  * @param viewName 视图名：CV 运行时对象为 "包/对象"；节点预览中间视图为 "包/对象/dp/节点"
  */
-export async function runtimeViewExists(pool: HanaPool, viewName: string): Promise<boolean> {
+export async function runtimeViewExists(pool: HanaPool, viewName: string): Promise<RuntimeViewExistence> {
   try {
     const rows = await pool.query<{ C: number }>(
       `SELECT COUNT(*) AS C FROM SYS.VIEWS WHERE SCHEMA_NAME = '_SYS_BIC' AND VIEW_NAME = ?`,
       [viewName],
+      { timeoutMs: pool.statementTimeoutMs },
     );
-    return (rows[0]?.C ?? 0) > 0;
+    return (rows[0]?.C ?? 0) > 0 ? 'exists' : 'missing';
   } catch (e) {
-    // 诊断降级：SYS 目录读不到时按「不存在」处理（与既有行为一致），留痕便于排障
-    logger.warn({ viewName, err: e }, '查询 SYS.VIEWS 失败，运行时视图存在性不可判定（按不存在处理）');
-    return false;
+    // 诊断降级：SYS 目录读不到（权限/瞬时失败）时**不可判定**（不是「不存在」），留痕便于排障
+    logger.warn({ viewName, err: e }, '查询 SYS.VIEWS 失败，运行时视图存在性不可判定');
+    return 'unknown';
   }
 }
 
 /**
- * 节点预览中间视图的**新鲜度信息回报**（D1）：复用到的视图建于何时、源 CV 最近一次激活于何时。
+ * 节点预览中间视图的**新鲜度信息回报**：复用到的视图建于何时、源 CV 最近一次激活于何时。
  *
  * 为什么只回报不改行为：复用策略是用户明确口径（存在即复用、**不校验新鲜度**，见 preview.service
  * 头注与 rules=preview）。本函数只提供**判据**——`stale=true`（中间视图创建时间早于源 CV 最近激活）
  * 时调用方自行决定「先删该视图 / 改 forceDerive / 接受旧数据」，服务端不替它做选择。
  *
  * 全部时间戳比较**在 SQL 里做**（`A.LAST_ACT > V.CREATE_TIME`）：两列出自不同口径的系统表，
- * 驱动回传的字符串格式不保证一致，拉回 JS 再 parse 是自找口径分叉（这属于 I3：一条规则一份实现）。
+ * 驱动回传的字符串格式不保证一致，拉回 JS 再 parse 是自找口径分叉。
  *
  * fail-open：任何失败（SYS.VIEWS/_SYS_REPO 不可读、视图刚被并发删掉）都只回 `detail`，
  * **绝不让信息回报把预览本身打挂**——它不是预览结果的一部分，只是附注。
@@ -410,6 +452,7 @@ export async function readIntermediateFreshness(
                       WHERE PACKAGE_ID = ? AND OBJECT_NAME = ?) A
         WHERE V.SCHEMA_NAME = '_SYS_BIC' AND V.VIEW_NAME = ?`,
       [packageId, objectName, viewName],
+      { timeoutMs: pool.statementTimeoutMs },
     );
     const row = rows[0];
     const createdAt = timestampText(row?.CREATED_AT);
@@ -430,11 +473,17 @@ function timestampText(v: unknown): string | undefined {
   return v instanceof Date ? v.toISOString() : String(v);
 }
 
-/** 当前用户对某 schema 是否有 SELECT（EFFECTIVE_PRIVILEGES） */
+/**
+ * 当前用户对某 schema 是否有 **schema 级** SELECT（EFFECTIVE_PRIVILEGES）。
+ *
+ * `OBJECT_NAME IS NULL` 是对象层级的判别式（与 visibility.service 的区分口径同源）：
+ * 该表同时含 schema 级与**对象级**授权行——不加这个过滤时，用户只对 schema 下某一张表有 SELECT
+ * 也会命中（BW 常见对象级授权），同 schema 的其它基表被误判「已授予」（评审 #1119）。
+ */
 async function hasSchemaSelect(pool: HanaPool, schema: string): Promise<boolean> {
   const rows = await pool.query<{ C: number }>(
     `SELECT COUNT(*) AS C FROM SYS.EFFECTIVE_PRIVILEGES
-     WHERE USER_NAME = CURRENT_USER AND SCHEMA_NAME = ? AND PRIVILEGE = 'SELECT'`,
+     WHERE USER_NAME = CURRENT_USER AND SCHEMA_NAME = ? AND OBJECT_NAME IS NULL AND PRIVILEGE = 'SELECT'`,
     [schema],
   );
   return (rows[0]?.C ?? 0) > 0;
@@ -551,8 +600,8 @@ function isLeafAccessible(leaf: LeafAccess): boolean {
 /**
  * derived 通道：解析视图 XML → 追溯全部叶子数据源 → 逐个探测可达性（**唯一实现**）。
  *
- * 原先 verbose（checkBaseTables）与 brief（probeUpstream）各写一份遍历，两份的判定/去重规则
- * 容易漂移；现合并为结构化事实 + 两个纯渲染函数，verbose 只决定渲染内容。
+ * 叶子遍历与去重只有一份实现（collectLeafAccess＋两个纯渲染函数），verbose/brief 仅在渲染层分叉，
+ * 判定与去重规则不会在两份遍历间漂移。
  * 返回的 leaves 与 XML 中的出现**一一对应**（不在这里去重）：渲染层保持既有行为
  * （verbose 对重复出现逐个报 blocker；baseTables/brief 清单按首次出现去重）。
  * 探测并行（Promise.all）：上游数可达十几个，串行往返会成倍拖慢；连接池满时自动排队复用。
@@ -598,7 +647,7 @@ async function collectLeafAccess(
   return { ok: true, sourceCount: def.dataSources.length, leaves: probed.filter((l): l is LeafAccess => l !== null) };
 }
 
-/** verbose 渲染：写 checks/blockers/hints 明细并返回去重后的 baseTables（文案与合并前逐字一致） */
+/** verbose 渲染：写 checks/blockers/hints 明细并返回去重后的 baseTables */
 function renderLeafTraversalVerbose(
   traversal: LeafTraversal,
   checks: DiagnosisCheck[],
@@ -687,11 +736,10 @@ function renderLeafTraversalBrief(traversal: LeafTraversal): {
 } {
   if (!traversal.ok) return { baseTables: [], inaccessible: [] };
 
-  // 按原叶子顺序组装（去重），保证结果稳定
+  // 按原叶子顺序组装（去重），保证结果稳定；去重口径单点在 pushBaseTable（与 verbose 清单同源）
   const baseTables: BaseTableAccess[] = [];
   const inaccessible: DiagnosisBrief['upstreamInaccessible'] = [];
   for (const leaf of traversal.leaves) {
-    if (baseTables.some((x) => `${x.schema}.${x.table}` === `${leaf.schema}.${leaf.table}`)) continue;
     const item: BaseTableAccess =
       leaf.type === 'DATA_BASE_TABLE'
         ? {
@@ -714,7 +762,7 @@ function renderLeafTraversalBrief(traversal: LeafTraversal): {
             code: leaf.probe.accessible ? undefined : leaf.probe.code,
             message: leaf.probe.accessible ? undefined : leaf.probe.message,
           };
-    baseTables.push(item);
+    if (!pushBaseTable(baseTables, item)) continue;
     if (!item.selectable) {
       inaccessible.push({ table: item.table, type: item.type, code: item.code, message: item.message });
     }
@@ -739,10 +787,12 @@ function collectLeafDataSources(
   return def.dataSources.filter((d) => d.type === 'DATA_BASE_TABLE' || d.type === 'CALCULATION_VIEW');
 }
 
-/** 基表去重（按 schema.table，保留首个） */
-function pushBaseTable(arr: BaseTableAccess[], item: BaseTableAccess): void {
+/** 基表去重（按 schema.table，保留首个）；返回是否入列（false = 该键已存在，调用方按重复项处理） */
+function pushBaseTable(arr: BaseTableAccess[], item: BaseTableAccess): boolean {
   const key = `${item.schema}.${item.table}`;
-  if (!arr.some((x) => `${x.schema}.${x.table}` === key)) arr.push(item);
+  if (arr.some((x) => `${x.schema}.${x.table}` === key)) return false;
+  arr.push(item);
+  return true;
 }
 
 /**
@@ -767,9 +817,45 @@ async function probeRuntimeAccess(pool: HanaPool, packageId: string, objectName:
 }
 
 /**
+ * 分析权限检测三态（评审 #1118/#1120）：
+ * - 'undetermined'：设计时 XML 读不到/无 CDATA——保护与否**无法判定**（不是「未受保护」）；
+ * - 'unprotected'：确定不启用分析权限校验（checkAnalyticPrivileges≠true）；仅声明 applyPrivilegeType
+ *   时经 declaredApplyPrivilegeType 如实带出（不给「受保护」级结论）；
+ * - 'protected'：checkAnalyticPrivileges=true，附授权数检测状态。
+ */
+type AnalyticPrivilegeOutcome =
+  | { kind: 'undetermined'; detail: string }
+  | { kind: 'unprotected'; declaredApplyPrivilegeType?: string }
+  | { kind: 'protected'; status: AnalyticPrivilegeStatus };
+
+/** brief 的分析权限子对象（评审 #1118）：不可判定时不写 protected=false/grantedCount=0 这类肯定值 */
+function briefAnalyticPrivilege(check: AnalyticPrivilegeOutcome): DiagnosisBrief['analyticPrivilege'] {
+  if (check.kind === 'undetermined') return { determined: false, detail: check.detail };
+  if (check.kind === 'unprotected') {
+    return {
+      determined: true,
+      protected: false,
+      ...(check.declaredApplyPrivilegeType !== undefined
+        ? { applyPrivilegeType: check.declaredApplyPrivilegeType }
+        : {}),
+    };
+  }
+  const s = check.status;
+  return {
+    determined: true,
+    protected: true,
+    ...(s.applyPrivilegeType !== undefined ? { applyPrivilegeType: s.applyPrivilegeType } : {}),
+    // 授权数不可判定（查询失败）时缺省：不写 0（0 的口径是「已确认没有任何授权」），原因进 detail
+    ...(s.grantedCount !== undefined ? { grantedCount: s.grantedCount } : { detail: s.detail }),
+  };
+}
+
+/**
  * 分析权限检测：读设计时 XML 的 applyPrivilegeType / checkAnalyticPrivileges，并查当前用户被授予的
  * ANALYTICAL_PRIVILEGE 条数。BW 视图几乎都 checkAnalyticPrivileges=true，schema SELECT 无法替代分析权限。
- * @returns 受保护且有明确判定时返回状态；无法读取 XML 或不受保护时返回 undefined（不阻断）
+ *
+ * 「受保护」只认 checkAnalyticPrivileges=true（评审 #1120）：applyPrivilegeType 单独出现时不给
+ * 「受保护 / 确认为分析权限缺失」级结论；XML 读不到时如实返回 'undetermined'（评审 #1118）。
  */
 async function checkAnalyticPrivilege(
   pool: HanaPool,
@@ -777,74 +863,79 @@ async function checkAnalyticPrivilege(
   objectName: string,
   kind: ViewKind | undefined,
   checks: DiagnosisCheck[],
-): Promise<AnalyticPrivilegeStatus | undefined> {
+): Promise<AnalyticPrivilegeOutcome> {
   let def: ViewDefinition | undefined;
   try {
     const result = await viewDefinitionCache.get(pool, packageId, objectName, { kind });
     def = result.definition;
-  } catch {
-    return undefined; // 无法读 XML 时不阻断（运行时探测兜底）
+  } catch (e) {
+    // 读不到 XML ⇒ 保护与否不可判定（不得渲染成「未受保护」）；留痕便于排障
+    logger.warn({ packageId, objectName, err: e }, '诊断无法读取视图设计时 XML，分析权限保护与否不可判定');
+    return {
+      kind: 'undetermined',
+      detail: '无法读取/解析视图设计时 XML（可能缺少 _SYS_REPO 的 SELECT 权限）：分析权限保护与否不可判定',
+    };
   }
-  if (!def) return undefined;
+  if (!def) return { kind: 'undetermined', detail: '视图设计时 XML 无 CDATA：分析权限保护与否不可判定' };
 
   const applyPrivilegeType = def.applyPrivilegeType;
   const checkAnalyticPrivileges = def.checkAnalyticPrivileges;
-  const protectedByAnalyticPrivilege =
-    (applyPrivilegeType != null && applyPrivilegeType.toUpperCase() === 'ANALYTIC_PRIVILEGE') ||
-    checkAnalyticPrivileges === true;
+  const protectedByAnalyticPrivilege = checkAnalyticPrivileges === true;
+  const declaredAnalyticPrivilege =
+    applyPrivilegeType != null && applyPrivilegeType.toUpperCase() === 'ANALYTIC_PRIVILEGE';
 
   if (!protectedByAnalyticPrivilege) {
-    // 不受分析权限保护：无需检测，记一条通过项
+    // 不受（已确认的）分析权限保护：无需检测授权数，记一条通过项
     checks.push({
       item: '分析权限',
-      required: '视图不受分析权限保护（applyPrivilegeType != ANALYTIC_PRIVILEGE 且 checkAnalyticPrivileges != true）',
+      required: '视图启用分析权限校验（checkAnalyticPrivileges=true）时检测 ANALYTICAL_PRIVILEGE 授权',
       passed: true,
-      detail: '无需分析权限',
+      detail: declaredAnalyticPrivilege
+        ? '视图声明了 applyPrivilegeType=ANALYTIC_PRIVILEGE 但未启用校验（checkAnalyticPrivileges≠true）：不按「受保护」处置，不检测授权数'
+        : '无需分析权限',
     });
-    return undefined;
+    return declaredAnalyticPrivilege
+      ? { kind: 'unprotected', declaredApplyPrivilegeType: applyPrivilegeType }
+      : { kind: 'unprotected' };
   }
 
   // 查当前用户被授予的 ANALYTICAL_PRIVILEGE 条数（EFFECTIVE_PRIVILEGES 含角色继承的）
-  let grantedCount = 0;
-  let detail: string;
   try {
     const rows = await pool.query<{ C: number }>(
       `SELECT COUNT(*) AS C FROM SYS.EFFECTIVE_PRIVILEGES
        WHERE USER_NAME = CURRENT_USER AND PRIVILEGE = 'ANALYTICAL_PRIVILEGE'`,
     );
-    grantedCount = rows[0]?.C ?? 0;
+    const grantedCount = rows[0]?.C ?? 0;
+    // grantedCount === 0 且视图受保护 → 高度疑似缺分析权限（最终以运行时探测为准）
+    const passed = grantedCount > 0;
+    const detail = passed
+      ? `受分析权限保护，已授予 ${grantedCount} 条 ANALYTICAL_PRIVILEGE`
+      : `受分析权限保护，但当前用户未被授予任何 ANALYTICAL_PRIVILEGE（0 条）——schema SELECT 无法替代`;
+    checks.push({
+      item: '分析权限',
+      required: 'ANALYTICAL_PRIVILEGE 授权（视图 checkAnalyticPrivileges=true）',
+      passed,
+      detail,
+    });
+    return {
+      kind: 'protected',
+      status: {
+        protectedByAnalyticPrivilege: true,
+        applyPrivilegeType,
+        checkAnalyticPrivileges,
+        grantedCount,
+        passed,
+        detail,
+      },
+    };
   } catch (e) {
-    // 查不到授权信息时无法判定，不阻断（运行时探测兜底）；诊断降级留痕
+    // 查不到授权信息时无法判定，不阻断（运行时探测兜底）；grantedCount **缺省**——不写 0（评审 #1118）
     logger.warn({ packageId, objectName, err: e }, '无法查询 ANALYTICAL_PRIVILEGE 授权数（降级为运行时探测兜底）');
-    detail = '受分析权限保护，但无法查询授权情况（运行时探测兜底判定）';
+    const detail = '受分析权限保护，但无法查询授权情况（运行时探测兜底判定）';
     checks.push({ item: '分析权限', required: 'ANALYTICAL_PRIVILEGE 授权', passed: true, detail });
     return {
-      protectedByAnalyticPrivilege: true,
-      applyPrivilegeType,
-      checkAnalyticPrivileges,
-      grantedCount: 0,
-      passed: true,
-      detail,
+      kind: 'protected',
+      status: { protectedByAnalyticPrivilege: true, applyPrivilegeType, checkAnalyticPrivileges, passed: true, detail },
     };
   }
-
-  // grantedCount === 0 且视图受保护 → 高度疑似缺分析权限（最终以运行时探测为准）
-  const passed = grantedCount > 0;
-  detail = passed
-    ? `受分析权限保护，已授予 ${grantedCount} 条 ANALYTICAL_PRIVILEGE`
-    : `受分析权限保护，但当前用户未被授予任何 ANALYTICAL_PRIVILEGE（0 条）——schema SELECT 无法替代`;
-  checks.push({
-    item: '分析权限',
-    required: 'ANALYTICAL_PRIVILEGE 授权（视图 applyPrivilegeType=ANALYTIC_PRIVILEGE）',
-    passed,
-    detail,
-  });
-  return {
-    protectedByAnalyticPrivilege: true,
-    applyPrivilegeType,
-    checkAnalyticPrivileges,
-    grantedCount,
-    passed,
-    detail,
-  };
 }

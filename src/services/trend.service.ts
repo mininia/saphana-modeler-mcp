@@ -10,15 +10,15 @@
  * 不必跨视图对齐时间轴（跨视图对齐会引入"两边的采样时刻差几秒"这类无法解释的错位）。
  *
  * ⚠ 实测结构（决定了查询怎么写，照文档猜会写错）：
- *   - 该视图**每约 10 秒一个采样点**（同一小时的 358 个采样点落在同一个 `SNAPSHOT_ID` 里）。
- *     实测 1012 个 SNAPSHOT_ID × 358 采样/小时 = 362545 行，跨约 42 天。
+ *   - 该视图**每约 10 秒一个采样点**（同一小时的数百个采样点落在同一个 `SNAPSHOT_ID` 里）。
+ *     实测总量为数十万行、跨约一个月（具体随保留期配置与实例规模而变）。
  *   - **`SERVER_TIMESTAMP` 是快照写入时刻，`TIME` 才是采样时刻**。同一 SERVER_TIMESTAMP
- *     下有 358 行不同的 TIME —— 用 SERVER_TIMESTAMP 做时间轴会把一整小时的采样压成一个点，
- *     趋势图会退化成 1012 根柱子。故时间轴一律用 `TIME`（实测该列无 NULL）。
- *   - `INDEX` 是 `<host>:<TIME>` 的**行唯一键**（362545 行有 362545 个取值），
+ *     下有数百行不同的 TIME —— 用 SERVER_TIMESTAMP 做时间轴会把一整小时的采样压成一个点，
+ *     趋势图会退化成「每小时一根柱子」。故时间轴一律用 `TIME`（实测该列无 NULL）。
+ *   - `INDEX` 是 `<host>:<TIME>` 的**行唯一键**（行数与取值数一一对应），
  *     不是服务维度，不能拿它做 GROUP BY。
  *
- * 保留期实测约 42 天且**可配置**，故窗口超出时如实报告"只回溯到 X"，而不是假装数据齐全。
+ * 保留期实测约一个月且**可配置**，故窗口超出时如实报告"只回溯到 X"，而不是假装数据齐全。
  */
 
 import type { HanaPool } from '../core/hana-client.js';
@@ -75,7 +75,7 @@ export const DEFAULT_BUCKET_MINUTES = 60;
 /** 窗口上限（90 天）：超过保留期没有意义，且能防住误传超大值把库拖住 */
 export const MAX_HOURS = 24 * 90;
 
-/** 校验并规范化 metrics 参数 */
+/** 校验并规范化 metrics 参数：非法值给中文硬错误并列出合法值（工具面 schema 按 SSD §1.6 保持宽松） */
 export function normalizeTrendMetrics(
   metrics?: string[],
 ): { ok: true; value: TrendMetric[] } | { ok: false; message: string } {
@@ -89,20 +89,23 @@ export function normalizeTrendMetrics(
 
 /*
  * 各指标组产出的数值列（键名即输出字段名，带单位后缀以免误读）——与下方 `put(...)` 调用
- * 一一对应，原先那份 `METRIC_KEYS` 常量表零引用（死代码）已删除，但把口径留在这里：
+ * 一一对应，口径留在这里：
  *   cpu     → cpuPct
  *   memory  → memoryUsedGiB / memoryUsedPct（占**配额**比，与 Cockpit 的 "Used %" 同口径）
  *   disk    → diskUsedGiB / diskUsedPct
  *   network → networkInKiB / networkOutKiB
  *   swap    → swapInBytes / swapOutBytes
  * ⚠ 采样间隔约 10 秒，故 network / swap 是"每个采样周期内的量"，**不是速率**。
+ * ⚠ 配额/总量（MEMORY_ALLOCATION_LIMIT / DISK_SIZE）在某个桶取不到时，该桶**整对省略**
+ *   memoryUsedPct/memoryLimitGiB（或 diskUsedPct/diskTotalGiB）——分母为 0 的占比是误报，
+ *   省略原因写进 caveats，不让键值静默消失。
  */
 
 /**
  * 执行趋势查询。
  *
- * 聚合**在 SQL 侧按时间桶完成**：实测该视图 36 万行、约 10 秒一个采样点，
- * 24 小时窗口就有 8600 行，42 天窗口 36 万行——拉回明细再在 JS 里分桶既慢又没必要。
+ * 聚合**在 SQL 侧按时间桶完成**：实测该视图数十万行、约 10 秒一个采样点，
+ * 24 小时窗口就有近万行——拉回明细再在 JS 里分桶既慢又没必要。
  * 桶的划分用 `FLOOR(SECONDS_BETWEEN(窗口起点, TIME) / 桶宽秒数)`，
  * 起点由 `ADD_SECONDS(CURRENT_TIMESTAMP, -窗口秒数)` 在库内算，避免客户端与库的时钟差。
  */
@@ -119,26 +122,27 @@ export async function runTrend(pool: HanaPool, req: TrendRequest): Promise<Trend
       `SELECT MIN(TIME) AS T0, MAX(TIME) AS T1 FROM _SYS_STATISTICS.HOST_LOAD_HISTORY_HOST`,
     );
     if (r[0]?.T0 && r[0]?.T1) {
-      // ⚠ 口径不一致（已知，暂不在此处修）：这里用 `new Date(时间串)` 在**客户端**解析 HANA 的
+      // ⚠ 口径不一致（已知）：这里用 `new Date(时间串)` 在**客户端**解析 HANA 的
       // TIME 值（无时区后缀 → 按进程时区解释），而窗口与分桶基准是**库内的 CURRENT_TIMESTAMP**。
       // 两者相差一个时区偏移时，spansHours 会有整小时级偏差（DST 切换处再差 1 小时）。
-      // 正解是把跨度的计算下推到 SQL（如 SECONDS_BETWEEN(MIN(TIME), MAX(TIME))/3600.0），
-      // 那要改这条既有语句的文本；本模块的实机验收已通过，**没有实机环境不凭空改 SQL**，
-      // 故保留现状并由下面的 Number.isFinite 兜底把"解析失败"如实报出来。
+      // 正解是把跨度的计算下推到 SQL（如 SECONDS_BETWEEN(MIN(TIME), MAX(TIME))/3600.0）；
+      // 现状由下面的 Number.isFinite 兜底，把"解析失败"如实报出来。
       const spansHours = round((new Date(r[0].T1).getTime() - new Date(r[0].T0).getTime()) / 3_600_000, 1);
-      const coversWindow = spansHours >= req.hours;
+      // 时间串的可解析性：MIN/MAX(TIME) 原样来自库（驱动可能给字符串或 Date），解析不出有限值时
+      // spansHours 是 NaN、`NaN >= hours` 恒为 false——**不能据此断言"超出保留期"**：那会先输出
+      // 一句带「约 NaN 小时」的截断结论，再被紧随其后的"无法解析"自我否定。故只有有限值才推截断
+      // caveat；解析失败只留"无法确认是否被截断"一条（coversWindow 保持 false = 不能说覆盖了窗口）。
+      const retentionKnown = Number.isFinite(spansHours);
+      const coversWindow = retentionKnown && spansHours >= req.hours;
       retention = { earliest: r[0].T0, latest: r[0].T1, spansHours, coversWindow };
-      if (!coversWindow) {
+      if (retentionKnown && !coversWindow) {
         caveats.push(
           `请求窗口 ${req.hours} 小时超出了历史层保留期（实测该实例约 ${spansHours} 小时）——` +
             `返回的只是窗口的后半段。**未覆盖的那部分不等于"正常"**，只是没有数据。` +
             '要拉长保留期需调整统计服务的收集配置。',
         );
       }
-      // 时间串的可解析性：MIN/MAX(TIME) 原样来自库（驱动可能给字符串或 Date），
-      // 若解析不出有限值，spansHours 会是 NaN 而 coversWindow 恒为 false——
-      // 结论方向没错（"不能说覆盖了窗口"），但必须把"这是解析失败而非真的保留期不足"讲清楚。
-      if (!Number.isFinite(spansHours)) {
+      if (!retentionKnown) {
         logger.warn({ view: 'HOST_LOAD_HISTORY_HOST' }, '保留期时间串无法解析为有限时长，已按"未确认覆盖"处理');
         caveats.push(
           '历史层保留期的起止时刻无法解析为时长（时间串缺少时区/格式不可识别），' +
@@ -147,7 +151,7 @@ export async function runTrend(pool: HanaPool, req: TrendRequest): Promise<Trend
       }
     }
   } catch (e) {
-    // 这条 catch 原先完全静默（只推 caveat）；记一条日志便于区分"视图不可读"与"确实没有保留期数据"
+    // 记一条日志，便于区分"视图不可读"与"确实没有保留期数据"
     logger.warn({ err: e, view: 'HOST_LOAD_HISTORY_HOST' }, '未能确定历史层保留期');
     caveats.push('未能确定历史层保留期（统计服务视图不可读或权限不足），无法判断窗口是否被截断。');
   }
@@ -174,8 +178,8 @@ export async function runTrend(pool: HanaPool, req: TrendRequest): Promise<Trend
 
   if (rows.length === 0) {
     // 窗口边界与"非空"分支取**同一个口径**：都来自库内时间（非空分支透传 TIME 的 MIN/MAX，
-    // 这里没有行可取，就单独向库要一次窗口起止）。原先这里用 `new Date().toISOString()`（JS 的 UTC），
-    // 与非空分支的库内值放在一起会得到两套时间基准——同一字段在不同分支含义不同，是最难发现的坑。
+    // 这里没有行可取，就单独向库要一次窗口起止）——两个分支共用同一时间基准，
+    // 同一字段在不同分支含义不同是最难发现的坑。
     let winFrom = '';
     let winTo = '';
     try {
@@ -210,6 +214,9 @@ export async function runTrend(pool: HanaPool, req: TrendRequest): Promise<Trend
   }
 
   const wanted = new Set(req.metrics);
+  // 配额/总量取不到的桶（NULL 经 num 收敛为 0）：占比与总量都是分母为 0 的派生值，整对省略——
+  // "配额 0 GiB"的读数和 NaN（JSON 后为 null）都是误报；省略原因在下方 caveats 里说明。
+  const missingQuota = new Set<'memoryLimit' | 'diskTotal'>();
   const points: TrendPoint[] = rows.map((r) => {
     const memLimit = num(r.MEM_LIMIT);
     const memTotal = num(r.MEM_TOTAL);
@@ -225,15 +232,31 @@ export async function runTrend(pool: HanaPool, req: TrendRequest): Promise<Trend
     if (wanted.has('cpu')) put('cpuPct', r.CPU_MIN, r.CPU_MAX, r.CPU_AVG, 1, 1);
     if (wanted.has('memory')) {
       put('memoryUsedGiB', r.MEM_MIN, r.MEM_MAX, r.MEM_AVG, GIB);
-      // 占配额比（与 Cockpit 的 "Used %" 同口径：实例已用 ÷ 分配配额，不是 ÷ 物理内存）
-      put('memoryUsedPct', r.MEM_MIN, r.MEM_MAX, r.MEM_AVG, memLimit / 100, 2);
-      values.memoryLimitGiB = { min: round(memLimit / GIB), max: round(memLimit / GIB), avg: round(memLimit / GIB) };
+      if (memLimit > 0) {
+        // 占配额比（与 Cockpit 的 "Used %" 同口径：实例已用 ÷ 分配配额，不是 ÷ 物理内存）
+        put('memoryUsedPct', r.MEM_MIN, r.MEM_MAX, r.MEM_AVG, memLimit / 100, 2);
+        values.memoryLimitGiB = {
+          min: round(memLimit / GIB),
+          max: round(memLimit / GIB),
+          avg: round(memLimit / GIB),
+        };
+      } else {
+        missingQuota.add('memoryLimit');
+      }
       values.physicalGiB = { min: round(memTotal / GIB), max: round(memTotal / GIB), avg: round(memTotal / GIB) };
     }
     if (wanted.has('disk')) {
       put('diskUsedGiB', r.DISK_MIN, r.DISK_MAX, r.DISK_AVG, GIB);
-      put('diskUsedPct', r.DISK_MIN, r.DISK_MAX, r.DISK_AVG, diskTotal / 100, 2);
-      values.diskTotalGiB = { min: round(diskTotal / GIB), max: round(diskTotal / GIB), avg: round(diskTotal / GIB) };
+      if (diskTotal > 0) {
+        put('diskUsedPct', r.DISK_MIN, r.DISK_MAX, r.DISK_AVG, diskTotal / 100, 2);
+        values.diskTotalGiB = {
+          min: round(diskTotal / GIB),
+          max: round(diskTotal / GIB),
+          avg: round(diskTotal / GIB),
+        };
+      } else {
+        missingQuota.add('diskTotal');
+      }
     }
     if (wanted.has('network')) {
       put('networkInKiB', r.NIN_MIN, r.NIN_MAX, r.NIN_AVG, KIB, 1);
@@ -275,6 +298,18 @@ export async function runTrend(pool: HanaPool, req: TrendRequest): Promise<Trend
   }
   if (swaps > 0) {
     caveats.push(`窗口内检测到 swap 活动（合计 ${swaps} 字节）——HANA 出现 swap 意味着物理内存不足，属明确异常信号。`);
+  }
+  if (missingQuota.has('memoryLimit')) {
+    caveats.push(
+      '部分桶取不到内存配额（MEMORY_ALLOCATION_LIMIT 为 NULL/0），已省略 memoryUsedPct/memoryLimitGiB——' +
+        '分母为 0 时它们会输出 NaN 或"配额 0 GiB"，都是误报。',
+    );
+  }
+  if (missingQuota.has('diskTotal')) {
+    caveats.push(
+      '部分桶取不到磁盘总量（DISK_SIZE 为 NULL/0），已省略 diskUsedPct/diskTotalGiB——' +
+        '分母为 0 时它们会输出 NaN 或"总量 0 GiB"，都是误报。',
+    );
   }
   if (req.bucketMinutes * 60 < 10) {
     caveats.push('桶宽小于采样间隔（约 10 秒），部分桶可能只有很少采样点，min/max 会显得跳动。');

@@ -1,15 +1,10 @@
 import type { RuleObject } from './index.js';
 
 /**
- * 血缘与影响半径规则（关系图 / 字段级血缘）。
+ * 血缘与影响半径规则（关系图 / 字段级血缘）：depth 闭包口径、单跳判定、字段级血缘与 asOf 扫描口径。
  *
- * 来源（搬迁自，保留原文措辞）：
- * - src/server.ts 的 SERVER_INSTRUCTIONS 第 17、27 行（血缘数据源与「改/删前查依赖」）；
- * - src/capabilities/defs/metadata.ts 的 hana_metadata_where_used.description（depth 与闭包口径）、
- *   hana_metadata_get_field_logic.description（includeUsage 字段级血缘）、
- *   hana_metadata_search_objects.description（by=field 反查）；
- * - src/services/repository.service.ts 的 P4/P6 头注（**判定用的是直接下游（单跳）**，传递影响面另查 depth>1）；
- * - src/services/catalog.service.ts 的头注（asOf = 构建时刻）。
+ * 本规则正文是**唯一维护处**：相关工具（hana_metadata_where_used / hana_metadata_get_field_logic /
+ * hana_metadata_search_objects）的描述只给选择指引并指向 rules=metadata_graph，不复写正文。
  */
 
 export const metadataGraphRules: readonly RuleObject[] = [
@@ -32,7 +27,7 @@ export const metadataGraphRules: readonly RuleObject[] = [
       '',
       '字段级血缘：hana_metadata_get_field_logic(includeUsage=true)——谁在哪个节点引用了该字段：',
       '逐列归因的命中在 usage.downstream（含消费方节点与目标列）；列名对齐型输入（Union 无映射）另列',
-      'usage.nameAlignedConsumers；带 viewsScanned/truncated/asOf 扫描口径（受 usageMaxViews 约束，默认 50）。',
+      'usage.nameAlignedConsumers；带 viewsScanned/truncated/failedCandidates/asOf 扫描口径（受 usageMaxViews 约束，默认 50；failedCandidates=坏 CDATA/期间被删而跳过的候选数）。',
       '',
       '使用时机：修改/删除视图前用 hana_metadata_where_used 评估影响面；',
       '反向「哪些视图的输出里含某字段」用 hana_metadata_search_objects(by=field)；',

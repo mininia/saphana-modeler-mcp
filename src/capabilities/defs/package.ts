@@ -60,7 +60,7 @@ export const packageCapabilities = {
     description:
       '在仓库中新建一个包（目录），用于组织设计时对象（XS REST：POST /base/file/<pkg>/）。' +
       '重复建包 200/201 均被接受（幂等），因此不加锁、不需要 If-Match。' +
-      '安全约束：新建包路径须在 HANA_WRITE_PACKAGES 配置的可写范围内（留空=未配置写边界，声明写包的调用会被运行期闸门以 boundary_off 拒绝；非空=仅配置包及其子包可写）。' +
+      '安全约束：目标包须在 HANA_WRITE_PACKAGES 配置的可写范围内（语义见 hana_system_get_info(rules=write_boundary)）。' +
       '创建后可用 hana_package_list / hana_package_list_objects 观察。',
     inputSchema: z.object({
       packageId: zWritePackageId('目标包名（完整路径）；须在 HANA_WRITE_PACKAGES 配置的可写范围内，如 ZDEMO.SUB'),
@@ -81,14 +81,20 @@ export const packageCapabilities = {
     title: '导出包为 zip 备份（Transfer API）',
     description:
       '把仓库包导出为 zip 归档（XS REST Transfer API：GET /base/xfer/export），用于设计时对象备份与迁移。' +
-      '导出是读操作，不限制包。saveTo 提供时把 zip 写到该本地路径（相对路径按服务器工作目录解析），' +
+      "导出是读操作，不限制包。saveTo 提供时把 zip 写到该本地路径：未配置本地文件根（MCP_LOCAL_ROOT）时只接受服务器工作目录内的相对路径（绝对路径与含 '..' 的路径一律拒绝）；配置了本地文件根时，路径（含绝对路径）必须落在该根之内，越根一律拒绝，" +
       '省略时返回 base64 内容（小包适用，大包建议 saveTo）。' +
       '**对 HANA 仓库只读**：唯一的写入是 saveTo 指定的本地文件（因此注解 readOnlyHint=false）；' +
       '权限层级归 admin（暴露面收敛，与 Transfer API 其余两条同档）——只读部署（MCP_TOOL_GROUPS=read）' +
       '不再直接看见它，需要导出时把它加进 MCP_TOOL_ALLOW（或启用 admin 组）。',
     inputSchema: z.object({
       packageId: zReadPackageId('要导出的包名（完整路径），如 ZDEMO 或 ZDEMO.SUB'),
-      saveTo: z.string().max(500).optional().describe('zip 落盘路径（本地文件）；省略=返回 base64'),
+      saveTo: z
+        .string()
+        .max(500)
+        .optional()
+        .describe(
+          'zip 落盘路径（本地文件；默认仅允许服务器工作目录内的相对路径，配置本地文件根后须落在根内）；省略=返回 base64',
+        ),
     }),
     annotations: { readOnlyHint: false, idempotentHint: true, openWorldHint: false, destructiveHint: false },
   }),
@@ -105,10 +111,17 @@ export const packageCapabilities = {
       '来源二选一：filePath=本地文件路径（默认取文件名做目标文件名），或 content+fileName=内联内容。' +
       '导入后回读对象元数据：回执带 ETag/etagSource 与并发迹象（跨进程并发导入无服务端前置，属已知例外）。' +
       '【默认路径】本工具只用于**新对象**导入：目标文件已存在时默认拒绝，已有对象的修改请走 hana_view_update（读取 → 修改 → 更新，版本演进），' +
-      '确需覆盖导入（备份恢复）显式传 overwrite=true。安全约束：目标包须在 HANA_WRITE_PACKAGES 配置的可写范围内（留空=未配置写边界，声明写包的调用会被运行期闸门以 boundary_off 拒绝；非空=仅配置包及其子包可写）。',
+      '确需覆盖导入（备份恢复）显式传 overwrite=true。安全约束：目标包须在 HANA_WRITE_PACKAGES 配置的可写范围内（语义见 hana_system_get_info(rules=write_boundary)）。' +
+      '导入写入前会解析 SQL 模式视图的 <definition> 脚本做读取范围校验（限定名按可读 schema 白名单、未限定名按当前默认 schema），命中即整次拒绝且零写入；zip 归档等无法解析的载荷会在回执 contentScanNote 里如实标注未做该扫描；含 <definition> 元素却提取不出脚本正文（如元素带命名空间前缀）的载荷整次拒绝（零写入）。',
     inputSchema: z.object({
       targetPackageId: zWritePackageId('目标包名；须在 HANA_WRITE_PACKAGES 配置的可写范围内'),
-      filePath: z.string().max(1000).optional().describe('本地源文件路径（xml/zip）；与 content 二选一'),
+      filePath: z
+        .string()
+        .max(1000)
+        .optional()
+        .describe(
+          '本地源文件路径（xml/zip）；与 content 二选一。默认仅允许服务器工作目录内的相对路径（绝对路径与 .. 拒绝）；配置本地文件根后须落在根内',
+        ),
       content: z.string().optional().describe('内联文件内容（xml 文本）；须同时提供 fileName'),
       fileName: z
         .string()

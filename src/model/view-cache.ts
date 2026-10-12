@@ -1,5 +1,5 @@
 import type { HanaPool } from '../core/hana-client.js';
-import { getViewDefinition, VIEW_SUFFIXES } from '../services/metadata.service.js';
+import { getViewDefinition, suffixInClause, suffixesOf } from '../services/metadata.service.js';
 import type { ViewDefinitionResult } from '../services/metadata.service.js';
 import type { ViewDefinition, ViewKind } from './view-types.js';
 
@@ -21,6 +21,10 @@ import type { ViewDefinition, ViewKind } from './view-types.js';
  * _SYS_REPO.CDATA 对所有调用方相同）。若将来按客户端身份裁剪视图定义（多租户），
  * 必须把身份维度加进 key，否则会跨客户端串数据。
  *
+ * 依赖例外：本模块 import services/metadata.service 取数与版本校验（model→services 的反向边，
+ * 已登记在 CONTRIBUTING 的分层一节）。两模块互为运行时环，导入值只在函数体内使用（求值期不
+ * 互相解引用），故在 ESM 下成立。
+ *
  * 该模块可被任意需要「读视图定义 + 解析」的服务复用（当前预览服务使用）。
  */
 export class ViewDefinitionCache {
@@ -39,7 +43,9 @@ export class ViewDefinitionCache {
     objectName: string,
     opts: { kind?: ViewKind } = {},
   ): Promise<ViewDefinitionResult> {
-    const suffixes = opts.kind ? [VIEW_SUFFIXES[opts.kind]] : Object.values(VIEW_SUFFIXES);
+    // 后缀解析与 IN 占位符复用 metadata.service 的单点实现（suffixesOf / suffixInClause）：
+    // 与 getViewDefinition 是同一条 ACTIVE_OBJECT 查询口径，过滤语义演进时不会分叉。
+    const suffixes = suffixesOf(opts.kind);
     const key = `${packageId}/${objectName}/${suffixes.join(',')}`;
     const entry = this.entries.get(key);
 
@@ -47,7 +53,7 @@ export class ViewDefinitionCache {
       // 缓存命中：轻量版本校验（不取 CDATA），版本未变直接用缓存
       const rows = await pool.query<{ VERSION_ID: number }>(
         `SELECT VERSION_ID FROM "_SYS_REPO"."ACTIVE_OBJECT"
-         WHERE PACKAGE_ID = ? AND OBJECT_NAME = ? AND OBJECT_SUFFIX IN (${suffixes.map(() => '?').join(',')})
+         WHERE PACKAGE_ID = ? AND OBJECT_NAME = ? AND OBJECT_SUFFIX IN ${suffixInClause(suffixes)}
          ORDER BY VERSION_ID DESC LIMIT 1`,
         [packageId, objectName, ...suffixes],
       );

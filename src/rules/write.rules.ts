@@ -3,12 +3,8 @@ import type { RuleObject } from './index.js';
 /**
  * 写路径规则：可写包边界 / 传输通道 / 回执信号。
  *
- * 来源（搬迁自，保留原文措辞）：
- * - src/server.ts 的 SERVER_INSTRUCTIONS 第 31、33、44 行；
- * - src/capabilities/defs/modeling.ts 的 hana_view_create.description（transport/activate/防覆盖一段）、
- *   hana_view_update.description（412/etag/dryRun/migration/changeset 一段）、hana_view_delete.description；
- * - src/capabilities/defs/package.ts 的 hana_package_create / hana_repo_import.description；
- * - src/services/repository.service.ts 的通道与 P5/P6/P7 头注（ETag/etagSource/破坏性/变更集口径）。
+ * 本文件是这些语义的模型可查全文：改动 repository.service.ts 的写路径行为或工具描述里的
+ * 对应措辞时，必须同步此处，否则规则给模型的口径与实际行为不符。
  */
 
 export const writeRules: readonly RuleObject[] = [
@@ -76,13 +72,15 @@ export const writeRules: readonly RuleObject[] = [
       '- probeRows（默认 10）在激活成功后回探测前 N 行，**0 行会附带排查提示**——避免「激活成功 ≠ 逻辑正确」的',
       '  误判（0 行常见根因：键值补零格式、号码列选错、数据在另一个表/分区）。',
       '',
-      '冲突协议（P5 起）：412（乐观锁冲突）与 OBJECT_NOT_FOUND（404）返回**业务失败信封**（raw.code 机读），',
+      '冲突协议：412（乐观锁冲突）与 OBJECT_NOT_FOUND（404）返回**业务失败信封**（raw.code 机读），',
       'raw.conflict 带 currentETag/currentVersion——它是冲突时点的**补读值**（实测 412 响应不带 ETag 头），',
       '不是本次写的新基线；可重读后重放。成功回执带新基线 etag 与 etagSource：',
       '- response-header=写响应头同刻读数；',
+      '- read-back=独立回读（删除前记录的基线 / 导入完成后的回读），与写响应不同源、只代表读那一刻的状态，',
+      '  不当作本次写的新基线（hana_view_delete / hana_repo_import 的成功回执按此读）；',
       '- unavailable=响应头未给 ETag，不补读冒充。',
       '',
-      '破坏性/预演/变更集（P6/P7）：',
+      '破坏性/预演/变更集：',
       '- dryRun=true（只读预演）：读当前设计时定义 → 应用 operations/xml → 结构 diff → 影响半径 → 破坏性判定，',
       '  一次写入都不发生（不 PUT、不激活、不发 probe），回执带 mode=dryRun 与成功回执区分；',
       '- 成功回执带 breaking（level=none/breaking/unknown——unknown ≠ 非破坏，基线不可用时由 baselineUnavailable',

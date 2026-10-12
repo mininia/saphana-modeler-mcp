@@ -135,7 +135,12 @@ export function deriveNodeSql(def: ViewDefinition, nodeId: string): DerivedNodeS
       });
     }
     // 2) 节点自身引用的列（filter/formula/属性过滤）→ 输入源列
+    //    计算列在所属节点内计算（resolve 时内联公式，见 calcAwareResolve），**不是输入列**，
+    //    故不下推作为输入需求——否则叶子 SELECT 会多出幽灵列（基表无此列 → 报错/静默错值）。
+    //    计算列公式自身的引用列由 referencedColumns 扫描全部公式时一并下推（含链式引用）。
+    const calcIds = calculatedIds(n);
     for (const c of referencedColumns(n)) {
+      if (calcIds.has(c)) continue;
       let mapped = false;
       n.inputs.forEach((inp, idx) => {
         const m = inp.mappings.find((mm) => mm.target === c);
@@ -276,12 +281,49 @@ function nodeSql(node: ViewNode, gen: (ref: string) => string, emit: string[]): 
   }
 }
 
-/** 把公式/过滤表达式中的双引号列引用改写为「别名.列」（join 多输入时避免歧义） */
+/**
+ * 按 SQL 引号规则扫描表达式：单引号段（字符串字面量）与双引号段（标识符）各自成对，
+ * 段内的 `''` / `""` 是转义。**所有表达式改写都必须先跳过这些段**——否则字面量里的
+ * `"列名"` 会被当成列引用（子查询多出"幽灵列"、值被改写），`'if(...)'` 会被当成函数改写。
+ */
+function scanQuoted(s: string): { strs: [number, number][]; idents: [number, number][] } {
+  const strs: [number, number][] = [];
+  const idents: [number, number][] = [];
+  let i = 0;
+  while (i < s.length) {
+    const ch = s[i];
+    if (ch === "'" || ch === '"') {
+      const end = skipQuoted(s, i, ch);
+      (ch === "'" ? strs : idents).push([i, end]);
+      i = end + 1;
+      continue;
+    }
+    i++;
+  }
+  return { strs, idents };
+}
+
+/** 位置是否落在任一引号段内（`spans` 按起始下标有序、互不相交） */
+function insideQuoted(spans: ReadonlyArray<[number, number]>, at: number): boolean {
+  for (const [start, end] of spans) {
+    if (at < start) return false; // 有序：后面的段起点更靠后
+    if (at <= end) return true;
+  }
+  return false;
+}
+
+/** 把公式/过滤表达式中的双引号列引用改写为「别名.列」（join 多输入时避免歧义）；字面量里的引号是数据，不改写 */
 function qualify(expr: string, resolve: (col: string) => string): string {
-  return expr.replace(/"(?:[^"\\]|\\.)*"/g, (m) => {
-    const col = m.slice(1, -1).replace(/""/g, '"');
-    return resolve(col);
-  });
+  const { idents } = scanQuoted(expr);
+  if (idents.length === 0) return expr;
+  let out = '';
+  let last = 0;
+  for (const [start, end] of idents) {
+    out += expr.slice(last, start);
+    out += resolve(expr.slice(start + 1, end).replace(/""/g, '"'));
+    last = end + 1;
+  }
+  return out + expr.slice(last);
 }
 
 /** 表达式最终形态：COLUMN_ENGINE 翻译 → 列引用别名限定 */
@@ -331,14 +373,25 @@ export function translateColumnEngine(exprStr: string): string {
 const CE_FN_RE = /\b(if|float|isnull)\s*\(/i;
 
 function translateOnce(s: string): string {
-  const m = CE_FN_RE.exec(s);
-  if (!m) return s;
-  const name = m[1].toLowerCase();
-  const open = m.index + m[0].length - 1; // '(' 下标
+  // 只在**引号段之外**找函数名：字面量里的 'if(1,2,3)' 是数据、双引号标识符里的同名片段也不是函数
+  const { strs, idents } = scanQuoted(s);
+  const spans = [...strs, ...idents].sort((a, b) => a[0] - b[0]);
+  const re = new RegExp(CE_FN_RE.source, 'gi');
+  let hit: RegExpExecArray | null = null;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(s)) !== null) {
+    if (!insideQuoted(spans, m.index)) {
+      hit = m;
+      break;
+    }
+  }
+  if (!hit) return s;
+  const name = hit[1].toLowerCase();
+  const open = hit.index + hit[0].length - 1; // '(' 下标
   const close = findMatchingParen(s, open);
   if (close < 0) return s;
   const args = splitTopLevelArgs(s.slice(open + 1, close));
-  const before = s.slice(0, m.index);
+  const before = s.slice(0, hit.index);
   const after = s.slice(close + 1);
   if (name === 'if') {
     if (args.length !== 3) return s;
@@ -449,9 +502,37 @@ function emitCol(alias: string, source: string, target: string): string {
   return source === target ? ref : `${ref} AS ${quoteIdentifier(target)}`;
 }
 
+/**
+ * 计算列感知的列引用解析：被引用的列若定义为**本节点**的计算列，则递归内联其公式（带环检测）；
+ * 其余列走 `base`（输入别名限定）。
+ *
+ * 为什么必须内联：计算列不是输入列。若把它的 id 当普通列引用（`"I1"."DIFF"`）下推到输入别名下，
+ * 子查询里会多出一个不存在的"幽灵列"——基表无此列时 HANA 报 260（错误点看起来像基表列名拼错），
+ * 基表恰有同名列时 WHERE 过滤的是基表列而非计算结果（静默错值）。
+ */
+function calcAwareResolve(node: ViewNode, base: (col: string) => string): (col: string) => string {
+  const calc = new Map(node.calculatedAttributes.map((ca) => [ca.id, ca] as const));
+  const stack: string[] = [];
+  const resolve = (col: string): string => {
+    const ca = calc.get(col);
+    if (!ca) return base(col);
+    if (stack.includes(col)) {
+      throw new HanaBusinessError(`节点 ${node.id} 的计算列存在循环引用（${[...stack, col].join(' → ')}），无法推导`);
+    }
+    if (!ca.formula) throw new HanaBusinessError(`节点 ${node.id} 的计算列 ${col} 缺公式，无法推导`);
+    stack.push(col);
+    try {
+      return `(${expr(ca.formula, resolve)})`;
+    } finally {
+      stack.pop();
+    }
+  };
+  return resolve;
+}
+
 function projectionSql(node: ViewNode, gen: (ref: string) => string, emit: string[]): string {
   const { alias, src, map } = singleInput(node, gen);
-  const resolve = (c: string): string => `${alias}.${quoteIdentifier(map.get(c) ?? c)}`;
+  const resolve = calcAwareResolve(node, (c) => `${alias}.${quoteIdentifier(map.get(c) ?? c)}`);
   const calc = calculatedIds(node);
   const parts = emit.map((a) => {
     if (calc.has(a)) {
@@ -487,10 +568,10 @@ function joinSql(node: ViewNode, gen: (ref: string) => string, emit: string[]): 
   for (const { inp, alias } of inputs) {
     for (const m of inp.mappings) colSource.set(m.target, { alias, source: m.source });
   }
-  const resolve = (col: string): string => {
+  const resolve = calcAwareResolve(node, (col) => {
     const cs = colSource.get(col);
     return cs ? `${cs.alias}.${quoteIdentifier(cs.source)}` : `${inputs[0].alias}.${quoteIdentifier(col)}`;
-  };
+  });
   const calc = calculatedIds(node);
   const parts = emit.map((a) => {
     if (calc.has(a)) {
@@ -523,7 +604,7 @@ function joinSql(node: ViewNode, gen: (ref: string) => string, emit: string[]): 
 
 function aggregationSql(node: ViewNode, gen: (ref: string) => string, emit: string[]): string {
   const { alias, src, map } = singleInput(node, gen);
-  const resolve = (c: string): string => `${alias}.${quoteIdentifier(map.get(c) ?? c)}`;
+  const resolve = calcAwareResolve(node, (c) => `${alias}.${quoteIdentifier(map.get(c) ?? c)}`);
   const groupBy = aggGroupBy(node);
   const measures = aggMeasures(node);
   const groupSet = new Set(groupBy);
@@ -576,7 +657,7 @@ function rankSql(node: ViewNode, gen: (ref: string) => string, emit: string[]): 
   if (!rk || rk.partitionBy.length === 0 || rk.orderBy.length === 0) {
     throw new HanaBusinessError(`Rank 节点 ${node.id} 缺分组/排序定义（windowFunction），无法推导`);
   }
-  const resolve = (c: string): string => `${alias}.${quoteIdentifier(map.get(c) ?? c)}`;
+  const resolve = calcAwareResolve(node, (c) => `${alias}.${quoteIdentifier(map.get(c) ?? c)}`);
   if (emit.length === 0) throw new HanaBusinessError(`Rank 节点 ${node.id} 无输出列，无法推导`);
   const calc = calculatedIds(node);
   const innerParts = emit.map((a) => {
@@ -609,17 +690,15 @@ function rankSql(node: ViewNode, gen: (ref: string) => string, emit: string[]): 
  */
 export { aggGroupBy, aggMeasures, normalizeBwSchema };
 
-/** 节点自身引用的列（filter + 计算列公式 + 属性过滤 ID，均以输出列名表示） */
+/** 节点自身引用的列（filter + 计算列公式 + 属性过滤 ID，均以输出列名表示）；字符串字面量里的引号不算列引用 */
 function referencedColumns(node: ViewNode): string[] {
   const cols: string[] = [];
   const push = (c: string): void => {
     if (c && !cols.includes(c)) cols.push(c);
   };
-  const RE = /"((?:[^"\\]|\\.)*)"/g;
   const scan = (s?: string): void => {
     if (!s) return;
-    let m: RegExpExecArray | null;
-    while ((m = RE.exec(s)) !== null) push(m[1].replace(/""/g, '"'));
+    for (const [start, end] of scanQuoted(s).idents) push(s.slice(start + 1, end).replace(/""/g, '"'));
   };
   scan(node.filter);
   for (const ca of node.calculatedAttributes) scan(ca.formula);

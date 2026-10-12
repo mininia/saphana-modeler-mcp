@@ -1,26 +1,22 @@
 import { HanaBusinessError } from '../core/errors.js';
 import { escapeXmlAttr } from '../core/xml.js';
 import {
+  logicalModelAttributeXml,
   normalizeScriptedColumns,
+  scenarioDataCategory,
   scriptedOutputSectionsXml,
   scriptedViewAttributesXml,
   wrapScriptedBody,
   type ScriptedColumnSpec,
 } from './view-builder.js';
-import type { ViewNode } from './view-types.js';
+import { sinkNodes, type ViewNode } from './view-types.js';
 import { parseViewDefinition } from './view-xml.js';
 
 /**
  * 计算视图「声明式加 join」的确定性 XML 变换（修改 CV 无需模型手写 XML）。
  *
- * 目标形态与 BW query 视图生成器同款（以 ZDEMOBI/COPYOFZDEMO01_CV034_1 的 16 级 join 链为范本）：
- *   1. 新增 <DataSource type="CALCULATION_VIEW">（resourceUri 指向源视图）；
- *   2. 新增 Projection_N 把源视图字段取出来（输出源侧原始列名）；
- *   3. 新增 Join_N（leftOuter 等）：左输入 = 原输出节点全字段透传，右输入 = 条件/带出字段映射，
- *      joinAttribute 用「左侧字段名」；左右列名不同时按 BW 同款做法在 join 输入映射里重命名
- *      （target=左字段 source=右字段，范本：该视图 Join_1 的 target="0MATERIAL" source="4ZDEMO01R014_TH"）；
- *   4. logicalModel：id 与全部 keyMapping/measureMapping 的 columnObjectName 重接线到新 Join 节点，
- *      并为带出字段追加 attribute（order 顺延，带源字段中文描述）。
+ * 目标形态（BW query 视图生成器同款）、joinAttribute/重命名契约与范本、方言实测注记
+ * 见 rules=bw_dialect（src/rules/bw-dialect.rules.ts），这里不复制正文。
  *
  * 实现策略：对原始 XML 做「锚点字符串手术」而不是 parse→rebuild——
  * 除插入/替换片段外其余内容逐字节保留（informationModelLayout、layout shapes、hidden 属性等零损耗）。
@@ -77,10 +73,13 @@ function nextNodeNumber(ids: string[], prefix: string): number {
   return max + 1;
 }
 
-/** 输出节点 = 没有任何节点引用的汇点；必须恰好 1 个（BW 链状结构保证） */
+/**
+ * 输出节点 = 没有任何节点引用的汇点；必须恰好 1 个（BW 链状结构保证）。
+ * 汇点枚举共用 view-types.sinkNodes（引用语法的唯一实现）；本处保留严格策略——多汇点（孤儿节点）
+ * /零汇点（环）一律拒绝，不像 diff 那样退化为 logicalModel 声明（后者要的只是可判与可比）。
+ */
 function findFinalNode(nodes: ViewNode[]): ViewNode {
-  const referenced = new Set(nodes.flatMap((n) => n.inputs.map((i) => i.node.replace(/^#/, ''))));
-  const sinks = nodes.filter((n) => !referenced.has(n.id));
+  const sinks = sinkNodes(nodes);
   if (sinks.length === 0) throw new HanaBusinessError('视图中找不到输出节点（所有节点都被下游引用，疑似环）');
   if (sinks.length > 1) {
     throw new HanaBusinessError(
@@ -94,11 +93,15 @@ function findFinalNode(nodes: ViewNode[]): ViewNode {
 /**
  * 读取当前输出节点（join 将挂载的左侧输入）及其字段清单。
  * 供服务层在生成默认带出字段清单时使用（与 addJoinToViewXml 内部同一套判定）。
+ * 图论汇点与 logicalModel 声明必须一致：不一致 = 半重挂/脏视图，无法确定挂载点，拒绝变换。
  */
 export function getJoinTargetAttrs(xml: string): { nodeId: string; attributes: string[] } {
   const finalNode = findFinalNode(parseViewDefinition(xml, 'calculationview').nodes);
-  const lmId = xml.match(/<logicalModel id="([^"]+)"/)?.[1];
-  if (lmId && lmId !== finalNode.id) {
+  const lmId = logicalModelDeclaredId(xml);
+  if (!lmId) {
+    throw new HanaBusinessError('XML 中缺少 <logicalModel id="…"> 声明，无法确定输出节点，拒绝变换');
+  }
+  if (lmId !== finalNode.id) {
     throw new HanaBusinessError(`输出节点不一致：节点树汇点 ${finalNode.id} ≠ logicalModel 声明 ${lmId}，拒绝变换`);
   }
   return { nodeId: finalNode.id, attributes: finalNode.attributes };
@@ -129,12 +132,33 @@ export interface FullXmlGuardResult {
 }
 
 /**
- * 全量 XML 更新（hana_view_update xml 方式）的服务端护栏——手工改 XML 两大高频事故在写入前拦下：
+ * 写入前的 XML 声明校验（xml 全量通道与 operations 各 op 的逐条变换共用）：两条通道都把整篇文档
+ * 写回仓库，而落库字节恒为 UTF-8——声明与实际字节不符的制品对「按声明解析字节的消费者」不可用。
+ * 声明可缺省（XML 默认 UTF-8）；encoding 非 UTF-8/us-ascii 即抛中文业务错误，不改写声明（归一等于
+ * 替调用方修改文档）。只认文档开头的声明（XML 规范规定的唯一位置）。
+ */
+function assertWritableXmlDeclaration(xml: string): void {
+  const decl = /^\s*<\?xml[^>]*\?>/.exec(xml);
+  const encoding = decl?.[0].match(/\bencoding\s*=\s*["']([^"']*)["']/i)?.[1];
+  if (encoding && !/^(?:utf-?8|us-ascii|ascii)$/i.test(encoding.trim())) {
+    throw new HanaBusinessError(
+      `XML 声明 encoding="${encoding}" 与本服务的写入编码不符（本服务恒以 UTF-8 写入仓库）：` +
+        `声明与实际字节不一致的制品对"按声明解析字节的消费者"不可用。` +
+        `请把声明改为 encoding="UTF-8"（或删除声明）后重试`,
+    );
+  }
+}
+
+/**
+ * 全量 XML 更新（hana_view_update xml 方式）的服务端护栏——手工改 XML 三类高频事故在写入前拦下：
  * 1. 场景 id 与目标对象不一致（粘贴了其他对象的定义 / 误改根 id）；
- * 2. logicalModel 指向的输出节点不存在（重构节点后忘记把 id 与 keyMapping/measureMapping 重接线）。
+ * 2. logicalModel 指向的输出节点不存在（重构节点后忘记把 id 与 keyMapping/measureMapping 重接线）；
+ * 3. XML 声明的编码与本服务的写入编码不符（assertWritableXmlDeclaration；operations 通道的逐条
+ *    变换共用该校验）。
  * 校验失败即抛错（不发起 PUT），通过则返回摘要供模型确认。
  */
 export function guardFullXmlUpdate(xml: string, objectName: string): FullXmlGuardResult {
+  assertWritableXmlDeclaration(xml);
   const def = parseViewDefinition(xml, 'calculationview');
   if (!def.id) throw new HanaBusinessError('XML 缺少根节点 id（Calculation:scenario @id），拒绝全量更新');
   if (def.id.toUpperCase() !== objectName.toUpperCase()) {
@@ -143,7 +167,7 @@ export function guardFullXmlUpdate(xml: string, objectName: string): FullXmlGuar
         `全量更新要求 scenario id 与对象名一致；如需复制成新对象请改走 hana_repo_import`,
     );
   }
-  const lmId = xml.match(/<logicalModel id="([^"]+)"/)?.[1];
+  const lmId = logicalModelDeclaredId(xml);
   if (!lmId) throw new HanaBusinessError('XML 缺少 <logicalModel id="..."> 声明，无法确定输出节点，拒绝全量更新');
   if (!def.nodes.some((n) => n.id === lmId)) {
     throw new HanaBusinessError(
@@ -166,46 +190,22 @@ export function guardFullXmlUpdate(xml: string, objectName: string): FullXmlGuar
 }
 
 /**
- * logicalModel 输出属性块的生成（add_join 追加带出字段 / add_calculated_column 追加计算列两处共用）：
- * 形状与 BW 方言一致（属性 + keyMapping 指向**节点列**）。
- */
-function outputAttributeBlock(id: string, order: number, sourceObject: string, description?: string): string {
-  const lines = [
-    `      <attribute id="${escapeXmlAttr(id)}" order="${order}"` +
-      ` attributeHierarchyActive="false" displayAttribute="false">`,
-  ];
-  if (description) lines.push(`        <descriptions defaultDescription="${escapeXmlAttr(description)}"/>`);
-  lines.push(
-    `        <keyMapping columnObjectName="${escapeXmlAttr(sourceObject)}" columnName="${escapeXmlAttr(id)}"/>`,
-    `      </attribute>`,
-  );
-  return lines.join('\n');
-}
-
-/**
- * 往 logicalModel 的 <attributes> 段追加输出属性块（单点实现，两处 op 共用）。
- * 锚点要兼容三种形态——Studio 逐行排版 / 自闭合空段 / **单行紧凑 XML**
- * （最后一类是本服务生成器的产出：漏了它，「刚 create 出来的视图」就加不了字段）
+ * 往 logicalModel 的 <attributes> 段追加输出属性块（单点实现，add_join / add_calculated_column 两处 op 共用）。
+ * 三形态兼容（Studio 逐行排版 / 自闭合空段 / **单行紧凑 XML**——最后一类是本服务生成器的产出：
+ * 漏了它，「刚 create 出来的视图」就加不了字段）与锚点唯一性断言都委托 replaceSection 承担：
+ * 「找段 + 锚点唯一 + 自闭合 + 缩进」规则只有那一份实现，散落成第二份必然各自漂移。
+ * 属性块的渲染器共用 view-builder 的 logicalModelAttributeXml（同一形状不在两处声明）。
  */
 function appendLogicalModelAttribute(lmContent: string, blocks: string[]): string {
   if (blocks.length === 0) return lmContent;
-  const attrCloseIndented = '\n    </attributes>';
-  if (lmContent.includes(attrCloseIndented)) {
-    return lmContent.replace(attrCloseIndented, `\n${blocks.join('\n')}${attrCloseIndented}`);
-  }
-  if (lmContent.includes('<attributes/>')) {
-    return lmContent.replace('<attributes/>', `<attributes>\n${blocks.join('\n')}\n    </attributes>`);
-  }
-  if (lmContent.includes('</attributes>')) {
-    return lmContent.replace('</attributes>', `${blocks.join('\n')}\n    </attributes>`);
-  }
-  throw new HanaBusinessError('logicalModel 中找不到 </attributes> 或 <attributes/> 锚点，无法追加输出字段');
+  return replaceSection(lmContent, 'attributes', { kind: 'append', block: blocks.join('\n') });
 }
 
 /**
  * 对原始设计时 XML 执行「追加一个 join」变换（纯函数；失败即抛错，不产出半成品）。
  */
 export function addJoinToViewXml(xml: string, spec: AddJoinSpec): AddJoinEditResult {
+  assertWritableXmlDeclaration(xml);
   if (spec.conditions.length === 0) throw new HanaBusinessError('join 条件不能为空（至少 1 组 leftField/rightField）');
   // SQL 模式视图的输出就是脚本本身，图形化加 join 无意义（改了也编译不过）——直接指路而不是报"找不到锚点"
   if (/calculationScenarioType="SCRIPT_BASED"/.test(xml)) {
@@ -215,7 +215,8 @@ export function addJoinToViewXml(xml: string, spec: AddJoinSpec): AddJoinEditRes
     );
   }
   const { nodeId: finalNodeId, attributes: leftAttrs } = getJoinTargetAttrs(xml);
-  const nodeIds = parseViewDefinition(xml, 'calculationview').nodes.map((n) => n.id);
+  const def = parseViewDefinition(xml, 'calculationview');
+  const nodeIds = def.nodes.map((n) => n.id);
 
   // 条件校验：左字段必须在输出节点上；左字段不得重复（同目标多次映射冲突）
   const seenLeft = new Set<string>();
@@ -240,6 +241,32 @@ export function addJoinToViewXml(xml: string, spec: AddJoinSpec): AddJoinEditRes
     seenBring.add(f.id);
   }
 
+  // 悬空映射守卫：重接线会把 logicalModel 的全部映射（keyMapping/measureMapping）机械改指新 Join，
+  // 而新 Join 只声明原输出节点的 viewAttributes（+ 带出字段）。原输出节点上若有被映射引用的计算列
+  // （<calculatedViewAttribute>，如 op=add_calculated_column 的产物），重接线后映射会指向新 Join 上
+  // 不存在的列——写出一个悬空映射的坏定义（激活必失败），而变换回执照报成功。
+  // 本变换不代迁计算列（整段 XML 需连 formula/datatype 搬运，列间引用还要传递闭包），故当场拒绝。
+  const joinColumns = new Set([...leftAttrs, ...spec.fields.map((f) => f.id)]);
+  const o = def.outputs;
+  const dangling = [
+    ...new Set(
+      [...o.attributes, ...o.calculatedAttributes, ...o.measures, ...o.calculatedMeasures, ...o.restrictedMeasures]
+        .filter(
+          (f) => f.sourceObject === finalNodeId && f.sourceColumn !== undefined && !joinColumns.has(f.sourceColumn),
+        )
+        .map((f) => f.sourceColumn!),
+    ),
+  ].sort();
+  if (dangling.length > 0) {
+    throw new HanaBusinessError(
+      `输出节点 ${finalNodeId} 上有被 logicalModel 映射引用的列不在节点 viewAttributes 中：${dangling.join(', ')}` +
+        `（如节点计算列 <calculatedViewAttribute>）。add_join 会把 logicalModel 的全部映射机械重挂到新 Join 节点，` +
+        `而新 Join 只声明原节点 viewAttributes 的列 → 这些映射会指向新 Join 上不存在的列（悬空映射，激活必失败）。` +
+        `本 op 不代迁计算列：请改走 xml 全量通道（把计算列整段复制进新 Join 的 <calculatedViewAttributes>），` +
+        `或先删掉这些输出字段再加 join`,
+    );
+  }
+
   const projectionId = `Projection_${nextNodeNumber(nodeIds, 'Projection')}`;
   const joinId = `Join_${nextNodeNumber(nodeIds, 'Join')}`;
 
@@ -254,6 +281,19 @@ export function addJoinToViewXml(xml: string, spec: AddJoinSpec): AddJoinEditRes
     `      <resourceUri>${escapeXmlAttr(spec.sourceResourceUri)}</resourceUri>`,
     `    </DataSource>`,
   ].join('\n');
+
+  // DataSource id 冲突守卫：id 直接取源对象名——同一源视图二次 add_join（如换一组条件再拉一次），
+  // 或跨包同名源视图各加一次，会让文档里出现两个同 id 的 <DataSource>，`#id` 引用不再唯一
+  //（<input node="#..."> 解析取谁不再由文档决定）。同 id 同 resourceUri ⇒ 复用现有数据源（不新增，
+  // Projection 的 `#id` 输入自然指回既有声明）；同 id 不同 resourceUri ⇒ 拒绝（fail-closed）。
+  const existingSource = def.dataSources.find((d) => d.id === spec.sourceId);
+  if (existingSource && (existingSource.resourceUri ?? '') !== spec.sourceResourceUri) {
+    throw new HanaBusinessError(
+      `数据源 id "${spec.sourceId}" 已存在于文档中且指向不同对象（现有 resourceUri：` +
+        `${existingSource.resourceUri ?? '（未声明）'}；本次：${spec.sourceResourceUri}）——` +
+        `同一文档内数据源 id 必须唯一，拒绝变换。请改用其他源视图，或走 xml 全量通道自行处理 id 冲突`,
+    );
+  }
 
   // Projection 输出源侧原始列名（join 条件右字段 + 带出字段，去重保序）
   const projFields = [...spec.conditions.map((c) => c.rightField), ...spec.fields.map((f) => f.id)].filter(
@@ -296,23 +336,26 @@ export function addJoinToViewXml(xml: string, spec: AddJoinSpec): AddJoinEditRes
 
   // ── 锚点手术（每步断言锚点唯一，打不准就整体失败）────────────────────────
   let out = xml;
-  out = replaceSection(out, 'dataSources', { kind: 'append', block: dataSourceBlock });
+  // 同 id 同 resourceUri 的源已存在 ⇒ 复用（见上面的 DataSource id 冲突守卫），不重复新增
+  if (!existingSource) out = replaceSection(out, 'dataSources', { kind: 'append', block: dataSourceBlock });
   out = replaceSection(out, 'calculationViews', { kind: 'append', block: `${projectionBlock}\n${joinBlock}` });
 
   // logicalModel 重接线（在插入后的最新文本上重新定位，位置已因插入而偏移）：
   // id → 新 join 节点；全部 columnObjectName="旧节点" → 新节点
   // （columnObjectName 同时出现在 keyMapping 与 measureMapping，一并重接线）
-  const lmStart = out.indexOf('<logicalModel');
-  const lmEnd = out.indexOf('</logicalModel>', lmStart);
-  if (lmStart < 0 || lmEnd < 0) throw new HanaBusinessError('XML 中找不到 <logicalModel> 段，无法重接线输出');
-  let lmNew = out.slice(lmStart, lmEnd);
-  const maxOrder = [...lmNew.matchAll(/order="(\d+)"/g)].reduce((m, x) => Math.max(m, Number(x[1])), 0);
+  const lmSpan = logicalModelSpan(out);
+  const maxOrder = [...lmSpan.content.matchAll(/order="(\d+)"/g)].reduce((m, x) => Math.max(m, Number(x[1])), 0);
   const addedOutputFields = spec.fields.map((f, i) => ({ id: f.id, order: maxOrder + i + 1 }));
-  const attrBlocks = spec.fields.map((f, i) => outputAttributeBlock(f.id, maxOrder + i + 1, joinId, f.description));
-  lmNew = lmNew.replace(/<logicalModel id="[^"]+"/, `<logicalModel id="${joinId}"`);
-  lmNew = lmNew.split(`columnObjectName="${finalNodeId}"`).join(`columnObjectName="${joinId}"`);
-  lmNew = appendLogicalModelAttribute(lmNew, attrBlocks);
-  out = out.slice(0, lmStart) + lmNew + out.slice(lmEnd);
+  const attrBlocks = spec.fields.map((f, i) => logicalModelAttributeXml(f.id, maxOrder + i + 1, joinId, f.description));
+  const rewiredLm = appendLogicalModelAttribute(
+    lmSpan.content.split(`columnObjectName="${finalNodeId}"`).join(`columnObjectName="${joinId}"`),
+    attrBlocks,
+  );
+  out = out.slice(0, lmSpan.contentStart) + rewiredLm + out.slice(lmSpan.contentEnd);
+  // id 在开标签上（span 内容之外）：内容重排后单独替换。宽容匹配开标签 id 前的其他属性，
+  // 口径与 guardFullXmlUpdate 一致——严格形态漏配时 id 不重接线，而 columnObjectName 却已全改，
+  // 会静默产出「声明 id 与映射目标不一致」的 XML
+  out = out.replace(/<logicalModel[^>]*\bid="[^"]+"/, `<logicalModel id="${joinId}"`);
 
   return {
     xml: out,
@@ -374,8 +417,7 @@ function locateSection(xml: string, tag: string): Section {
 }
 
 /**
- * 标签段的唯一手术入口（原先 findSection / replaceSectionInner / stripSectionWrapper /
- * insertBeforeClose 四个助手各写一遍「找段 + 锚点唯一 + 自闭合 + 缩进」，规则会各自漂移）：
+ * 标签段的唯一手术入口：找段 / 锚点唯一 / 自闭合 / 缩进只有这一份实现，避免规则散落漂移。
  * - replace：整段（含标签）换掉；
  * - inner：  只换段内容，开/闭标签与缩进沿用原文（内容为空 → 收敛为自闭合段）；
  * - append： 在闭标签前插入块。三种形态都要能落：逐行排版（块与锚点行缩进对齐）、
@@ -392,7 +434,7 @@ function replaceSection(
   if (rewrite.kind === 'replace') {
     text = rewrite.text;
   } else if (rewrite.kind === 'inner') {
-    // 与旧实现严格同形：开标签重建为裸 <tag>（不带属性），闭标签前补一个换行 + 行首缩进
+    // 保持既有产出形态：开标签重建为裸 <tag>（不带属性），闭标签前补一个换行 + 行首缩进
     text = rewrite.content === '' ? `<${tag}/>` : `<${tag}>${rewrite.content}\n${sec.indent}</${tag}>`;
   } else if (sec.selfClosed) {
     text = `<${tag}>\n${rewrite.block}\n  </${tag}>`;
@@ -414,8 +456,7 @@ function sectionContent(section: string, tag: string): string {
  * 与 addJoinToViewXml 同一策略：对原始 XML 做锚点字符串手术，除被替换的片段外逐字节保留。
  * 三处被替换：SqlScriptView 的 <definition>（SQL 正文）、该节点的 <viewAttributes>（列 + datatype）、
  * logicalModel 的 <attributes>/<baseMeasures>（输出字段与类型）。
- * 之所以整体重建输出段而不是增量追加：脚本一换，输出列集合通常会变（增删列都常见），
- * 增量补齐会留下旧列 → 激活报"输出字段不存在于脚本"。 */
+ * 输出列清单是**整体替换**语义（理由与后果见规则 sql_mode）：输出段整体重建，不增量追加。 */
 
 /** set_script 的输入（列清单类型直接复用 view-builder，避免同一形状两处声明） */
 export interface SetScriptSpec {
@@ -442,6 +483,7 @@ export interface SetScriptEditResult {
  * @throws 非 SQL 模式（无 SqlScriptView 节点）或锚点缺失时抛错，不产出半成品
  */
 export function setScriptInViewXml(xml: string, spec: SetScriptSpec): SetScriptEditResult {
+  assertWritableXmlDeclaration(xml);
   // 与 create 同一包装规则：正文必须是 BEGIN…VAR_OUT = <查询>;…END 的过程体（见 wrapScriptedBody）
   const script = wrapScriptedBody(spec.script);
 
@@ -467,8 +509,8 @@ export function setScriptInViewXml(xml: string, spec: SetScriptSpec): SetScriptE
   const attributes = columns.filter((c) => !c.isMeasure);
   const measures = columns.filter((c) => c.isMeasure);
 
-  // 1) SqlScriptView 节点块：<definition> 与 <viewAttributes> 都在**节点内**替换
-  // （旧实现取全文档第一个 <definition>，文档里若有别的 definition 会写错元素且静默"成功"）
+  // 1) SqlScriptView 节点块：<definition> 与 <viewAttributes> 都在**节点内**替换——
+  // 全文档第一个 <definition> 可能属于别的节点，照它替换会写错元素且静默"成功"。
   const nodeOpen = /<calculationView[^>]*xsi:type="Calculation:SqlScriptView"[^>]*>/.exec(xml);
   if (!nodeOpen) throw new HanaBusinessError('XML 中找不到 SqlScriptView 节点开标签，拒绝变换');
   const nodeClose = xml.indexOf('</calculationView>', nodeOpen.index + nodeOpen[0].length);
@@ -491,11 +533,8 @@ export function setScriptInViewXml(xml: string, spec: SetScriptSpec): SetScriptE
 
   // 2) logicalModel：按新列清单整体重建 attributes / baseMeasures（同一生成器）
   const sections = scriptedOutputSectionsXml(columns, scriptNode.id);
-  const lmOpen = /<logicalModel[^>]*>/.exec(out);
-  if (!lmOpen) throw new HanaBusinessError('XML 中找不到 <logicalModel>，拒绝变换');
-  const lmClose = out.indexOf('</logicalModel>', lmOpen.index + lmOpen[0].length);
-  if (lmClose < 0) throw new HanaBusinessError('logicalModel 未闭合，拒绝变换');
-  let lm = out.slice(lmOpen.index + lmOpen[0].length, lmClose);
+  const lmSpan = logicalModelSpan(out);
+  let lm = lmSpan.content;
   lm = replaceSection(lm, 'attributes', {
     kind: 'inner',
     content: sectionContent(sections.attributes, 'attributes'),
@@ -504,11 +543,16 @@ export function setScriptInViewXml(xml: string, spec: SetScriptSpec): SetScriptE
     kind: 'inner',
     content: sectionContent(sections.measures, 'baseMeasures'),
   });
-  out = out.slice(0, lmOpen.index + lmOpen[0].length) + lm + out.slice(lmClose);
+  // 三个计算小节一并清空（输出列清单为整体替换，理由与后果见规则 sql_mode）；
+  // 段不存在时跳过（不因方言缺段而拒绝）。
+  for (const tag of ['calculatedAttributes', 'calculatedMeasures', 'restrictedMeasures']) {
+    if (containerRange(lm, tag)) lm = replaceSection(lm, tag, { kind: 'inner', content: '' });
+  }
+  out = out.slice(0, lmSpan.contentStart) + lm + out.slice(lmSpan.contentEnd);
 
   // 3) 根节点 dataCategory 随度量集合重写：本环境实测「含度量必须 CUBE」，
   //    否则 set_script 会产出 create 路径刻意规避的「DEFAULT + 有度量」→ 激活被 40117 拒绝
-  const dataCategory = measures.length > 0 ? 'CUBE' : 'DEFAULT';
+  const dataCategory = scenarioDataCategory(measures.length);
   out = out.replace(
     /(<Calculation:scenario[^>]*\sdataCategory=")[^"]*(")/,
     (_m, a: string, b: string) => `${a}${dataCategory}${b}`,
@@ -588,6 +632,7 @@ function locateRootDescriptions(xml: string): RootDescriptionsAnchor {
  * @throws 两字段都没给 / 两个给的值不一致 / 找不到根级锚点时抛中文业务错误，不产出半成品
  */
 export function setDescriptionInViewXml(xml: string, spec: SetDescriptionSpec): SetDescriptionEditResult {
+  assertWritableXmlDeclaration(xml);
   const given: string[] = [];
   if (spec.description !== undefined) given.push('description');
   if (spec.displayName !== undefined) given.push('displayName');
@@ -607,31 +652,35 @@ export function setDescriptionInViewXml(xml: string, spec: SetDescriptionSpec): 
   const anchor = locateRootDescriptions(xml);
   // 值本就相同 ⇒ 不改一个字节（幂等，也不给调用方制造"改过了"的假象）
   if (anchor.value === target) return { xml, changed: [] };
+  // 替换串用**函数形式**：target 是用户文本，`$&`/`$'`/`` $` `` 会被 String.replace 展开成匹配文本
+  // （写出嵌套引号的非法 XML 而回执照报成功）
   const open =
     anchor.value !== undefined
-      ? anchor.open.replace(/\sdefaultDescription="[^"]*"/, ` defaultDescription="${target}"`)
+      ? anchor.open.replace(/\sdefaultDescription="[^"]*"/, () => ` defaultDescription="${target}"`)
       : // 元素存在但没带 defaultDescription（如 <descriptions/>）：最小插入 = 只补这一个属性
-        anchor.open.replace(/^<descriptions/, `<descriptions defaultDescription="${target}"`);
+        anchor.open.replace(/^<descriptions/, () => `<descriptions defaultDescription="${target}"`);
   return { xml: xml.slice(0, anchor.start) + open + xml.slice(anchor.start + anchor.open.length), changed: given };
 }
 
-/* ── P8 其余 op（2026-10-09）：rename_field / drop_field / add_calculated_column / set_attribute_filter / set_variable ──
- * 与既有三个 op 同一策略：锚点字符串手术（除被改动的片段外逐字节保留）、锚点缺失或结构与已知方言不符即拒绝，
- * 失败不产出半成品。结构面判据与参数面在 services/view-ops.rules.ts（声明↔schema↔实现三方由单测钉住）。
+/* ── op=rename_field / drop_field / add_calculated_column / set_attribute_filter / set_variable ──
+ * 与 add_join / set_script / set_description 同一策略：锚点字符串手术（除被改动的片段外逐字节保留）、
+ * 锚点缺失或结构与已知方言不符即拒绝，失败不产出半成品。
+ * 结构面判据与参数面在 services/view-ops.rules.ts（声明↔schema↔实现三方由单测钉住）。
  * 方言依据：tests/fixtures/*.xml 的真实导出形态 + model/view-xml.ts 的解析契约（两侧同源，不各写一份）。 */
 
-/** 输出字段的种类（= logicalModel 里五个小节；与 view-xml 的 ViewOutputKind 对应） */
+/** 输出字段的种类（= logicalModel 里五个小节；与 view-xml.parseOutputList 的 section/kind 对应） */
 export type OutputFieldKind =
   'attribute' | 'calculatedAttribute' | 'measure' | 'calculatedMeasure' | 'restrictedMeasure';
 
 /**
- * logicalModel 的五个输出小节。`tags` 兼容两种元素名（与 view-xml.parseOutputList 同口径）：
- * 本仓语料用 kind 名（`<attribute>`/`<measure>`），真实方言也可能用 section 单数（`<calculatedAttribute>` 等）。
+ * logicalModel 的五个输出小节。`tags` = 该小节可能出现的条目元素名，与 view-xml.parseOutputList 同口径：
+ * section 单数 + kind 名两种都收（如 baseMeasures 既可能是 `<baseMeasure>` 也可能是 `<measure>`）。
+ * 少收一种名字 = 该方言下条目对编辑定位不可见：字段明明在，rename_field/drop_field 却报「不存在」。
  */
 const OUTPUT_SECTIONS: ReadonlyArray<{ section: string; kind: OutputFieldKind; tags: readonly string[] }> = [
   { section: 'attributes', kind: 'attribute', tags: ['attribute'] },
   { section: 'calculatedAttributes', kind: 'calculatedAttribute', tags: ['calculatedAttribute', 'attribute'] },
-  { section: 'baseMeasures', kind: 'measure', tags: ['measure'] },
+  { section: 'baseMeasures', kind: 'measure', tags: ['baseMeasure', 'measure'] },
   { section: 'calculatedMeasures', kind: 'calculatedMeasure', tags: ['calculatedMeasure', 'measure'] },
   { section: 'restrictedMeasures', kind: 'restrictedMeasure', tags: ['restrictedMeasure', 'measure'] },
 ];
@@ -646,6 +695,15 @@ const REFERENCE_SECTIONS = ['calculatedAttributes', 'calculatedMeasures', 'restr
 /** 正则元字符转义（id 来自调用方，不能直接拼进 RegExp） */
 function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * XML 里 logicalModel 的声明 id（找不到——缺声明或缺 id——返回 undefined，由调用方按各自口径拒绝）。
+ * 宽容匹配开标签上的其他属性（`<logicalModel xsi:type="…" id="X">` 同样识别）：id 提取全仓只此一处，
+ * 严格形态一旦漏配，就会「id 不重接线而 columnObjectName 已全部重挂」地半生效，静默产出坏定义。
+ */
+function logicalModelDeclaredId(xml: string): string | undefined {
+  return /<logicalModel[^>]*\bid="([^"]+)"/.exec(xml)?.[1];
 }
 
 /** logicalModel 段的内容边界（多个助手共用；找不到/未闭合即抛错） */
@@ -735,6 +793,20 @@ function outputFieldMissing(xml: string, id: string, verb: string): HanaBusiness
 }
 
 /**
+ * 引用守卫的扫描文本：从 masked 小节内容里剥掉**不构成按名引用**的两个元素——
+ * `<descriptions …>`（描述文案，中文建模常写字段名，如 "AMOUNT 的合计"，会被误判成公式引用）
+ * 与 `<keyMapping|measureMapping …>`（columnName 是**节点列**名，输出别名改名不影响它，
+ * 见 REFERENCE_SECTIONS 头注的"两层名字"）。剩下的 formula/filter 等才是真正的按名引用。
+ */
+function referenceScanText(sectionContent: string): string {
+  return sectionContent
+    .replace(/<descriptions\b[^>]*\/>/g, '')
+    .replace(/<descriptions\b[^>]*>[\s\S]*?<\/descriptions>/g, '')
+    .replace(/<(?:key|measure)Mapping\b[^>]*\/>/g, '')
+    .replace(/<(?:key|measure)Mapping\b[^>]*>[\s\S]*?<\/(?:key|measure)Mapping>/g, '');
+}
+
+/**
  * 引用守卫：被改动的字段不得被 logicalModel 的计算小节**按名引用**（公式/过滤器/限制度量）——
  * 直接改名/删除会让引用静默失效（激活才发现，或更糟：激活成功但口径变了）。服务端不代改公式（fail-closed）。
  */
@@ -748,7 +820,7 @@ function assertNotReferencedByCalculated(xml: string, id: string, own: { start: 
   for (const section of REFERENCE_SECTIONS) {
     const r = containerRange(masked, section);
     if (!r) continue;
-    if (token.test(masked.slice(r.contentStart, r.contentEnd))) {
+    if (token.test(referenceScanText(masked.slice(r.contentStart, r.contentEnd)))) {
       throw new HanaBusinessError(
         `输出字段 "${id}" 被 logicalModel 的 <${section}> 按名引用（公式/过滤器）：直接改它会让引用失效。` +
           `请先处理引用（或走 xml 全量通道），服务端不代改公式`,
@@ -757,12 +829,13 @@ function assertNotReferencedByCalculated(xml: string, id: string, own: { start: 
   }
 }
 
-/** set_tag_attr：给自闭合标签补/换一个属性（在 `/>` 前插入；已有则替换）。值一律转义 */
+/** set_tag_attr：给自闭合标签补/换一个属性（在 `/>` 前插入；已有则替换）。值一律转义；
+ *  替换串用**函数形式**（value 是用户文本，`$&` 等会被 String.replace 当替换模式展开） */
 function setTagAttribute(tagText: string, name: string, value: string): string {
   const re = new RegExp(`\\s${name}="[^"]*"`);
   const escaped = escapeXmlAttr(value);
-  if (re.test(tagText)) return tagText.replace(re, ` ${name}="${escaped}"`);
-  return tagText.replace(/\/>$/, ` ${name}="${escaped}"/>`);
+  if (re.test(tagText)) return tagText.replace(re, () => ` ${name}="${escaped}"`);
+  return tagText.replace(/\/>$/, () => ` ${name}="${escaped}"/>`);
 }
 
 /** op=rename_field：改输出字段名（输出**别名**——keyMapping 的节点列不动，这是 HANA 里"改输出名"的语义） */
@@ -781,6 +854,7 @@ export interface RenameFieldResult {
 }
 
 export function renameFieldInViewXml(xml: string, spec: RenameFieldSpec): RenameFieldResult {
+  assertWritableXmlDeclaration(xml);
   const target = locateOutputField(xml, spec.field);
   if (!target) throw outputFieldMissing(xml, spec.field, '改名');
   if (!/^[A-Za-z0-9_]{1,127}$/.test(spec.newName)) {
@@ -811,6 +885,7 @@ export interface DropFieldResult {
 }
 
 export function dropFieldFromViewXml(xml: string, field: string): DropFieldResult {
+  assertWritableXmlDeclaration(xml);
   const target = locateOutputField(xml, field);
   if (!target) throw outputFieldMissing(xml, field, '删除');
   assertNotReferencedByCalculated(xml, field, target);
@@ -865,6 +940,7 @@ export interface AddCalculatedColumnResult {
 }
 
 export function addCalculatedColumnToViewXml(xml: string, spec: AddCalculatedColumnSpec): AddCalculatedColumnResult {
+  assertWritableXmlDeclaration(xml);
   if (/calculationScenarioType="SCRIPT_BASED"/.test(xml)) {
     throw new HanaBusinessError(
       '该视图为 SQL 模式（SCRIPT_BASED）：输出列由脚本决定，不支持 add_calculated_column。' +
@@ -885,7 +961,7 @@ export function addCalculatedColumnToViewXml(xml: string, spec: AddCalculatedCol
   if (formula.length > 4000) throw new HanaBusinessError(`formula 过长（${formula.length} > 4000 字符）`);
 
   const def = parseViewDefinition(xml, 'calculationview');
-  const lmNode = /<logicalModel[^>]*\bid="([^"]+)"/.exec(xml)?.[1];
+  const lmNode = logicalModelDeclaredId(xml);
   const nodeId = spec.node ?? lmNode;
   if (!nodeId) throw new HanaBusinessError('XML 中找不到 <logicalModel id="…">，无法确定默认挂载节点');
   const node = def.nodes.find((n) => n.id === nodeId);
@@ -922,7 +998,7 @@ export function addCalculatedColumnToViewXml(xml: string, spec: AddCalculatedCol
   const maxOrder = [...lm.content.matchAll(/order="(\d+)"/g)].reduce((m, x) => Math.max(m, Number(x[1])), 0);
   const order = maxOrder + 1;
   const newLm = appendLogicalModelAttribute(lm.content, [
-    outputAttributeBlock(spec.name, order, nodeId, spec.description),
+    logicalModelAttributeXml(spec.name, order, nodeId, spec.description),
   ]);
 
   // 两处替换都在原文档上算好（节点块在前、logicalModel 在后），**从后往前**落，避免下标漂移
@@ -958,11 +1034,12 @@ export interface SetAttributeFilterResult {
 }
 
 export function setAttributeFilterInViewXml(xml: string, spec: SetAttributeFilterSpec): SetAttributeFilterResult {
+  assertWritableXmlDeclaration(xml);
   if (spec.value.length === 0 || spec.value.length > 200) {
     throw new HanaBusinessError(`value 长度须在 1~200 之间（当前 ${spec.value.length}）`);
   }
   const def = parseViewDefinition(xml, 'calculationview');
-  const lmNode = /<logicalModel[^>]*\bid="([^"]+)"/.exec(xml)?.[1];
+  const lmNode = logicalModelDeclaredId(xml);
   const nodeId = spec.node ?? lmNode;
   if (!nodeId) throw new HanaBusinessError('XML 中找不到 <logicalModel id="…">，无法确定默认节点');
   const node = def.nodes.find((n) => n.id === nodeId);
@@ -989,7 +1066,8 @@ export function setAttributeFilterInViewXml(xml: string, spec: SetAttributeFilte
   let replaced = false;
   if (attrText.endsWith('/>')) {
     // 自闭合 → 展开并插入（缩进从 8 空格起，与既有生成器形态不冲突：XML 空白无语义）
-    newAttrText = attrText.replace(/\/>$/, `>\n        ${filterXml}\n      </viewAttribute>`);
+    // 替换串用函数形式：filterXml 含用户给的过滤值（`$&` 等会被 String.replace 展开成匹配文本）
+    newAttrText = attrText.replace(/\/>$/, () => `>\n        ${filterXml}\n      </viewAttribute>`);
   } else {
     const openLen = attrText.indexOf('>') + 1;
     const inner = attrText.slice(openLen, attrText.lastIndexOf('</viewAttribute>'));
@@ -1045,6 +1123,7 @@ export interface SetVariableResult {
 }
 
 export function setVariableInViewXml(xml: string, spec: SetVariableSpec): SetVariableResult {
+  assertWritableXmlDeclaration(xml);
   const changed: string[] = [];
   if (spec.defaultValue !== undefined) changed.push('defaultValue');
   if (spec.description !== undefined) changed.push('description');
@@ -1068,13 +1147,20 @@ export function setVariableInViewXml(xml: string, spec: SetVariableSpec): SetVar
   }
   let block = inner.slice(blk.start, blk.end);
 
+  // 变量结构守卫**无条件执行**：三个字段（含只给 description）都要求本仓方言的变量形态，
+  // 即 <variable …><variableProperties …/></variable>。此前守卫只包住 defaultValue/mandatory 分支，
+  // 而 description 分支要往 <variable> 内部插 <descriptions>——目标是自闭合 <variable …/> 时
+  // 插入点会落到元素之外（<descriptions> 成为 localVariables 的子元素、变量实际没改，回执却报成功），
+  // 同一残缺变量只有给 defaultValue 才被拒：宽严不一且声明不成立。现提到所有分支之前统一 fail-closed。
+  const vp = /<variableProperties\b[^>]*\/>/.exec(block);
+  if (!vp) {
+    throw new HanaBusinessError(
+      `变量 "${spec.variableId}" 的结构与已知方言不符（本仓方言须为 <variable><variableProperties …/></variable>；` +
+        `自闭合 <variable …/> 或缺 variableProperties 一律拒绝），拒绝变换——请先修正变量结构或走 xml 全量通道`,
+    );
+  }
+
   if (spec.defaultValue !== undefined || spec.mandatory !== undefined) {
-    const vp = /<variableProperties\b[^>]*\/>/.exec(block);
-    if (!vp) {
-      throw new HanaBusinessError(
-        `变量 "${spec.variableId}" 没有自闭合的 <variableProperties …/> 段（结构与已知方言不符），拒绝变换`,
-      );
-    }
     let vpText = vp[0];
     if (spec.defaultValue !== undefined) vpText = setTagAttribute(vpText, 'defaultValue', spec.defaultValue);
     if (spec.mandatory !== undefined) vpText = setTagAttribute(vpText, 'mandatory', String(spec.mandatory));
@@ -1089,9 +1175,10 @@ export function setVariableInViewXml(xml: string, spec: SetVariableSpec): SetVar
         setTagAttribute(desc[0], 'defaultDescription', spec.description) +
         block.slice(desc.index + desc[0].length);
     } else {
-      // 变量块内没有 <descriptions>：紧跟开标签插入一行
-      const openEnd = block.indexOf('>') + 1;
-      block = `${block.slice(0, openEnd)}\n      <descriptions defaultDescription="${escapeXmlAttr(spec.description)}"/>${block.slice(openEnd)}`;
+      // 变量块内没有 <descriptions>：插到 <variableProperties> 之前（变量元素内；结构守卫保证它存在）。
+      // 不用 indexOf('>') 定位开标签——属性值里合法出现 `>` 时插入点会落到元素外
+      const vpAt = block.indexOf('<variableProperties');
+      block = `${block.slice(0, vpAt)}<descriptions defaultDescription="${escapeXmlAttr(spec.description)}"/>\n      ${block.slice(vpAt)}`;
     }
   }
 

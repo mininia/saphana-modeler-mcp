@@ -1,5 +1,5 @@
 import { HanaBusinessError } from './errors.js';
-import { LOCK_WAIT_MS_DEFAULT } from './limits.js';
+import { LOCK_WAIT_MS_DEFAULT, normalizeWaitMs } from './limits.js';
 
 /**
  * 进程内按 key 串行化（keyed mutex）：把「先查后写」（check-then-act）的临界区锁起来。
@@ -16,10 +16,9 @@ import { LOCK_WAIT_MS_DEFAULT } from './limits.js';
  *   waitMs 到点若仍未开始执行，立刻 reject（LOCK_WAIT_TIMEOUT_CODE），并把该排队项标记为已跳过：
  *   轮到它时**直接跳过、绝不执行 fn**（链尾照旧吞错，后续排队者不受影响）；已经开始的 fn 不受
  *   超时影响（定时器已清）。仍然不做「报超时但 fn 照跑」：那会产生幽灵写，调用方已收到失败、
- *   写却发生了，与 P7 的补偿/回滚交错时会破坏「部分成功显式枚举」（I2）。
- *   为什么从「轮到时才检查」改成「到点即拒」：旧实现只在轮到自己执行时才看超时标志——持锁者若卡住
- *   （例如锁内的 DB 读挂住），排队者的 promise 永不 settle，waitMs 形同虚设，与本模块「排队不会
- *   无限期」的承诺相反。
+ *   写却发生了，与变更集的补偿/回滚交错时会破坏「部分成功显式枚举」。
+ *   必须到点即拒：若等轮到自己才检查超时标志，持锁者卡住（例如锁内的 DB 读挂住）时排队者的
+ *   promise 永不 settle，waitMs 形同虚设，与本模块「排队不会无限期」的承诺相反。
  * - 队列排空后条目立即移除，Map 不随 key 数量增长
  * - 仅进程内有效：多进程/多实例部署需外部锁（本服务为单进程 HTTP 服务，进程内即足够）
  *
@@ -36,7 +35,7 @@ import { LOCK_WAIT_MS_DEFAULT } from './limits.js';
 /** 锁等待超时的机读错误码（HanaBusinessError.code → 失败信封 raw.code；值即名字，日志可直读） */
 export const LOCK_WAIT_TIMEOUT = 'LOCK_WAIT_TIMEOUT';
 
-/** 错误码别名（调用方/测试按此名引用，SSD §4.3 的导出名） */
+/** 错误码别名（调用方/测试按此名引用；导出名即契约，勿改） */
 export const LOCK_WAIT_TIMEOUT_CODE = LOCK_WAIT_TIMEOUT;
 
 /** withKeyedLock 的可选项 */
@@ -44,7 +43,7 @@ export interface KeyedLockOptions {
   /**
    * 排队等待上限 ms（缺省 LOCK_WAIT_MS_DEFAULT）。显式 0 按 0ms 处理：
    * 只给真正无需等待的调用留预算，任何可见的排队都视为超时。
-   * NaN / Infinity / 负数不是合法输入，一律回落 LOCK_WAIT_MS_DEFAULT（见 normalizeWaitMs）。
+   * NaN / Infinity / 负数不是合法输入，一律回落 LOCK_WAIT_MS_DEFAULT（见 limits.ts 的 normalizeWaitMs）。
    */
   waitMs?: number;
 }
@@ -58,12 +57,12 @@ const tails = new Map<string, Promise<void>>();
  * 且该排队项被跳过——fn **不会执行**。
  */
 export async function withKeyedLock<T>(key: string, fn: () => Promise<T>, opts: KeyedLockOptions = {}): Promise<T> {
-  const waitMs = normalizeWaitMs(opts.waitMs ?? LOCK_WAIT_MS_DEFAULT);
+  const waitMs = normalizeWaitMs(opts.waitMs, LOCK_WAIT_MS_DEFAULT);
   // 接在当前链尾之后（prev 已 settled 或 pending，但永不 reject）
   const prev = tails.get(key) ?? Promise.resolve();
 
   // 到点即拒：超时 promise 与「轮到自己」的 run 抢跑，谁先 settle 谁定调用方看到的结果。
-  // 与旧实现的关键差别是不看「轮到自己」这个时点——否则持锁者卡住时排队者永不 settle，waitMs 失效。
+  // 关键点：不看「轮到自己」这个时点——否则持锁者卡住时排队者永不 settle，waitMs 失效。
   let started = false; // true = fn 已开始执行（此后不再受排队超时约束）
   let skipped = false; // true = 已对调用方到点拒；轮到本条目时必须跳过 fn（幽灵写禁令）
   let timeoutError: HanaBusinessError | undefined;
@@ -119,16 +118,4 @@ export function keyedLockSize(): number {
  */
 export function resetKeyedLocks(): void {
   tails.clear();
-}
-
-/**
- * waitMs 入参收敛（与 semaphore 的 normalizeLimit 同款手法，防两模块口径分叉）：
- * - 显式 0 必须原样保留：它是合法语义（只给无需等待的调用留预算），不能当缺省处理；
- * - NaN / Infinity / 负数一律回落默认值：三者直接进 setTimeout 都会被钳到 1ms（实测 Node 分别发
- *   TimeoutNaNWarning / TimeoutOverflowWarning / TimeoutNegativeWarning），等价于偷偷写了个 1ms 超时——
- *   这与「排队有上界」的承诺相反，且不收敛时调用方无从察觉。
- */
-function normalizeWaitMs(waitMs: number): number {
-  if (waitMs === 0) return 0;
-  return Number.isFinite(waitMs) && waitMs > 0 ? waitMs : LOCK_WAIT_MS_DEFAULT;
 }

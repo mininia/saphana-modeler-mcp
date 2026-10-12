@@ -1,5 +1,5 @@
 /**
- * 调用方面（surface）、可触达上限（entitlement）与**提升**（P10-f）。
+ * 调用方面（surface）、可触达上限（entitlement）与**提升**。
  *
  * ## 三个词，别混
  *
@@ -11,14 +11,15 @@
  *
  * 关系：`surface ⊆ entitlement ⊆ 部署策略`（不变量 A：动态面 ⊆ 静态策略）。
  *
- * ## 提升是**按分类**的（2026-10-09 定稿，对齐 hana-cli 的 Dynamic Tool Promotion）
+ * ## 提升是**按分类**的（对齐 hana-cli 的 Dynamic Tool Promotion）
  *
  * 粒度取分类而不是单个能力，有两个理由：
  * 1. **对齐既有约定**：模型的动作本来就是"我要做建模"（选一个门面），按分类提升与这个粒度同形；
- * 2. **淘汰单位与提升单位一致**：上限 `MCP_CAPABILITY_SURFACE_MAX`（默认 50）按**工具数**算，
+ * 2. **淘汰单位与提升单位一致**：上限 `MCP_CAPABILITY_SURFACE_MAX`（默认 50）按**工具数**算
+ *    （只数能注册为工具的成员，`routeOnly` 操作级条目不注册也不计，见 `toolCountOf`），
  *    超出时**最旧的那个分类**整体淘汰（hana-cli 同款 FIFO）——单一能力的淘汰会让面里
  *    出现"同类里有一半在面上"的破碎状态，比整体进出更难解释。
- *    本仓当前只有 28 条具体能力，上限实际不会触发；它存在的意义是**能力增长时不静默失控**。
+ *    上限存在的意义是**能力增长时不静默失控**。
  *
  * ## 状态的范围（不变量 F：面是**呈现**设施，不是正确性设施）
  *
@@ -30,10 +31,11 @@
  */
 
 import { CAPABILITY_LIST, findCapability, membersOfCategory } from '../capabilities/manifest.js';
-import { FACADE_CATEGORIES, type Capability, type FacadeCategory } from '../capabilities/types.js';
-import { resolveProfile, type CallerProfile } from '../config/profiles.js';
+import { type Capability, type FacadeCategory } from '../capabilities/types.js';
+import { activeProfile, profileAllows, type CallerProfile } from '../config/profiles.js';
 import type { HanaConfig } from '../config/config.js';
-import { matchGlob, shouldRegisterTool, type ToolFilterConfig } from './groups.js';
+import { ANONYMOUS_CLIENT_ID, currentIdentity } from '../core/request-context.js';
+import { shouldRegisterTool, type ToolFilterConfig } from './groups.js';
 
 /**
  * 面的计算只需要"策略 + 配置"两件事。**刻意不 import `./index.js` 的 ToolContext**：
@@ -45,11 +47,8 @@ export interface SurfaceContext {
   toolFilter: ToolFilterConfig;
 }
 
-/** HTTP 未配 Token 时的匿名身份名（与 src/http.ts 的同名常量一致；此处只用于判定"未认证"） */
-const ANONYMOUS_CLIENT_ID = 'anonymous';
-
 /** stdio 进程（单客户端）的提升键 */
-export const STDIO_SURFACE_KEY = '(stdio)';
+const STDIO_SURFACE_KEY = '(stdio)';
 
 /** 提升注册表：调用方键 → 已提升的分类（按提升顺序，FIFO 淘汰用最旧在前） */
 const promotedByCaller = new Map<string, FacadeCategory[]>();
@@ -73,13 +72,27 @@ export function canPromote(identity: { clientId?: string } | undefined): boolean
 }
 
 /** 调用方键（提升注册表的键） */
-export function surfaceKeyOf(identity: { clientId?: string } | undefined): string {
+function surfaceKeyOf(identity: { clientId?: string } | undefined): string {
   return identity?.clientId ?? STDIO_SURFACE_KEY;
 }
 
-/** 一批分类覆盖的工具数（上限按它算） */
+/**
+ * 当前调用方的归属键（提升注册表与异步任务归属共用同一条派生）：HTTP 用已认证 clientId，
+ * stdio 用 '(stdio)'。两处必须同源——异步任务的提交侧与查询/取消侧若各自现算，任一侧口径
+ * 变化（如改取 profileId）都会让「自己提交的任务查不到」且没有任何报错。
+ * 未配 Token 的 HTTP 部署所有调用方都是 anonymous：任务按单租户假设互相可见（写进 README）。
+ */
+export function currentSurfaceKey(): string {
+  return surfaceKeyOf(currentIdentity());
+}
+
+/**
+ * 一批分类覆盖的**工具数**（提升预算按它算）。与 {@link computeSurface} 同口径：只数能注册为
+ * 工具的成员——`routeOnly` 操作级别名永不进 `tools/list`，计入会让「面里从未超过上限」的部署
+ * 被提前淘汰，而运维按 tools/list 数工具复现不出来，正是最难排查的一类现场。
+ */
 function toolCountOf(categories: readonly FacadeCategory[]): number {
-  return categories.reduce((sum, c) => sum + membersOfCategory(c).length, 0);
+  return categories.reduce((sum, c) => sum + membersOfCategory(c).filter((m) => m.routeOnly !== true).length, 0);
 }
 
 /**
@@ -122,7 +135,7 @@ export function promoteCategories(
  * 注意它**包含**门面与非门面两类条目：门面是入口，非门面是路由/提升目标——路由目标虽然不一定进
  * `tools/list`，但必须"有权调用"，所以它们的资格也在这里判。
  *
- * **门面常驻（2026-10-09 定稿，门面层不做限制）**：门面是入口，不参与能力层的权限判定——
+ * **门面常驻（门面层不做限制）**：门面是入口，不参与能力层的权限判定——
  * 分组开关（`shouldRegisterTool`）与档案都只管**具体能力**。否则一个按 glob 收紧的档案
  * （如只允许 `hana_metadata_*`）会把六个门面全部拒掉，本次连接一个工具都注册不出来（自锁死）；
  * 入口常在、索引可能为空，才是"可用性收窄"的正确表达。
@@ -134,16 +147,14 @@ export function entitlementOf(
   ids: string[];
   profile: CallerProfile | undefined;
 } {
-  const profile = resolveProfile(ctx.config.profiles, identity?.profileId ?? ctx.config.profileId);
+  const profile = activeProfile(ctx.config, identity);
   /** 单个能力的可触达判定：可见性配置 + 档案（门面只过 deny 那一关，见上） */
   const entitled = (c: Capability): boolean => {
     if (!shouldRegisterTool(c.id, ctx.toolFilter)) return false;
     if (c.facadeOf !== undefined) return true; // 门面：入口不参与能力层判定（分组/档案都不拦它）
-    // 档案维度：未配档案（隐式 default）时 resolveProfile 返回全 kind 的档案，等价于不收紧
-    if (profile === undefined) return false; // 配了档案却查不到 → 空档案（全拒），与 authorizeCall 同口径
-    if (!profile.allowKinds.includes(c.kind)) return false;
-    if (profile.allowCapabilities && !matchGlob(c.id, profile.allowCapabilities)) return false;
-    return true;
+    // 档案维度与调用期闸门共用 config/profiles.ts 的 profileAllows（单点实现）：
+    // undefined 档案 → profile_unknown → false（空档案全拒）；『与 authorizeCall 同口径』由同一实现保证
+    return profileAllows(profile, c.id, c.kind).ok;
   };
   const ids = CAPABILITY_LIST.filter(entitled).map((c) => c.id);
   return { ids, profile };
@@ -199,7 +210,7 @@ export function computeSurface(
   return { key, canPromote: allowed, entitlementIds, surfaceIds, promoted };
 }
 
-/** 面内的能力条目（按 id 排序：确定性顺序，SSD §7.6 的列表语义） */
+/** 面内的能力条目（按 id 排序：确定性顺序，跨传输/跨调用方比对列表时顺序稳定） */
 export function surfaceCapabilities(ids: ReadonlySet<string>): Capability[] {
   return CAPABILITY_LIST.filter((c) => ids.has(c.id)).sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
@@ -227,6 +238,3 @@ export function paramNamesOf(cap: Capability): string[] {
 export function resolveCapability(id: string): Capability | undefined {
   return findCapability(id);
 }
-
-/** 分类目录的合法值（门面 id ↔ 分类的对应由 `facadeIdOf` 给出） */
-export { FACADE_CATEGORIES };

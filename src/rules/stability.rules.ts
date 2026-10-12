@@ -3,11 +3,9 @@ import type { RuleObject } from './index.js';
 /**
  * 稳定性诊断族规则（health / activity / storage / trend）。
  *
- * 来源（搬迁自，保留原文措辞与实测数值）：src/capabilities/defs/health.ts 的四条 description。
- *
- * 为什么单列一组（非冻结 id）：瘦身批的字数硬指标要求 description top5 收缩，其中
- * hana_table_storage（2537 字）与 hana_system_health（1909 字）是第 1、3 长——它们的解释性散文
- * （口径陷阱、实测数值、成本量级）必须先在规则里有落点，砍了才不等于丢。
+ * 分工：各诊断工具的口径陷阱、实测数值与成本量级只在这里维护（模型按需经
+ * hana_system_get_info(rules=…) 查询）；四条工具描述只留骨架、参数面与指向规则 id 的查询指针，
+ * 避免同一段知识在两处各写一份而漂移。
  *
  * 与 src/services/health.rules.ts 的区别：那里是阈值判定引擎（DEFAULT_THRESHOLDS 等），
  * 这里是给模型读的知识条目，两者同名不同物。
@@ -47,12 +45,13 @@ export const stabilityRules: readonly RuleObject[] = [
       '  **不做「参数应该设成多少」的比对**——推荐值会随版本过时而变成噪声。',
       '• lifecycle：已弃用特性的使用情况（M_FEATURE_USAGE）——衡量的**不是当前健康度**，而是升级前风险：',
       '  已弃用却仍在被调用的特性，会在版本升级时一次性中断。',
-      '• encryption：数据/日志/备份加密状态（M_ENCRYPTION_OVERVIEW，权威视图）。**恒为 info 级**：',
-      '  是否要求加密是合规决策不是稳定性缺陷，只进读数、不参与判定。',
+      '• encryption：数据/日志/备份加密状态（M_ENCRYPTION_OVERVIEW，权威视图）。**有数据时恒为 info 级**：',
+      '  是否要求加密是合规决策不是稳定性缺陷，不做 warn/critical 判定；但视图不可见或取不到时（空集/查询失败）',
+      '  本项标 unknown，整体 verdict 因此不能为 ok（无更重级别时即为 indeterminate）。',
       '',
       '**关键语义**：HANA 的监视视图按权限**行级过滤**，权限不足时静默返回空集而不报错。故本工具是**三态**：',
-      'ok / 异常 / unknown（看不见）——凡无法判定的项一律标 unknown，整体 verdict 会退化为 indeterminate',
-      '而**不会**谎报 ok；报告里的 visibility 与 coverage 会说明「覆盖了什么、漏了什么、为什么漏」，',
+      'ok / 异常 / unknown（看不见）——凡无法判定的项一律标 unknown，整体 verdict 至多退化为 indeterminate',
+      '（有 warn/critical 时按更重的一级报），而**不会**谎报 ok；报告里的 visibility 与 coverage 会说明「覆盖了什么、漏了什么、为什么漏」，',
       '读数里也会为该类项留一条「无法判定」而不让它静默消失。',
       '',
       '不包含明细：要看阻塞链与长事务明细用 hana_system_activity，要看表级存储用 hana_table_storage，',
@@ -89,29 +88,29 @@ export const stabilityRules: readonly RuleObject[] = [
       '• disk          磁盘占用 TOP N ——「谁在占盘」（M_TABLE_PERSISTENCE_STATISTICS.DISK_SIZE）',
       '• fragmentation delta 占总量之比 TOP N ——「谁该做 merge」（配 lastMergeTime 看多久没合并）',
       '• hotness       读/写次数 TOP N ——「谁在被访问」，用作优化收益排序的依据',
-      '• partition     分区数 TOP N ——「谁被分区了、分了多少」；**默认只看 BW 活动数据表**（subtype 参数可切换），',
+      '• partition     分区数 TOP N ——「谁被分区了、分了多少」；**默认按 BW 活动表过滤（未分类/非 BW 表照常列出）**（subtype 参数可切换），',
       '                因为同一个 BW 对象在 HANA 上是一组物理表（活动表 / 入站队列 QUEUE / 变更日志 CHANGE_LOG /',
       '                PSA 暂存区），表名只差后缀；**同时给 schema 与 table 时**改为返回该表的**逐分区明细**',
       '                （每分区内存/记录/上次 merge）',
-      '• column        列级内存 TOP N ——「**这张表里哪一列在吃内存**」（M_CS_ALL_COLUMNS，实测 109 万行）。',
+      '• column        列级内存 TOP N ——「**这张表里哪一列在吃内存**」（M_CS_ALL_COLUMNS，实测百万行量级）。',
       '                每行带：列内存（含 main/delta/可分页）、**压缩类型**、行数、不同值数、该列的索引类型',
       '                （FULL/NONE）、是否已加载、最后访问时间、分区数。**刻意不返回 COMPRESSION_RATIO_IN_PERCENTAGE**：',
       '                实测该列在本版本会出现 361890% 这种不可能的值（口径反推为 内存÷UNCOMPRESSED_SIZE×100，',
       '                而后者大量为 NULL），返回它等于邀请调用方按错误语义判断。压缩改用**类型**表达——',
       '                「同为 CLUSTD 列，一张用 DEFAULT 一张用 INDIRECT」才是可行动的线索',
-      '• index         索引内存 TOP N ——「**索引又占了多少**」（M_CS_INDEXES，实测 84,513 行、合计 11 GiB）。',
-      '                每行带索引内存、拼接列内存、分区数，以及**该索引占所属表内存的百分比**。实测这个比例在',
-      '                **73%~83%**：SAPABAP1./BIC/AZDEMO001 表内存 3303.6 MiB、另有一个 2748.8 MiB 的 INVERTED',
-      '                VALUE 索引——**只看表内存会把这张表的真实成本少算近一半**。不给 HASH_COLLISION_COUNT：',
+      '• index         索引内存 TOP N ——「**索引又占了多少**」（M_CS_INDEXES，实测十万行量级、索引内存合计十 GiB 量级）。',
+      '                每行带索引内存、拼接列内存、分区数，以及**该索引占所属表内存的百分比**。实测这个比例可达',
+      '                **七成以上**：有的表，其 INVERTED VALUE 索引内存与表自身内存同量级——**只看表内存会把',
+      '                这张表的真实成本少算近一半**。不给 HASH_COLLISION_COUNT：',
       '                实测该列全库只有 -1 一个取值，无信号',
       '',
       '**成本提示（实测，调用前务必知道）**：column / index 在不给 table 时**固定约 7~9 秒**——',
-      'M_CS_ALL_COLUMNS（109 万行）与 M_CS_INDEXES **不吃 SCHEMA_NAME 谓词消减**（实测带与不带 schema 过滤',
+      'M_CS_ALL_COLUMNS（百万行量级）与 M_CS_INDEXES **不吃 SCHEMA_NAME 谓词消减**（实测带与不带 schema 过滤',
       '都是约 6.7 秒），只有**同时给 schema 与 table** 才降到约 0.5 秒（13 倍差）。',
       '即：单表下钻很便宜、全局排行很贵；连续刷多个 schema 时请预期这个量级。',
       '',
       '所有表级口径都**先在 SQL 侧按 (schema, table) 聚合再排序**：M_CS_TABLES 的一行是一个**分区**',
-      '（实测 74836 行 = 71565 张表），直接排序取 TOP 会得到「最大的分区」而不是「最大的表」。',
+      '（行数是"表数 × 分区数"的量级），直接排序取 TOP 会得到「最大的分区」而不是「最大的表」。',
       '分区数取 COUNT(DISTINCT PART_ID)，实测与 M_TABLE_PARTITIONS 的节点数**逐行一致**（19=19 / 22=22 / 8=8），',
       '即**表分区**；delta 在 M_CS_TABLES 里是**列**（MEMORY_SIZE_IN_DELTA）而不是行，',
       '「同一 (表, PART_ID) 多行」在全库实测 0 例，故分区数不会混入 delta。',
@@ -141,16 +140,16 @@ export const stabilityRules: readonly RuleObject[] = [
       '（跨视图对齐会引入「两边采样时刻差几秒」这类无法解释的错位）。',
       '',
       '**实测结构**（照文档猜会写错，这三条决定了输出长什么样）：',
-      '• 约 **10 秒一个采样点**，实测 362,545 行跨约 42 天（1012 个 SNAPSHOT_ID × 358 采样/小时）；',
-      '• **SERVER_TIMESTAMP 是快照写入时刻，TIME 才是采样时刻**：同一 SERVER_TIMESTAMP 下有 358 行',
+      '• 约 **10 秒一个采样点**，实测数十万行、跨约一个月（具体随保留期配置与实例规模而变）；',
+      '• **SERVER_TIMESTAMP 是快照写入时刻，TIME 才是采样时刻**：同一 SERVER_TIMESTAMP 下有数百行',
       '  不同 TIME。用 SERVER_TIMESTAMP 做时间轴会把一整小时的采样压成一个点。本工具用 **TIME**；',
-      '• INDEX 是 `<host>:<TIME>` 的行唯一键（36 万行有 36 万个取值），**不是服务维度**。',
+      '• INDEX 是 `<host>:<TIME>` 的行唯一键（行数与取值数一一对应），**不是服务维度**。',
       '',
       '参数：hours 回溯窗口、bucketMinutes 桶宽、metrics 选指标组；每个桶给出所选指标的 min / max / avg',
       '与采样点数。单位：内存/磁盘 GiB（与 Cockpit 一致），CPU 与占比用 %，网络用 KiB。',
       '**网络与 swap 是「每个采样周期（约 10 秒）内的量」，不是速率**——乘除 10 才是每秒。',
       '',
-      '**保留期是有限的**（实测该实例约 42 小时×24，且可配置）：窗口超出时报告里的 `retention.coversWindow`',
+      '**保留期是有限的**（实测约一个月，且可配置）：窗口超出时报告里的 `retention.coversWindow`',
       '为 false、caveats 会说明只回溯到什么时候——**未覆盖的那段不等于「正常」，只是没有数据**。',
       '注意本工具**不给「上升就是坏」的简单结论**：配额内的自然增长未必异常，真正可行动的是增长速率与',
       '「离配额还有多远」，故 summary 里给首尾桶的变化率，判断留给人。',

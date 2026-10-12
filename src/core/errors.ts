@@ -1,15 +1,13 @@
-import { ProtocolError, SdkError, SdkErrorCode, SdkHttpError } from '@modelcontextprotocol/server';
+import { ProtocolError, SdkError, SdkErrorCode } from '@modelcontextprotocol/server';
 import type { Envelope, HanaMessage } from '../types/hana.js';
 import { logger, redactSensitive } from './logger.js';
 import { currentAgentLabel, currentClientId } from './request-context.js';
-
-export { ProtocolError, SdkError, SdkErrorCode, SdkHttpError };
 
 /**
  * 乐观锁冲突（412）/ 目标缺失（404）的机读载荷，经 withErrorEnvelope 进 envelope.raw.conflict。
  *
  * 关于 currentETag：它是**冲突时点的补读值**（捕获 412 后立刻再读一次 fileMeta），
- * **不是**本次写的新基线——实测 412 响应不带 ETag 头（P5 §4.9#B），只能补读；
+ * **不是**本次写的新基线——实测 412 响应不带 ETag 头，只能补读；
  * 这一次额外往返不可省，且补读结果不许被当成"最新基线"回写或重试。
  * 补读本身失败（如对象已被并发删除）时原因写进 currentUnavailable——
  * 不许把补读失败静默成 undefined（"查不到"与"没去查"必须可区分）。
@@ -30,7 +28,7 @@ export interface ConflictInfo {
 }
 
 /**
- * HANA 业务错误：驱动/SQL 层错误归一化载体（对齐 bw7.5 的 SapBusinessError）。
+ * HANA 业务错误：驱动/SQL 层错误归一化载体（对齐既有 BW 建模服务错误对象的 code/sqlState/messages 三元组形状）。
  * - code：HANA/SAP 错误码（如 '7'=权限不足、'259'=对象不存在、'-10709'=连接失败）
  * - sqlState：SQLSTATE
  * - messages：可选的结构化消息列表（激活错误明细等）
@@ -38,7 +36,7 @@ export interface ConflictInfo {
  */
 export class HanaBusinessError extends Error {
   /**
-   * 冲突载荷（P5 §4.2）：412/404 的机读形状，经 withErrorEnvelope 进 envelope.raw.conflict。
+   * 冲突载荷：412/404 的机读形状，经 withErrorEnvelope 进 envelope.raw.conflict。
    * 非 readonly（可写）：由 withConflict 工厂在构造后赋值，构造器保持原签名不变。
    */
   conflict?: ConflictInfo;
@@ -109,7 +107,7 @@ export function wrapUnknownError(_e: unknown): SdkError {
 }
 
 /**
- * tool handler 统一错误归一化（§5.3 双通道约定）：
+ * tool handler 统一错误归一化（双通道约定）：
  * - HANA 业务错误（HanaBusinessError）→ 信封 success:false + messages
  * - v2 MCP 错误（ProtocolError/SdkError）→ 透传抛出（协议层处理）
  * - 未知错误 → 包装为 SdkError 抛出
@@ -136,7 +134,7 @@ export async function withErrorEnvelope<T>(fn: () => Promise<T>): Promise<Envelo
       const extra = {
         ...(e.diagnosis != null ? { diagnosis: e.diagnosis } : {}),
         ...(e.rawDetail != null ? { errorDetail: e.rawDetail } : {}),
-        // 冲突载荷（412/404 的机读形状，P5 §4.2）与 code 同一层显式并入——不许落在 errorDetail 里反推
+        // 冲突载荷（412/404 的机读形状）与 code 同一层显式并入——不许落在 errorDetail 里反推
         ...(e.conflict ? { conflict: e.conflict } : {}),
       };
       const rawWithDiagnosis = Object.keys(extra).length > 0 ? { ...(raw ?? {}), ...extra } : raw;
@@ -158,9 +156,9 @@ export async function withErrorEnvelope<T>(fn: () => Promise<T>): Promise<Envelo
 }
 
 /**
- * 从失败信封读取冲突码（工具层与测试共用的**唯一**读取实现，I3）。
+ * 从失败信封读取冲突码（工具层与测试共用的**唯一**读取实现）。
  *
- * 业务失败信封里只有 raw.code 是机读码；conflict 是 P5 新增的**显式字段**
+ * 业务失败信封里只有 raw.code 是机读码；conflict 是失败信封中与 code 同层的**显式字段**
  * （withErrorEnvelope 只产出 raw.code / diagnosis / errorDetail / conflict 这一层，
  * 不会从 errorDetail 里反推）——故这里直接读 raw.code / raw.conflict，不做散文匹配。
  * 语义：success !== false → undefined；raw.code 不是 '412'/'OBJECT_NOT_FOUND' → undefined；
@@ -190,7 +188,7 @@ function isConflictInfo(v: unknown): v is ConflictInfo {
 }
 
 /**
- * 硬错误返回（§5.3）：参数非法 / 对象不存在等不可恢复错误，返回 MCP isError
+ * 硬错误返回：参数非法 / 对象不存在等不可恢复错误，返回 MCP isError
  * 并附恢复提示（把死胡同变成下一步）。工具 handler 直接 return 此对象。
  */
 export function mcpErrorText(
@@ -203,3 +201,17 @@ export function mcpErrorText(
   const text = hint ? `${message}。${hint}` : message;
   return { isError: true, content: [{ type: 'text', text }] };
 }
+
+/**
+ * 请求被策略拦截时的统一前缀（对外形状契约：客户端与冒烟脚本按该文本断言）。
+ *
+ * 拦截消息是**返回给调用方（通常是模型）**的，它需要一眼看出「这是服务端策略拦截，
+ * 不是我的参数写错了」，从而停下并交由人决策。
+ * 三个使用方（config/authorize.ts、config/preflight.ts、services/repository.service.ts）
+ * 都从这里取——services → config/preflight 会经能力清单成环，故定义放在叶子层。
+ *
+ * 同样重要的一点：这些消息**不得**包含"改哪一项配置即可放行"之类的补救指引——
+ * 那等于把绕过方法直接交给被拦的一方。补救指引只应出现在面向运维的位置
+ * （服务启动自检、README），不出现在请求响应里。
+ */
+export const BLOCKED_PREFIX = '被 MCP 安全策略拦截';

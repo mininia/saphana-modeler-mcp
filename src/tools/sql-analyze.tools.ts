@@ -8,11 +8,11 @@ import { CAP } from '../capabilities/manifest.js';
 import type { Envelope } from '../types/hana.js';
 
 /**
- * SQL 分析工具（hana_sql_analyze，分组 **admin**）。
+ * SQL 分析工具（hana_sql_analyze，条目 kind: 'write'——只启用 read 的部署看不到它）。
  *
- * 经 capabilityRegistrar 按能力清单注册（条目 gate=preflight）：要的就是它**在 handler 之前**的预检闸门
- * （规划本次会读哪些 schema → 对照生效策略判定）。该闸门只做「规划 + 判定」，与工具归哪个分组无关；
- * 因为本工具不声明可写包，写边界的 boundary_off 不适用于它。
+ * 经 capabilityRegistrar 按能力清单注册：预检闸门带资源维度——由 effects.plan（planSqlAnalyze）
+ * 表达，在 handler 之前按「本次会读哪些 schema」对照生效策略判定（只做规划 + 判定，不执行）。
+ * 闸门对所有能力统一生效、与工具归哪个分组无关；本工具不声明可写包，写边界的 boundary_off 不适用于它。
  */
 export function registerSqlAnalyzeTools(server: McpServer, ctx: ToolContext): void {
   const regCap = capabilityRegistrar(server, ctx);

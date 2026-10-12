@@ -1,4 +1,4 @@
-import { objectRefsOfUpdate, sameObjectRef, type ObjectRef } from '../write-plan.js';
+import { dedupeRefs, objectRefsOfUpdate, sameObjectRef, type ObjectRef } from '../write-plan.js';
 
 /**
  * 变更集（多对象事务）的**规划与相交检测** —— SSD §6.1 第 1 步 + §6.2。纯函数、零 I/O。
@@ -65,15 +65,15 @@ export interface ChangesetPlanResult {
    */
   order: Array<{ action: ChangesetAction; originalIndex: number }>;
   conflicts: ChangesetConflict[];
-  /** 每个动作的对象级读写集，**按原始顺序**排列（refs[k].originalIndex === k），诊断/回执用 */
+  /** 每个动作的对象级读写集，**按原始顺序**排列（refs[k].originalIndex === k）；诊断用（回执出口是 uncertain） */
   refs: Array<{ originalIndex: number; reads: ObjectRef[]; writes: ObjectRef[] }>;
   /**
    * §6.2 降级口径的**出口**：解析不出对象级的引用（join 源只给半个坐标、create 的 scripted 脚本内容、
    * xml 里非「包路径…/视图目录段/对象名」形态的 resourceUri）**不参与相交判定**，但必须如实上报——
-   * 此前这类引用被静默丢弃，「不判」与「没有引用」在回执里无从区分。
+   * 只有能区分「不判」与「没有引用」，调用方才敢按这份批次的相交结论行事。
    * 逐条中文说明、含第几项（originalIndex，从 0 数）与解析不出的原因；
    * 全部解析成功时为空数组（不制造噪音）。按 originalIndex 升序排列。
-   * 合并进调用方各自的 uncertain 通道（服务层/规划器）由消费侧按需做——本模块只保证有出口。
+   * 本模块只保证有出口，不替消费侧做判定：服务层在非空时把它原样带进变更集回执（ChangesetReport.uncertain）。
    */
   uncertain: string[];
 }
@@ -160,16 +160,24 @@ function refsOfAction(action: ChangesetAction): { reads: ObjectRef[]; writes: Ob
       // 目标对象恒被写入（update 改的就是它本身）：即便共享件漏报也必须进写集——写集漏一个对象
       // 就等于相交检测漏一次拒绝。
       return {
-        reads: dedupeRefs(derived.reads),
+        // objectRefsOfUpdate 返回前已用同一 dedupeRefs 保序去重（write-plan.ts），这里不再空扫一遍
+        reads: derived.reads,
         writes: dedupeRefs([target, ...derived.writes]),
         uncertain: derived.uncertain,
       };
     }
     case 'create': {
       // source 是 schema 下的物理表/视图，不是仓库对象 ⇒ 不进对象级读集（SSD §6.2 的粒度到此为止）；
-      // scripted.script 不解析：SQL 里的仓库对象引用需要再写一份扫描器（I3 禁止），宁漏不猜——
-      // 但**不静默**：脚本里可能藏着仓库对象引用，如实落 uncertain（§6.2 降级口径把"不判"与"没有"区分开）。
-      const script = typeof action.scripted?.script === 'string' ? action.scripted.script.trim() : '';
+      // scripted.script **只有 mode='sql' 会被服务端消费**（mode 缺省=projection，projection 分支只读
+      // source、从不读 scripted，见 createCalculationView）：该模式下不解析脚本——SQL 里的仓库对象引用
+      // 需要再写一份扫描器（I3 禁止），宁漏不猜，但**不静默**：脚本里可能藏着仓库对象引用，如实落
+      // uncertain（§6.2 降级口径把"不判"与"没有"区分开）。
+      // projection 下 scripted 是**不参与批次的载荷**，报「脚本不解析」会把调用方引向一个不存在的盲区；
+      // 与规划器同口径（那里的 create/scripted 分支也只扫 mode='sql' 的载荷）。
+      const script =
+        (action.mode ?? 'projection') === 'sql' && typeof action.scripted?.script === 'string'
+          ? action.scripted.script.trim()
+          : '';
       const uncertain: string[] =
         script === ''
           ? []
@@ -222,13 +230,6 @@ function intersectRefs(left: ObjectRef[], right: ObjectRef[]): ObjectRef[] {
   for (const ref of left) {
     if (right.some((r) => sameObjectRef(r, ref)) && !out.some((r) => sameObjectRef(r, ref))) out.push(ref);
   }
-  return out;
-}
-
-/** 读写集去重（保持首次出现顺序）：重复对象没有信息量，还会在相交检测里放大成重复冲突对 */
-function dedupeRefs(refs: ObjectRef[]): ObjectRef[] {
-  const out: ObjectRef[] = [];
-  for (const ref of refs) if (!out.some((r) => sameObjectRef(r, ref))) out.push(ref);
   return out;
 }
 

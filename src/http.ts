@@ -5,7 +5,7 @@ import { createMcpHandler, type AuthInfo } from '@modelcontextprotocol/server';
 import type { HanaConfig, HttpClientIdentity } from './config/config.js';
 import { isLoopbackHost } from './config/deployment.js';
 import { logger } from './core/logger.js';
-import { runWithIdentity } from './core/request-context.js';
+import { ANONYMOUS_CLIENT_ID, runWithIdentity } from './core/request-context.js';
 import { createServer } from './server.js';
 import type { ToolContext } from './tools/index.js';
 
@@ -27,11 +27,8 @@ import type { ToolContext } from './tools/index.js';
 /** MCP 端点唯一路径（忽略 querystring；其余路径一律 404，缩小暴露面） */
 const MCP_HTTP_PATH = '/mcp';
 
-/** 请求体上限：Content-Length 超限直接 413（防暴露场景下大 body 打满内存） */
+/** 请求体上限（三层共用同一值：手写守卫按 Content-Length 先应答，SDK 适配层与处理器按字节计数兜住流式 body） */
 const MCP_HTTP_MAX_BODY_BYTES = 10 * 1024 * 1024;
-
-/** 未配置任何 Token（回环默认边界）时的客户端身份名 */
-const ANONYMOUS_CLIENT_ID = 'anonymous';
 
 /** 请求守卫：返回 false 表示已自行应答（403/404/401/413），调用方不得再处理该请求 */
 type RequestGuard = (req: IncomingMessage, res: ServerResponse) => boolean;
@@ -98,7 +95,10 @@ function bearerTokenGuard(clients: HttpClientIdentity[]): RequestGuard {
   };
 }
 
-/** Content-Length 超限拒绝（413）；流式（chunked）请求无该头，交由代理层限长（README 已注明） */
+/**
+ * Content-Length 超限拒绝（413，给客户端干净应答的第一道）；流式（chunked）请求无该头，
+ * 由下面透传给 SDK 两层的 maxRequestBodySize（同一常量值）按字节计数拦截，不交由代理层限长。
+ */
 function bodySizeGuard(req: IncomingMessage, res: ServerResponse): boolean {
   const declared = Number(req.headers['content-length'] ?? 0);
   if (!Number.isFinite(declared) || declared <= MCP_HTTP_MAX_BODY_BYTES) return true;
@@ -117,9 +117,12 @@ export async function startHttpServer(
 ): Promise<{ port: number; close: () => Promise<void> }> {
   const handler = createMcpHandler(() => createServer(ctx), {
     onerror: (e) => logger.error({ err: e }, 'saphana-modeler-mcp HTTP handler 内部错误'),
+    // 两层必须同值：只配一层时另一层仍按 SDK 默认 4 MiB 先拒（4–10 MiB 区间会不可用）
+    maxRequestBodySize: MCP_HTTP_MAX_BODY_BYTES,
   });
   const nodeHandler = toNodeHandler(handler, {
     onerror: (e) => logger.error({ err: e }, 'saphana-modeler-mcp HTTP 适配层错误'),
+    maxRequestBodySize: MCP_HTTP_MAX_BODY_BYTES,
   });
   const validateHost = hostHeaderValidation(config.httpAllowedHosts);
   const validateOrigin = originValidation(config.httpAllowedOrigins);
@@ -170,8 +173,12 @@ export async function startHttpServer(
   }
 
   const close = async (): Promise<void> => {
+    // 顺序与上方注释一致：先停新请求（server.close 停止接受新连接；顺手断开空闲 keep-alive 连接，
+    // 不依赖运行时对 close() 的隐式处理），再关 handler 中止在途请求，最后等 server 完全关闭。
+    const serverClosed = new Promise<void>((resolve) => server.close(() => resolve()));
+    server.closeIdleConnections();
     await handler.close();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await serverClosed;
   };
 
   return { port, close };

@@ -1,5 +1,5 @@
 /**
- * 环境档案（EnvironmentProfile，P9 / SSD §9）——"本环境实际是什么样"的探测结果。
+ * 环境档案（EnvironmentProfile）——"本环境实际是什么样"的探测结果。
  *
  * ## 为什么要有它
  *
@@ -109,7 +109,7 @@ async function probeVersion(pool: HanaPool): Promise<string> {
  */
 async function probePrivilegeTier(pool: HanaPool): Promise<string> {
   // 动态 import：本模块 ← services/system.service（getSystemInfo 要档案），而档案又要复用
-  // getPrivileges 的判定——静态互引会形成 import 环（tests/unit/import-cycles.test.ts 的棘轮会拦）。
+  // getPrivileges 的判定——静态互引会形成 import 环（本地保留的 tests/unit/import-cycles.test.ts（不入库）的棘轮会拦）。
   // 调用期取值：那时两个模块都已求值完，不存在"模块级数据尚未初始化"的窗口。
   const { getPrivileges } = await import('../services/system.service.js');
   const { summary, schemaSelect } = await getPrivileges(pool);

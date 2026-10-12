@@ -1,5 +1,5 @@
 import { HanaBusinessError } from '../core/errors.js';
-import { isSafeRuntimeName } from '../core/sql.js';
+import { assertSafeRuntimeName, isSafeRuntimeName } from '../core/sql.js';
 import { createXmlBuilder, escapeXmlAttr } from '../core/xml.js';
 import { CHAR_TYPES, isNumericType } from './view-types.js';
 
@@ -25,11 +25,47 @@ export interface MinCalcViewSpec {
    * 源表列（列名 + 类型名）。
    * 刻意保持内联形状，不用 metadata.service 的 ColumnInfo：调用方是把查到的列映射成
    * `{columnName, dataTypeName}` 字面量再传进来，而 ColumnInfo 还要求 position/isNullable 等
-   * 本生成器用不到的字段——挂上它会让调用点被迫造多余字段（曾经的 import 就是这样变成死代码的）。
+   * 本生成器用不到的字段——挂上它会让调用点被迫造多余字段，把本层与元数据服务的形状耦在一起。
    */
   columns: Array<{ columnName: string; dataTypeName?: string }>;
   /** 度量策略：SUM_NUMERIC=数值列进 baseMeasures 聚合 sum；ALL_ATTRIBUTES=全部当属性（默认后者最保守） */
   measureMode?: 'SUM_NUMERIC' | 'ALL_ATTRIBUTES';
+}
+
+/**
+ * scenario 根节点的固定属性（六个）：图形化对象树与 SQL 字符串模板共用同一份值。
+ * 两处各写一套时，任一处随 SPS 调整都会让 create(图形化) 与 create(SQL) 产出的根属性分叉——
+ * 表现为激活被拒且难以归因。defaultClient/defaultLanguage 是激活期由 HANA 替换的占位符，
+ * 其余值对齐 Studio 导出。
+ */
+const SCENARIO_ROOT_ATTRS = {
+  applyPrivilegeType: 'ANALYTIC_PRIVILEGE',
+  checkAnalyticPrivileges: 'false',
+  defaultClient: '$$client$$',
+  defaultLanguage: '$$language$$',
+  outputViewType: 'Projection',
+  enforceSqlExecution: 'false',
+} as const;
+
+/** 共享固定属性 → 对象树形态（fast-xml-parser 的属性键前缀 '@_'） */
+function scenarioRootAttrsObject(): Record<string, string> {
+  return Object.fromEntries(Object.entries(SCENARIO_ROOT_ATTRS).map(([k, v]) => [`@_${k}`, v]));
+}
+
+/** 共享固定属性 → 字符串模板形态（` k="v"` 串；值均为无实体字符的常量，无需转义） */
+function scenarioRootAttrsXml(): string {
+  return Object.entries(SCENARIO_ROOT_ATTRS)
+    .map(([k, v]) => ` ${k}="${v}"`)
+    .join('');
+}
+
+/**
+ * 根节点 dataCategory 的单点判定（图形化 create / SQL create / op=set_script 三条写路径共用）：
+ * 本环境（SPS08 实测）含度量的 CV 必须 dataCategory="CUBE"（对齐 Studio 导出），含度量却标
+ * DEFAULT 会被激活器以 40117 "No measures defined" 拒绝。
+ */
+export function scenarioDataCategory(measureCount: number): 'CUBE' | 'DEFAULT' {
+  return measureCount > 0 ? 'CUBE' : 'DEFAULT';
 }
 
 /**
@@ -39,10 +75,17 @@ export interface MinCalcViewSpec {
 export function buildMinCalcViewXml(spec: MinCalcViewSpec): string {
   const { objectName, schema, table } = spec;
   const desc = spec.description ?? objectName;
+  // 源表名/schema 校验：显式列分支会让上游的列校验（getTableColumns 的 assertSafeRuntimeName）短路，
+  // 未校验的名字会裸拼进 <columnObject> 的属性位——该位置（fast-xml-parser 对象树，processEntities=false）
+  // 只自动转义双引号，`&`/`<`/`>` 会产出非法 XML 写进仓库（激活报看不懂的解析错）。运行时名口径与仓库
+  // 其余写路径一致（isSafeRuntimeName，允许 /），在入口单点拒绝。
+  assertSafeRuntimeName(schema, 'schema');
+  assertSafeRuntimeName(table, '源表');
   // 列名过滤用运行时名口径（允许 /）：与 core/sql 的 SAFE_RUNTIME_NAME_RE 字符集逐字符相同。
-  // 刻意不收紧成 isSafeObjectName（禁 /）：那会改变"哪些列被映射"的行为——本生成器在已实机验证的
-  // 写路径上，收紧必须是带测试的独立决定，不能藏在去重里。
-  const columns = (spec.columns ?? []).filter((c) => isSafeRuntimeName(c.columnName));
+  // 刻意不收紧成设计时名口径（assertSafeObjectName / SAFE_NAME_RE，禁 /）：那会改变"哪些列被映射"
+  // 的行为——本生成器在已实机验证的写路径上，收紧必须是带测试的独立决定，不能藏在去重里。
+  const requested = spec.columns ?? [];
+  const columns = requested.filter((c) => isSafeRuntimeName(c.columnName));
   if (columns.length === 0) {
     // 抛业务错误而不是裸 Error：裸 Error 会被 withErrorEnvelope 降级成"内部错误"，
     // 把"源表无可映射列"这个可操作原因吞掉
@@ -50,6 +93,26 @@ export function buildMinCalcViewXml(spec: MinCalcViewSpec): string {
       `源表 ${schema}/${table} 无可映射列（或列名含非法字符），无法生成视图`,
       'NO_MAPPABLE_COLUMNS',
     );
+  }
+  // 部分列名非法 ⇒ fail-closed 拒绝而不是静默丢弃：回执的度量数是按原始列清单统计的，丢弃会让
+  // 「回执有 N 个度量、生成的 XML 里 0 个度量」同时成立（激活被 40117 拒时无从归因），调用方
+  // 点名要的列也会无声消失。与 SQL 模式 normalizeScriptedColumns「含非法字符，已拒绝」同口径。
+  const dropped = requested.filter((c) => !isSafeRuntimeName(c.columnName));
+  if (dropped.length > 0) {
+    throw new HanaBusinessError(
+      `列名 ${dropped.map((c) => `"${c.columnName}"`).join('、')} 含非法字符，已拒绝` +
+        '（仅允许字母/数字/_/$/#/./-//）；请从 columns 中剔除或改用合法列名',
+    );
+  }
+  // 重复列名守卫（与 SQL 模式 normalizeScriptedColumns 同文案口径）：重复列名会让同一
+  // viewAttribute/mapping/logicalModel id 声明两份，激活被服务端拒（模型拿到的只有难归因的
+  // 激活失败）；两个模式对同类输入必须给同一份精确中文拒绝。
+  const seenColumn = new Set<string>();
+  for (const c of columns) {
+    if (seenColumn.has(c.columnName)) {
+      throw new HanaBusinessError(`输出列名 "${c.columnName}" 重复，已拒绝（列名须唯一）`);
+    }
+    seenColumn.add(c.columnName);
   }
 
   const dsId = 'SRC_1';
@@ -112,16 +175,10 @@ export function buildMinCalcViewXml(spec: MinCalcViewSpec): string {
       '@_xmlns:Calculation': 'http://www.sap.com/ndb/BiModelCalculation.ecore',
       '@_schemaVersion': '2.3',
       '@_id': objectName,
-      '@_applyPrivilegeType': 'ANALYTIC_PRIVILEGE',
-      '@_checkAnalyticPrivileges': 'false',
-      '@_defaultClient': '$$client$$',
-      '@_defaultLanguage': '$$language$$',
-      // 实测（SPS08）：含度量的 CV 必须 dataCategory="CUBE"（对齐 Studio 导出），
-      // DEFAULT 无度量会被激活器以 40117 "No measures defined" 拒绝
-      '@_dataCategory': measureSet.size > 0 ? 'CUBE' : 'DEFAULT',
-      '@_outputViewType': 'Projection',
+      // 固定根属性（含 dataCategory 的 CUBE/DEFAULT 判定）与 SQL 形态共用单点实现
+      ...scenarioRootAttrsObject(),
+      '@_dataCategory': scenarioDataCategory(measures.length),
       '@_calculationScenarioType': 'TREE_BASED',
-      '@_enforceSqlExecution': 'false',
       origin: {},
       descriptions: { '@_defaultDescription': escapeXmlAttr(desc) },
       metadata: { '@_changedAt': '' },
@@ -156,13 +213,9 @@ export function buildMinCalcViewXml(spec: MinCalcViewSpec): string {
 /* ── SQL 模式（Scripted Calculation View）────────────────────────────
  * 「SQL 模式」= 单个 SqlScriptView 节点承载整段 SQL，输出列由脚本的 SELECT 决定。
  *
- * 本环境的方言要点（三者缺一不可，否则激活被拒）：
- *   1. 根节点 calculationScenarioType="SCRIPT_BASED"（不是图形化模型的 TREE_BASED）；
- *   2. SQL 正文放在 <definition> 元素内（XML 实体转义，不是 CDATA）；
- *   3. 每个 viewAttribute 必须显式声明 datatype（字符型还要 length）。
- * 生成器把这些约束固化在服务端：模型只给「SQL + 输出列清单」，不写也不读 XML。
- *
- * 注意：脚本内的表名若未限定 schema，激活时会按当前用户的默认 schema 解析——建议脚本里显式写 schema。"表"。
+ * 生成器把本环境方言（SCRIPT_BASED / <definition> / viewAttribute datatype 三者缺一不可）
+ * 固化在服务端：模型只给「SQL + 输出列清单」，不写也不读 XML；方言细节与避坑见 rules=sql_mode
+ * （src/rules/sql-mode.rules.ts），这里不复制正文。
  */
 
 /** 脚本输出列（顺序即 logicalModel 输出顺序） */
@@ -192,21 +245,14 @@ export interface ScriptedCalcViewSpec {
 }
 
 /** SqlScriptView 节点 id（单节点形态，固定） */
-export const SCRIPT_NODE_ID = 'SqlScript_1';
+const SCRIPT_NODE_ID = 'SqlScript_1';
 
 /**
- * 脚本正文包装：把「查询式 SQL」包成 HANA 认的过程体。
+ * 脚本正文包装：把「查询式 SQL」包成 HANA 认的过程体（`BEGIN VAR_OUT = …; END`）。
  *
- * 实机结论（SPS08，2026-09）：`<definition>` 会被**原样拼接**到生成的 DDL 末尾——
- *   create procedure "<...>/proc" ( OUT var_out "<...>/tabletype/VAR_OUT" ) language sqlscript ... as <definition>
- * 因此正文必须是**过程体（块）**，而不是裸语句；且输出必须赋值给 OUT 形参 `VAR_OUT`：
- *   裸 `SELECT ...`      → sql syntax error: incorrect syntax near "SELECT"
- *   `VAR_OUT = SELECT …` → incorrect syntax near "="
- *   `DO BEGIN … END`     → incorrect syntax near "BEGIN"
- *   `BEGIN VAR_OUT = … END` → 激活通过（本函数产出形态）
- * 同时：HANA 由本 XML 的 viewAttribute datatype/length 生成 VAR_OUT 的表类型
- * （`create type "…/proc/tabletype/VAR_OUT" as table ("KEY_A" NVARCHAR(60), …)`）——
- * 声明缺失时该类型为空表（`as table ()`），这也正是「viewAttribute 必须带 datatype」的真因。
+ * `<definition>` 会被原样拼进生成的 create procedure DDL——正文必须是过程体块、输出只能赋给
+ * OUT 形参 `VAR_OUT`；失败形态与 datatype↔VAR_OUT 表类型的耦合见 rules=sql_mode
+ * （hana_system_get_info(rules=sql_mode)）。
  *
  * 宽容处理：调用方若已给出完整过程体（以 BEGIN 开头，或 DO BEGIN 的匿名块写法）则原样使用。
  */
@@ -225,7 +271,7 @@ export function wrapScriptedBody(script: string): string {
 
 /**
  * 数据类型写法校验（允许精度写法，如 DECIMAL(15,2)、NVARCHAR(60)）。
- * 列名字符集不在此处：用 core/sql 的 isSafeRuntimeName（与原先的本地正则逐字符相同，见
+ * 列名字符集不在此处：用 core/sql 的 isSafeRuntimeName（全仓唯一的运行时名字符集事实源，见
  * buildMinCalcViewXml 的说明）；"必须给 length 的字符型"用 view-types 的 CHAR_TYPES（同一份集合）。
  */
 const DATA_TYPE_RE = /^[A-Z][A-Z0-9_ ]*(\(\s*\d+\s*(,\s*\d+\s*)?\))?$/;
@@ -300,16 +346,32 @@ export function scriptedViewAttributesXml(cols: NormalizedScriptedColumn[], inde
   return `${indent}<viewAttributes>\n${items}\n${indent}</viewAttributes>`;
 }
 
-/** 单个 logicalModel <attribute> 元素（属性列；order 在调用方按输出顺序算） */
-function scriptedAttributeXml(c: NormalizedScriptedColumn, order: number, nodeId: string, indent: string): string {
-  const id = escapeXmlAttr(c.name);
-  return (
-    `${indent}  <attribute id="${id}" order="${String(order)}"` +
-    ` attributeHierarchyActive="false" displayAttribute="false">\n` +
-    `${indent}    <descriptions defaultDescription="${escapeXmlAttr(c.description)}"/>\n` +
-    `${indent}    <keyMapping columnObjectName="${escapeXmlAttr(nodeId)}" columnName="${id}"/>\n` +
-    `${indent}  </attribute>`
+/**
+ * 单个 logicalModel <attribute> 元素（属性列）：order 由调用方按输出顺序算，indent 为父段缩进。
+ *
+ * 单一实现：SQL 模式 create / op=set_script 重建输出段与 op=add_join / add_calculated_column
+ * 追加输出字段共用——两处各写一份时，元素属性集的增删会只落一边，create 出的视图与 update
+ * 追加的字段形态分叉。description 缺省时不写 <descriptions>（追加字段可以没有描述）。
+ */
+export function logicalModelAttributeXml(
+  id: string,
+  order: number,
+  sourceObject: string,
+  description?: string,
+  indent = '    ',
+): string {
+  const lines = [
+    `${indent}  <attribute id="${escapeXmlAttr(id)}" order="${String(order)}"` +
+      ` attributeHierarchyActive="false" displayAttribute="false">`,
+  ];
+  if (description !== undefined) {
+    lines.push(`${indent}    <descriptions defaultDescription="${escapeXmlAttr(description)}"/>`);
+  }
+  lines.push(
+    `${indent}    <keyMapping columnObjectName="${escapeXmlAttr(sourceObject)}" columnName="${escapeXmlAttr(id)}"/>`,
+    `${indent}  </attribute>`,
   );
+  return lines.join('\n');
 }
 
 /** 单个 logicalModel <measure> 元素（度量列；order 接在属性之后） */
@@ -332,7 +394,9 @@ export function scriptedOutputSectionsXml(
 ): { attributes: string; measures: string } {
   const attributes = cols.filter((c) => !c.isMeasure);
   const measures = cols.filter((c) => c.isMeasure);
-  const attrItems = attributes.map((c, i) => scriptedAttributeXml(c, i + 1, nodeId, indent)).join('\n');
+  const attrItems = attributes
+    .map((c, i) => logicalModelAttributeXml(c.name, i + 1, nodeId, c.description, indent))
+    .join('\n');
   const measureItems = measures
     .map((c, i) => scriptedMeasureXml(c, attributes.length + i + 1, nodeId, indent))
     .join('\n');
@@ -369,13 +433,11 @@ export function buildScriptedCalcViewXml(spec: ScriptedCalcViewSpec): string {
   return [
     `<Calculation:scenario xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"` +
       ` xmlns:Calculation="http://www.sap.com/ndb/BiModelCalculation.ecore"` +
-      ` schemaVersion="2.3" id="${escapeXmlAttr(objectName)}" applyPrivilegeType="ANALYTIC_PRIVILEGE"` +
-      ` checkAnalyticPrivileges="false"` +
-      ` defaultClient="$$client$$" defaultLanguage="$$language$$"` +
-      // 含度量 → CUBE（与图形化形态同规则；无度量会被激活器以 40117 拒绝）
-      ` dataCategory="${measureCount > 0 ? 'CUBE' : 'DEFAULT'}" outputViewType="Projection"` +
+      ` schemaVersion="2.3" id="${escapeXmlAttr(objectName)}"` +
+      ` dataCategory="${scenarioDataCategory(measureCount)}"` +
+      scenarioRootAttrsXml() +
       // SQL 模式的判定标志：激活器据此按脚本节点（而非图形化节点树）编译
-      ` calculationScenarioType="SCRIPT_BASED" enforceSqlExecution="false">`,
+      ` calculationScenarioType="SCRIPT_BASED">`,
     `  <origin/>`,
     `  <descriptions defaultDescription="${escapeXmlAttr(desc)}"/>`,
     `  <metadata changedAt=""/>`,

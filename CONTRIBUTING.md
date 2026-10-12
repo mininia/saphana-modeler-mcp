@@ -7,18 +7,25 @@
 | 命令 | 作用 |
 | --- | --- |
 | `npm run typecheck` | 类型检查。**同时承担死代码检测**：`noUnusedLocals` / `noUnusedParameters` 会拦下未使用的导入与变量 |
-| `npm test` | 单元测试（483+ 项） |
+| `npm test` | 单元测试（900+ 项；测试文件在本地 `tests/`，不入库，见下） |
 | `npm run check` | 上面两个一起跑（提交前跑这个） |
 | `npm run format` | Prettier 格式化（`format:check` 只检查不写） |
 
-实机验收脚本（`verify:*` / `probe:*`）需要真实 HANA 连接，不在常规检查范围内。
+> 开发与检查要求 Node >= 24.18.1（与 package.json 的 engines 下限一致；启动期校验只比较 major.minor，即 >= 24.18 放行、patch 位不受校验，见 `core/node-version.ts`）。更低版本上 npm test 不可用：npm 在 Windows 固定用 cmd.exe 执行脚本，cmd 不展开 glob，而 Node 20 的 --test 也不展开（报 Could not find 或静默 0 用例）。
+
+`tests/` 与 `test-verification/` 均不入库（列在 `.gitignore`）：克隆后本地没有测试文件，`npm test` 需自备 `tests/` 才能跑；`verify:*` / `probe:*` 仅在保留本地实机脚本的环境可用，且需要真实 HANA 连接，不在常规检查范围内。
+
+## 打包与发布
+
+- 产出发布件一律用 `npm run release:pack`：先 `npm run build`，再用 `npm pack --dry-run --json` 断言 `dist/index.js` 在打包清单中，最后才 `npm pack` 产出 tarball。
+- 禁止走 `--ignore-scripts` 类打包路径（npm pack / npm publish --ignore-scripts）：会跳过 `prepare`（= `npm run build`），静默产出只含 LICENSE/README/package.json 的无代码空壳包——装得上、跑不了。
 
 ## 工具链
 
 - **Prettier**：`.prettierrc.json`，printWidth 120、单引号、分号、`endOfLine: auto`。格式问题不用手改，交给 `npm run format`。
 - **没有 ESLint**：`@typescript-eslint/parser` 目前 peer 要求 `typescript <6.1.0`，而本项目用 TS 7（Go 原生版，`typescript` 包已不含经典 JS API），装不上。因此 lint 的职责这样分摊：
   - 格式 → Prettier
-  - 未使用变量/导入、隐式返回、switch 穿透 → `tsconfig.json` 的 `noUnusedLocals` / `noUnusedParameters` / `noImplicitOverride` / `noFallthroughCasesInSwitch`
+  - 未使用变量/导入、隐式覆盖（漏写 `override`）、switch 穿透 → `tsconfig.json` 的 `noUnusedLocals` / `noUnusedParameters` / `noImplicitOverride` / `noFallthroughCasesInSwitch`
   - `console.*` → 靠约定与 code review（MCP stdio transport 独占 stdout，日志必须走 logger，见下）
 
 ## 分层与依赖方向
@@ -28,9 +35,10 @@ types ← core ← model ← services ← tools ← server ← index
               ↖ config
 ```
 
-- **依赖只能从左指向右**（`core` 不得 import `config`，`model` 不得 import `services`）。`core/logger.ts` 曾反向 import `config/config.js` 只因需要一个时区默认值 —— 该常量已下移到 `core/datetime.ts`。
+- **依赖只能从左指向右**（`core` 不得 import `config`，`model` 不得 import `services`）。`import type` 边不受此限：类型导入在编译期擦除，不构成运行时依赖（`core/hana-client.ts`、`core/xs-rest.ts` 以 `import type` 反向引用 `config/config.js` 的 `HanaConfig` 即此类）——即「`core` 不得 import `config`」的准确口径是「不得 import `config` 的运行时值」。`core/logger.ts` 曾反向 import `config/config.js` 只因需要一个时区默认值 —— 该常量已下移到 `core/datetime.ts`。
+- **已登记的例外**：`model/view-cache.ts` 与 `services/metadata.service.ts` 互相 import（前者取视图定义与 VERSION_ID 做缓存与版本校验，后者复用该缓存），是本仓库唯一一处 `model` 反向依赖 `services` 的运行时边，已登记在 `tests/unit/import-cycles.test.ts` 的环白名单里。两侧的导入值都只在函数体内使用、ESM 求值期不互相解引用，环才能成立；改动任一侧前先读 `model/view-cache.ts` 头注。
 - `config/` 依赖 `core/`，不依赖 `services/`。
-- `core/write-boundary.ts` 刻意是**纯叶子模块**（不 import 本项目任何模块），供 config 校验、启动流程、实机脚本共用同一份判定规则。
+- `config/write-boundary.ts` 刻意是**纯叶子模块**（不 import 本项目任何模块），供 config 校验、启动流程、实机脚本共用同一份判定规则。
 
 ## 错误处理
 

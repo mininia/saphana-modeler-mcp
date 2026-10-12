@@ -12,10 +12,11 @@
 | `fast-xml-parser` | MIT | 设计时 XML 解析 |
 | `pino` | MIT | 日志 |
 | `zod` | MIT | 配置/工具参数 schema 校验 |
-| `@modelcontextprotocol/core` / `node` / `server` | MIT | MCP 协议 SDK |
-| `@types/node` | MIT | Node 类型定义 |
+| `@modelcontextprotocol/node` / `server` | Apache-2.0 | MCP 协议 SDK（`core` 随 `@modelcontextprotocol/server` 传递安装；上游自 MIT 迁至 Apache-2.0；未重许可的历史贡献仍为 MIT，文档部分 CC-BY-4.0） |
+| `@types/node` | MIT | Node 类型定义（optionalDependencies） |
 | `tsx` | MIT | 开发期 TS 运行器（devDependencies） |
-| `typescript` | Apache-2.0 | 编译器（devDependencies） |
+| `prettier` | MIT | 开发期格式化（devDependencies） |
+| `typescript` | Apache-2.0 | 编译器（optionalDependencies；TS 7 的平台二进制为其包内可选依赖） |
 
 各传递依赖的许可以其自身包内声明为准，可用 `npm ls` / `license-checker` 自行核查。
 

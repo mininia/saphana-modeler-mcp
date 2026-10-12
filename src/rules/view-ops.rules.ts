@@ -2,7 +2,7 @@ import type { RuleObject } from './index.js';
 import { VIEW_OPS } from '../services/view-ops.rules.js';
 
 /**
- * 视图操作集（operations 通道的 8 个 op）与异步任务规则（2026-10-10）。
+ * 视图操作集（operations 通道的 8 个 op）与异步任务规则。
  *
  * 来源（搬迁自，保留原文措辞）：
  * - src/capabilities/defs/modeling.ts 的 hana_view_update.description（operations 三方式与参数面一段）；
@@ -28,7 +28,7 @@ export const viewOpsRules: readonly RuleObject[] = [
       '共同口径：',
       '- 变换基线取**设计时文件当前内容**（与 ETag 同会话读取）——存在未激活的挂起改动时以激活版为基线会静默丢失挂起工作；',
       '- 逐条按序应用、每条失败即整体拒绝（此前已应用的变换不落库——变换是纯函数，拼装完才发起一次 PUT）；',
-      '- 破坏性判定与闸门是 P6 同一套（结构 diff × 下游引用）：判定表打不到结构面的 op（如 set_description）',
+      '- 破坏性判定与闸门同一套口径（结构 diff × 下游引用，判定表见 services/migrate.rules.ts）：判定表打不到结构面的 op（如 set_description）',
       '  即便有下游也放行；口径类 op（set_attribute_filter / set_variable）按"行集合/参数语义变化"判破坏；',
       '- 每条的 effect 声明在 src/services/view-ops.rules.ts（destructive / 触碰面 / 数据源引用），',
       '  与工具 schema 的一致性由单测机械钉住。',

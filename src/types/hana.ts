@@ -1,5 +1,5 @@
 /**
- * 通用类型与 Envelope 约定（对齐 bw7.5-modeler-mcp 的 §2.2 风格）：
+ * 通用类型与 Envelope 约定（对齐既有 BW 建模服务的信封形状约定）：
  * 所有工具 handler 统一返回 { content:[{type:'text'}], structuredContent: envelope }，
  * 其中 envelope = { success, data?, messages[], raw? }。
  * - 业务校验失败（如激活报错明细）：envelope.success=false + messages

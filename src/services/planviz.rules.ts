@@ -1,5 +1,7 @@
 import { US_PER_SECOND, formatMicros } from '../core/num.js';
+import { ANALYZE_EXECUTION_TIMEOUT_MS, ANALYZE_MAX_ROWS } from '../core/limits.js';
 import {
+  LEVEL_ORDER,
   PLANVIZ_AGGREGATION_RE,
   PLANVIZ_JOIN_RE,
   formatRows,
@@ -43,6 +45,7 @@ export interface PlanVizChildEdge {
   id: string;
   /** 该子算子的实际输出行数（记在父算子的 Child 块里） */
   rows?: number;
+  /** <FetchCallCount>：**仅解析，当前无任何输出形态消费该字段**（行数已由 rows 带出） */
   fetchCount?: number;
 }
 
@@ -68,13 +71,14 @@ export interface PlanVizOperator {
   estimatedCardinality?: number;
   /** 实际输出行数：**由父算子的 Child 块回填**（根算子没有父，故为 undefined） */
   actualCardinality?: number;
-  estimatedCost?: number;
-  memoryBytes?: number;
   childIds: string[];
   edges: PlanVizChildEdge[];
   /** 从根算起算出的层深（0=根） */
   level: number;
-  /** true=来自 <InnerPlans>（逻辑/估计内层计划），不算主物理计划的算子 */
+  /**
+   * true=**不属于主计划作用域**：来自 `<InnerPlans>`（逻辑/估计内层计划）或平级子计划片段
+   * （下推到别的引擎的 `<Plan>`）——两者都不算主物理计划的算子。
+   */
   inInnerPlan: boolean;
 }
 
@@ -160,8 +164,8 @@ export interface PlanVizOperatorSummary {
 }
 
 /** 面板里逐算子/逐表条目的上限（避免大计划把输出撑爆；raw=true 时另有全量） */
-export const PANEL_OPERATOR_LIMIT = 15;
-export const PANEL_TABLE_LIMIT = 10;
+const PANEL_OPERATOR_LIMIT = 15;
+const PANEL_TABLE_LIMIT = 10;
 export const PANEL_TREE_LIMIT = 60;
 
 // ── XML 解析 ─────────────────────────────────────────────────
@@ -326,7 +330,7 @@ function parseEdges(own: string): PlanVizChildEdge[] {
 }
 
 /**
- * 解析计划 XML（Executed/Estimated 同 schema，见 README 的实测记录）。
+ * 解析计划 XML（Executed/Estimated 同 schema——服务端实测两份输出的结构一致）。
  *
  * 内层计划（`<InnerPlans>`，逻辑/估计内层计划）与主计划同形，靠**字符区间**判定归属：
  * 混在一起会让"算子数/线程数/表访问"全部虚高（实测那份 10.7MB 文件里 844 个 Relation
@@ -371,9 +375,6 @@ export function parsePlanVizXml(xml: string): PlanVizPlan {
       ...withDefined('userCpuUs', timeUs(own, 'UserCPUTime')),
       ...withDefined('kernelCpuUs', timeUs(own, 'KernelCPUTime')),
       ...withDefined('estimatedCardinality', numOf(tag(own, 'EstimatedOutputCardinality'))),
-      // 估计代价：数值在 <EstimatedCost> 内层的 <Inclusive>（带 Unit），外层本身没有 Unit
-      ...withDefined('estimatedCost', timeUs(tag(own, 'EstimatedCost') ?? '', 'Inclusive')),
-      ...withDefined('memoryBytes', numOf(tag(tag(own, 'MemoryUsage') ?? '', 'Max'))),
       childIds: edges.map((e) => e.id),
       edges,
       level: 0,
@@ -487,6 +488,14 @@ export interface PlanVizObjectAccess {
 }
 
 /**
+ * 「算一次表访问」的**唯一判据**：aggregateObjects（表聚合）、summarize（访问数）、
+ * planVizStatistics.scans 三处共用，避免同一响应的两个数字对不上。
+ * 空 ObjectName（`<ObjectName></ObjectName>` 解析成的空串）**不算**表访问——服务端没给出对象名时
+ * 把它计进访问数没有信息量，只会让面板与 statistics 各报一个数。
+ */
+const hasObject = (o: PlanVizOperator): boolean => o.object !== undefined && o.object !== '';
+
+/**
  * 按访问对象聚合。六栏的 Table Access 与结论的"对象瓶颈"**共用这一份口径**，
  * 且**不截断**——截断只发生在面板渲染处（PANEL_TABLE_LIMIT）；统计块用全量，
  * 否则会出现"554 处表访问"与"表 10 张"自相矛盾。
@@ -494,7 +503,7 @@ export interface PlanVizObjectAccess {
 export function aggregateObjects(plan: PlanVizPlan): PlanVizObjectAccess[] {
   const tableMap = new Map<string, PlanVizObjectAccess>();
   for (const o of plan.operators) {
-    if (!o.object) continue;
+    if (!hasObject(o)) continue;
     const key = `${o.schema ?? '?'}.${o.object}`;
     const cur = tableMap.get(key) ?? { object: key, ...withDefined('objectType', o.objectType), accesses: 0 };
     cur.accesses++;
@@ -596,16 +605,26 @@ function toSummary(o: PlanVizOperator, total: number | undefined): PlanVizOperat
   };
 }
 
-/** 文本树被截断时的说明（**绝不静默丢算子**） */
-const TREE_TRUNCATED_NOTE = '…（树已截断，完整算子见 raw=true）';
+/**
+ * 文本树被截断时的说明（**绝不静默丢算子**）。指向**同一响应内**的落点：这棵树只在 raw=true 时渲染，
+ * 读到这里时调用方已经带着 raw=true，"完整算子见 raw=true" 只会引发一次无意义的重复调用。
+ * 但同一响应的 operators 栏自身也按 limit 截断（默认 200、上限 1000），文案不能承诺"完整算子"：
+ * 全量明细本就无处可取，唯一完整的是计数 operatorCount（truncated 标注 operators 是否被截）。
+ */
+const TREE_TRUNCATED_NOTE = '…（树已截断；算子清单见同响应 operators 栏，受 limit 截断，总数见 operatorCount）';
 
-/** 缩进文本树（只画主计划；超限截断并标注，绝不静默丢算子）。仅经 buildPlanVizPanels 使用 */
+/**
+ * 缩进文本树：渲染**全部算子**的根（`plan.rootIds` = 主计划 + `<InnerPlans>`/平级子计划片段），
+ * 子计划的根带「[子计划]」前缀——它们与主计划的根同处深度 0，不标注会被读成同一条主干。
+ * 超限截断并标注，绝不静默丢算子。仅经 buildPlanVizPanels 使用。
+ */
 function renderPlanVizTree(plan: PlanVizPlan, limit: number): string {
   const byId = new Map(plan.operators.map((o) => [o.id, o]));
+  const primaryRoots = new Set(plan.primaryRootIds);
   const lines: TreeLine[] = [];
   // `seen` 防畸形计划里的环/重复引用：递归渲染在环上会无限展开（缩进由公共 renderTree 负责）
   const seen = new Set<string>();
-  const walk = (id: string, depth: number): void => {
+  const walk = (id: string, depth: number, label = ''): void => {
     if (seen.has(id)) return;
     seen.add(id);
     const op = byId.get(id);
@@ -614,17 +633,17 @@ function renderPlanVizTree(plan: PlanVizPlan, limit: number): string {
     const card = op.actualCardinality !== undefined ? ` [${formatRows(op.actualCardinality)} 行]` : '';
     lines.push({
       depth,
-      text: `${op.operator}${op.object ? ` ${op.schema ?? '?'}.${op.object}` : ''}${time}${card}`,
+      text: `${label}${op.operator}${op.object ? ` ${op.schema ?? '?'}.${op.object}` : ''}${time}${card}`,
     });
     for (const c of op.childIds) walk(c, depth + 1);
   };
-  for (const r of plan.rootIds) walk(r, 0);
+  for (const r of plan.rootIds) walk(r, 0, primaryRoots.has(r) ? '' : '[子计划] ');
   // 关系缺失导致根判不出来时兜底平铺，而不是给一棵空树
   if (lines.length === 0) {
     for (const op of plan.operators)
       lines.push({ depth: 0, text: `${op.operator}${op.object ? ` ${op.object}` : ''}` });
   }
-  // 截断说明由公共 renderTree 统一给出（EXPLAIN 侧的文本树不传说明：它只在 raw=true 出现，自指说不通）
+  // 截断说明由公共 renderTree 统一给出（EXPLAIN 侧的文本树不传说明：该通道的截断由同一响应的 truncated 字段标注）
   return renderTree(lines, limit, TREE_TRUNCATED_NOTE);
 }
 
@@ -641,10 +660,12 @@ const OBJECT_DOMINANT_SHARE = 0.2;
 /** 换算成 ERROR/FAIL 类的算子状态（正常终止态是 "Finished"，不能当异常报） */
 const ABNORMAL_STATUS_RE = /(ERROR|FAIL|ABORT|CANCEL|EXCEPTION|TIMEOUT|INVALID)/i;
 
+/**
+ * analyzePlanVizPlan 的渲染上下文：调用方只提供语句原文。
+ * 实测/估计口径一律读 `plan.measured`——同一判定不设第二个来源（从 ctx 再传一份会被静默忽略）。
+ */
 export interface PlanVizAnalysisContext {
   statement: string;
-  /** 计划来源口径：实测（Executed）还是估计（Estimated） */
-  measured: boolean;
 }
 
 /**
@@ -695,7 +716,7 @@ export function analyzePlanVizPlan(plan: PlanVizPlan, ctx: PlanVizAnalysisContex
     } else if (bottleneck?.kind === 'operator' && dominant !== undefined) {
       findings.push({
         level: bottleneck.share >= DOMINANT_SHARE ? 'risk' : 'info',
-        title: `最慢算子：${dominant.name ?? dominant.operator}（独占 ${formatMicros(bottleneck.exclusiveUs)}，占整体 ${(bottleneck.share * 100).toFixed(1)}%）`,
+        title: `最慢算子：${dominant.name ?? dominant.operator}（独占 ${formatMicros(bottleneck.exclusiveUs)}，占整体 ${(Math.min(bottleneck.share, 1) * 100).toFixed(1)}%）`,
         evidence:
           `算子 #${dominant.id}（${dominant.operator}${dominant.engine ? `，${dominant.engine} 引擎` : ''}）` +
           `${dominant.actualCardinality !== undefined ? `，实际输出 ${formatRows(dominant.actualCardinality)} 行` : ''}；` +
@@ -720,12 +741,19 @@ export function analyzePlanVizPlan(plan: PlanVizPlan, ctx: PlanVizAnalysisContex
   }
 
   if (!measured) {
+    // Type="Executed" 但服务端没回传 ExecutionTime：它**不是**"估计版/未执行"。
+    // 旧文案在这条路径上建议"用 analyze=true 再执行一次"——用户正处在 analyze=true 上，
+    // 照做只会在库上把同一条语句再跑一遍（本服务自己以"避免重复执行"为设计原则）
+    const executed = plan.type === 'Executed';
     findings.push({
       level: 'info',
-      title: '本计划是**估计版**，没有逐算子实测耗时',
+      title: executed
+        ? '本计划已执行，但服务端未回传逐算子实测耗时（ExecutionTime）'
+        : '本计划是**估计版**，没有逐算子实测耗时',
       evidence: `${plan.operators.length} 个算子全部没有 ExecutionTime（Type="${plan.type}"）`,
-      advice:
-        '要看真实耗时/实际行数/时间轴，用 analyze=true 让它真执行一次（执行受硬护栏：只允许 SELECT、单次执行最多 5 分钟、最多取 100 行、不返回数据行）',
+      advice: executed
+        ? '重试取计划可能恢复逐算子耗时；若持续不回传，请核对该 HANA 版本的 PlanViz 输出'
+        : `要看真实耗时/实际行数/时间轴，用 analyze=true 让它真执行一次（执行受硬护栏：只允许 SELECT、单次执行最多 ${ANALYZE_EXECUTION_TIMEOUT_MS / 60_000} 分钟、最多取 ${ANALYZE_MAX_ROWS} 行、不返回数据行）`,
     });
   }
 
@@ -751,14 +779,26 @@ export function analyzePlanVizPlan(plan: PlanVizPlan, ctx: PlanVizAnalysisContex
     });
   }
 
-  // ③ 真实并行度：单线程跑大计划是常见的"看起来慢"的原因
-  if (measured && plan.operators.length >= 10 && plan.threadCount <= 1) {
-    findings.push({
-      level: 'info',
-      title: `本次执行只用到 ${plan.threadCount || 1} 个线程（${plan.operators.length} 个算子）`,
-      evidence: 'ExecutionTime/Timestamps 里的线程号只有一个',
-      advice: '并行度受限可能来自数据量偏小、分区不足或该算子本身不可并行；数据量确实大时值得查分区与并行参数',
-    });
+  // ③ 真实并行度：单线程跑大计划是常见的"看起来慢"的原因。
+  // 只对"确采到且仅 1 个线程号"下结论：threadCount=0 意味着并行度**未知**（ExecutionTime 缺
+  // Timestamps、Timestamps 不是合法 JSON、或条目没有 thread 字段），不能拿 `|| 1` 兜底说
+  // "只用到 1 个线程"——那与同一响应里 panels.timeline.threads=0 自相矛盾
+  if (measured && plan.operators.length >= 10) {
+    if (plan.threadCount === 1) {
+      findings.push({
+        level: 'info',
+        title: `本次执行只用到 1 个线程（${plan.operators.length} 个算子）`,
+        evidence: 'ExecutionTime/Timestamps 里的线程号只有一个',
+        advice: '并行度受限可能来自数据量偏小、分区不足或该算子本身不可并行；数据量确实大时值得查分区与并行参数',
+      });
+    } else if (plan.threadCount === 0) {
+      findings.push({
+        level: 'info',
+        title: `计划未携带可解析的 Timestamps，无法判断并行度（${plan.operators.length} 个算子）`,
+        evidence: '算子的 ExecutionTime 里没有可解析的 Timestamps（缺失或格式不认识），线程号收集不到',
+        advice: '本次并行度无法从计划判断；可重试取计划，或改用服务端监控口径核实',
+      });
+    }
   }
 
   // ④ 大行数的中间物化
@@ -799,8 +839,8 @@ export function analyzePlanVizPlan(plan: PlanVizPlan, ctx: PlanVizAnalysisContex
     });
   }
 
-  const levelOrder: Record<Finding['level'], number> = { risk: 0, warn: 1, info: 2 };
-  findings.sort((a, b) => levelOrder[a.level] - levelOrder[b.level]);
+  // 严重度排序复用 EXPLAIN 通道的同一份 LEVEL_ORDER（sql-analyze.rules 导出）——两条通道不各持一份副本
+  findings.sort((a, b) => LEVEL_ORDER[a.level] - LEVEL_ORDER[b.level]);
 
   const statistics = planVizStatistics(plan, objects);
   const conclusion: PlanConclusion = {
@@ -858,14 +898,18 @@ function summarize(
   const head =
     measured && total !== undefined
       ? `${plan.type === 'Executed' ? '实测' : '估计'}计划：${plan.operators.length} 个算子，整体执行 ${formatMicros(total)}`
-      : `估计计划：${plan.operators.length} 个算子（未执行，无实测耗时）`;
+      : plan.type === 'Executed'
+        ? `已执行计划：${plan.operators.length} 个算子（服务端未回传逐算子耗时，无实测耗时数据）`
+        : `估计计划：${plan.operators.length} 个算子（未执行，无实测耗时）`;
   const engines = [...new Set(plan.operators.map((o) => o.engine).filter((e): e is string => e !== undefined))];
   const parts = [head];
   if (engines.length > 0) parts.push(`引擎 ${engines.join('/')}`);
-  if (plan.operators.some((o) => o.object)) parts.push(`${plan.operators.filter((o) => o.object).length} 处表访问`);
+  if (plan.operators.some(hasObject)) parts.push(`${plan.operators.filter(hasObject).length} 处表访问`);
   if (plan.subPlanCount > 0) parts.push(`${plan.subPlanCount} 个子计划`);
   if (measured && bottleneck !== undefined) {
-    const pct = Math.round(bottleneck.share * 100);
+    // 显示用占比统一封顶 100%（与对象侧同一口径）：并行下独占耗时互相重叠，可超过整体时间轴跨度，
+    // 不封顶会印出"占 1000%"这种数字；决策用的 share 本身保持原值（pickBottleneck 的比较不受影响）
+    const pct = Math.round(Math.min(bottleneck.share, 1) * 100);
     parts.push(
       bottleneck.kind === 'object'
         ? `瓶颈是对象 ${bottleneck.object.object}（占 ${pct}%）`
@@ -902,8 +946,9 @@ export function planVizStatistics(plan: PlanVizPlan, objects: PlanVizObjectAcces
     engineSwitch: engines.length > 1,
     tables,
     // 口径要对上 PlanViz 的 TypeName：表访问算子的特征是有 object（TABLE/TREX_SEARCH 之类都算），
-    // 用 EXPLAIN 的 /SCAN|SEARCH/ 去匹配会数到搜索包装算子头上、GROUP_BY（下划线）又匹配不到 /GROUP BY/
-    scans: plan.operators.filter((o) => o.object !== undefined).length,
+    // 用 EXPLAIN 的 /SCAN|SEARCH/ 去匹配会数到搜索包装算子头上、GROUP_BY（下划线）又匹配不到 /GROUP BY/。
+    // 「有 object」的判据是 hasObject（空 ObjectName 不算）——与表聚合、summary 同一份，三处数字必须一致
+    scans: plan.operators.filter(hasObject).length,
     joins: plan.operators.filter((o) => PLANVIZ_JOIN_RE.test(o.operator)).length,
     aggregations: plan.operators.filter((o) => PLANVIZ_AGGREGATION_RE.test(o.operator)).length,
     ...(rootOp?.estimatedCardinality !== undefined ? { estimatedRows: rootOp.estimatedCardinality } : {}),

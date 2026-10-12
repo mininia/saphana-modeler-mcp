@@ -16,8 +16,8 @@
  *
  * 退出码：
  *   0 = 声明的能力全部落在生效配置允许范围内，可以执行
- *   1 = 预检未通过（写包越界 / 工具不可见 / schema 不允许 / 未声明任何能力），不应继续执行
- *   2 = 用法或环境错误（参数缺失、配置读不到、dist 未构建）
+ *   1 = 预检未通过（写包越界 / 工具不可见 / schema 不允许），不应继续执行
+ *   2 = 用法或环境错误（参数缺失、未声明任何能力、配置读不到、dist 未构建）
  *
  * 配置来源（三处配置可能给出三个不同答案，故必须选对）：
  *   默认            = 与服务启动同源的解析链：进程环境变量，缺失时用仓库 .env 兜底
@@ -37,11 +37,11 @@ function usage() {
 
   <包名...>          本次执行将写入的仓库包（可多个），如 ZDEMO 或 ZDEMO.SUB
   --tool <工具名>    本次将调用的工具（可重复），如 --tool hana_view_create
-  --schema <名>      本次将读取的 schema（可重复），如 --schema SAPABW
+  --schema <名>      本次将读取的 schema（可重复），如 --schema SAPABAP1
   --from <文件>      以指定 mcp.json 的 env 为配置来源（本地模式用，如 .dsh/mcp.json）
   --server <名字>    --from 指向的文件含多个 server 时，指定用哪一个
 
-至少声明一项能力（包/工具/schema），否则无从判定、一律拦截。
+至少声明一项能力（包/工具/schema），否则无从判定，按用法错误处理。
 退出码: 0=通过 / 1=预检未通过（不要执行） / 2=用法或环境错误`);
 }
 
@@ -87,7 +87,14 @@ async function main() {
     usage();
     return EXIT_OK;
   }
-  // CLI 边界：一项能力都不声明属于用法错误（层里另有 no_needs 守卫，防程序化调用传空）
+  // --server 只在配合 --from 时生效；单独给出会被静默忽略，调用方可能误以为校验的是指定
+  // server 的配置（实则用了默认来源），故按用法错误处理，而不是拿错误来源的结论放行
+  if (opts.serverName && !opts.fromFile) {
+    console.error('[preflight] --server 仅在配合 --from 时有意义');
+    usage();
+    return EXIT_USAGE;
+  }
+  // CLI 边界：一项能力都不声明属于用法错误（预检层另有 no_request 守卫，防程序化调用传空）
   if (opts.targets.length === 0 && opts.tools.length === 0 && opts.schemas.length === 0) {
     console.error('[preflight] 未声明任何能力（写包 / 工具 / schema）——无从判定，拒绝在未知目标下放行');
     usage();

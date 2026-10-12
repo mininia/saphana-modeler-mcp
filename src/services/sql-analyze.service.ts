@@ -9,6 +9,7 @@ import { HanaBusinessError, normalizeHanaError } from '../core/errors.js';
 import { assertSchemaAllowed } from '../core/sql.js';
 import { logger } from '../core/logger.js';
 import { truncateWithNote } from '../core/text.js';
+import { ANALYZE_CONTROL_TIMEOUT_MS, ANALYZE_EXECUTION_TIMEOUT_MS, ANALYZE_MAX_ROWS } from '../core/limits.js';
 import { scanSqlSchemaRefs } from '../write-plan.js';
 import { assertSqlReadScopes } from './read-scope.service.js';
 import {
@@ -21,9 +22,6 @@ import {
   type PlanVizPlan,
 } from './planviz.rules.js';
 import {
-  ANALYZE_CONTROL_TIMEOUT_MS,
-  ANALYZE_EXECUTION_TIMEOUT_MS,
-  ANALYZE_MAX_ROWS,
   DEFAULT_OPERATOR_LIMIT,
   HARD_OPERATOR_CAP,
   MAX_OPERATOR_LIMIT,
@@ -72,6 +70,15 @@ const PLAN_CACHE = 'SYS.M_SQL_PLAN_CACHE';
  * 可变模块级状态会把别的请求的取值串进来）。
  */
 const ANALYZE_EXECUTION_GUARD = { timeoutMs: ANALYZE_EXECUTION_TIMEOUT_MS, maxRows: ANALYZE_MAX_ROWS } as const;
+
+/**
+ * 控制面/诊断查询（EXPLAIN 执行、计划缓存查询、计划表回读）的语句超时。
+ * 与 PlanViz 控制面调用（planVizCall）**同一口径**：这些查询一旦在服务端排队等待
+ * （对象锁、并发 DDL、计划表竞争——恰恰是本工具最常用的诊断场景），不设上限就会一直占着池位
+ * （池上限 4），几次这样的调用之后所有工具调用都会在 acquire 30s 上失败。
+ * `as const`：只读共享配置，不是跨请求传的状态（HTTP 模式多客户端并发下同 ANALYZE_EXECUTION_GUARD）。
+ */
+const CONTROL_QUERY_OPTS = { timeoutMs: ANALYZE_CONTROL_TIMEOUT_MS } as const;
 
 /** 错误信息里的语句开头摘要长度（进 notes/错误文本，避免整条 SQL 反复外溢） */
 const STATEMENT_HEAD_MAX_CHARS = 120;
@@ -178,15 +185,15 @@ export interface SqlAnalyzeResult {
    * - sql=按语句文本编译解释（对应官方 Visualize Plan 的估计计划）
    * - planCacheEntry=解释计划缓存条目（官方「SQL Plan Cache → Visualize Plan」同款）
    * - sqlExecuted=先执行、再解释缓存条目（仍是估计值 + 语句级运行时统计）
-   * - plv=**预留**：走 PlanViz 通道取计划（官方 Executed Plan 的落点，逐算子实测耗时/时间轴）。
-   *   实测（HANA 2.00.085）**已打通全流程，普通连接、无需 trace 权限**：
+   * - plv=analyze=true 的**默认取计划通道**（官方 Executed Plan 的落点，逐算子实测耗时/时间轴）；
+   *   通道不可用（服务端版本不支持等）时降级为 sqlExecuted，notes 写明原因。
+   *   实测（HANA 2.00.085）普通连接、无需 trace 权限即可走通全流程：
    *   `CALL SYS.PLANVIZ_ACTION(103|110,'')` 建 planviz 会话（老客户端走 `SET 'PLANVIZ'='ON'`）→
    *   `PLANVIZ_ACTION(201, sql)` 编译并返回 queryId（`<连接号>_<hash>`，即 Statement ID）→
    *   执行 = 把 `EXECUTE PLANVIZ STATEMENT ID '<上一步原样返回的 queryId>'` 当语句发出去 →
    *   `PLANVIZ_ACTION(402|401|301, queryId)` 取回 `XML_PLAN`，此时为 `Type="Executed"` 逐算子实测；
    *   不做第三步则同一步返回 `Type="Estimated"`。
    *   **id 必须原样传递**——自行拼 `ID_` 前缀/`_1` 后缀会让 HANA 直接打掉连接（89006）。
-   *   本期仍未接入，只保留取值位（服务端 trace 文件通道是另一回事，本环境 258/未开启）。
    */
   source: 'sql' | 'planCacheEntry' | 'sqlExecuted' | 'plv';
   /** 服务端生成的唯一语句名（回读凭它过滤） */
@@ -280,6 +287,10 @@ export async function analyzeSql(pool: HanaPool, opts: SqlAnalyzeOptions): Promi
           : opts.analyze === true
             ? await analyzeByExecution(pool, conn, { ...base, sql: String(opts.sql) })
             : await analyzeText(pool, conn, { ...base, sql: String(opts.sql) });
+      // PlanViz 路径（source='plv'）**不写** SYS.EXPLAIN_PLAN_TABLE：没有行要清理，
+      // 也就不该回报 planRowsCleaned——只读账号下 DELETE 必然失败，那些"计划行未清理、
+      // 需手工清理"的提示在这条路径上全是假告警（按提示去查是 0 行）
+      if (result.source === 'plv') return result;
       const cleaned = await cleanup();
       return withCleanupNote(result, planNames, cleaned);
     } catch (e) {
@@ -389,6 +400,7 @@ async function analyzeCacheEntry(
     conn,
     `SELECT ${CACHE_COLUMNS} FROM ${PLAN_CACHE} WHERE PLAN_ID = ? ORDER BY EXECUTION_COUNT DESC`,
     [args.planId],
+    CONTROL_QUERY_OPTS,
   );
   if (rows.length === 0) {
     throw new HanaBusinessError(
@@ -455,8 +467,13 @@ async function analyzeByExecution(
   if (planViz.ok) return planViz.result;
 
   // 第③步已经真执行过就不再执行第二遍：一次调用跑两遍语句意味着墙钟翻倍、库上负载翻倍，
-  // 而 PlanViz 失败正是在"语句已经跑完"之后才暴露的（取计划/解析那几步）
-  const execution = planViz.executed ?? (await execStreamingOn(conn, args.sql, ANALYZE_EXECUTION_GUARD));
+  // 而 PlanViz 失败正是在"语句已经跑完"之后才暴露的（取计划/解析那几步）。
+  // "已执行完成"（executed 带统计）与"已开始执行"（超时/中途驱动错误，统计没拿到）都不再执行第二遍：
+  // 只认 executed 的话，③步被中止的那次会让降级路径把同一条语句再跑一遍（又一次最多 5 分钟）
+  const executedBeforeFailure = planViz.executed !== undefined || planViz.executionStarted === true;
+  const execution =
+    planViz.executed ??
+    (executedBeforeFailure ? undefined : await execStreamingOn(conn, args.sql, ANALYZE_EXECUTION_GUARD));
 
   // 按"完全相同的文本"关联计划缓存条目：文本一致才能拿到同一个（重编译）计划。
   // 用 LIKE + ESCAPE 而非等值（STATEMENT_STRING 是 LOB，等值比较会报 NLocator 错误，实测）。
@@ -468,7 +485,10 @@ async function analyzeByExecution(
     planViz.executed !== undefined
       ? `PlanViz 通道在**语句已执行之后**失败（${planViz.reason}）：不会重复执行该语句，以下改用` +
           '「按语句文本关联计划缓存条目」的降级路径——计划仍是 EXPLAIN 的**估计值**、只有**语句级**聚合统计'
-      : `PlanViz 通道不可用（${planViz.reason}），已改用「执行后按语句文本关联计划缓存条目」的降级路径：` +
+      : planViz.executionStarted === true
+        ? `PlanViz 通道在**语句执行阶段**失败（${planViz.reason}）：该语句可能已经执行，不会重复执行第二遍，` +
+          '以下改用「按语句文本关联计划缓存条目 / 重新编译」的降级路径——计划是 EXPLAIN 的**估计值**，本次无执行统计'
+        : `PlanViz 通道不可用（${planViz.reason}），已改用「执行后按语句文本关联计划缓存条目」的降级路径：` +
           '计划仍是 EXPLAIN 的**估计值**、只有**语句级**聚合统计，没有逐算子实测耗时与时间轴',
   );
   // 降级原因必须**留痕**：它决定了这次结论是实测还是估计值——只在 notes 里说的话，
@@ -476,7 +496,7 @@ async function analyzeByExecution(
   logger.warn(
     {
       statementName: args.statementName,
-      executedBeforeFailure: planViz.executed !== undefined,
+      executedBeforeFailure,
       reason: planViz.reason,
     },
     'PlanViz 通道未走通，analyze 模式降级为「按语句文本关联计划缓存条目」（结论为估计值）',
@@ -486,6 +506,7 @@ async function analyzeByExecution(
       conn,
       `SELECT ${CACHE_COLUMNS} FROM ${PLAN_CACHE} WHERE USER_NAME = CURRENT_USER AND STATEMENT_STRING LIKE ? ${LIKE_ESCAPE_SQL} ORDER BY EXECUTION_COUNT DESC`,
       [escapeLikePattern(args.sql)],
+      CONTROL_QUERY_OPTS,
     );
     entry = rows[0];
   } catch (e) {
@@ -507,6 +528,12 @@ async function analyzeByExecution(
   let runtime: RuntimeStats | undefined;
   if (entry && typeof entry.PLAN_ID === 'number') {
     try {
+      // 与 analyzeCacheEntry 同一口径的第二道闸门：解释结果按**条目编译时的 schema** 解析并在
+      // SCHEMA_NAME/TABLE_NAME 里回显对象名；只按调用方的 schema 过读取范围拦不住这种越界
+      // （有 OPTIMIZER ADMIN 时还能解释别人的条目，而条目文本与 args.sql 同源、第一道分类器早已通过）。
+      // 判定失败按"这条取计划路径不可用"处理（下面的 catch 会退回解释文本，输出不再含条目对象名），
+      // 而不是让整次调用失败：本次要分析的 args.sql 本身已过闸门，条目只是取计划的实现细节。
+      await assertEntryAnalyzable(entry.STATEMENT_STRING ?? '', (entry.SCHEMA_NAME ?? '').trim(), entry.PLAN_ID);
       await runExplain(pool, conn, args.statementName, { planId: entry.PLAN_ID });
       runtime = toRuntime(entry);
       notes.unshift(
@@ -517,7 +544,9 @@ async function analyzeByExecution(
       // 解释缓存条目要 OPTIMIZER ADMIN：语句已经执行成功，不该因这一步整体失败 → 退回解释文本。
       // ⚠️ 必须换一个**新的语句名**：同名是追加而非替换，复用名字会把两条计划的算子混在一起
       // （根算子变 2 个、扫描数翻倍，结论静默出错）——正是唯一命名要防的事。
-      notes.push(`按计划缓存条目解释失败（${(e as Error).message}），已退回编译期计划；运行时统计不可用`);
+      notes.push(
+        `按计划缓存条目解释失败（${(e as Error).message}）：已退回编译期计划（EXPLAIN 估计值），运行时统计仍取自该缓存条目`,
+      );
       logger.warn(
         { err: e, planId: entry.PLAN_ID, statementName: args.statementName },
         'analyze 模式：按计划缓存条目解释失败（常见原因：缺 OPTIMIZER ADMIN），退回解释语句文本',
@@ -525,6 +554,9 @@ async function analyzeByExecution(
       planName = fallbackStatementName(args.statementName);
       await runExplain(pool, conn, planName, { sql: args.sql });
       notes.push('退回路径使用独立的计划标识，不与失败那次混行');
+      // 统计与"计划取自哪里"无关：entry 已在手上（成功分支用的就是它），解释条目失败不该把
+      // 执行次数/平均耗时这些同样想要的信息一起丢掉
+      runtime = toRuntime(entry);
     }
   } else if (!entry) {
     notes.push(
@@ -549,7 +581,7 @@ async function analyzeByExecution(
 const PLANVIZ_CALL = '{CALL PLANVIZ_ACTION(?,?)}';
 
 /**
- * 走 PlanViz 通道取**逐算子实测**计划。四步（每步都是实测出来的，见 README 的通道记录）：
+ * 走 PlanViz 通道取**逐算子实测**计划。四步（每步都是实测出来的）：
  *   ① `PLANVIZ_ACTION(103,'')` 建 planviz 会话
  *   ② `PLANVIZ_ACTION(201, sql)` 编译，拿 Statement ID（queryId）
  *   ③ `EXECUTE PLANVIZ STATEMENT ID '<queryId>'` —— **这一步就是真执行**，返回结果集本身
@@ -564,23 +596,31 @@ const PLANVIZ_CALL = '{CALL PLANVIZ_ACTION(?,?)}';
  *
  * `executed` 用于避免**重复执行**：PlanViz 的第③步已经真跑过语句了，若之后取计划才失败，
  * 降级路径不能再执行第二遍（墙钟翻倍、库上负载翻倍），而要把已测到的执行统计带出去。
+ * `executionStarted` 是"已开始执行"的独立状态位：③步超时/中途驱动错误时 `executed` 拿不到，
+ * 但语句可能已经跑过——同样不许降级路径再执行一遍（只体现在 notes，不谎报统计）。
  */
-type PlanVizAttempt = { ok: true; result: SqlAnalyzeResult } | { ok: false; reason: string; executed?: ExecutionStats };
+type PlanVizAttempt =
+  | { ok: true; result: SqlAnalyzeResult }
+  | { ok: false; reason: string; executed?: ExecutionStats; executionStarted?: boolean };
 
 async function tryPlanVizExecution(conn: HanaConnection, args: BaseArgs & { sql: string }): Promise<PlanVizAttempt> {
   let sessionOn = false;
   let executed: ExecutionStats | undefined;
+  let executionStarted = false;
   try {
     await planVizCall(conn, PLANVIZ_ACTION.ON, '');
     sessionOn = true;
     const queryId = await planVizPrepare(conn, args.sql);
     // ③ 执行走同一套护栏（执行超时 5 min / 总共只取 100 行 / 不返回数据行）——实测该 engine 语句
-    //    支持 setTimeout 与流式 execQuery，且**提前 close 之后计划照样能取到**（Type 仍是 Executed）
+    //    支持 setTimeout 与流式 execQuery，且**提前 close 之后计划照样能取到**（Type 仍是 Executed）。
+    //    "已开始执行"必须在进入执行原语**之前**置位：超时/中途出错时 executed 是 undefined，
+    //    但语句已经跑过，降级路径据此不再执行第二遍
+    executionStarted = true;
     executed = await execStreamingOn(conn, `EXECUTE PLANVIZ STATEMENT ID '${queryId}'`, ANALYZE_EXECUTION_GUARD);
     const xml = await planVizFetchPlan(conn, queryId);
     const plan = parsePlanVizXml(xml);
     const panels = buildPlanVizPanels(plan, { tree: args.raw });
-    const conclusion = analyzePlanVizPlan(plan, { statement: args.sql, measured: plan.measured });
+    const conclusion = analyzePlanVizPlan(plan, { statement: args.sql });
     const notes = [
       `计划来自 PlanViz 通道（官方 Executed Plan 同款）：Type="${plan.type}"，` +
         `${plan.operators.length} 个算子（主计划 ${plan.primaryOperators.length}）` +
@@ -621,8 +661,13 @@ async function tryPlanVizExecution(conn: HanaConnection, args: BaseArgs & { sql:
     };
   } catch (e) {
     // 降级：不是"错误"，只是这条路走不通（旧版本不支持 / 权限 / 会话忙）——让调用方继续走 EXPLAIN。
-    // 若第③步已经执行成功，把执行统计带出去，降级路径**不会再执行第二遍**
-    return { ok: false, reason: (e as Error).message, ...(executed !== undefined ? { executed } : {}) };
+    // 若第③步已经开始执行，把该状态（及成功时的执行统计）带出去，降级路径**不会再执行第二遍**
+    return {
+      ok: false,
+      reason: (e as Error).message,
+      ...(executed !== undefined ? { executed } : {}),
+      ...(executionStarted ? { executionStarted: true } : {}),
+    };
   } finally {
     if (sessionOn) {
       try {
@@ -867,7 +912,9 @@ async function runExplain(
   target: ExplainTarget,
 ): Promise<void> {
   try {
-    await pool.execOn(conn, buildExplainStatement(statementName, target));
+    // EXPLAIN 编译可能被对象锁/并发 DDL 阻塞：与其它控制面查询一样设语句超时，
+    // 否则这条连接会一直占着池位（池上限 4）
+    await pool.execOn(conn, buildExplainStatement(statementName, target), undefined, CONTROL_QUERY_OPTS);
   } catch (e) {
     throw await explainFailure(pool, conn, e, target);
   }
@@ -917,16 +964,18 @@ async function readPlanBack(
   let connectionFiltered = connectionId !== null;
   let rows =
     connectionId === null
-      ? await pool.execOn<PlanRow[]>(conn, `${base} ORDER BY OPERATOR_ID`, [statementName])
-      : await pool.execOn<PlanRow[]>(conn, `${base} AND CONNECTION_ID = ? ORDER BY OPERATOR_ID`, [
-          statementName,
-          connectionId,
-        ]);
+      ? await pool.execOn<PlanRow[]>(conn, `${base} ORDER BY OPERATOR_ID`, [statementName], CONTROL_QUERY_OPTS)
+      : await pool.execOn<PlanRow[]>(
+          conn,
+          `${base} AND CONNECTION_ID = ? ORDER BY OPERATOR_ID`,
+          [statementName, connectionId],
+          CONTROL_QUERY_OPTS,
+        );
 
   if (rows.length === 0 && connectionFiltered) {
     // CONNECTION_ID 的语义在不同版本/部署下若有差异，不要让工具整体不可用：去掉该过滤再试，
     // 名字本身已经唯一，结果仍然正确——但要如实告诉调用方"这轮没按连接过滤"。
-    rows = await pool.execOn<PlanRow[]>(conn, `${base} ORDER BY OPERATOR_ID`, [statementName]);
+    rows = await pool.execOn<PlanRow[]>(conn, `${base} ORDER BY OPERATOR_ID`, [statementName], CONTROL_QUERY_OPTS);
     connectionFiltered = false;
   }
   if (rows.length === 0) {

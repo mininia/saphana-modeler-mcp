@@ -1,9 +1,16 @@
 import type { HanaPool } from '../core/hana-client.js';
 import { HanaBusinessError } from '../core/errors.js';
-import { isPermissionError, shouldDiagnoseAccessError, PREVIEW_PERMISSION_CODES } from '../core/hana-errors.js';
+import {
+  hanaErrorMessage,
+  isPermissionError,
+  shouldDiagnoseAccessError,
+  PREVIEW_PERMISSION_CODES,
+} from '../core/hana-errors.js';
 import { withKeyedLock } from '../core/keyed-mutex.js';
 import { logger } from '../core/logger.js';
+import { clampLimit } from '../core/num.js';
 import { assertSafeRuntimeName, assertSchemaAllowed, quoteIdentifier, quoteLiteral, qualifyName } from '../core/sql.js';
+import { truncateWithNote } from '../core/text.js';
 import { viewDefinitionCache } from '../model/view-cache.js';
 import type { ViewKind } from '../model/view-types.js';
 import { deriveNodeSql } from './preview.derive.js';
@@ -32,6 +39,7 @@ import {
  * 中间视图命名与生命周期（确定性命名 + 复用 + 有条件释放）：
  * - 视图名固定为 `<包路径/对象名>/dp/<节点名>`（见 intermediateViewName），人工可在 _SYS_BIC 中直接定位；
  * - 创建前先查 SYS.VIEWS：已存在则**不重复创建**，直接复用（并发调用、上次残留、他人建的都走这条）；
+ *   存在性查询失败（不可判定）时仍尝试创建，CREATE 撞「对象已存在」按复用继续（评审 #1111）；
  * - 释放时先判断占用：本进程内还有调用在用、或视图非本服务创建 → 保留；无人占用才 DROP；
  *   DROP 失败（本进程外的会话正在读）同样保留，交由下次调用复用。
  *   注意：复用不校验视图新鲜度——CV 在视图创建后被重新激活时，同名视图仍是旧定义，
@@ -40,9 +48,16 @@ import {
  * 行数规则：无筛选默认 10 行，有筛选默认 100 行；显式 limit 上限 1000。
  * 截断判定：多取 1 行探测是否还有更多（LIMIT n+1 → truncated）。
  */
+/**
+ * 筛选操作符合法值（单源）：PreviewFilter 的 op 类型、服务侧 SQL 校验与工具 schema 都从这里取，
+ * 不要在别处手抄第二份。
+ */
+export const PREVIEW_FILTER_OPS = ['=', '!=', '<', '<=', '>', '>=', 'LIKE'] as const;
+export type PreviewFilterOp = (typeof PREVIEW_FILTER_OPS)[number];
+
 export interface PreviewFilter {
   column: string;
-  op: '=' | '!=' | '<' | '<=' | '>' | '>=' | 'LIKE';
+  op: PreviewFilterOp;
   value: string | number;
 }
 
@@ -118,7 +133,7 @@ export interface PreviewResult {
   node?: string;
   nodeType?: string;
   /** 预览通道：direct（整体直查）/ intermediate（HANA 中间视图）/ derived（XML 推导） */
-  via?: 'direct' | 'intermediate' | 'derived';
+  via?: PreviewChannel;
   /** 结果列名 */
   columns: string[];
   rows: Record<string, unknown>[];
@@ -142,7 +157,7 @@ export interface IntermediateViewInfo {
   /** dropped=false 时说明保留原因 */
   keptBecause?: string;
   /**
-   * 新鲜度回报（D1，**仅复用时有**）：复用到的中间视图建于何时、源对象最近激活于何时。
+   * 新鲜度回报（**仅复用时有**）：复用到的中间视图建于何时、源对象最近激活于何时。
    * 服务端**不据此改变行为**（复用策略是用户明确口径：存在即复用、不校验新鲜度）——
    * 只把差异摆出来，`stale=true` 时由调用方决定删视图 / 改 forceDerive / 接受旧数据。
    * 新建路径没有该字段：刚由当前定义生成，新鲜度是构造性成立的。
@@ -151,7 +166,8 @@ export interface IntermediateViewInfo {
 }
 
 const MAX_LIMIT = 1000;
-const OPS = new Set(['=', '!=', '<', '<=', '>', '>=', 'LIKE']);
+/** 服务侧操作符白名单（纵深防御：绕过工具 schema 的直接服务调用同样要校验）；取自 PREVIEW_FILTER_OPS 单源 */
+const OPS: ReadonlySet<string> = new Set<string>(PREVIEW_FILTER_OPS);
 /** 输入参数名允许字符集（WITH PARAMETERS 内是字面量，仍做纵深防御） */
 const PARAM_NAME_RE = /^[A-Za-z0-9_.-]+$/;
 /** 中间视图：VERSION=0（Repo1 经典仓库）/1（HDI） */
@@ -160,6 +176,13 @@ const INTERMEDIATE_VERSION = 0;
 const INTERMEDIATE_SCHEMA = '_SYS_BIC';
 /** HANA 标识符长度上限（SQL Reference）；超限提前给可读错误，而非让 CREATE 抛晦涩语法错 */
 const MAX_IDENTIFIER_LEN = 127;
+/**
+ * 中间视图控制面调用（CREATE / DROP）的语句超时：这两个 CALL 一挂住就占着池位（池上限 4），
+ * 不设超时会让几个请求拖垮整个工具面（评审 #1112）。控制面调用不该跑几分钟，给固定小上限。
+ */
+const INTERMEDIATE_CONTROL_TIMEOUT_MS = 30_000;
+/** CREATE 撞「对象已存在」的错误消息特征（服务端无稳定错误码，只有消息文本；按特征识别） */
+const ALREADY_EXISTS_RE = /already exists|已存在/i;
 
 /**
  * 节点预览中间视图名：`<包路径/对象名>/dp/<节点名>`（确定性命名，与 _SYS_BIC 里 CV 运行时对象同名风格）。
@@ -183,17 +206,12 @@ function intermediateLockKey(viewName: string): string {
   return `dp:${viewName}`;
 }
 
-/** 数值收敛到 [lo, hi]：limit / sampleRows 的入参归一（越界收敛而非报错，与既有行为一致） */
-function clamp(v: number, lo: number, hi: number): number {
-  return Math.min(Math.max(v, lo), hi);
-}
-
 /**
- * LIMIT n+1 → truncated 的**统一截断判定与切片**。
- * 四处预览/勘察（direct / intermediate / derived / 基表勘察）逐字节相同，合并为单点，
- * 避免某一路径漏取一行或多切一行造成 truncated 与 rows 不自洽。
+ * LIMIT n+1 → truncated 的**统一截断判定与切片**（service 层共用的单点，勿内联复制）。
+ * 各调用路径（预览三条通道、基表勘察、写路径的激活后行探测）多取 1 行后统一走这里：
+ * 判定与切片分开写时，漏取一行 / 多切一行都会让 truncated 与 rows 不自洽。
  */
-function slicePage<T>(rows: T[], limit: number): { rows: T[]; truncated: boolean } {
+export function slicePage<T>(rows: T[], limit: number): { rows: T[]; truncated: boolean } {
   const truncated = rows.length > limit;
   return { rows: truncated ? rows.slice(0, limit) : rows, truncated };
 }
@@ -212,11 +230,14 @@ export async function previewData(
   // 包名/对象名字符集校验（纵深防御；值一律参数绑定）
   assertSafeRuntimeName(packageId, '包名');
   assertSafeRuntimeName(objectName, '对象名');
-  const limit = clamp(opts.limit ?? (opts.filter && opts.filter.length > 0 ? 100 : 10), 1, MAX_LIMIT);
+  const limit = clampLimit(opts.limit, opts.filter && opts.filter.length > 0 ? 100 : 10, 1, MAX_LIMIT);
+  // 空 parameters 对象（{}）折叠为「未传」（评审 #1113）：{} 为真值，会让直接预览拼出
+  // `WITH PARAMETERS ()`（空参数列表是 HANA 语法错），也会让节点预览的无参校验误报「不支持输入参数」
+  const parameters = opts.parameters && Object.keys(opts.parameters).length > 0 ? opts.parameters : undefined;
 
   // 节点预览：默认仅走 HANA 中间视图；缺权限直接返回「不支持」（不自动回退其他尝试）
   if (opts.node) {
-    if (opts.parameters) {
+    if (parameters) {
       throw new HanaBusinessError(
         '节点预览暂不支持输入参数（parameters）；可去掉 node 对视图整体预览（VIRTUAL 视图变量在直接预览时传入）',
       );
@@ -259,11 +280,12 @@ export async function previewData(
 
   // 直接路径：已激活视图运行时对象（包层级用 . 分隔）
   let base = `SELECT * FROM ${qualifyName('_SYS_BIC', `${packageId}/${objectName}`)}`;
-  if (opts.parameters) base += ` WITH PARAMETERS (${buildParameters(opts.parameters)})`;
+  if (parameters) base += ` WITH PARAMETERS (${buildParameters(parameters)})`;
   const where = buildWhere(opts.filter);
   const sql = `${base}${where.clause} LIMIT ?`;
   const rows = await withPermissionDiagnosis(pool, packageId, objectName, opts.kind, 'direct', () =>
-    pool.query<Record<string, unknown>>(sql, [...where.params, limit + 1]),
+    // 语句超时与写路径同源（pool.statementTimeoutMs）：无上限的慢预览会占着池位拖垮整个工具面（评审 #1112）
+    pool.query<Record<string, unknown>>(sql, [...where.params, limit + 1], { timeoutMs: pool.statementTimeoutMs }),
   );
   const { rows: sliced, truncated } = slicePage(rows, limit);
   return {
@@ -346,21 +368,35 @@ async function previewNodeViaIntermediate(
 
   // 取用：已存在（并发刚建的 / 上次残留 / 他人建的）则跳过创建，直接复用
   let reused = false;
-  /** D1：仅复用路径回报新鲜度；新鲜度查询在锁内做——此刻视图必然还在（锁外读会撞上并发 DROP 的窗口） */
+  /** 仅复用路径回报新鲜度；新鲜度查询在锁内做——此刻视图必然还在（锁外读会撞上并发 DROP 的窗口） */
   let freshness: IntermediateFreshness | undefined;
   await withKeyedLock(intermediateLockKey(viewName), async () => {
-    if (await runtimeViewExists(pool, viewName)) {
+    // 存在性三态（评审 #1111/#1121）：'unknown'（SYS.VIEWS 读失败/不可见）不得冒充「不存在」——
+    // 它照走 CREATE，但容忍「对象已存在」并回退到复用；只有 'missing' 是确定的「不存在」。
+    const existence = await runtimeViewExists(pool, viewName);
+    if (existence === 'exists') {
       reused = true;
       freshness = await readIntermediateFreshness(pool, viewName, packageId, objectName);
     } else {
-      await pool.execute(`CALL SYS.CREATE_INTERMEDIATE_CALCULATION_VIEW_DEV(?, ?, ?, ?, ?)`, [
-        INTERMEDIATE_SCHEMA,
-        viewRef,
-        node,
-        viewName,
-        INTERMEDIATE_VERSION,
-      ]);
-      intermediateOwned.add(viewName); // 本服务创建的才可清理（预存在的他人对象不在此列）
+      try {
+        await pool.execute(
+          `CALL SYS.CREATE_INTERMEDIATE_CALCULATION_VIEW_DEV(?, ?, ?, ?, ?)`,
+          [INTERMEDIATE_SCHEMA, viewRef, node, viewName, INTERMEDIATE_VERSION],
+          { timeoutMs: INTERMEDIATE_CONTROL_TIMEOUT_MS },
+        );
+        intermediateOwned.add(viewName); // 本服务创建的才可清理（预存在的他人对象不在此列）
+      } catch (e) {
+        // 存在性不可判定（读失败）或跨进程竞态（两进程同判「不存在」，一方先 CREATE）下，
+        // 对象其实在场 ⇒ CREATE 撞「对象已存在」：按复用继续（重读新鲜度），不让只读预览打成假失败
+        // （评审 #1111）。其余错误照常上抛。
+        if (ALREADY_EXISTS_RE.test(hanaErrorMessage(e))) {
+          logger.warn({ viewName, err: e }, '中间视图已存在（存在性不可判定或并发创建）：跳过创建，按复用继续');
+          reused = true;
+          freshness = await readIntermediateFreshness(pool, viewName, packageId, objectName);
+        } else {
+          throw e;
+        }
+      }
     }
     intermediateInUse.set(viewName, (intermediateInUse.get(viewName) ?? 0) + 1);
   });
@@ -371,7 +407,10 @@ async function previewNodeViaIntermediate(
   try {
     const where = buildWhere(opts.filter);
     sql = `SELECT * FROM ${qualifyName(INTERMEDIATE_SCHEMA, viewName)}${where.clause} LIMIT ?`;
-    rows = await pool.query<Record<string, unknown>>(sql, [...where.params, limit + 1]);
+    // 语句超时（评审 #1112）：重 join 视图上的 SELECT 可能长时间不返回（LIMIT 不保证提前返回）
+    rows = await pool.query<Record<string, unknown>>(sql, [...where.params, limit + 1], {
+      timeoutMs: pool.statementTimeoutMs,
+    });
   } finally {
     // 无论成败都解除占用（失败路径下由释放策略决定是否清理）。
     // 释放做成 **best-effort**：锁等待超时（keyed lock 的排队上限）或锁内异常都不得让整个预览请求失败
@@ -446,11 +485,11 @@ async function releaseIntermediateView(
       return { dropped: false, reason: '视图非本服务创建（他人或历史残留），不主动删除' };
     }
     try {
-      await pool.execute(`CALL SYS.DROP_INTERMEDIATE_CALCULATION_VIEW_DEV(?, ?, ?)`, [
-        INTERMEDIATE_SCHEMA,
-        viewName,
-        INTERMEDIATE_VERSION,
-      ]);
+      await pool.execute(
+        `CALL SYS.DROP_INTERMEDIATE_CALCULATION_VIEW_DEV(?, ?, ?)`,
+        [INTERMEDIATE_SCHEMA, viewName, INTERMEDIATE_VERSION],
+        { timeoutMs: INTERMEDIATE_CONTROL_TIMEOUT_MS },
+      );
       intermediateOwned.delete(viewName);
       return { dropped: true };
     } catch (e) {
@@ -476,7 +515,9 @@ async function previewNodeViaDerivation(
   const derived = deriveNodeSql(result.definition, opts.node!);
   const where = buildWhere(opts.filter);
   const sql = `SELECT * FROM (${derived.sql}) AS "PREVIEW"${where.clause} LIMIT ?`;
-  const rows = await pool.query<Record<string, unknown>>(sql, [...where.params, limit + 1]);
+  const rows = await pool.query<Record<string, unknown>>(sql, [...where.params, limit + 1], {
+    timeoutMs: pool.statementTimeoutMs,
+  });
   const { rows: sliced, truncated } = slicePage(rows, limit);
   return {
     object: { packageId, objectName, objectSuffix: opts.kind },
@@ -492,7 +533,7 @@ async function previewNodeViaDerivation(
 }
 
 /**
- * 预览失败错误的**统一判定**（单点：消除原先 isPermissionError / shouldAutoDiagnose 两份重复正则）：
+ * 预览失败错误的**统一判定**（单点：权限判定与诊断触发共用同一口径，避免两处各写一份判定而漂移）：
  * - permission：权限类（码集 PREVIEW_PERMISSION_CODES=10/2950 + 权限消息正则，见 core/hana-errors）
  *   → 归一为「无权限」提示（含本服务自有的「无权限：」前缀）；
  * - diagnose：是否自动触发权限诊断 = 权限类 + 对象不可见类（258/259）。后两者在 _SYS_BIC 预览语境下
@@ -548,11 +589,11 @@ const PROFILE_VALUE_CHARS = 80;
 const INSPECT_DEFAULT_ROWS = 200;
 const INSPECT_MAX_ROWS = 2000;
 
-/** 值 → 展示字符串（null 单独处理；超长截断并标注） */
+/** 值 → 展示字符串（null/undefined 映为 'NULL'；超长值按 core/text 的统一截断文案标注） */
 function displayValue(v: unknown): string {
   if (v === null || v === undefined) return 'NULL';
   const s = typeof v === 'string' ? v : typeof v === 'object' ? JSON.stringify(v) : String(v);
-  return s.length > PROFILE_VALUE_CHARS ? `${s.slice(0, PROFILE_VALUE_CHARS)}…(${s.length} 字符)` : s;
+  return truncateWithNote(s, PROFILE_VALUE_CHARS);
 }
 
 /** 单列统计（纯函数；输入为采样行） */
@@ -596,7 +637,7 @@ export async function inspectTable(pool: HanaPool, opts: TableInspectOptions): P
   // 此处不再包一层改写文案（改写既丢错误码，又让白名单描述与 core 漂移）。
   assertSchemaAllowed(opts.schema);
   assertSafeRuntimeName(opts.table, '表/视图');
-  const sampleRows = clamp(opts.sampleRows ?? INSPECT_DEFAULT_ROWS, 1, INSPECT_MAX_ROWS);
+  const sampleRows = clampLimit(opts.sampleRows, INSPECT_DEFAULT_ROWS, 1, INSPECT_MAX_ROWS);
   const { clause, params } = buildWhere(opts.filter);
 
   // 列清单：显式给出则校验后用；缺省按元数据取（有上限，避免宽表把上下文塞满）。
@@ -607,7 +648,7 @@ export async function inspectTable(pool: HanaPool, opts: TableInspectOptions): P
   for (const c of columnNames ?? []) assertSafeRuntimeName(c, '列名');
   try {
     const { getTableColumns } = await import('./metadata.service.js');
-    const cols = await getTableColumns(pool, opts.schema, opts.table, { limit: 50 });
+    const { columns: cols } = await getTableColumns(pool, opts.schema, opts.table, { limit: 50 });
     for (const c of cols) metaByName.set(c.columnName, { dataType: c.dataTypeName, length: c.length ?? undefined });
     if (!columnNames || columnNames.length === 0) columnNames = cols.map((c) => c.columnName);
   } catch (e) {
@@ -620,7 +661,9 @@ export async function inspectTable(pool: HanaPool, opts: TableInspectOptions): P
   const target = `${quoteIdentifier(opts.schema)}.${quoteIdentifier(opts.table)}`;
   const selectList = columnNames.map((c) => quoteIdentifier(c)).join(', ');
   const sql = `SELECT ${selectList} FROM ${target}${clause} LIMIT ?`;
-  const rows = await pool.query<Record<string, unknown>>(sql, [...params, sampleRows + 1]);
+  const rows = await pool.query<Record<string, unknown>>(sql, [...params, sampleRows + 1], {
+    timeoutMs: pool.statementTimeoutMs,
+  });
   const { rows: sliced, truncated } = slicePage(rows, sampleRows);
 
   const profiles = columnNames.map((name) =>

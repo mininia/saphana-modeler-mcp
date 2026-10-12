@@ -1,8 +1,9 @@
 /**
  * 建模写工具（分组 **write**）：视图的新建/更新/激活/删除/校验与校验动作查询。
  *
- * 各工具经 capabilityRegistrar 按能力清单（capabilities/defs/modeling.ts）注册：写工具
- * gate=preflight（handler 之前先过预检闸门），只读的 hana_view_check_actions gate=none。
+ * 各工具经 capabilityRegistrar 按能力清单（capabilities/defs/modeling.ts）注册；**所有**能力共用
+ * 同一个调用期闸门（authorizeCall）——写能力的资源维度（写包边界、读 schema 白名单）由清单的
+ * effects.plan 声明，闸门按它判定；只读能力同样过闸门，只是可能没有资源维度。
  * 可写包范围由 HANA_WRITE_PACKAGES 决定。
  */
 
@@ -25,10 +26,10 @@ import { CHANGESET_MAX_ACTIONS } from '../services/changeset.plan.js';
 import { getCheckActions, validateCalculationView } from '../services/validation.service.js';
 import { MIGRATION_DECLARATIONS } from '../services/migrate.rules.js';
 import { findCapability } from '../capabilities/manifest.js';
+import { aliasArgsToParentCall } from '../capabilities/planners.js';
 import { capabilityRegistrar, type CapabilityHandler, type ToolContext } from './index.js';
 import { toToolResult } from './common.js';
-import { surfaceKeyOf } from './surface.js';
-import { currentIdentity } from '../core/request-context.js';
+import { currentSurfaceKey } from './surface.js';
 import { CAP } from '../capabilities/manifest.js';
 import { DELETE_MIGRATION_DECLARATIONS } from '../capabilities/defs/modeling.js';
 import type { Envelope } from '../types/hana.js';
@@ -43,9 +44,11 @@ function normalizeSetScriptOp(op: { op: 'set_script'; script: string; scriptColu
  * schema 刻意是宽松的 `z.string()`——任何取值都能到达 handler，由这里给**中文硬错误**并列出合法值；
  * 用 z.enum 时非法值会落到 SDK 协议层（英文报错、合法值也不可见）。同款先例：health 的 checks/sections。
  * 合法值常量来自 migrate.rules（单一事实源）；delete 通道的子集由 defs/modeling 从全集派生。
+ * changeset 通道的逐项校验复用本函数（合法值判定与文案只有这一份实现）。
+ * 导出供单测直接覆盖（入口级断言另见门面路由用例）。
  * @returns error=非法值的中文硬错误文案；value=收窄后的声明（未给 migration 时为 undefined）。
  */
-function normalizeMigrationStrategy<T extends string>(
+export function normalizeMigrationStrategy<T extends string>(
   migration: { strategy: string; note?: string } | undefined,
   allowed: readonly T[],
   channel: string,
@@ -77,9 +80,11 @@ type ScriptColumnSpec = {
  * update=字段级策略∪显式承担（MIGRATION_DECLARATIONS）；delete=仅显式承担（DELETE_MIGRATION_DECLARATIONS）；
  * create 无破坏面（新建对象没有下游可断），不接受该声明——给了就是调用方误解，点名拒绝。
  * 非法值中文硬错误（SSD §1.6：schema 刻意宽松，合法值在调用时列出）；收窄点在这里，服务层只记声明。
+ * 判定与文案复用 normalizeMigrationStrategy——只多做两件事：create 拒绝分支与「第几项 / action」前缀。
+ * 导出供单测直接覆盖（入口级断言另见门面路由用例）。
  * @returns 命中时返回中文硬错误文案（点名第几项与合法值）；全部合法返回 undefined。
  */
-function changesetMigrationDeclarationError(
+export function changesetMigrationDeclarationError(
   actions: ReadonlyArray<{ action: 'update' | 'create' | 'delete'; migration?: { strategy: string } }>,
 ): string | undefined {
   for (let i = 0; i < actions.length; i++) {
@@ -91,19 +96,16 @@ function changesetMigrationDeclarationError(
         '新建对象没有下游破坏面，该声明只对 update / delete 动作有意义'
       );
     }
-    const allowed = action === 'update' ? MIGRATION_DECLARATIONS : DELETE_MIGRATION_DECLARATIONS;
-    if (!(allowed as readonly string[]).includes(migration.strategy)) {
-      return (
-        `变更集第 ${i} 项（从 0 数）action=${action} 的 migration.strategy "${migration.strategy}" 不是合法取值；` +
-        `合法值：${allowed.join(' / ')}`
-      );
-    }
+    const allowed: readonly string[] = action === 'update' ? MIGRATION_DECLARATIONS : DELETE_MIGRATION_DECLARATIONS;
+    const mig = normalizeMigrationStrategy(migration, allowed, `变更集第 ${i} 项（从 0 数）action=${action}`);
+    if ('error' in mig) return mig.error;
   }
   return undefined;
 }
 
 export function registerModelingTools(server: McpServer, ctx: ToolContext): void {
-  // 写工具一律经预检闸门注册：判定不通过时在 handler 之前拦截，不进 service（见 tools/index.ts）
+  // 注册器把每个 handler 套上统一的调用期闸门（authorizeCall）：判定不通过会在 handler 之前拦截、
+  // 不进 service（闸门实现与判定依据见 tools/index.ts 与 config/authorize.ts）。
   const registrar = capabilityRegistrar(server, ctx);
   const regCap = registrar;
   /** 操作级别名专用注册入口（只登记原始 handler、不注册工具；fail-closed 校验 routeOnly 标记） */
@@ -152,6 +154,9 @@ export function registerModelingTools(server: McpServer, ctx: ToolContext): void
                   schema: sourceSchema!,
                   name: sourceName!,
                   measureMode,
+                  // 工具面 columns 是列名字符串数组：类型不在工具层补，由服务层按列名回查源表列目录
+                  // 补齐（1153——此前只映射 columnName，类型恒 undefined ⇒ 默认 SUM_NUMERIC 下 0 度量、
+                  // 视图无法激活，且回执把原因误报成 measureMode 选择）。列名不存在/不可查时服务层报中文错误。
                   columns: columns?.map((c) => ({ columnName: c })),
                 },
               }),
@@ -289,7 +294,7 @@ export function registerModelingTools(server: McpServer, ctx: ToolContext): void
       // 的语义不变。提交失败（运行上限）在此抛中文硬错误，尚未发生任何写。
       if (runAsync === true) {
         const envelope: Envelope = await withErrorEnvelope(async () =>
-          submitChangesetTask(ctx.config, ctx.pool, normalizedActions, surfaceKeyOf(currentIdentity())),
+          submitChangesetTask(ctx.config, ctx.pool, normalizedActions, currentSurfaceKey()),
         );
         return toToolResult(envelope);
       }
@@ -352,15 +357,13 @@ export function registerModelingTools(server: McpServer, ctx: ToolContext): void
     const opCap = findCapability(opId);
     if (!opCap) throw new Error(`清单里缺操作级条目 ${opId}（VIEW_OPS 与 manifest 漂移）`);
     regCapAlias(opCap, async (args, serverCtx) => {
-      const { packageId, objectName, ifMatch, dryRun, migration, ...payload } = args as Record<string, unknown>;
+      // 身份参数（packageId/objectName/ifMatch/dryRun/migration）→ op 载荷的切分共用 planners 的
+      // aliasArgsToParentCall：本处不再手抄清单（同一份清单多处副本必然漂移）。
+      const call = aliasArgsToParentCall(decl.id, args as Record<string, unknown>);
       return handleViewUpdate(
         {
-          packageId,
-          objectName,
-          operations: [{ op: decl.id, ...payload }],
-          ifMatch,
-          dryRun: dryRun === true,
-          migration,
+          ...call,
+          dryRun: call.dryRun === true,
           activate: false,
           probeRows: DEFAULT_PROBE_ROWS,
           async: false,

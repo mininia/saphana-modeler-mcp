@@ -1,4 +1,4 @@
-import { aggGroupBy, aggMeasures, normalizeBwSchema } from './view-types.js';
+import { aggGroupBy, aggMeasures, normalizeBwSchema, sinkNodes } from './view-types.js';
 import type {
   ViewDataSource,
   ViewDefinition,
@@ -12,7 +12,7 @@ import type {
 } from './view-types.js';
 
 /**
- * 两个 ViewDefinition 的**结构化 diff**（P6 dryRun 的地基，SSD §5.2）。
+ * 两个 ViewDefinition 的**结构化 diff**（dryRun 的地基，SSD §5.2）。
  *
  * 为什么必须先归一化再比：同一份视图经 Studio 重存、Aggregation 方言改写（格式 A/B）、布局重排后，
  * XML 文本会大面积变化而语义不变——直接比文本/raw 会被假 diff 淹死，破坏性判定随之失真。
@@ -26,7 +26,7 @@ import type {
  *   5) 公式/脚本比**解码后文本**（模型里已是 text() 解码结果），不比 raw/XML 文本；
  *   6) raw 不参与比较：informationModelLayout、<metadata changedAt=""> 等布局噪声只存在于 raw；
  *   7) 数据源 schemaName 先过 normalizeBwSchema（ABAP ↔ SAPABAP1）再比；
- *   8) **输入绑定参与比较**（P6 修复批，评审 #1/#2/#9）：映射索引按 target → 排序后的
+ *   8) **输入绑定参与比较**：映射索引按 target → 排序后的
  *      (inputNode, source) 列表比（见 mappingIndex）——输入换人（哪怕映射逐字同名）/ 映射重指向 /
  *      Union 输入增删都命中，该节点 fields 记 'inputs'；同一组 (inputNode, source) 的重排不产生
  *      差异（文档序无语义，别制造假 diff）。
@@ -39,8 +39,14 @@ import type {
  */
 
 /** logicalModel 的五个输出字段列表（keyMapping 属性 / 计算属性 / 基础度量 / 计算度量 / 受限度量） */
-export type ViewOutputList =
-  'attributes' | 'calculatedAttributes' | 'measures' | 'calculatedMeasures' | 'restrictedMeasures';
+const OUTPUT_LISTS = [
+  'attributes',
+  'calculatedAttributes',
+  'measures',
+  'calculatedMeasures',
+  'restrictedMeasures',
+] as const;
+export type ViewOutputList = (typeof OUTPUT_LISTS)[number];
 
 /** 数据源回执条目（added/removed 用；字段取原值——比较才归一化，回执如实反映文件内容） */
 export interface ViewDiffDataSource {
@@ -89,10 +95,18 @@ export interface ViewDiff {
    * 最终输出节点（把结果交给 logicalModel 的那个节点）是否换人。
    *
    * passThrough 是**豁免的证据**，不是结论（判定层据此决定「输出换人 + 既有字段仅 sourceObject 变化」
-   * 能否降级为非破坏；证据不成立时不得豁免）：true ⇔ after 定义里 `to` 节点有一条输入
-   * （inputs[].node）直接指向 `from` —— 即新输出节点是直接站在旧输出节点之上的直通（add_join 的
-   * 机械重挂形态）。changed=true 时恒带该键（布尔：证据成立与否的一手答案）；changed=false 时
-   * 不产生 from/to/passThrough（不制造噪音）。
+   * 能否降级为非破坏；证据不成立时不得豁免）：true ⇔ after 定义里 `to` 节点是**透明直通型**的——
+   * 类型 ∈ {ProjectionView, JoinView}（JoinView 还要求 joinType = leftOuter——inner/rightOuter/
+   * fullOuter 会改 from 侧行集合）、自身没有任何会改行集合/取数口径的配置
+   * （aggregateBy / measures / attributeAggregations / attributeFilters / filter / rank / script），
+   * 且它引用 `from` 的那条输入边的映射**全部恒等**（target === source）且至少一条。
+   * 只看「有一条输入直指 from」不够：在旧输出节点上压一个 Aggregation / 带 filter 的新节点再整体重挂，
+   * 形态同样命中，但列名不变、值已变（新节点自身不透明时不是直通证据）。changed=true 时恒带该键
+   * （布尔：证据成立与否的一手答案）；changed=false 时不产生 from/to/passThrough（不制造噪音）。
+   * from/to 各自缺省 = 该侧输出不可判（图论汇点与 logicalModel 声明分歧，见 resolveOutputNode），
+   * 不是「没有输出节点」。两侧都不可判时不短路成 changed=false——退化比较两侧 logicalModel 声明
+   * id，声明换人（半重挂对）即如实报 changed=true（不可判 ≠ 未换人，见 diffOutputNode）；声明相同
+   * （含两侧都无声明——AV 等无节点树形态）才报 changed=false。
    */
   output: { changed: boolean; from?: string; to?: string; passThrough?: boolean };
   outputs: {
@@ -163,8 +177,9 @@ function listKey(entries: string[]): string {
 
 /* ── 数据源 ───────────────────────────────────────────────── */
 
-type DataSourceField = 'type' | 'resourceUri' | 'schemaName' | 'columnObjectName';
-const DS_FIELDS: DataSourceField[] = ['type', 'resourceUri', 'schemaName', 'columnObjectName'];
+/** 数据源逐字段比较的字段位 */
+const DS_FIELDS = ['type', 'resourceUri', 'schemaName', 'columnObjectName'] as const;
+type DataSourceField = (typeof DS_FIELDS)[number];
 
 function dsValue(ds: ViewDataSource, field: DataSourceField): string {
   switch (field) {
@@ -210,26 +225,12 @@ function diffDataSources(before: ViewDataSource[], after: ViewDataSource[]): Vie
 
 /* ── 节点 ─────────────────────────────────────────────────── */
 
-type NodeField =
-  | 'type'
-  | 'joinType'
-  | 'joinAttributes'
-  | 'attributes'
-  | 'calculatedAttributes'
-  | 'aggregateBy'
-  | 'measures'
-  | 'attributeAggregations'
-  | 'attributeFilters'
-  | 'attributeTypes'
-  | 'filter'
-  | 'script'
-  | 'rank';
 /**
- * 逐字段比较的字段位（与 SSD §5.2 的 fields 允许集逐字对齐；改这个清单 = 改契约）。
+ * 节点逐字段比较的字段位（与 SSD §5.2 的 fields 允许集逐字对齐；改这个清单 = 改契约）。
  * 注意 fields 的完整允许集 = 本清单 ∪ {'inputs'}：'inputs' 由输入绑定比较产出（见 mappingIndex），
  * 不是标量字段位，故不进本数组。
  */
-const NODE_FIELDS: NodeField[] = [
+const NODE_FIELDS = [
   'type',
   'joinType',
   'joinAttributes',
@@ -243,7 +244,17 @@ const NODE_FIELDS: NodeField[] = [
   'filter',
   'script',
   'rank',
-];
+] as const;
+type NodeField = (typeof NODE_FIELDS)[number];
+
+/**
+ * joinType 归一（与推导层 preview.derive 的 JOIN_TYPE_MAP 同口径）：缺省 = inner；
+ * 'left outer' ≡ 'leftOuter'（大小写/空格/下划线无语义）。字段比较与 isPassThrough 的透明性判定
+ * 共用这一处——同一份 XML 不会被两个口径各自解读。
+ */
+function normalizeJoinType(node: ViewNode): string {
+  return (node.joinType ?? 'inner').toLowerCase().replace(/[\s_]/g, '');
+}
 
 function measureKey(measures: ViewNodeMeasure[]): string {
   return listKey(
@@ -262,13 +273,18 @@ function rankKey(rank: ViewRankDefinition | undefined): string {
 }
 
 /**
- * attributeTypes 比较键：view-types 已声明该字段（P6 解析器从 viewAttribute 的 datatype/length 填充），
+ * attributeTypes 比较键：view-types 已声明该字段（解析器从 viewAttribute 的 datatype/length 填充），
  * 直接用声明后的形状按 (id, datatype, length) 三元组比——缺省与显式空串等价（规则 4「缺省 ≡ 空」），
- * 条目按 id 排序（文档序无语义）。此前用稳定 JSON 序列化「结构未知的预留字段」，会把
- * {datatype: undefined} 与缺键当成两种写法（显式 undefined 序列化成 null），是潜在假 diff 源。
+ * 条目按 id 排序（文档序无语义）。datatype 先 toUpperCase 再比（HANA 类型名大小写不敏感，口径同
+ * outputs/variables 的 datatype 字段）：仅大小写不同不是节点级类型变更——否则有下游时会造成假破坏
+ * 与无意义的 migration_required 拒写。不要退回对象序列化：它会把「显式空串」与「缺省/undefined」
+ * 劈成两种写法（'' 序列化为 ""，而 undefined 与缺键同等丢键）——恰好违反规则 4「缺省 ≡ 空」，
+ * 制造假 diff；本键的 `?? ''` 归一正是为此。
  */
 function attributeTypesKey(node: ViewNode): string {
-  return listKey((node.attributeTypes ?? []).map((t) => `${t.id}\u0000${t.datatype ?? ''}\u0000${t.length ?? ''}`));
+  return listKey(
+    (node.attributeTypes ?? []).map((t) => `${t.id}\u0000${(t.datatype ?? '').toUpperCase()}\u0000${t.length ?? ''}`),
+  );
 }
 
 function nodeFieldValue(node: ViewNode, field: NodeField): string {
@@ -277,8 +293,7 @@ function nodeFieldValue(node: ViewNode, field: NodeField): string {
     case 'type':
       return node.type;
     case 'joinType':
-      // 缺省 = inner（与推导层 JOIN_TYPE_MAP 同口径）；'left outer' ≡ 'leftOuter'（大小写/空格/下划线无语义）
-      return (node.joinType ?? 'inner').toLowerCase().replace(/[\s_]/g, '');
+      return normalizeJoinType(node);
     case 'joinAttributes':
       return setKey(node.joinAttributes);
     case 'attributes':
@@ -325,25 +340,36 @@ function nodeFieldValue(node: ViewNode, field: NodeField): string {
 }
 
 /**
- * 输入绑定索引：target → 排序后的 (inputNode, source) 列表（跨输入合并，但**保留输入归属**）。
- *
- * 为什么必须带 inputNode：只比 target → source 集合时，「Join 左侧输入由 #Proj_A 换成 #Proj_B
- * （两个投影暴露同名同列、映射逐字不变）」完全不产生差异——下游取到的值已变，diff 却报 empty，
- * 这是最隐蔽的语义漂移通道（评审 #1/#2/#9 的实测反例）。列表排序 = 输入次序不参与比较。
- * 没有任何映射的输入不产生条目（此时输入归属在映射层面不可见；Union 走 inputBindingKey 的引用集合分支）。
+ * 遍历节点的全部输入映射（两处映射索引**唯一**的迭代实现）：`#` 前缀归一是引用语法糖、空 target/source
+ * 是解析噪声——过滤口径必须两处一致，否则 'inputs' 判定与 mappings 差量回执会对同一份文件各说各话。
+ * 回调拿到「输入节点 id（已去 #）+ target + source」。
  */
-function mappingIndex(node: ViewNode): Map<string, string[]> {
-  const m = new Map<string, Set<string>>();
+function forEachMapping(node: ViewNode, visit: (target: string, input: string, source: string) => void): void {
   for (const inp of node.inputs) {
     // 输入引用统一去掉 # 前缀：同一节点的 "#P1"/"P1" 两种写法等价（# 是 XML 引用语法糖，不是身份）
     const input = inp.node.replace(/^#/, '');
     for (const { target, source } of inp.mappings) {
       if (target === '' || source === '') continue; // 解析噪声
-      let s = m.get(target);
-      if (!s) m.set(target, (s = new Set()));
-      s.add(`${input}\u0000${source}`);
+      visit(target, input, source);
     }
   }
+}
+
+/**
+ * 输入绑定索引：target → 排序后的 (inputNode, source) 列表（跨输入合并，但**保留输入归属**）。
+ *
+ * 为什么必须带 inputNode：只比 target → source 集合时，「Join 左侧输入由 #Proj_A 换成 #Proj_B
+ * （两个投影暴露同名同列、映射逐字不变）」完全不产生差异——下游取到的值已变，diff 却报 empty，
+ * 这是最隐蔽的语义漂移通道。列表排序 = 输入次序不参与比较。
+ * 没有任何映射的输入不产生条目（此时输入归属在映射层面不可见；Union 走 inputBindingKey 的引用集合分支）。
+ */
+function mappingIndex(node: ViewNode): Map<string, string[]> {
+  const m = new Map<string, Set<string>>();
+  forEachMapping(node, (target, input, source) => {
+    let s = m.get(target);
+    if (!s) m.set(target, (s = new Set()));
+    s.add(`${input}\u0000${source}`);
+  });
   return new Map([...m].map(([k, v]) => [k, [...v].sort(cmpStr)] as const));
 }
 
@@ -352,7 +378,7 @@ function mappingIndex(node: ViewNode): Map<string, string[]> {
  * - 非 Union：映射索引 target → 排序后的 (inputNode, source)——输入换人（映射逐字同名）/ 映射重指向
  *   都会改变键 ⇒ 命中 'inputs'；
  * - Union：只比输入节点引用集合——「列按名对齐」的既有归一决定 Union 的映射（含缺映射）无语义，
- *   但输入集合必须比：增/删输入改变行集合（哪怕列同名，评审反例 b）；重排不改变集合 ⇒ 不产生差异。
+ *   但输入集合必须比：增/删输入改变行集合（哪怕列同名）；重排不改变集合 ⇒ 不产生差异。
  */
 function inputBindingKey(node: ViewNode): string {
   if (node.type === 'UnionView') {
@@ -365,17 +391,18 @@ function inputBindingKey(node: ViewNode): string {
     .join('\u0003');
 }
 
-/** target → 源列集合（跨输入合并、丢弃输入归属）：仅用于产出 mappings 差量回执（ViewDiffMappingDelta 的既有形状） */
+/**
+ * target → 源列集合（同一 forEachMapping 迭代的投影：跨输入合并、丢弃输入归属）：
+ * 仅用于产出 mappings 差量回执（ViewDiffMappingDelta 的既有形状）——与 inputBindingKey 的
+ * 'inputs' 判定同源，两者不会对同一份文件给出互相矛盾的解释。
+ */
 function mappingSources(node: ViewNode): Map<string, string[]> {
   const m = new Map<string, Set<string>>();
-  for (const inp of node.inputs) {
-    for (const { target, source } of inp.mappings) {
-      if (target === '' || source === '') continue; // 解析噪声
-      let s = m.get(target);
-      if (!s) m.set(target, (s = new Set()));
-      s.add(source);
-    }
-  }
+  forEachMapping(node, (target, _input, source) => {
+    let s = m.get(target);
+    if (!s) m.set(target, (s = new Set()));
+    s.add(source);
+  });
   return new Map([...m].map(([k, v]) => [k, [...v].sort(cmpStr)] as const));
 }
 
@@ -406,12 +433,12 @@ function diffMappings(b: ViewNode, a: ViewNode): ViewDiffMappingDelta {
 
 function nodeChange(b: ViewNode, a: ViewNode): ViewDiffNodeChange | undefined {
   const fields: string[] = NODE_FIELDS.filter((f) => nodeFieldValue(b, f) !== nodeFieldValue(a, f)).sort(cmpStr);
-  // 规则 8：输入绑定参与比较——命中即标记 'inputs'（新增允许值），与逐字段位并列（mappings 只是列级明细）
+  // 规则 8：输入绑定参与比较——命中即标记 'inputs'（新增允许值），与逐字段位并列（mappings 只是列级明细）。
+  // mappings 差量不需要单独充当「节点有变更」的判据：非 Union 节点的映射集合变化必然已把 'inputs'
+  // 推进 fields（mappingSources 与 inputBindingKey 走同一迭代），Union 的 mappings 差量恒为空。
   if (inputBindingKey(b) !== inputBindingKey(a)) fields.push('inputs');
-  const mappings = diffMappings(b, a);
-  const mappingsChanged = mappings.added.length > 0 || mappings.removed.length > 0 || mappings.retargeted.length > 0;
-  if (fields.length === 0 && !mappingsChanged) return undefined;
-  return { id: a.id, type: a.type, fields: fields.sort(cmpStr), mappings };
+  if (fields.length === 0) return undefined;
+  return { id: a.id, type: a.type, fields: fields.sort(cmpStr), mappings: diffMappings(b, a) };
 }
 
 function diffNodes(before: ViewNode[], after: ViewNode[]): ViewDiff['nodes'] {
@@ -447,35 +474,80 @@ function logicalModelId(raw: unknown): string | undefined {
 }
 
 /**
- * 输出节点 = 图论汇点（无任何节点引用它）。单汇点时以图为准；
- * 多汇点（残留孤儿节点）/零汇点（环/空节点树）时退化为 XML 里 logicalModel 的显式声明，仍不可判则 undefined。
+ * 输出节点判定 = 图论汇点与 XML 里 logicalModel 显式声明**两口径一致**时才可判：
+ * - 单汇点且与声明一致（或 XML 无声明——AV 等形态）：该汇点；
+ * - 单汇点与声明分歧（半重挂/脏视图）：不可判 ⇒ undefined，**不静默选边**——否则回执的
+ *   output.from/to/passThrough 建立在错节点上（声明输出真的换人却被报成「未换人」）；
+ * - 多汇点（残留孤儿节点）/零汇点（环/空节点树）：退化为显式声明，仍不可判则 undefined。
+ * 汇点枚举共用 view-types.sinkNodes（引用语法的唯一实现，与 view-edit 的 add_join 判定同源）；
+ * 空 id 节点是解析噪声（见 indexById 头注），不进汇点集合。
+ * 两侧都不可判（本函数两侧均为 undefined）不是可比较结论：diffOutputNode 对它退化为比较两侧的
+ * logicalModel 声明（不可判 ≠ 未换人）。
  */
 function resolveOutputNode(def: ViewDefinition): string | undefined {
-  const referenced = new Set<string>();
-  for (const n of def.nodes) for (const inp of n.inputs) referenced.add(inp.node.replace(/^#/, ''));
-  const sinks = def.nodes
-    .filter((n) => n.id !== '' && !referenced.has(n.id))
+  const declared = logicalModelId(def.raw);
+  const sinks = sinkNodes(def.nodes)
+    .filter((n) => n.id !== '')
     .map((n) => n.id)
     .sort(cmpStr);
-  if (sinks.length === 1) return sinks[0];
-  return logicalModelId(def.raw);
+  if (sinks.length === 1) {
+    if (declared !== undefined && declared !== sinks[0]) return undefined; // 两口径分歧：不可判
+    return sinks[0];
+  }
+  return declared;
 }
 
 /**
- * 重挂证据判定：after 定义里 `to` 节点是否有一条输入直接指向 `from`（新输出节点站在旧输出节点
- * 之上的直通形态——add_join 的机械重挂）。只在 from/to 都有值时才有意义；缺任一侧 ⇒ false
- * （无证据可给，豁免不得成立）。
+ * 重挂证据判定：after 定义里 `to` 节点是否是对 `from` 的**透明直通重挂**（add_join 的机械重挂形态）。
+ * 只在 from/to 都有值时才有意义；缺任一侧 ⇒ false（无证据可给，豁免不得成立）。
+ *
+ * 证据必须闭到「直通」语义，不是「有一条输入边」：在旧输出节点上压一个会改变语义的
+ * 新节点（Aggregation 聚合 / 带 filter 的行集合变化）再整体重挂输出，同样「有一条输入直指 from」，
+ * 列名不变而值已变——旧证据会把它误豁免成非破坏。故还要求：
+ *   - `to` 节点类型 ∈ {ProjectionView, JoinView}（透明的重映射节点；Aggregation/Rank/SqlScript 不算）；
+ *   - `to` 节点自身没有任何会改行集合/取数口径的配置（aggregateBy / measures / attributeAggregations /
+ *     attributeFilters / filter / rank / script）；JoinView 还要求 joinType = leftOuter——过滤型
+ *     join（inner/rightOuter/fullOuter，含缺省 = inner）会改变 from 侧行集合，不能作直通证据；
+ *   - `to` 引用 `from` 的那条输入边上的映射**全部恒等**（target === source）且至少一条——
+ *     没有映射 = 直通无从证明（Union 列按名对齐等形态不算证据，fail-closed）。
  */
 function isPassThrough(after: ViewDefinition, from: string, to: string): boolean {
   const node = after.nodes.find((n) => n.id === to);
   if (!node) return false;
-  return node.inputs.some((inp) => inp.node.replace(/^#/, '') === from);
+  if (node.type !== 'ProjectionView' && node.type !== 'JoinView') return false;
+  // JoinView 的 joinType 决定行集合是否被改：只有左外连接保留左侧输入（add_join 的机械重挂里 from
+  // 恒为左输入）的全部行——inner 丢无匹配左行、rightOuter 丢左行、fullOuter 增补未匹配行，都会改
+  // 行集合，不能算透明直通。缺省 joinType = inner（同 normalizeJoinType），一并拒绝。
+  if (node.type === 'JoinView' && normalizeJoinType(node) !== 'leftouter') return false;
+  if (
+    node.aggregateBy.length > 0 ||
+    node.measures.length > 0 ||
+    node.attributeAggregations.length > 0 ||
+    node.attributeFilters.length > 0 ||
+    node.filter !== undefined ||
+    node.rank !== undefined ||
+    node.script !== undefined
+  ) {
+    return false;
+  }
+  const edge = node.inputs.find((inp) => inp.node.replace(/^#/, '') === from);
+  if (!edge) return false;
+  return edge.mappings.length > 0 && edge.mappings.every((m) => m.target === m.source);
 }
 
 function diffOutputNode(before: ViewDefinition, after: ViewDefinition): ViewDiff['output'] {
   const from = resolveOutputNode(before);
   const to = resolveOutputNode(after);
-  if (from === to) return { changed: false };
+  // 只有两侧都判到、且判到同一节点，才是「未换人」。
+  if (from !== undefined && from === to) return { changed: false };
+  // 两侧都不可判（undefined === undefined）不能短路成 changed=false：那正是把「不可判」呈现为
+  // 「未换人」——声明输出真的换人（如 P1→P2 的半重挂对）会被报成未换。changed 的一手依据是
+  // 「把结果交给 logicalModel 的那个节点」，此时退化比较两侧 logicalModel 声明 id：相同（含两侧
+  // 都无声明——AV 等无节点树形态）报无变化；不同即如实报 changed=true（from/to 缺省 = 该侧不可判；
+  // passThrough=false——两侧不可判时不给豁免证据）。
+  if (from === undefined && to === undefined && logicalModelId(before.raw) === logicalModelId(after.raw)) {
+    return { changed: false };
+  }
   const out: ViewDiff['output'] = {
     changed: true,
     passThrough: from !== undefined && to !== undefined && isPassThrough(after, from, to),
@@ -487,29 +559,8 @@ function diffOutputNode(before: ViewDefinition, after: ViewDefinition): ViewDiff
 
 /* ── 输出字段 ─────────────────────────────────────────────── */
 
-const OUTPUT_LISTS: ViewOutputList[] = [
-  'attributes',
-  'calculatedAttributes',
-  'measures',
-  'calculatedMeasures',
-  'restrictedMeasures',
-];
-
-type OutputFieldName =
-  | 'datatype'
-  | 'length'
-  | 'aggregationType'
-  | 'measureType'
-  | 'sourceColumn'
-  | 'sourceObject'
-  | 'description'
-  | 'key'
-  | 'hidden'
-  | 'order'
-  | 'formula'
-  | 'expressionLanguage';
-/** 与 SSD §5.2 的 fields 允许集逐字对齐 */
-const OUTPUT_FIELDS: OutputFieldName[] = [
+/** 输出字段逐字段比较的字段位（与 SSD §5.2 的 fields 允许集逐字对齐） */
+const OUTPUT_FIELDS = [
   'datatype',
   'length',
   'aggregationType',
@@ -522,7 +573,36 @@ const OUTPUT_FIELDS: OutputFieldName[] = [
   'order',
   'formula',
   'expressionLanguage',
-];
+] as const;
+export type OutputFieldName = (typeof OUTPUT_FIELDS)[number];
+
+/**
+ * 输出字段位的分类——判定表的判据面，分类决策的**单一事实源**：
+ *   - 'type'：       数据类型声明（datatype / length）——改类型可 cast / 保列新建 / move；
+ *   - 'resolution'： 取数解析（sourceColumn / sourceObject / aggregationType / measureType / formula /
+ *                    expressionLanguage）——解析变了，下游按原解析消费会受影响；
+ *   - 'display'：    展示属性（description / key / hidden / order）——即便有下游引用也永不破坏。
+ * 用 Record<OutputFieldName, …> 穷尽收口：新增字段位不在这里补录就编译不过——
+ * 消费方（services/migrate.rules 的判定表）从本映射取分类，不手抄子集，
+ * 避免新字段位被静默归入「展示类、永不破坏」。
+ */
+export type OutputFieldCategory = 'type' | 'resolution' | 'display';
+
+/** OUTPUT_FIELDS 每一位 → 分类（穷尽映射，见 OutputFieldCategory） */
+export const OUTPUT_FIELD_CATEGORY: Record<OutputFieldName, OutputFieldCategory> = {
+  datatype: 'type',
+  length: 'type',
+  sourceColumn: 'resolution',
+  sourceObject: 'resolution',
+  aggregationType: 'resolution',
+  measureType: 'resolution',
+  formula: 'resolution',
+  expressionLanguage: 'resolution',
+  description: 'display',
+  key: 'display',
+  hidden: 'display',
+  order: 'display',
+};
 
 function outputFieldValue(f: ViewOutputField, name: OutputFieldName): string {
   switch (name) {
@@ -585,15 +665,9 @@ function diffOutputs(before: ViewOutputs, after: ViewOutputs): ViewDiff['outputs
 
 /* ── 变量 ─────────────────────────────────────────────────── */
 
-type VariableField = 'parameter' | 'datatype' | 'length' | 'defaultValue' | 'mandatory' | 'description';
-const VARIABLE_FIELDS: VariableField[] = [
-  'parameter',
-  'datatype',
-  'length',
-  'defaultValue',
-  'mandatory',
-  'description',
-];
+/** 变量逐字段比较的字段位 */
+const VARIABLE_FIELDS = ['parameter', 'datatype', 'length', 'defaultValue', 'mandatory', 'description'] as const;
+type VariableField = (typeof VARIABLE_FIELDS)[number];
 
 function variableFieldValue(v: ViewVariable, name: VariableField): string {
   switch (name) {
@@ -629,17 +703,8 @@ function diffVariables(before: ViewVariable[], after: ViewVariable[]): ViewDiff[
 
 /* ── 根级属性 ─────────────────────────────────────────────── */
 
-type RootField =
-  | 'description'
-  | 'dataCategory'
-  | 'outputViewType'
-  | 'checkAnalyticPrivileges'
-  | 'applyPrivilegeType'
-  | 'dimensionType'
-  | 'id'
-  | 'schemaVersion';
-/** 与 SSD §5.2 的 fields 允许集逐字对齐 */
-const ROOT_FIELDS: RootField[] = [
+/** 根级属性逐字段比较的字段位（与 SSD §5.2 的 fields 允许集逐字对齐） */
+const ROOT_FIELDS = [
   'description',
   'dataCategory',
   'outputViewType',
@@ -648,7 +713,8 @@ const ROOT_FIELDS: RootField[] = [
   'dimensionType',
   'id',
   'schemaVersion',
-];
+] as const;
+type RootField = (typeof ROOT_FIELDS)[number];
 
 function rootFieldValue(def: ViewDefinition, name: RootField): string {
   switch (name) {

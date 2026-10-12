@@ -11,23 +11,21 @@ import {
   XS_TIMEOUT_MS_DEFAULT,
   XS_XFER_TIMEOUT_MS_DEFAULT,
 } from '../core/limits.js';
-import { splitList } from '../core/text.js';
-import { XS_BASE_PATH } from '../core/xs-rest.js';
+import { IDENTITY_NAME_HINT, IDENTITY_NAME_RE, splitList } from '../core/text.js';
+import { XS_BASE_PATH, deriveXsPort } from '../core/xs-rest.js';
 import { findInvalidWritePackages } from './write-boundary.js';
 import { IMPLICIT_DEFAULT_PROFILE_ID, parseProfiles, type CallerProfile } from './profiles.js';
 import { DEFAULT_HTTP_HOST, DEFAULT_SSL_VALIDATE, DEFAULT_TLS } from './deployment.js';
 
-export { DEFAULT_TIMEZONE };
-
-/** 默认 Locale，与 HANA Studio 登录页默认值一致 */
-export const DEFAULT_LOCALE = 'zh_CN';
+/** 默认 Locale，与 HANA Studio 登录页默认值一致（仅本文件使用） */
+const DEFAULT_LOCALE = 'zh_CN';
 
 /**
  * 布尔环境变量的真值集合（其余取值在 boolSchema 下 fail-fast 拒绝）。
  * preflight 的原生 env 解析（mcp.json 路径）读的是原始值、无法走 zod，
- * 但它必须与这里的真值口径**同源**，故共用本常量 + {@link isEnvTrue}。
+ * 但它必须与这里的真值口径**同源**，故共用 {@link isEnvTrue} 的口径。
  */
-export const ENV_TRUE_VALUES = ['true', '1', 'TRUE'] as const;
+const ENV_TRUE_VALUES = ['true', '1', 'TRUE'] as const;
 const ENV_FALSE_VALUES = ['false', '0', 'FALSE'] as const;
 /** boolSchema 的合法取值全集（真值 + 假值；其它取值在启动时即报错，不被静默当成假） */
 const BOOL_ENV_VALUES = [...ENV_TRUE_VALUES, ...ENV_FALSE_VALUES] as const;
@@ -41,9 +39,20 @@ export function isEnvTrue(v: unknown): boolean {
   return (ENV_TRUE_VALUES as readonly string[]).includes(String(v));
 }
 
-/** 值是否存在且非空（空串/全空白视为未设置）；非字符串先 String() 归一，null/undefined 直接为假 */
+/**
+ * 「非空值」判定与取值的唯一原语（空串/全空白视同未设置 = undefined；非空串返回 trim 后的字符串）。
+ * hasValue 是它的布尔投影；emptyAsUnset 的「空」判定也委托它——字符串域的"空"只有这一处口径，
+ * 将来调整空白定义只改这里，不会出现 hasValue 与各 preprocess 分叉。
+ */
+function nonEmptyEnvValue(v: unknown): string | undefined {
+  if (v === undefined || v === null) return undefined;
+  const s = String(v).trim();
+  return s === '' ? undefined : s;
+}
+
+/** 值是否存在且非空（空串/全空白视为未设置）。判定委托 {@link nonEmptyEnvValue}（唯一原语） */
 export function hasValue(v: unknown): boolean {
-  return v != null && String(v).trim() !== '';
+  return nonEmptyEnvValue(v) !== undefined;
 }
 
 /**
@@ -72,18 +81,28 @@ const timeZoneSchema = z
   }, '非法 IANA 时区名称（如 Asia/Shanghai、UTC）');
 
 /**
- * 数字型环境变量（正整数、可留空）：P5 的池/超时/并发旋钮（SSD §4.3）共用。
- * - 空串按「未设置」处理（照 MCP_HTTP_PORT 的 preprocess 手法：z.coerce.number('') === 0
- *   会解析成 0 并撞下限，报出与真实原因无关的错）；
+ * 空串/纯空白按「未设置」处理（"空"的判定委托 {@link nonEmptyEnvValue}，唯一原语）。
+ * 非字符串值原样通过；非空字符串也原样返回、不 trim（需要去掉首尾空白的消费方见 {@link trimmedOrUnset}）。
+ * 不先归一就交给下游会报出与真实原因无关的错：z.coerce.number('') 解析成 0 撞下限、parseInt('') 得 NaN。
+ */
+const emptyAsUnset = (v: unknown): unknown =>
+  typeof v === 'string' && nonEmptyEnvValue(v) === undefined ? undefined : v;
+
+/** 同 emptyAsUnset，但非空字符串顺带去掉首尾空白（端口串等格式严格项：先归一再校验） */
+const trimmedOrUnset = (v: unknown): unknown => {
+  const s = emptyAsUnset(v);
+  return typeof s === 'string' ? s.trim() : s;
+};
+
+/**
+ * 数字型环境变量（正整数、可留空）：池、超时与激活并发这类运行旋钮共用，默认值见 core/limits.js。
+ * - 空串按「未设置」处理（见 emptyAsUnset）；
  * - 非数字/越界取值启动即失败（fail-closed，与本文件其余部分同口径）——这些值静默取错
  *   只表现为「莫名变慢/莫名失败」，比启动失败难查得多；
  * - 默认值一律从 core/limits.js 取常量，不写数字字面量（避免「配置默认值 ≠ 运行时兜底值」分叉）。
  */
 const intEnvSchema = (defaultValue: number, min: number, max: number) =>
-  z.preprocess(
-    (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
-    z.coerce.number().int().min(min).max(max).default(defaultValue),
-  );
+  z.preprocess(emptyAsUnset, z.coerce.number().int().min(min).max(max).default(defaultValue));
 
 /** 实例号校验（00-99） */
 const instanceSchema = z
@@ -91,13 +110,27 @@ const instanceSchema = z
   .regex(/^[0-9]{2}$/, '实例号必须是两位数字（00-99）')
   .default('00');
 
+/** 提升预算默认值（zod default 与 parseSurfaceMax 的错误消息共用，防两处字面量漂移） */
+const SURFACE_MAX_DEFAULT = 50;
+
 const envSchema = z.object({
   // 安全要求：连接信息（主机/端口/库名/用户名/密码）一律只允许来自环境变量 / mcp.json，
   // 禁止默认值或硬编码真实环境值
   HANA_HOST: z.string().min(1),
   HANA_INSTANCE: instanceSchema,
-  /** SQL 端口（可选）。若留空，按实例号自动推导：3<instance>13/15 */
-  HANA_PORT: z.string().optional(),
+  /**
+   * SQL 端口（可选）。若留空，按实例号自动推导：3<instance>13/15。
+   * 只接受纯数字（空串/纯空白按未设置，见 emptyAsUnset）：'3.5'/'30115abc'/'30,015'
+   * 这类笔误在 parseInt 下会被静默截断成 3 / 30115 / 30 并连到从未配置过的端口，失败要拖到
+   * 首次工具调用才暴露、报错里的端口还与会话里写的对不上——故格式校验与 HANA_XS_PORT 同口径。
+   */
+  HANA_PORT: z.preprocess(
+    trimmedOrUnset,
+    z
+      .string()
+      .regex(/^[0-9]+$/, '无效的 SQL 端口：必须是纯数字（如 30015；不含小数点/千分位等其它字符）')
+      .optional(),
+  ),
   HANA_USER: z.string().min(1),
   HANA_PASSWORD: z.string().min(1),
   /** 连接 Locale（默认 zh_CN），影响服务器端语言/错误消息 */
@@ -139,7 +172,7 @@ const envSchema = z.object({
    */
   MCP_TOOL_DENY: z.string().default('').transform(splitList),
   /**
-   * 调用方档案定义（P10-c）：`name=kinds[:glob|glob][;name2=…]`，kinds 用 + 连接。
+   * 调用方档案定义：`name=kinds[:glob|glob][;name2=…]`，kinds 用 + 连接。
    * 例：MCP_PROFILES="analyst=read;dev=read+write:hana_view_*|hana_metadata_*;default=read"
    * 档案**只能收紧**部署策略；配了档案就必须定义 default（HTTP 无档案参数的 Token 与 stdio 都落它）。
    * 解析即校验（src/config/profiles.ts），非法条目启动失败。
@@ -165,14 +198,17 @@ const envSchema = z.object({
     .default('')
     .transform((s) => s.trim()),
   /**
-   * 单调用方的**提升预算**（P10-f）：按**工具数**算，超出时**最旧的那个分类**整体淘汰（FIFO）。
-   * 与 hana-cli 的 `MAX_DYNAMIC_TOOLS` 同值同义（默认 50）。
-   * 本仓当前只有 28 条具体能力，实际不会触发；它存在的意义是能力增长时不静默失控。
+   * 单调用方的**提升预算**：按**工具数**算（只数能注册为工具的成员，操作级条目不注册也不计），
+   * 超出时**最旧的那个分类**整体淘汰（FIFO）。与 hana-cli 的 `MAX_DYNAMIC_TOOLS` 同值同义。
+   * 上限的意义是能力增长时不静默失控；空串按未设置处理（与其余数字旋钮同口径）。
    */
-  MCP_CAPABILITY_SURFACE_MAX: z
-    .string()
-    .default('50')
-    .transform((s) => s.trim()),
+  MCP_CAPABILITY_SURFACE_MAX: z.preprocess(
+    emptyAsUnset,
+    z
+      .string()
+      .default(String(SURFACE_MAX_DEFAULT))
+      .transform((s) => s.trim()),
+  ),
   /** 额外允许的 SQL 查询 schema（逗号分隔，追加到 core/sql.ts 白名单；默认仅系统 schema） */
   HANA_SCHEMA_ALLOW: z.string().default('').transform(splitList),
   /**
@@ -181,7 +217,7 @@ const envSchema = z.object({
    * **空/未填不是「所有包可写」**：端到端表现为写不可用——写工具已暴露时，任何声明写包的调用
    * 都会被运行期闸门以 boundary_off 拒绝（只有服务层的纵深防御是 fail-open，见 config/write-boundary.ts 头注）。
    * 例：HANA_WRITE_PACKAGES="ZDEMO,ZDEMO.ZDEMO_SD" → 允许 ZDEMO、ZDEMO.X、ZDEMO.ZDEMO_SD、ZDEMO.ZDEMO_SD.SUB，
-   * 拒绝 ZDEMO.ZDEMO_MKC（不在配置的包前缀下）。
+   * 拒绝 OTHER、OTHER.X（既不等于配置项，也不以其加「.」开头）。
    */
   HANA_WRITE_PACKAGES: z
     .string()
@@ -204,15 +240,20 @@ const envSchema = z.object({
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
   /**
    * XS Classic 设计时 REST 端口（直连 HTTP）。
-   * 缺省按实例号推导 80<instance>（与官方文档 §8.2 / 本库实测一致）。
+   * 缺省按实例号推导 `80<instance>`（实机一致）；与 HANA_PORT 同口径：空串按未设置、
+   * 纯数字校验在装载时做，越界（如 '0'/'99999'）在 loadConfig 统一收口——不让坏值拖到首次
+   * XS REST 调用才以驱动层错误暴露。
    */
-  HANA_XS_PORT: z
-    .string()
-    .regex(/^[0-9]+$/, 'XS 端口必须是数字')
-    .optional(),
+  HANA_XS_PORT: z.preprocess(
+    trimmedOrUnset,
+    z
+      .string()
+      .regex(/^[0-9]+$/, 'XS 端口必须是数字')
+      .optional(),
+  ),
   /** XS 设计时 REST 基础路径（默认 /sap/hana/xs/dt/base） */
   HANA_XS_BASE_PATH: z.string().min(1).default(XS_BASE_PATH),
-  /* ── P5 并发与超时旋钮（SSD §10.1）：池、SQL/XS 超时、激活并发 ──
+  /* ── 并发与超时旋钮：池、SQL/XS 超时、激活并发 ──
    * 全部为 intEnvSchema（数字型、可留空、留空 = 默认值；非法值启动即失败）；
    * 前缀 HANA_ 的理由：这些都是与 HANA 连接侧资源相关的运行参数（与 HANA_XS_PORT/HANA_SCHEMA_ALLOW 同类），
    * 不属 MCP_ 工具面/传输面。默认值与运行时兜底值同源（core/limits.js）。 */
@@ -233,13 +274,10 @@ const envSchema = z.object({
   /**
    * Streamable HTTP transport 端口。未设置 = stdio 传输（默认，向后兼容）；
    * 设置后以 Streamable HTTP 模式监听（端点 /mcp）。0 = 随机端口（测试用）。
-   * 空串（`MCP_HTTP_PORT=`）按"未设置"处理——与 HANA_PORT 等同一约定，
+   * 空串（`MCP_HTTP_PORT=`）按"未设置"处理（见 emptyAsUnset，与 HANA_PORT 等同一约定），
    * 也避免出现「配置解析成 0（= 进 HTTP 模式）而策略判定成 stdio」的分叉。
    */
-  MCP_HTTP_PORT: z.preprocess(
-    (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
-    z.coerce.number().int().min(0).max(65535).optional(),
-  ),
+  MCP_HTTP_PORT: z.preprocess(emptyAsUnset, z.coerce.number().int().min(0).max(65535).optional()),
   /**
    * Streamable HTTP 监听地址。默认 127.0.0.1（仅本机，fail-closed）；
    * 对外暴露需显式配置（如 0.0.0.0），并同步放行 MCP_HTTP_ALLOWED_HOSTS/ORIGINS。
@@ -254,9 +292,12 @@ const envSchema = z.object({
    */
   MCP_HTTP_TOKEN: z
     .string()
-    .min(16, 'MCP_HTTP_TOKEN 长度须 ≥16 字符（防弱凭据）')
-    .optional()
-    .transform((s) => s?.trim()),
+    // 先 trim 再查长度（与 MCP_HTTP_TOKENS 路径同口径）：长度下限在 trim 之前会被空白填充绕过——
+    // 'a' + 15 个空格能通过 16 字符校验，实际口令只有 1 字符；纯空白则 trim 成空串、同样被拒
+    //（不允许"看起来配了 Token、实际按未配置处理"，那会静默改变这些部署的认证语义）。
+    .transform((s) => s.trim())
+    .refine((s) => s.length >= 16, 'MCP_HTTP_TOKEN 长度须 ≥16 字符（防弱凭据）')
+    .optional(),
   /**
    * 多客户端 Token → 身份映射（逗号分隔的 `name:token`）。
    * 用于 HTTP 模式下把请求归属到具体客户端：envelope.clientId、审计日志与排障都据此归因
@@ -298,22 +339,19 @@ export interface HttpClientIdentity {
   /** 该身份的 Bearer Token（仅驻内存，不落日志/不回显） */
   token: string;
   /**
-   * 该身份使用的调用方档案（MCP_HTTP_TOKENS 的第三段，P10-c）；缺省 = 进程默认档案（MCP_PROFILE）。
+   * 该身份使用的调用方档案（MCP_HTTP_TOKENS 的第三段）；缺省 = 进程默认档案（MCP_PROFILE）。
    * 只影响**调用期授权**（能调什么），不影响注册期可见性（工具面仍是部署级）。
    */
   profileId?: string;
 }
 
 /** 仅配置 MCP_HTTP_TOKEN（无 per-client 区分）时的身份名：如实表达「共享凭据」 */
-export const SHARED_CLIENT_ID = 'shared';
-
-/** 客户端身份名合法字符集（防怪异名字进日志/审计） */
-const CLIENT_ID_RE = /^[A-Za-z0-9_.-]{1,32}$/;
+const SHARED_CLIENT_ID = 'shared';
 
 /**
  * 解析 HTTP 客户端身份映射：MCP_HTTP_TOKENS 的 `name:token[:profile]` 列表 + 可选单一 MCP_HTTP_TOKEN。
  *
- * 三段式（P10-c）：第三段是**调用方档案名**（须在 MCP_PROFILES 中定义，启动自检核对）。
+ * 三段式：第三段是**调用方档案名**（须在 MCP_PROFILES 中定义，启动自检核对）。
  * 两段式仍完全兼容（= 不给档案，落进程默认档案）。
  *
  * fail-closed：名字/Token 重复、Token 过短、分段数非法、**Token 段含 `:`** 一律抛错（启动失败），
@@ -345,8 +383,8 @@ export function parseHttpClients(raw: string, singleToken?: string): HttpClientI
     const clientId = parts[0].trim();
     const token = parts[1].trim();
     const profileId = parts.length === 3 ? parts[2].trim() : undefined;
-    if (!CLIENT_ID_RE.test(clientId)) {
-      throw new Error(`MCP_HTTP_TOKENS 第 ${idx + 1} 项的客户端名非法：仅允许字母/数字/下划线/点/连字符且长度 ≤32`);
+    if (!IDENTITY_NAME_RE.test(clientId)) {
+      throw new Error(`MCP_HTTP_TOKENS 第 ${idx + 1} 项的客户端名非法：${IDENTITY_NAME_HINT}`);
     }
     if (token.length < 16) {
       throw new Error(`MCP_HTTP_TOKENS 中客户端 "${clientId}" 的 Token 长度须 ≥16 字符（防弱凭据）`);
@@ -410,7 +448,7 @@ export interface HanaConfig {
   profileId: string;
   /** 进程级归因标签（来自 MCP_AGENT_LABEL；空 = 不产生该字段） */
   agentLabel: string;
-  /** 单调用方的提升预算（来自 MCP_CAPABILITY_SURFACE_MAX，默认 50；按工具数、最旧分类整体淘汰） */
+  /** 单调用方的提升预算（来自 MCP_CAPABILITY_SURFACE_MAX；按工具数、最旧分类整体淘汰） */
   surfaceMax: number;
   logLevel: string;
   /** Streamable HTTP 端口。undefined = stdio 传输（默认）；设置 = HTTP 模式监听（0 = 随机端口） */
@@ -435,7 +473,10 @@ export interface HanaConfig {
    * 风险：某个变量的外部残留值会静默覆盖 .env 里的同名值，可能连到另一套环境 —— 入口处告警。
    */
   connectionSourceMixed: boolean;
-  /** XS Classic 设计时 REST 直连端口（80<instance>）；未配置时运行时按实例号推导 */
+  /**
+   * XS Classic 设计时 REST 直连端口。loadConfig 恒赋值（显式配置或按实例号推导 80<instance>）；
+   * 可选只为容纳手搭的残缺配置——运行时兜底用 core/xs-rest.js 的同一推导函数（防两处规则分叉）。
+   */
   xsPort?: number;
   /** XS 设计时 REST 基础路径（默认 /sap/hana/xs/dt/base） */
   xsBasePath: string;
@@ -445,7 +486,7 @@ export interface HanaConfig {
   poolWaitMs: number;
   /** 池满时的排队上限（来自 HANA_POOL_MAX_WAITERS，默认 64） */
   poolMaxWaiters: number;
-  /** 写路径语句超时 ms（来自 HANA_SQL_TIMEOUT_MS，默认 60000）：写路径四条语句的超时来源，不做全局默认 */
+  /** 写路径语句超时 ms（来自 HANA_SQL_TIMEOUT_MS，默认 60000）：写路径五条语句的超时来源，不做全局默认 */
   sqlTimeoutMs: number;
   /** XS REST 请求超时 ms（来自 HANA_XS_TIMEOUT_MS，默认 30000） */
   xsTimeoutMs: number;
@@ -559,15 +600,8 @@ const RENAMED_ENV_KEYS: ReadonlyArray<readonly [oldName: string, newName: string
   ['HANA_TOOL_DENY', 'MCP_TOOL_DENY'],
 ];
 
-/** 读一个"非空"的环境变量值（空串/空白视同未设置） */
-function nonEmptyEnvValue(v: unknown): string | undefined {
-  if (v === undefined || v === null) return undefined;
-  const s = String(v).trim();
-  return s === '' ? undefined : s;
-}
-
 /**
- * 环境变量**旧名归一**（P10-c 改名）：把已弃用的旧名映射到新名，返回新对象（不改调用方的对象）。
+ * 环境变量**旧名归一**：把已弃用的旧名映射到新名，返回新对象（不改调用方的对象）。
  *
  * 三条规则：
  * 1. 只有旧名 → 用旧名的值 + **告警**（仍生效，给迁移留时间）；
@@ -601,15 +635,32 @@ export function resolveEnvAliases(env: Record<string, unknown>): Record<string, 
 }
 
 /**
+ * 不经 envSchema、由运行期直读 process.env 的受支持变量：它们同样"生效"，必须进 known 集合，
+ * 否则启动告警会把它们误报成「不生效（拼写错误？已改名？已移除？）」——运维按服务自己的处置建议
+ * 设置了变量，反而被劝退（如撤回 HANA_XS_TLS 会静默退回 XS 明文通道）。
+ * - HANA_XS_TLS：XS 写通道 scheme（core/xs-rest.ts 的 xsSchemeFromEnv 直读；core 层不依赖 config
+ *   运行时模块，走不了 zod。deployment.ts 的 xs_plaintext 处置建议与 preflight 判定都指向它）；
+ * - MCP_LOCAL_ROOT：本地文件读写边界根（services/repository.service.ts 的 resolveLocalPath 直读）。
+ * 新增这类运行期直读变量时同步登记于此（与运行期直读点必须同名）。
+ */
+const RUNTIME_DIRECT_ENV_KEYS = ['HANA_XS_TLS', 'MCP_LOCAL_ROOT'] as const;
+
+/**
  * 未识别的 HANA_/MCP_/LOG_ 环境变量告警（拼错、已改名、已被删除的名字）。
  *
  * 为什么值得一条告警：envSchema 对未知键**静默剥离**，于是一个拼错的变量名会表现为
  * 「该项配置没生效」，而运维看到的值与生效值不一致——本仓库已经踩过一次
  * （`.dsh/mcp.json` 里写成 `HANA_WRITE_PACKAGE`（少一个 S），写边界因此静默失效）。
  * 只对这三个前缀告警，避免把 PATH/无关变量卷进来。
+ * known 集合 = envSchema 键 + 弃用旧名 + 运行期直读键（见 RUNTIME_DIRECT_ENV_KEYS）：
+ * **生效的**变量一个都不许进这条告警，否则就是反方向的「生效值 ≠ 运维以为的值」。
  */
 function warnUnknownEnvKeys(env: Record<string, unknown>): void {
-  const known = new Set<string>([...Object.keys(envSchema.shape), ...RENAMED_ENV_KEYS.map(([o]) => o)]);
+  const known = new Set<string>([
+    ...Object.keys(envSchema.shape),
+    ...RENAMED_ENV_KEYS.map(([o]) => o),
+    ...RUNTIME_DIRECT_ENV_KEYS,
+  ]);
   const suspicious = Object.keys(env).filter((k) => /^(HANA_|MCP_|LOG_)/.test(k) && !known.has(k));
   if (suspicious.length > 0) {
     logger.warn(
@@ -621,6 +672,9 @@ function warnUnknownEnvKeys(env: Record<string, unknown>): void {
 
 /**
  * 档案配置自检（启动即失败，不给"以为生效其实没有"的机会）：
+ * 0. **未配置 MCP_PROFILES 时也不放过显式档案名**：MCP_PROFILE 非 default、或任一 Token 带第三段
+ *    → 拒绝启动（没有条目可解析，静默忽略就是"生效值 ≠ 运维以为的值"；Token 里含一个冒号的
+ *    旧写法也会在此响亮失败，见 parseHttpClients）；
  * 1. 配了 MCP_PROFILES 就必须定义 `default` —— HTTP 里不带第三段的 Token 与 stdio 进程都落它，
  *    缺了会把"没指定档案"误读成"没有限制"；
  * 2. MCP_PROFILE 指向的档案必须存在；
@@ -633,7 +687,29 @@ function assertProfileConfig(
   rawTokens: string,
   singleToken?: string,
 ): void {
-  if (profiles.size === 0) return; // 未配置档案：一切走隐式 default，无约束
+  // Token 表先解析（**先于空表早退**）：它既是格式校验（含"Token 段含 : 一律失败"），
+  // 也让下面的"第三段档案必须已定义"在未配置档案的部署里同样生效——否则
+  // `name:<恰好含一个冒号的 Token>` 会被切成三段静默改义（Token 段截半、后半段被当档案名忽略）。
+  const clients = parseHttpClients(rawTokens, singleToken);
+  if (profiles.size === 0) {
+    // 未配置档案：一切走隐式 default（不收紧）；但**显式写了档案名**就没有任何条目可解析，
+    // 静默忽略会让"生效值 ≠ 运维以为的值"，必须响亮失败（本文件最常防的一类问题）。
+    if (processProfileId !== IMPLICIT_DEFAULT_PROFILE_ID) {
+      throw new Error(
+        `MCP_PROFILE="${processProfileId}" 未在 MCP_PROFILES 中定义（当前未配置任何档案）：` +
+          '请配置 MCP_PROFILES（并含 default 档案），或去掉 MCP_PROFILE / 改回 default',
+      );
+    }
+    const withProfile = clients.find((c) => c.profileId !== undefined);
+    if (withProfile) {
+      throw new Error(
+        `MCP_HTTP_TOKENS 中客户端 "${withProfile.clientId}" 指定了档案 "${withProfile.profileId}"，` +
+          '但 MCP_PROFILES 未配置任何档案（无从解析）：请配置 MCP_PROFILES，或去掉 Token 的第三段；' +
+          '若 Token 本身含冒号，请更换 Token（冒号已用于分隔身份与档案）',
+      );
+    }
+    return;
+  }
   if (!profiles.has(IMPLICIT_DEFAULT_PROFILE_ID)) {
     throw new Error(
       `MCP_PROFILES 未定义 default 档案：HTTP 中不带档案段的 Token 与 stdio 进程都落 default，` +
@@ -646,7 +722,7 @@ function assertProfileConfig(
     );
   }
   // Token 的档案段（只报身份名，不回显 Token）
-  for (const client of parseHttpClients(rawTokens, singleToken)) {
+  for (const client of clients) {
     if (client.profileId !== undefined && !profiles.has(client.profileId)) {
       throw new Error(
         `MCP_HTTP_TOKENS 中客户端 "${client.clientId}" 指定的档案 "${client.profileId}" 未在 MCP_PROFILES 中定义：` +
@@ -657,14 +733,16 @@ function assertProfileConfig(
 }
 
 /**
- * 解析提升预算（MCP_CAPABILITY_SURFACE_MAX）：1..1000 的整数，默认 50（与 hana-cli 的
- * `MAX_DYNAMIC_TOOLS` 同值）。越界一律启动失败——配错却静默取默认，表现为"面突然被提前淘汰"，
- * 是很难查的。
+ * 解析提升预算（MCP_CAPABILITY_SURFACE_MAX）：1..1000 的整数，缺省 {@link SURFACE_MAX_DEFAULT}
+ * （与 hana-cli 的 `MAX_DYNAMIC_TOOLS` 同值）。越界一律启动失败——配错却静默取默认，表现为
+ * "面突然被提前淘汰"，是很难查的。
  */
 function parseSurfaceMax(raw: string): number {
   const n = Number(raw);
   if (!Number.isInteger(n) || n < 1 || n > 1000) {
-    throw new Error(`MCP_CAPABILITY_SURFACE_MAX 非法：应为 1..1000 的整数（当前 "${raw}"，默认 50）`);
+    throw new Error(
+      `MCP_CAPABILITY_SURFACE_MAX 非法：应为 1..1000 的整数（当前 "${raw}"，默认 ${SURFACE_MAX_DEFAULT}）`,
+    );
   }
   return n;
 }
@@ -691,11 +769,23 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HanaConfig {
     throw new Error(`无效的 SQL 端口: ${explicitPort || derivedPort}`);
   }
 
+  // XS 端口同口径收口：'0'/'99999' 这类越界值若放行，要到首次 XS REST 调用才以驱动层错误暴露
+  const explicitXsPort = parsed.HANA_XS_PORT;
+  const xsPort = explicitXsPort ? parseInt(explicitXsPort, 10) : deriveXsPort(parsed.HANA_INSTANCE);
+  if (xsPort < 1 || xsPort > 65535) {
+    throw new Error(`无效的 XS 端口: ${explicitXsPort || xsPort}`);
+  }
+
   // 将解析后的时区应用到整个进程（影响 new Date() 等本地时间语义）
   process.env.TZ = parsed.HANA_TIMEZONE;
 
   // 凭据生命周期：取出密码后即从进程环境移除，避免常驻 process.env 被同机进程/子进程/调试器读取
   delete process.env.HANA_PASSWORD;
+  // HTTP Bearer Token 与密码同属"能触发全部工具（含写）的凭据"，同一威胁模型下一并移除：
+  // 值已进 config.httpTokens 内存副本，后续判定不再读 env（服务进程内禁止重新解析 env，
+  // 见 index.ts 与 preflight.policyFromConfig 的说明）
+  delete process.env.MCP_HTTP_TOKEN;
+  delete process.env.MCP_HTTP_TOKENS;
 
   // 连接目标/凭据的来源归因：多于一个来源 = 混用（如 shell 残留的 HANA_USER + .env 其余项）
   const connectionSourceMixed = new Set(Object.values(dotenv.sources)).size > 1;
@@ -729,9 +819,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HanaConfig {
     agentLabel: parsed.MCP_AGENT_LABEL,
     surfaceMax: parseSurfaceMax(parsed.MCP_CAPABILITY_SURFACE_MAX),
     logLevel: parsed.LOG_LEVEL,
-    xsPort: parsed.HANA_XS_PORT ? parseInt(parsed.HANA_XS_PORT, 10) : parseInt(`80${parsed.HANA_INSTANCE}`, 10),
+    xsPort,
     xsBasePath: parsed.HANA_XS_BASE_PATH,
-    // P5 并发/超时旋钮（默认值来自 core/limits.js；接线处见 index.ts 的 HanaPool 构造与各调用点）
+    // 并发/超时旋钮（默认值来自 core/limits.js；接线处见 index.ts 的 HanaPool 构造与各调用点）
     poolMax: parsed.HANA_POOL_MAX,
     poolWaitMs: parsed.HANA_POOL_WAIT_MS,
     poolMaxWaiters: parsed.HANA_POOL_MAX_WAITERS,

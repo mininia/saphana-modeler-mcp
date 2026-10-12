@@ -13,7 +13,7 @@ import type { PolicyRequest } from './config/preflight.js';
  * 本模块只描述「会发生什么」；判定仍由预检层（config/preflight.ts）按生效权限配置做，
  * 不在这里另写一套规则。
  *
- * P7 起把声明细化到**对象级**（`reads`/`writes`，SSD §6.2）：变更集批内相交检测不能用包级粒度
+ * 声明细化到**对象级**（`reads`/`writes`）：变更集批内相交检测不能用包级粒度
  * （同包多对象的正常批次会因 writePackages 全相同被整批误拒），判定粒度必须是 `{packageId, objectName}`。
  *
  * 规划只做**只读**的分析，不产生任何副作用。
@@ -33,12 +33,16 @@ export interface WritePlan {
    */
   readPackages: string[];
   /**
-   * 本次将读取（引用）的仓库对象（对象级；相交检测用）。解析不出的引用落 uncertain，不在这里假装确定。
+   * 本次将读取（引用）的仓库对象（对象级）。解析不出的引用落 uncertain，不在这里假装确定。
    * 可选：未做对象级声明的规划器/调用方不填（既有调用方零改动）。
-   * 未声明（undefined）与「已声明无」（`[]`）语义不同——前者表示对象级静态不可知，后者才表示确实没有。
+   * 未声明（undefined）与「已声明无」（`[]`）语义不同——前者表示对象级静态不可知，后者才表示确实没有；
+   * 拦截报告（formatWritePlan）按这一区别原样展示。
+   *
+   * **不参与拦截判定**：包级判定只消费 writePackages/readSchemas（planToRequest）；批内相交检测由
+   * 执行侧（changeset.plan）用同一套推导（objectRefsOfUpdate）另行计算，不经本字段。
    */
   reads?: ObjectRef[];
-  /** 本次将写入/创建/删除的仓库对象（对象级；相交检测用）。可选、只声明不判定，口径同 reads。 */
+  /** 本次将写入/创建/删除的仓库对象（对象级）。可选；语义与消费面同 reads（含"不参与拦截判定"）。 */
   writes?: ObjectRef[];
   /**
    * 计划无法静态确定的点。必须显式列出而不是假装确定——
@@ -48,7 +52,7 @@ export interface WritePlan {
 }
 
 /**
- * 仓库对象引用（对象级）——SSD §6.2 相交检测的判定粒度。
+ * 仓库对象引用（对象级）——批内相交检测的判定粒度。
  * 为什么必须到对象级：包级相交会把「同包多对象正常批次」整批误拒（10 个对象同包 ⇒ writePackages 全相同 ⇒ 全拒）。
  */
 export interface ObjectRef {
@@ -81,6 +85,16 @@ export function formatWritePlan(plan: WritePlan): string {
       `；读 schema ${plan.readSchemas.length ? plan.readSchemas.join(', ') : '(无)'}` +
       `；跨包只读引用 ${plan.readPackages.length ? plan.readPackages.join(', ') : '(无)'}`,
   );
+  // 对象级读写集（可选）：未声明（undefined）= 静态不可知，不印；已声明（含 `[]`）如实印出——
+  // 「已声明无」与「未声明」在报告里必须可区分，否则读报告的人会把"不可知"当成"没有引用"。
+  for (const [label, refs] of [
+    ['写', plan.writes],
+    ['读', plan.reads],
+  ] as const) {
+    if (refs === undefined) continue;
+    const listed = refs.map((r) => `${r.packageId}/${r.objectName}`).join(', ');
+    lines.push(`  对象级${label}集：${listed === '' ? '(无)' : listed}`);
+  }
   for (const u of plan.uncertain) lines.push(`  [不确定] ${u}`);
   return lines.join('\n');
 }
@@ -144,8 +158,8 @@ const VIEW_URI_SEGMENTS = new Set(['calculationviews', 'attributeviews', 'analyt
  *
  * 解析不出的形态（段数不足 / 目录段不是视图类 / 无前导斜杠）**跳过不猜**——
  * 对象级引用会被批内相交检测直接消费，猜错可能把正常批次误拒，或让真实冲突漏检。
- * 跳过不猜的引用**不在这里静默丢弃**：带降级出口的投影（scanXmlObjectRefsWithUnresolved）
- * 把它们如实带回给调用方落 uncertain（§6.2）。
+ * 跳过不猜的引用**不在扫描件里静默丢弃**：带降级出口的投影（scanXmlObjectRefsWithUnresolved）
+ * 把它们如实带回给调用方落 uncertain——只看 refs 时「跳过不猜」与「根本没有引用」无从区分。
  */
 export function scanXmlObjectRefs(xml: string): ObjectRef[] {
   return scanXmlObjectRefsWithUnresolved(xml).refs;
@@ -153,11 +167,11 @@ export function scanXmlObjectRefs(xml: string): ObjectRef[] {
 
 /**
  * `scanXmlObjectRefs` 的**带降级出口**投影（同一实现的两个视图，不是第二份扫描器）：
- * 解析出的对象照旧（去重保序）；解析不出的 resourceUri 值**如实带回**——
- * §6.2 要求「解析不出的引用落 uncertain」，而只看 refs 时「跳过不猜」与「根本没有引用」无从区分。
+ * 解析出的对象照旧（去重保序）；解析不出的 resourceUri 值**如实带回**给调用方逐条落自己的
+ * uncertain（hana_repo_import 的内联内容分支与 objectRefsOfUpdate 都是这么用的）。
  * unresolved 按值去重（同一个解析不出的 URI 出现多处只报一条，不制造重复噪音）。
  */
-function scanXmlObjectRefsWithUnresolved(xml: string): { refs: ObjectRef[]; unresolved: string[] } {
+export function scanXmlObjectRefsWithUnresolved(xml: string): { refs: ObjectRef[]; unresolved: string[] } {
   const refs: ObjectRef[] = [];
   const unresolved: string[] = [];
   for (const value of scanXmlResourceUriValues(xml)) {
@@ -190,8 +204,11 @@ function nonEmptyStr(v: unknown): string | undefined {
   return t === '' ? undefined : t;
 }
 
-/** 对象级引用去重（保持先到先得的次序，保证计划输出确定性） */
-function dedupeRefs(refs: ObjectRef[]): ObjectRef[] {
+/**
+ * 对象级引用去重（保持先到先得的次序，保证计划输出确定性）。
+ * 判等走 `sameObjectRef`——对象级判等与容器去重都只有这一处实现，规划器与批内相交检测共用。
+ */
+export function dedupeRefs(refs: ObjectRef[]): ObjectRef[] {
   const out: ObjectRef[] = [];
   for (const r of refs) if (!out.some((x) => sameObjectRef(x, r))) out.push(r);
   return out;
@@ -261,17 +278,60 @@ export function objectRefsOfUpdate(input: {
  * 是否含**未限定 schema** 的表引用（`FROM <名字>` 后面不是 `.`）。
  * 这类表名由 HANA 按当前用户的默认 schema 解析——服务层据此校验那个 schema 是否在允许范围内
  * （扫描器无法得知默认 schema，故这里只做探测，解析交给服务层查 CURRENT_SCHEMA）。
+ *
+ * **CTE 名逐语句收集**（作用域=语句，与表名区的 `;` 语句边界同一口径，见 tableNameRegion /
+ * splitSqlStatements）：CTE 只在本语句内可见。对整份脚本取并集时，前一条语句定义的 CTE 名会把
+ * 后续语句里**同名的真实表**一并抑制，hasUnqualifiedTableRef 返回 false ⇒ 服务层
+ * （read-scope.service）的默认 schema 白名单判定整段跳过、越界读取放行。实测：
+ * `BEGIN VAR_OUT = WITH AMOUNT AS (…) SELECT * FROM AMOUNT; SELECT * FROM AMOUNT; END`
+ * 里后半句的 AMOUNT 是真实表，必须按未限定表名报出（带列清单与引号名形态同理）。
  */
 export function hasUnqualifiedTableRef(sql: string): boolean {
   const text = stripSqlLiteralsAndComments(sql);
-  const ctes = collectCteNames(text);
-  const anchor = /\b(FROM|JOIN)\b/gi;
-  let m: RegExpExecArray | null;
-  while ((m = anchor.exec(text)) !== null) {
-    if (regionHasUnqualifiedName(tableNameRegion(text, m.index + m[0].length), ctes)) return true;
-    anchor.lastIndex = m.index + m[0].length;
+  for (const stmt of splitSqlStatements(text)) {
+    const ctes = collectCteNames(stmt); // 语句级作用域：不得并集到整份脚本（见上）
+    const anchor = /\b(FROM|JOIN)\b/gi;
+    let m: RegExpExecArray | null;
+    while ((m = anchor.exec(stmt)) !== null) {
+      if (regionHasUnqualifiedName(tableNameRegion(stmt, m.index + m[0].length), ctes)) return true;
+      anchor.lastIndex = m.index + m[0].length;
+    }
   }
   return false;
+}
+
+/**
+ * 按**顶层 `;`** 切分语句（引号标识符按 token 整体跳过——`FROM "A;B"` 里的分号不是语句边界；
+ * 括号内不切）。服务于 CTE 的**语句级作用域**：WITH 定义只在本语句内可见，
+ * 逐语句收集 CTE 名才不会让前一条语句的 CTE 名抑制后续语句里的同名真实表。
+ *
+ * 只切 `;`、**不切**语句起始关键字：关键字（如 CASE…END 的 END）会出现在单条语句内部，
+ * 按它切会把同一条语句里的 CTE 名拆到两个片段、`FROM <CTE>` 被当成未限定表误报，
+ * 合法脚本被默认 schema 白名单误拦；`;` 才是 SQL 语句的真正分隔符（CTE 作用域与之一致）。
+ * 未闭合引号时剩余部分整段收进当前语句（与 tableNameRegion 的未闭合处理同一口径）。
+ */
+function splitSqlStatements(text: string): string[] {
+  const out: string[] = [];
+  let start = 0;
+  let depth = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '"') {
+      const end = skipQuotedIdentifier(text, i);
+      if (end < 0) break; // 未闭合引号：剩余部分原样收进当前语句
+      i = end - 1; // -1 抵消循环自增
+      continue;
+    }
+    if (ch === '(') depth++;
+    else if (ch === ')') {
+      if (depth > 0) depth--;
+    } else if (ch === ';' && depth === 0) {
+      out.push(text.slice(start, i));
+      start = i + 1;
+    }
+  }
+  out.push(text.slice(start));
+  return out;
 }
 
 /**
@@ -279,9 +339,21 @@ export function hasUnqualifiedTableRef(sql: string): boolean {
  * `SELECT * FROM SYS.DUMMY, MARA` 里 MARA 才是未限定的那张，只看第一个会漏（评审实测）——
  * 而漏判的后果是"默认 schema 不在允许范围内"这类越界读取直接放行。
  * 按**顶层逗号**分片（括号内的逗号属于函数调用参数，不分片），每片只看头一个标识符。
+ * 以 `(` 开头的分片是**括号 join**（`FROM (MARA A JOIN …)`）或子查询：括号 join 的首表没有
+ * 别的锚点可见路径（`FROM (MARA …)` 里 MARA 在 FROM 锚点之后的第一个括号里），必须递归进
+ * 括号内容判定；子查询不归这里管——它内部的表由自己的 FROM 锚点扫到。
  */
 function regionHasUnqualifiedName(region: string, ctes: Set<string>): boolean {
   for (const part of splitTopLevel(region)) {
+    const paren = leadingParen(part);
+    if (paren >= 0) {
+      const end = skipBalanced(part, paren);
+      if (end > 0) {
+        const inner = part.slice(paren + 1, end - 1);
+        if (!startsWithSubquery(inner) && regionHasUnqualifiedName(inner, ctes)) return true;
+      }
+      continue;
+    }
     const head = /^\s*(?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_$#]*))\s*([.(]?)/.exec(part);
     if (!head) continue;
     const quoted = head[1] !== undefined;
@@ -295,7 +367,12 @@ function regionHasUnqualifiedName(region: string, ctes: Set<string>): boolean {
       if (open >= 0 && regionHasUnqualifiedName(part.slice(open + 1), ctes)) return true;
       continue;
     }
-    if (quoted) return true;
+    // 引号标识符：引号 CTE 名按大小写敏感比对（collectCteNames 对引号名原样收集）。
+    // 不查 ctes 时 `WITH "B" AS (…) … FROM "B"` 会被当成未限定表名误报（合法脚本被拦）
+    if (quoted) {
+      if (ctes.has(name)) continue;
+      return true;
+    }
     const upper = name.toUpperCase();
     // DUMMY 是 SYS 下的伪表（恒 1 行）；CTE 名与保留字都不是表引用
     if (upper === 'DUMMY' || SQL_NON_SCHEMA.has(upper) || ctes.has(upper)) continue;
@@ -304,12 +381,31 @@ function regionHasUnqualifiedName(region: string, ctes: Set<string>): boolean {
   return false;
 }
 
-/** 收集 `WITH <名> AS (` 定义的 CTE 名——它们出现在 FROM 位置时不是表引用 */
+/** 分片是否以 `(` 开头（括号 join / 子查询 / 括号包裹的表引用）；是则返回该括号的偏移，否则 -1 */
+function leadingParen(part: string): number {
+  let i = 0;
+  while (i < part.length && /\s/.test(part[i])) i++;
+  return part[i] === '(' ? i : -1;
+}
+
+/**
+ * 收集 `WITH <名> [(<列清单>)] AS (` 定义的 CTE 名——它们出现在 FROM 位置时不是表引用。
+ * **按单条语句调用**（文本不跨 `;`）：CTE 作用域是语句级，对整份脚本取并集会让前一条语句的
+ * CTE 名抑制后续语句里的同名真实表（见 hasUnqualifiedTableRef / splitSqlStatements）。
+ * 三种形态都要收（每种都对应一类实测误报）：
+ * - 未引号名：按 HANA 标识符规则折成大写（未引号引用也折大写，故比对一致）；
+ * - 引号名（`"B"`）：**原样**收集、比对大小写敏感（`"B"` 与 `"b"` 是不同标识符）；
+ * - 带列清单（`WITH C (A) AS (…)`）：列清单是合法写法，必须跳过，否则 `FROM C` 被当成未限定表。
+ * 用前视断言代替 `\b`：`\b` 在引号前不成立（前一个字符通常是非单词字符），引号名会漏收。
+ */
 function collectCteNames(text: string): Set<string> {
   const names = new Set<string>();
-  const re = /\b([A-Za-z_][A-Za-z0-9_$#]*)\s+AS\s*\(/gi;
+  const re = /(?<![\w$#"])([A-Za-z_][A-Za-z0-9_$#]*|"[^"]+")\s*(?:\([^)]*\))?\s+AS\s*\(/gi;
   let m: RegExpExecArray | null;
-  while ((m = re.exec(text)) !== null) names.add(m[1].toUpperCase());
+  while ((m = re.exec(text)) !== null) {
+    const raw = m[1];
+    names.add(raw.startsWith('"') ? raw.slice(1, -1) : raw.toUpperCase());
+  }
   return names;
 }
 
@@ -345,33 +441,86 @@ function skipBalanced(text: string, open: number): number {
   return -1;
 }
 
-/** `(` 前紧邻标识符（或引号标识符的收尾）= 表函数调用；否则 `(` 属于派生表/子查询 */
-function isCallParen(before: string): boolean {
-  return /[A-Za-z0-9_$#"]$/.test(before.replace(/\s+$/, ''));
+/** 跳过一段引号标识符（含 `""` 转义），返回收尾引号之后的偏移；未闭合返回 -1 */
+function skipQuotedIdentifier(text: string, open: number): number {
+  let i = open + 1;
+  while (i < text.length) {
+    if (text[i] === '"' && text[i + 1] === '"')
+      i += 2; // "" 转义
+    else if (text[i] === '"') return i + 1;
+    else i++;
+  }
+  return -1;
+}
+
+/** 括号内容是否是子查询（派生表 / CTE 体 / LATERAL 子查询）：以 SELECT 或 WITH 开头 */
+function startsWithSubquery(inner: string): boolean {
+  return /^\s*(?:SELECT|WITH)\b/i.test(inner);
 }
 
 /**
- * 把**派生表/子查询**的括号内容抹成空白（保持偏移不变）。
+ * 把**派生表/子查询**的括号内容抹成空白（保持偏移不变），并按括号内容区分其余括号：
  *
- * 为什么必须抹：`SELECT V.A FROM (SELECT T.A FROM SYS.TAB T) V` 里 `T.A` 的 `T` 是派生表的别名，
- * 不是 schema——不抹会被当成 schema 收集，而任何白名单都不可能有 `T`，于是**合法语句被误拒**
- * （实测：main 上返回 `['SYS']`，加括号扫描后变成 `['T','SYS']`）。
- * 派生表内部的表名不会因此漏掉：它自己的 `FROM` 会被锚点单独扫到（`SYS.TAB` 就在内层）。
- * **函数调用的参数不抹**——表函数的参数里可以有表名，而那里没有 FROM 锚点兜底。
+ * - **子查询**（内容以 SELECT/WITH 开头）：整段抹除。`SELECT V.A FROM (SELECT T.A FROM SYS.TAB T) V`
+ *   里 `T.A` 的 `T` 是派生表的别名，不是 schema——不抹会被当成 schema 收集，而任何白名单都不可能有
+ *   `T`，于是**合法语句被误拒**（实测：main 上返回 `['SYS']`，加括号扫描后变成 `['T','SYS']`）。
+ *   派生表内部的表名不会因此漏掉：它自己的 `FROM` 会被锚点单独扫到（`SYS.TAB` 就在内层）。
+ *   判定**以内容为先**，不看 `(` 前面是什么 token：`JOIN (SELECT …)`、`LATERAL (SELECT …)` 的
+ *   `(` 前恰好是标识符字符（N/L），先前"`(` 前是标识符即函数调用"的判定会把子查询当函数参数
+ *   留下，里面的别名限定列（`X.K`）被扫成 schema → 合法语句被 schema_not_allowed 硬拦（评审实测）。
+ * - **非子查询括号**（表函数调用、括号 join）：**不整段抹**——表函数参数里可以有表名
+ *   （`APPLY_FILTER("S"."T", …)`），括号 join 的首表更是没有别的锚点可见路径
+ *   （`FROM (SECRET.T1 A JOIN ZEMP.T2 B ON …)`），抹掉等于整个表引用漏扫。
+ *   改为**递归**进括号内容：表名继续参与扫描；里面若还有子查询照样按子查询抹除；
+ *   并把括号 join 的 **join 条件（顶层 ON …）** 抹掉——`ON A.X=B.X` 里的限定名是列不是 schema
+ *   （不抹会被当成 schema 收集，合法语句被误拒）。
+ *   函数参数里的表名不会因此漏：递归同样保留它们，只有子查询与 join 条件被抹。
  */
 function maskDerivedTables(region: string): string {
   let out = '';
   let i = 0;
   while (i < region.length) {
-    if (region[i] === '(' && !isCallParen(out)) {
+    const ch = region[i];
+    if (ch === '"') {
+      // 引号标识符按 token 整体跳过：内容里的 `(`、`ON`、逗号都不是语法结构
+      const end = skipQuotedIdentifier(region, i);
+      if (end < 0) {
+        out += region.slice(i); // 未闭合引号：原样保留，交给后续扫描
+        break;
+      }
+      out += region.slice(i, end);
+      i = end;
+      continue;
+    }
+    if (ch === '(') {
       const end = skipBalanced(region, i);
       if (end > 0) {
-        out += ' '.repeat(end - i);
+        const inner = region.slice(i + 1, end - 1);
+        if (startsWithSubquery(inner)) {
+          out += ' '.repeat(end - i); // 子查询：整段抹除
+          i = end;
+          continue;
+        }
+        out += '(' + maskDerivedTables(inner) + ')'; // 表函数/括号 join：递归保留表名、抹条件
         i = end;
         continue;
       }
     }
-    out += region[i];
+    // 括号 join 底下的 join 条件：顶层 ON 之后整段抹掉（`ON A.X=B.X` 的限定名是列不是 schema）。
+    // 表名区扫描（tableNameRegion）已把顶层 ON 截断，这里处理的是冒泡进括号 join 内容的条件；
+    // 条件里出现的表名都有自己的 FROM/JOIN 锚点兜底，不会漏。
+    if (
+      (ch === 'O' || ch === 'o') &&
+      (i === 0 || !/[A-Za-z0-9_$#]/.test(region[i - 1])) &&
+      /^ON(?![A-Za-z0-9_$#])/i.test(region.slice(i))
+    ) {
+      const resume = skipJoinCondition(region, i + 2);
+      const stop = resume < 0 ? region.length : resume - 1; // 逗号本身保留：它是表名区的分片符
+      out += ' '.repeat(stop - i);
+      i = stop;
+      continue;
+    }
+    out += ch;
     i++;
   }
   return out;
@@ -402,11 +551,31 @@ function skipAlias(text: string, from: number): number {
  * `APPLY_FILTER("SAPSR3"."MARA", $$X=1$$)`、`CE_COLUMN_TABLE("S"."T")`、`(SELECT * FROM C.T)`，
  * 早切会让它们整体逃过扫描（评审实测：这是读边界被绕过的一类写法）。顶层边界仍然是
  * ON/WHERE/GROUP/… 与语句结尾；顶层的 `=` 也切（旧行为，保留）；`AS` 只跳别名不截断（见 skipAlias）。
+ *
+ * `ON` 不是**整段**表名区的终点：`JOIN … ON 条件, SECRET.T3` 里 ON 之后的顶层逗号列表仍可能有
+ * 表引用（标准 SQL 的 FROM 逗号列表允许在 join 链之后再以逗号追加表），命中 ON 时越过条件表达式、
+ * 在下一个顶层逗号处恢复扫描（条件本身不参与扫描——里面的 `A.X` 是列不是 schema）。
+ * 引号标识符按 token 整体跳过：`FROM "ON"."T"` 的引号名里出现子句关键字不能截断表名区。
+ *
+ * **语句边界**：`;` 与语句起始关键字（STATEMENT_KEYWORD，如 BEGIN/END/SELECT）在顶层同样收住——
+ * 表名区不得跨语句。多语句过程体（`BEGIN … ; … END`）里每条语句有自己的 FROM/JOIN 锚点，
+ * 表名区越过边界后会把后续语句的列限定名/列名当成表引用（实测：合法脚本被闸门误拒）；
+ * 后续语句自己的表引用由它自己的锚点扫到，在这里收住不会漏。
+ *
+ * WITH/FOR **不是**边界：它们是**表引用子句关键字**（`WITH HINT(…)` / `WITH PARAMETERS(…)` /
+ * `FOR SYSTEM_TIME AS OF …`），出现在表名区里表示表级子句、不是新语句的起点，须继续扫其后的
+ * 顶层逗号列表（`FROM SYS.T1 WITH HINT(NO_INLINE), SECRET.T2` 的 SECRET 不能漏；见 STATEMENT_KEYWORD 注）。
  */
 function tableNameRegion(text: string, start: number): string {
   let depth = 0;
   for (let i = start; i < text.length; i++) {
     const ch = text[i];
+    if (ch === '"') {
+      const end = skipQuotedIdentifier(text, i);
+      if (end < 0) return text.slice(start); // 未闭合引号：整段原样收下
+      i = end - 1; // -1 抵消循环自增；引号内容不参与关键字判定
+      continue;
+    }
     if (ch === '(') {
       depth++;
       continue;
@@ -416,6 +585,7 @@ function tableNameRegion(text: string, start: number): string {
       depth--;
       continue;
     }
+    if (depth === 0 && ch === ';') return text.slice(start, i); // 语句边界：表名区不跨语句
     if (depth === 0 && ch === '=') return text.slice(start, i);
     if (depth === 0 && /[A-Za-z_]/.test(ch)) {
       CLAUSE_KEYWORD.lastIndex = i;
@@ -424,8 +594,15 @@ function tableNameRegion(text: string, start: number): string {
           // AS 不是终点：跳过它和紧跟的别名，继续扫同一张表名区里后面的表
           return text.slice(start, i) + ' ' + tableNameRegion(text, skipAlias(text, i + 2));
         }
+        if (/^ON(?![A-Za-z0-9_$#])/i.test(text.slice(i))) {
+          // ON 条件之后的顶层逗号列表里还有表（`… ON a=b, SECRET.T3`）：越过条件，从逗号后恢复扫描
+          const resume = skipJoinCondition(text, i + 2);
+          if (resume >= 0) return text.slice(start, i) + ', ' + tableNameRegion(text, resume);
+        }
         return text.slice(start, i);
       }
+      STATEMENT_KEYWORD.lastIndex = i;
+      if (STATEMENT_KEYWORD.test(text)) return text.slice(start, i); // 语句起始关键字：同样收住
     }
   }
   return text.slice(start);
@@ -433,6 +610,74 @@ function tableNameRegion(text: string, start: number): string {
 
 /** 表名区的顶层子句边界关键字（粘性匹配：只在当前位置判定，避免把 `ONYX` 当 `ON`） */
 const CLAUSE_KEYWORD = /\b(?:ON|WHERE|GROUP|ORDER|HAVING|UNION|EXCEPT|INTERSECT|AS)\b/iy;
+
+/**
+ * 语句起始关键字——表名区与 ON 恢复扫描的**语句边界**（与 `;` 同一口径，仅深度 0 生效）。
+ *
+ * 为什么需要：SQLScript 过程体 / SQL 模式视图 <definition> 是多语句脚本（语句以 `;` 分隔），
+ * 每条语句有自己独立的 FROM/JOIN 锚点。表名区（或 ON 恢复扫描）越过语句边界后，会把后续语句里的
+ * 列限定名（`X.COL`）、select 列表头当成表引用 —— 扫出假 schema / 假未限定表名，合法脚本被
+ * 闸门误拒（多语句过程体实测）。字符串与注释已被剥离、引号标识符整 token 跳过，因此表位置上的
+ * 这些词只可能是新语句的起点；本语句自己的表引用都在边界之前，收住不会漏扫。
+ * `END` 例外（CASE 表达式的收尾）见 skipJoinCondition 的深度计数。
+ *
+ * **WITH / FOR 故意不在此列**（独立复核 ①–④：把两者并进来手段过宽）：它们同时是**表引用子句关键字**
+ * —— `WITH HINT(…)` / `WITH PARAMETERS(…)` / `FOR SYSTEM_TIME AS OF …`（以及 `FOR UPDATE`）跟在
+ * FROM 表引用之后，是**表级子句**而不是新语句的起点。区分口径：本文件只在 FROM/JOIN 锚点**之后**的
+ * 表名区里做关键字判定，而真正的语句起点前面必有 `;`（已单独收住，或就是扫描起点）——所以表名区里
+ * 出现的 WITH/FOR 不可能是语句起点，遇到它们应**继续扫**其后的顶层逗号列表。当硬边界用的后果：
+ * `… WITH HINT(NO_INLINE), SECRET.T2` 里逗号追加的 SECRET 整体漏扫，schema 白名单可再次被绕过。
+ */
+const STATEMENT_KEYWORD =
+  /\b(?:SELECT|INSERT|UPDATE|UPSERT|DELETE|MERGE|CREATE|DROP|ALTER|TRUNCATE|CALL|DO|BEGIN|END|IF|WHILE|LOOP|RETURN|DECLARE|EXPORT|IMPORT|GRANT|REVOKE|EXPLAIN|SET)\b/iy;
+
+/**
+ * 从 join 条件处（`ON` 关键字之后）扫到**下一个顶层逗号**——那里恢复表名区扫描（逗号列表的下一张表）。
+ * 条件表达式里的逗号都在括号内（depth > 0）不分片；引号标识符里的内容（含逗号）按 token 跳过。
+ * 条件之后没有表引用时（下一个是其他子句、回到外层括号或语句结尾）返回 -1，表名区照旧在此结束。
+ *
+ * **语句边界**：`;` 与语句起始关键字（STATEMENT_KEYWORD）同样返回 -1 —— 恢复扫描不得跨语句
+ * （跨过去会在后续语句里找到顶层逗号并恢复表名区扫描，后续语句的列名/列限定名被当成表引用，
+ * 合法脚本被误拒）。`END` 例外：它可能是 ON 条件里 CASE 表达式的收尾（不是语句边界），
+ * 用 CASE 深度计数区分——带 `CASE…END` 的条件之后，顶层逗号列表仍要恢复扫描（2.2 修复不退化）。
+ * 表引用子句关键字是 WITH/FOR 时同样不收住（它们不在 STATEMENT_KEYWORD 里，见其注）：
+ * 条件之后跟着表级子句时，继续找其后的顶层逗号列表。
+ */
+function skipJoinCondition(text: string, from: number): number {
+  let depth = 0;
+  let caseDepth = 0; // ON 条件里未闭合的 CASE 数（只在深度 0 计数）
+  for (let i = from; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '"') {
+      const end = skipQuotedIdentifier(text, i);
+      if (end < 0) return -1;
+      i = end - 1; // -1 抵消循环自增
+      continue;
+    }
+    if (ch === '(') depth++;
+    else if (ch === ')') {
+      if (depth === 0) return -1; // 回到外层括号：条件之后没有逗号列表
+      depth--;
+    } else if (ch === ',' && depth === 0) return i + 1;
+    else if (ch === ';' && depth === 0)
+      return -1; // 语句边界：恢复扫描不得跨语句
+    else if (depth === 0 && /[A-Za-z_]/.test(ch)) {
+      CLAUSE_KEYWORD.lastIndex = i;
+      // ON 例外：join 链可以不带逗号直接接下一个 ON（`… ON x JOIN C ON y, SECRET.T`），
+      // 越过它继续找顶层逗号；其余子句关键字说明条件之后不会再跟表引用，就此收住。
+      if (CLAUSE_KEYWORD.test(text) && !/^ON(?![A-Za-z0-9_$#])/i.test(text.slice(i))) return -1;
+      if (/^CASE(?![A-Za-z0-9_$#])/i.test(text.slice(i))) {
+        caseDepth++; // CASE…END 的收尾 END 不是语句边界（见函数头注）
+        continue;
+      }
+      STATEMENT_KEYWORD.lastIndex = i;
+      if (!STATEMENT_KEYWORD.test(text)) continue;
+      if (/^END(?![A-Za-z0-9_$#])/i.test(text.slice(i)) && caseDepth > 0) caseDepth--;
+      else return -1; // 语句起始关键字：条件扫描不跨进下一条语句
+    }
+  }
+  return -1;
+}
 
 /** SQL 里不会作为 schema 出现的保留字（表位置上的兜底过滤） */
 const SQL_NON_SCHEMA = new Set([
@@ -536,6 +781,12 @@ export function stripSqlLiteralsAndComments(sql: string): string {
  *    CTE 名（`WITH BASE AS … SELECT BASE.X`）不是 schema，误报会把合法调用硬拦在预检；
  * 3. 引号形式（`"SAPSR3"."MARA"`）与大小写写法都要识别（引号内保留原样、未加引号按 HANA 规则折成大写）：
  *    只认全大写未加引号会漏掉 `"SAPSR3"."MARA"` = 读边界被绕过。
+ *
+ * 多语句脚本（SQLScript 过程体 `BEGIN … END`）**逐语句扫描**：表名区止于语句边界（`;` 与
+ * 语句起始关键字，见 tableNameRegion），每条语句的表引用由它自己的 FROM/JOIN 锚点扫到——
+ * 越过语句边界会把后续语句的列限定名（`X.COL`）扫成假 schema，合法脚本被闸门误拒。
+ * `WITH HINT` / `WITH PARAMETERS` / `FOR SYSTEM_TIME AS OF` 这类**表引用子句关键字**不是语句边界：
+ * 它们之后的顶层逗号列表（逗号追加的表）仍照扫（见 STATEMENT_KEYWORD 注）。
  *
  * 仍不覆盖（在计划里以「不确定」显式标注，不假装完整）：未限定 schema 的表名（服务端按当前用户默认
  * schema 解析）与动态 SQL。

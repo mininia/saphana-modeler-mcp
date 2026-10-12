@@ -10,16 +10,18 @@
     "url": "git+https://github.com/mininia/saphana-modeler-mcp.git"
   },
   "bin": {
-    "saphana-modeler-mcp": "./dist/index.js"
+    "saphana-modeler-mcp": "dist/index.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "THIRD-PARTY-NOTICES.md"
   ],
   "engines": {
-    "node": ">=20.12.0"
+    "node": ">=24.18.1"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json && node -e \"require('fs').chmodSync('dist/index.js',0o755)\"",
+    "prebuild": "node -e \"const p=require('./package.json');const bad=['typescript','@types/node'].filter((n)=>p.devDependencies&&p.devDependencies[n]);if(bad.length){console.error('构建工具链不得声明在 devDependencies（命中：'+bad.join('、')+'）：NODE_ENV=production 与 --omit=dev 会省略 devDependencies，而 prepare 仍会在安装后执行构建，克隆/npx 安装将失败；请改为声明在 optionalDependencies。');process.exit(1)};const r=(s)=>{try{require.resolve(s);return true}catch{return false}};if(!(r('typescript')&&r('@types/node/package.json'))){console.error('构建工具链缺失：typescript 或 @types/node 当前不可加载（--omit=optional 的省略式安装不装它们，optional 依赖安装失败同样缺失）。请用完整安装（npm ci / npm install）后重试。');process.exit(1)}\"",
+    "build": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json && node -e \"require('fs').chmodSync('dist/index.js',0o755)\"",
     "prepare": "npm run build",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "format": "prettier --write .",
@@ -27,7 +29,9 @@
     "check": "npm run typecheck && npm test",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
+    "pretest": "node -e \"if(require('fs').globSync('tests/unit/*.test.ts').length===0){console.error('未匹配到任何测试文件（tests/unit/*.test.ts）：tests/ 目录不入库（.gitignore），克隆后需自备本地测试。此处刻意以非零退出，避免「0 个测试」被当作通过。');process.exit(1)}\"",
     "test": "node --import tsx --test tests/unit/*.test.ts",
+    "pretest:watch": "npm run pretest",
     "test:watch": "node --import tsx --test --watch tests/unit/*.test.ts",
     "smoke": "npm run build && node scripts/smoke-stdio.mjs",
     "smoke:http": "npm run build && node scripts/smoke-http.mjs",
@@ -47,10 +51,10 @@
     "verify:dry-run": "npm run build && node test-verification/verify-dry-run.mjs",
     "verify:changeset": "npm run build && node test-verification/verify-changeset.mjs",
     "verify:ops": "npm run build && node test-verification/verify-ops.mjs",
-    "verify:tasks": "npm run build && node test-verification/verify-tasks.mjs"
+    "verify:tasks": "npm run build && node test-verification/verify-tasks.mjs",
+    "release:pack": "npm run build && node -e \"const{execSync}=require('child_process');const[info]=JSON.parse(execSync('npm pack --dry-run --json --ignore-scripts',{encoding:'utf8'}));const files=info.files.map((f)=>f.path);if(!files.includes('dist/index.js')){console.error('release:pack 中止：打包清单缺少 dist/index.js，会出现无代码空壳包');process.exit(1);}console.log('release:pack 产物校验通过：dist/index.js 已在打包清单中（共 '+files.length+' 个文件）');\" && npm pack"
   },
   "dependencies": {
-    "@modelcontextprotocol/core": "^2.0.0",
     "@modelcontextprotocol/node": "^2.0.0",
     "@modelcontextprotocol/server": "^2.0.0",
     "@sap/hana-client": "^2.26.26",
@@ -59,14 +63,14 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@types/node": "^26.3.0",
     "prettier": "^3.9.9",
     "tsx": "^4.23.12"
   },
   "optionalDependencies": {
+    "@types/node": "^24.19.2",
     "typescript": "^7.0.2"
   },
   "allowScripts": {
-    "@sap/hana-client@2.26.26": true
+    "@sap/hana-client": true
   }
 }

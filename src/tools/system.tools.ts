@@ -2,7 +2,9 @@
  * 系统信息工具（分组 **read**）：hana_system_get_info（数据库/主机基础信息）、
  * hana_check_privileges（当前用户权限矩阵与建模能力摘要）。
  *
- * 两者都是对 SYS.M_* 的只读查询，经 capabilityRegistrar 按能力清单注册；该模块全部 gate=none，无调用期闸门。
+ * 两者都是对 SYS.M_* 的只读查询，经 capabilityRegistrar 按能力清单注册；kind=read 且不声明
+ * effects.plan（固定系统视图，没有写包/读 schema 资源维度），但每次调用同样过统一闸门
+ * authorizeCall——可见性与档案判定对读能力一样生效。
  */
 
 import type { McpServer } from '@modelcontextprotocol/server';

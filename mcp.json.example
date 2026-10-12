@@ -16,9 +16,6 @@
         "HANA_TIMEZONE": "Asia/Shanghai",
         "HANA_SCHEMA_ALLOW": "",
         "HANA_WRITE_PACKAGES": "ZDEMO1,ZDEMO2.ZDEMO_SD",
-        "HANA_TOOL_GROUPS": "",
-        "HANA_TOOL_ALLOW": "",
-        "HANA_TOOL_DENY": "",
         "LOG_LEVEL": "info"
       }
     }

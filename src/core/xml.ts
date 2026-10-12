@@ -2,7 +2,9 @@ import { XMLBuilder, XMLParser, type X2jOptions, type XmlBuilderOptions } from '
 
 /**
  * HANA 仓库对象 XML（_SYS_REPO CDATA 内容）解析/构造公共配置。
- * 公共解析选项沉淀于此；解析器与构造器分别在 metadata、modeling 服务中实现。
+ * 解析器（createXmlParser）唯一调用方为 model/view-xml.ts（设计时 XML → 结构化模型）；
+ * 构造器（createXmlBuilder）唯一调用方为 model/view-builder.ts（结构化模型 → 设计时 XML）。
+ * 改共享选项前先看这两个消费方的影响面。
  *
  * 要点：
  * - 视图 XML 大小写敏感、含属性，且节点间有顺序语义 → 关闭属性前缀、保留大小写
@@ -43,8 +45,7 @@ export function createXmlBuilder(): XMLBuilder {
  * `&` `<` `>` 必须在元素文本内转义，属性值还需转义 `"` —— 统一按最严处理，
  * 避免"同一段文本用在文本位与属性位得到不同转义结果"这类隐患。
  *
- * 此前 view-builder 与 view-edit 各有一份逐字节相同的实现（后者注释自认同规则），
- * 归此单点后 XML 转义只有一种答案。
+ * 全仓唯一的 XML 转义实现（不要再写第二份）：口径分叉会让同一段文本在不同位置落出不同的 XML。
  */
 export function escapeXmlAttr(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');

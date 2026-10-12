@@ -1,5 +1,5 @@
 import { HanaBusinessError } from './errors.js';
-import { SEMAPHORE_WAIT_MS_DEFAULT } from './limits.js';
+import { normalizeWaitMs, SEMAPHORE_WAIT_MS_DEFAULT } from './limits.js';
 
 /**
  * 进程内全局并发闸门（信号量）：按 name 分组限制「同时执行」的操作数。
@@ -25,14 +25,16 @@ import { SEMAPHORE_WAIT_MS_DEFAULT } from './limits.js';
 /** 信号量等待超时的机读错误码（HanaBusinessError.code → 失败信封 raw.code；值即名字，日志可直读） */
 export const SEMAPHORE_WAIT_TIMEOUT = 'SEMAPHORE_WAIT_TIMEOUT';
 
-/** 错误码别名（调用方/测试按此名引用，SSD §4.6 的导出名） */
-export const SEMAPHORE_WAIT_TIMEOUT_CODE = SEMAPHORE_WAIT_TIMEOUT;
+/** 错误码别名（与 SEMAPHORE_WAIT_TIMEOUT 同值；仅本模块构造超时错误时引用） */
+const SEMAPHORE_WAIT_TIMEOUT_CODE = SEMAPHORE_WAIT_TIMEOUT;
 
 /** withSemaphore 的可选项 */
 export interface SemaphoreOptions {
   /**
    * 排队等待上限 ms（缺省 SEMAPHORE_WAIT_MS_DEFAULT）。显式 0 按 0ms 处理：
    * 只给真正无需等待的调用留预算，任何可见的排队都视为超时。
+   * NaN / Infinity / 负数不是合法输入，一律回落 SEMAPHORE_WAIT_MS_DEFAULT
+   * （收敛逻辑与 keyed lock 共用在 limits.ts 的 normalizeWaitMs）。
    */
   waitMs?: number;
 }
@@ -57,7 +59,8 @@ const gates = new Map<string, Gate>();
 
 /**
  * 在 name 队列中取得一个许可后执行 fn（同 name 同时执行数不超过 limit），执行完自动归还。
- * 排队等待超过 waitMs 时抛 SEMAPHORE_WAIT_TIMEOUT_CODE，fn **不会执行**。
+ * 排队等待超过 waitMs 时抛 SEMAPHORE_WAIT_TIMEOUT（对外契约名；模块内私有别名 SEMAPHORE_WAIT_TIMEOUT_CODE
+ * 与它同值，仅实现细节），fn **不会执行**。
  */
 export async function withSemaphore<T>(
   name: string,
@@ -65,7 +68,7 @@ export async function withSemaphore<T>(
   fn: () => Promise<T>,
   opts: SemaphoreOptions = {},
 ): Promise<T> {
-  const gate = await acquireGate(name, normalizeLimit(limit), opts.waitMs ?? SEMAPHORE_WAIT_MS_DEFAULT);
+  const gate = await acquireGate(name, normalizeLimit(limit), normalizeWaitMs(opts.waitMs, SEMAPHORE_WAIT_MS_DEFAULT));
   try {
     return await fn();
   } finally {

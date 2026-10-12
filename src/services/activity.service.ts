@@ -4,7 +4,7 @@
  * 为什么单列一个工具而不并进健康检查：形状不同。健康检查回答"有没有问题"（阈值判定），
  * 这里回答"问题在哪、谁造成的"（拓扑与明细）。把明细塞进健康检查会让后者每次都吐出几屏数据。
  *
- * 视图选择（实测，见 docs/health-monitoring-findings.md §六）：
+ * 视图选择（实测）：
  *  - 阻塞用 `M_BLOCKED_TRANSACTIONS`，**不是** `M_LOCKS`（后者在 HANA 2.00.085 上不存在，
  *    参考实现的 blocking 命令正是栽在这里）。
  *  - `M_BLOCKED_TRANSACTIONS` 自带 LOCK_OWNER_CONNECTION_ID，可直接建出"谁堵谁"的链。
@@ -15,7 +15,17 @@ import { num, round, US_PER_SECOND } from '../core/num.js';
 import { truncateWithNote } from '../core/text.js';
 import { logger } from '../core/logger.js';
 import { probeVisibility, emptyIsAmbiguous, type Visibility } from './visibility.service.js';
-import { addCaveat, formatDuration, reportCheckedAt, type DiagnosticReportBase } from './health.rules.js';
+import {
+  addCaveat,
+  countBlockedTransactions,
+  countLongTransactions,
+  fetchBlockedTransactions,
+  fetchLongTransactions,
+  formatDuration,
+  reportCheckedAt,
+  waitingObjectName,
+  type DiagnosticReportBase,
+} from './health.rules.js';
 
 /** 可查询的段落 */
 export type ActivitySection = 'blocking' | 'transactions' | 'statements';
@@ -91,11 +101,17 @@ export interface ActivityReport extends DiagnosticReportBase {
    * 于是"0 个阻塞"可能只是"看不到别人的阻塞"——结论会附 caveat 说明，不会冒充"集群无阻塞"。
    */
   visibility: Visibility;
+  /**
+   * 各段条数：`count` 是**满足条件的真实总数**（来自不带 LIMIT 的 COUNT(*)），
+   * `items` 只含前 limit 条明细——两者不等时报告会附一条 caveat 说明成因
+   * （count > limit 即被 limit 截断；count ≤ limit 则是两次查询之间的竞态，重查可得）。
+   * 禁止把 count 读成"本次明细条数"。
+   */
   blocking?: { count: number; items: BlockingItem[] };
   transactions?: { count: number; items: LongTransactionItem[] };
   statements?: { count: number; items: LongStatementItem[] };
   summary: string;
-  /** 结果可能被行过滤时的提示（仅在缺权限且某段为空时出现） */
+  /** 结果可能被行过滤（缺权限且某段为空），或规模少报（limit 截断、计数与明细竞态）时的提示 */
   caveats: string[];
 }
 
@@ -150,36 +166,23 @@ async function fetchCurrentStatements(pool: HanaPool, ids: number[]): Promise<Ma
 }
 
 async function collectBlocking(pool: HanaPool, limit: number): Promise<NonNullable<ActivityReport['blocking']>> {
-  const rows = await pool.query<{
-    BLOCKED_CONNECTION_ID: unknown;
-    LOCK_OWNER_CONNECTION_ID: unknown;
-    BLOCKED_TIME: string;
-    WAITING_SCHEMA_NAME: string;
-    WAITING_TABLE_NAME: string;
-    WAITING_OBJECT_NAME: string;
-    LOCK_TYPE: string;
-    LOCK_MODE: string;
-    WAIT_SEC: unknown;
-  }>(
-    `SELECT BLOCKED_CONNECTION_ID, LOCK_OWNER_CONNECTION_ID, BLOCKED_TIME,
-            WAITING_SCHEMA_NAME, WAITING_TABLE_NAME, WAITING_OBJECT_NAME,
-            LOCK_TYPE, LOCK_MODE,
-            SECONDS_BETWEEN(BLOCKED_TIME, CURRENT_TIMESTAMP) AS WAIT_SEC
-     FROM SYS.M_BLOCKED_TRANSACTIONS ORDER BY WAIT_SEC DESC LIMIT ?`,
-    [limit],
-  );
+  // 取数与"对象"串同 health 的 blocked 规则共用（health.rules 的 fetchBlockedTransactions /
+  // waitingObjectName）：同一视图、同一行在两个工具里必须给出同一个对象名。
+  const rows = await fetchBlockedTransactions(pool, limit);
   const conns = await fetchConnections(
     pool,
     rows.flatMap((r) => [num(r.BLOCKED_CONNECTION_ID), num(r.LOCK_OWNER_CONNECTION_ID)]),
   );
+  // 计数不带 LIMIT：明细被截断时 count 仍是真实总数（否则 200 个阻塞事务会被报成 limit 个）。
+  // Math.max 是防御：两条查询之间数据变化时，总数不得小于已列出的条数。
   return {
-    count: rows.length,
+    count: Math.max(await countBlockedTransactions(pool), rows.length),
     items: rows.map((r) => ({
       waitingSec: round(num(r.WAIT_SEC), 1),
       blockedConnection: num(r.BLOCKED_CONNECTION_ID),
       ownerConnection: num(r.LOCK_OWNER_CONNECTION_ID),
       blockedSince: r.BLOCKED_TIME,
-      object: [r.WAITING_SCHEMA_NAME, r.WAITING_TABLE_NAME || r.WAITING_OBJECT_NAME].filter(Boolean).join('.'),
+      object: waitingObjectName(r),
       lockType: r.LOCK_TYPE,
       lockMode: r.LOCK_MODE,
       owner: conns.get(num(r.LOCK_OWNER_CONNECTION_ID)) ?? null,
@@ -193,32 +196,14 @@ async function collectTransactions(
   minDurationSec: number,
   limit: number,
 ): Promise<NonNullable<ActivityReport['transactions']>> {
-  const rows = await pool.query<{
-    CONNECTION_ID: unknown;
-    TRANSACTION_ID: unknown;
-    START_TIME: string;
-    ELAPSED_SEC: unknown;
-    UNDO_LOG_AMOUNT: unknown;
-    CREATED_VERSION_COUNT: unknown;
-    ALLOCATED_VERSION_SIZE: unknown;
-    ACQUIRED_LOCK_COUNT: unknown;
-    LOCK_WAIT_COUNT: unknown;
-  }>(
-    `SELECT CONNECTION_ID, TRANSACTION_ID, START_TIME,
-            SECONDS_BETWEEN(START_TIME, CURRENT_TIMESTAMP) AS ELAPSED_SEC,
-            UNDO_LOG_AMOUNT, CREATED_VERSION_COUNT, ALLOCATED_VERSION_SIZE,
-            ACQUIRED_LOCK_COUNT, LOCK_WAIT_COUNT
-     FROM SYS.M_TRANSACTIONS
-     WHERE TRANSACTION_STATUS = 'ACTIVE' AND TRANSACTION_TYPE = 'USER TRANSACTION'
-       AND START_TIME < ADD_SECONDS(CURRENT_TIMESTAMP, -?)
-     ORDER BY ELAPSED_SEC DESC LIMIT ?`,
-    [minDurationSec, limit],
-  );
+  // 取数同 health 的 transactions 规则共用（health.rules 的 fetchLongTransactions）
+  const rows = await fetchLongTransactions(pool, minDurationSec, limit);
   const ids = rows.map((r) => num(r.CONNECTION_ID));
   const conns = await fetchConnections(pool, ids);
   const stmts = await fetchCurrentStatements(pool, ids);
+  // 同 collectBlocking：count 用不带 LIMIT 的 COUNT(*) 取真实总数（明细只含前 limit 条）
   return {
-    count: rows.length,
+    count: Math.max(await countLongTransactions(pool, minDurationSec), rows.length),
     items: rows.map((r) => {
       const id = num(r.CONNECTION_ID);
       return {
@@ -273,8 +258,17 @@ async function collectStatements(
   );
   const ids = rows.map((r) => num(r.CONNECTION_ID));
   const conns = await fetchConnections(pool, ids);
+  // 同 collectBlocking：count 用不带 LIMIT 的 COUNT(*) 取真实总数（明细只含前 limit 条）
+  const cnt = await pool.query<{ N: unknown }>(
+    `SELECT COUNT(*) AS N
+     FROM SYS.M_ACTIVE_STATEMENTS
+     WHERE STATEMENT_STATUS = 'ACTIVE'
+       AND LAST_EXECUTED_TIME IS NOT NULL
+       AND LAST_EXECUTED_TIME < ADD_SECONDS(CURRENT_TIMESTAMP, -?)`,
+    [minDurationSec],
+  );
   return {
-    count: rows.length,
+    count: Math.max(num(cnt[0]?.N), rows.length),
     items: rows.map((r) => {
       const id = num(r.CONNECTION_ID);
       return {
@@ -310,31 +304,48 @@ export async function runActivity(pool: HanaPool, req: ActivityRequest): Promise
 
   if (req.sections.includes('blocking')) {
     report.blocking = await collectBlocking(pool, req.limit);
-    if (report.blocking.count === 0) {
-      parts.push('当前无被阻塞的事务');
-      pushCaveat(report, visibility, '阻塞');
+    // 分支看**明细条数**（绝不对空数组取 [0]）；count 是真实总数，可能 > 明细条数
+    // （被 limit 截断，或计数与明细两次查询之间的瞬间竞态——后者只报总数并提示重查）
+    if (report.blocking.items.length === 0) {
+      if (report.blocking.count === 0) {
+        parts.push('当前无被阻塞的事务');
+        pushCaveat(report, visibility, '阻塞');
+      } else {
+        parts.push(`${report.blocking.count} 个事务被阻塞（明细未取到，重查可得）`);
+      }
     } else {
       parts.push(`${report.blocking.count} 个事务被阻塞，最长 ${formatDuration(report.blocking.items[0].waitingSec)}`);
+      pushTruncationCaveat(report, report.blocking, req.limit, '阻塞');
     }
   }
   if (req.sections.includes('transactions')) {
     report.transactions = await collectTransactions(pool, req.minDurationSec, req.limit);
-    if (report.transactions.count === 0) {
-      parts.push(`无超过 ${req.minDurationSec} 秒的活跃事务`);
-      pushCaveat(report, visibility, '长事务');
+    if (report.transactions.items.length === 0) {
+      if (report.transactions.count === 0) {
+        parts.push(`无超过 ${req.minDurationSec} 秒的活跃事务`);
+        pushCaveat(report, visibility, '长事务');
+      } else {
+        parts.push(`${report.transactions.count} 个长事务（明细未取到，重查可得）`);
+      }
     } else {
       parts.push(
         `${report.transactions.count} 个长事务，最长 ${formatDuration(report.transactions.items[0].elapsedSec)}`,
       );
+      pushTruncationCaveat(report, report.transactions, req.limit, '长事务');
     }
   }
   if (req.sections.includes('statements')) {
     report.statements = await collectStatements(pool, req.minDurationSec, req.limit);
-    if (report.statements.count === 0) {
-      parts.push(`无超过 ${req.minDurationSec} 秒的活跃语句`);
-      pushCaveat(report, visibility, '长语句');
+    if (report.statements.items.length === 0) {
+      if (report.statements.count === 0) {
+        parts.push(`无超过 ${req.minDurationSec} 秒的活跃语句`);
+        pushCaveat(report, visibility, '长语句');
+      } else {
+        parts.push(`${report.statements.count} 条长语句（明细未取到，重查可得）`);
+      }
     } else {
       parts.push(`${report.statements.count} 条长语句，最长 ${formatDuration(report.statements.items[0].elapsedSec)}`);
+      pushTruncationCaveat(report, report.statements, req.limit, '长语句');
     }
   }
 
@@ -351,6 +362,34 @@ function pushCaveat(report: ActivityReport, visibility: Visibility, what: string
   if (c) {
     logger.warn({ section: what, unfiltered: visibility.unfiltered }, '空结果可能来自行过滤，已附加 caveat');
     addCaveat(report.caveats, `${what}：${c}`);
+  }
+}
+
+/**
+ * 真实总数 > 返回明细条数 → 附一条 caveat。
+ * 少报规模与"把看不见当正常"同样误导：200 个被阻塞事务被读成 limit 个，影响面与排障优先级会判错。
+ *
+ * 成因有两种，措辞不能混：count 来自与明细**不同时刻**的 COUNT(*)——
+ *  - 明细取满 limit（items.length === limit）：多出来的差额只能是被 limit 截掉的；
+ *  - 明细没取满却仍与 count 不等：limit 截不出这种差距，只能是两次查询之间的瞬时竞态，应如实说明成因。
+ */
+function pushTruncationCaveat(
+  report: ActivityReport,
+  section: { count: number; items: readonly unknown[] },
+  limit: number,
+  what: string,
+): void {
+  if (section.count <= section.items.length) return;
+  if (section.items.length >= limit) {
+    addCaveat(
+      report.caveats,
+      `${what}：实际 ${section.count} 条，明细已按 limit=${limit} 截断为前 ${section.items.length} 条`,
+    );
+  } else {
+    addCaveat(
+      report.caveats,
+      `${what}：实际 ${section.count} 条，明细取到 ${section.items.length} 条（计数与明细两次查询之间数据变化，重查可得）`,
+    );
   }
 }
 

@@ -22,19 +22,25 @@
  * 7. 乐观锁：过期 If-Match → 412（引号可选）
  * 8. Transfer API：导出 GET /xfer/export/<pkg>.zip（201 + zip）；导入 POST /xfer/import/<pkg>/（目录目标+
  *    Slug 文件名，200 + Location）→ PUT 分片（Content-Range，201）→ 落库【实测：落库即激活，
- *    Activated=true / Version=1，**不存在 inactive 暂存**，见计划 §6 P0 ④】
+ *    Activated=true / Version=1，**不存在 inactive 暂存**】
  *    （目标含文件名会写进 <pkg>/<file>/<file> 错误路径，禁用）
- * 9. 【P5 实测】写成功响应的**响应头**带新 ETag（与随后 fileMeta 读值逐字一致、随每次写前进）——
+ * 9. 【实测】写成功响应的**响应头**带新 ETag（与随后 fileMeta 读值逐字一致、随每次写前进）——
  *    回执基线直接取响应头，禁补读拼装；412 响应**不带** ETag 头，冲突载荷只能在 412 后补读一次；
  *    DELETE 执行 If-Match：正确基线 → 204、陈旧基线 → 412、对象已不存在 → 404（重复删为 404 而非 412）
  *
- * 并发与超时（P5 §4.3/§4.6）：request() 出口统一超时（opts.timeoutMs 覆盖：写动词 30s、xfer 300s、
+ * 并发与超时：request() 出口统一超时（opts.timeoutMs 覆盖：写动词 30s、xfer 300s、
  * login/refreshCsrf 10s）；**所有会触发服务端激活的写**（writeFile 的 PUT 与 checkFile 的临时副本检查写，
  * 见上条 6：本 SPS 任何合法 PUT 都会激活）全程在激活信号量内——只按 activate=true 限流拦不住并发激活；
  * importFile 走 xfer 上传通道，是有意不纳入信号量的已知边界（xfer 超时放宽到 300s，长期占许可会饿死其它写，
  * 见其 JSDoc）。全局锁序 keyed lock → 信号量 → 网络/DB。
  *
- * 安全：凭据一律来自 config（不落日志）；请求体/头不做 debug 级日志。
+ * 安全（传输面）：
+ * - 凭据一律来自 config（不落日志）；请求体/头不做 debug 级日志。
+ * - **本通道默认是明文 HTTP**（`http://host:80<instance>`）：HANA 账号密码（form login）、xsId 会话
+ *   Cookie 与 CSRF token 全部经明文链路传输；HANA_TLS/HANA_SSL_VALIDATE 只作用于 SQL 通道，**不覆盖**
+ *   本通道。部署时必须由网络侧隔离（仅可信网段/本机可达），否则链路上的嗅探者可直接拿到一个具备仓库
+ *   写权限的 HANA 账号。XS 端点支持 TLS 时，显式设置环境变量 HANA_XS_TLS=true 可切到 https（证书
+ *   校验由 Node fetch 默认开启，fail-closed）；把 HANA_XS_PORT 指向 HTTPS 端口即可配合使用。
  */
 import type { HanaConfig } from '../config/config.js';
 import { HanaBusinessError, type ConflictInfo } from './errors.js';
@@ -47,6 +53,7 @@ import {
 } from './limits.js';
 import { logger } from './logger.js';
 import { withSemaphore } from './semaphore.js';
+import { truncateWithNote } from './text.js';
 
 /**
  * XS Classic 设计时 REST 基础路径的默认值（官方默认安装路径）。
@@ -58,6 +65,15 @@ import { withSemaphore } from './semaphore.js';
  * config.ts 的 HANA_XS_BASE_PATH 默认值引用本常量，故默认值全仓只有这一份定义。
  */
 export const XS_BASE_PATH = '/sap/hana/xs/dt/base';
+
+/**
+ * XS 设计时 REST 端口的默认推导：实例号 → `80<instance>`（如 '10' → 8010）。
+ * 与 XS_BASE_PATH 同属「默认值单点」：config.ts 的 HANA_XS_PORT 缺省与构造器兜底都调它，
+ * 抄第二份会让「配置里的值」与「运行时兜底值」在规则变化时分叉。
+ */
+export function deriveXsPort(instance: string): number {
+  return Number(`80${instance}`);
+}
 
 /** SapBackPack 头 JSON 的字段（集中在常量表，便于按 SPS 调字段名/大小写） */
 export interface SapBackPack {
@@ -75,7 +91,7 @@ export interface SapBackPack {
 }
 
 /**
- * 回执基线（ETag）的来源（P5 §4.2#1 的诚实性字段；服务层 repository.service 的回执同用此类型）：
+ * 回执基线（ETag）的来源（服务层 repository.service 的回执同用此类型）：
  * - 'response-header'：取自**本次写响应的响应头** ETag——与写动作同响应、同刻读取，是真正的新基线；
  * - 'read-back'：基线来自一次**独立**读（删除前记录的基线 / 导入完成后的回读）——只代表读那一刻的状态，
  *   不与写响应同源（读与写之间可能有第三方写入），下游不得把它当作「本次写的新基线」；
@@ -94,7 +110,7 @@ export interface FileMeta {
   /** 乐观锁 ETag（字符串，实测为毫秒时间戳） */
   ETag?: string;
   /**
-   * 回执基线的来源（仅写回执填充，P5 §4.2#1，三值语义见 EtagSource）。不许把补读 fileMeta 冒充成
+   * 回执基线的来源（仅写回执填充，三值语义见 EtagSource）。不许把补读 fileMeta 冒充成
    * 写响应头——PUT 与补读之间的第三方写入会被谎报为"本次写的新基线"，下游补偿会以第三方版本为基线静默覆盖。
    */
   etagSource?: EtagSource;
@@ -127,9 +143,11 @@ export interface CheckFileResult {
   /** 服务端错误码（如 40117） */
   errorCode?: string;
   /**
-   * 回执基线（ETag）：**只认本次 Check 响应的响应头**，与 writeFile 的 stampWriteEtag 同款口径——
-   * 响应头缺失即缺省，**禁止**补读 fileMeta 冒充同刻读数（补读值与本次写不同源，拿它当基线会证错对象）。
-   * 调用方据此做「实例级验身份」的基线：之后读到的 ETag 与它逐字一致，才说明对象还是同一次写入的实例。
+   * 本次 Check 响应头携带的 ETag（**只认响应头**，与 writeFile 的 stampWriteEtag 同款口径——
+   * 响应头缺失即缺省，**禁止**补读 fileMeta 冒充同刻读数）。
+   * **仅供审计/排障读取，勿用作对象实例验身份的基线**：同一进程内 checkFile 的写会推进 ETag，
+   * 拿旧读数做 If-Match 必得伪 412，重试路径会把自己的副本误报成残片。临时校验对象的归属由
+   * 「不可猜的临时名（进程 nonce）+ 进程内登记表」证明，不靠 ETag 比对。
    */
   etag?: string;
   /** 原始响应体（审计用） */
@@ -147,9 +165,14 @@ export interface WriteCheckResult {
   [key: string]: unknown;
 }
 
-/** 从写响应体提取激活检查结果（无则 undefined）；raw 保留原始 CheckResult 供调用方原样透出 */
+/**
+ * 从写响应体提取激活检查结果（无则 undefined）；raw 保留原始 CheckResult 供调用方原样透出。
+ * @param missingMessage CheckResult 未带结构化消息时的兜底文案（如 checkFile 传入的响应体级
+ *   兜底链）；缺省为「激活检查未通过」
+ */
 export function extractCheckResult(
   body: unknown,
+  missingMessage?: string,
 ): { consistent: boolean; message?: string; errorCode?: string; raw: WriteCheckResult } | undefined {
   const cr = (body as { CheckResult?: WriteCheckResult | string } | null | undefined)?.CheckResult;
   if (cr === undefined || cr === null) return undefined;
@@ -162,7 +185,7 @@ export function extractCheckResult(
   const msg = cr.error_msg ?? cr.errorMsg;
   return {
     consistent: activated,
-    message: activated ? undefined : msg ? String(msg) : '激活检查未通过',
+    message: activated ? undefined : msg ? String(msg) : (missingMessage ?? '激活检查未通过'),
     errorCode: code !== undefined ? String(code) : undefined,
     raw: cr,
   };
@@ -173,13 +196,15 @@ export function extractCheckResult(
  * 激活失败的明细里含 Type/Procedure DDL 全文（实测数 KB），截断会让调用方必须再调一次校验才能拿全——
  * 故上限设得足够宽；仅在极端响应体下兜底，且截断处显式标注，不静默丢内容。
  */
-export const MAX_ERROR_DETAIL_CHARS = 8000;
+const MAX_ERROR_DETAIL_CHARS = 8000;
 
-/** 截断兜底（超限时显式标注，不静默丢内容） */
+/**
+ * 截断兜底：截断方式与「已截断」标注单点在 core/text 的 truncateWithNote（含代理对边界处理），
+ * 本函数只在截断后补一句「怎么拿全明细」的指引——明细超限时调用方需要知道剩余部分从哪来。
+ */
 function capDetail(text: string): string {
-  return text.length > MAX_ERROR_DETAIL_CHARS
-    ? `${text.slice(0, MAX_ERROR_DETAIL_CHARS)}\n…（错误明细超过 ${MAX_ERROR_DETAIL_CHARS} 字符已截断；请求体不做日志，如需剩余部分请重跑该对象的设计时校验）`
-    : text;
+  if (text.length <= MAX_ERROR_DETAIL_CHARS) return text;
+  return `${truncateWithNote(text, MAX_ERROR_DETAIL_CHARS, 'chars')}\n（请求体不做日志，如需剩余部分请重跑该对象的设计时校验）`;
 }
 
 /**
@@ -220,10 +245,9 @@ export function extractErrorDetail(body: string): string {
  * - checkResult：响应体里的 CheckResult 原文（含 Write/Activate 与错误字段）
  * - body：完整响应体（已按上限截断，截断处有标注）
  *
- * 【承载范围】自 assertOk 统一改造后，它承载**任何** XS 非 2xx 响应（不再只是 writeFile 的写路径；
- * 名字保留不改，避免大范围改动）。唯一目的是让 HTTP 状态机读（envelope.raw.errorDetail.httpStatus）——
- * 调用方按状态分流（如 555 服务端并发写拒绝），不必正则解析失败文案；412/404 等已有专门机读分类的
- * 语义仍在各调用方**先行**分流，不走这条通用出口。
+ * 【承载范围】承载**任何** XS 非 2xx 响应（assertOk 的统一出口）。唯一目的是让 HTTP 状态机读
+ * （envelope.raw.errorDetail.httpStatus）——调用方按状态分流（如 555 服务端并发写拒绝），不必正则
+ * 解析失败文案；412/404 等已有专门机读分类的语义仍在各调用方**先行**分流，不走这条通用出口。
  */
 export class XsWriteError extends HanaBusinessError {
   constructor(
@@ -247,10 +271,37 @@ export class XsWriteError extends HanaBusinessError {
 export class XsAuthError extends HanaBusinessError {}
 
 /**
+ * HANA_XS_TLS 的真/假取值集合：与 config.ts 布尔变量的真值集合同口径。
+ * 为什么在这里直读 env 而不是走 config：core 层不依赖 config 的运行时模块（config → 本文件的 type-only
+ * 导入反向成环会破坏分层）；取值非法时构造即报错（与 config 的 fail-fast 口径一致——坏值不许静默
+ * 退化成明文或密文，那会让部署者以为自己开了 TLS 而实际没开）。
+ */
+const XS_TLS_TRUE_VALUES = new Set(['true', '1', 'TRUE']);
+const XS_TLS_FALSE_VALUES = new Set(['false', '0', 'FALSE']);
+
+/** XS 写通道的 URL scheme（默认 http = 明文；HANA_XS_TLS=true 时 https，见文件头安全说明） */
+function xsSchemeFromEnv(): 'http' | 'https' {
+  const raw = process.env.HANA_XS_TLS;
+  if (raw === undefined || raw.trim() === '') return 'http';
+  if (XS_TLS_TRUE_VALUES.has(raw)) return 'https';
+  if (XS_TLS_FALSE_VALUES.has(raw)) return 'http';
+  throw new HanaBusinessError(
+    `HANA_XS_TLS 取值非法：${JSON.stringify(raw)}（合法值：true/false/1/0/TRUE/FALSE；留空 = 默认明文 HTTP）`,
+  );
+}
+
+/** CSRF 失效的判定（403 + x-csrf-token: Required）：authed 的两处恢复分支共用同一判据，不各写一份 */
+function isCsrfRequired(resp: { status: number; headers: Record<string, string> }): boolean {
+  return resp.status === 403 && resp.headers['x-csrf-token'] === 'Required';
+}
+
+/**
  * XS REST 会话：
- * - 持有独立 HTTP agent（Node 原生 fetch，经 global fetch 或 http/https）
+ * - 走 Node 全局 fetch（undici 默认 dispatcher）：本类不配置独立 agent/dispatcher，连接池上限、
+ *   keep-alive 与 TLS 行为由进程全局决定
  * - cookie 由 fetch 的 Set-Cookie 手工维护（Node fetch 无 cookie jar）
- * - CSRF token 缓存，失效（401/403 x-csrf-token: Required）时自动重取
+ * - 会话失效（401，或 403 + x-csrf-token: Required）时**清空会话重登一次并重试**；
+ *   CSRF token 刷新取不到新值时抛错，不沿用旧值（见 authed/refreshCsrf 实现）
  */
 export class XsRestClient {
   private readonly baseUrl: string;
@@ -261,15 +312,16 @@ export class XsRestClient {
   private readonly timeoutMs: number;
   /** xfer 导入/导出超时（HANA_XS_XFER_TIMEOUT_MS）：整包上传/下载天然慢 */
   private readonly xferTimeoutMs: number;
-  /** 激活并发上限（HANA_ACTIVATION_CONCURRENCY）：所有会触发服务端激活的写共享（每次写恰好取一次，§4.6） */
+  /** 激活并发上限（HANA_ACTIVATION_CONCURRENCY）：所有会触发服务端激活的写共享（每次写恰好取一次） */
   private readonly activationConcurrency: number;
   private cookies = new Map<string, string>();
   private csrfToken?: string;
 
   constructor(config: HanaConfig) {
     const host = config.host;
-    const port = config.xsPort ?? Number(`80${config.instance}`);
-    this.baseUrl = `http://${host}:${port}`;
+    const port = config.xsPort ?? deriveXsPort(config.instance);
+    // scheme：默认明文 http（XS 端点未开 TLS 时唯一可用）；HANA_XS_TLS=true 显式切 https
+    this.baseUrl = `${xsSchemeFromEnv()}://${host}:${port}`;
     // 默认值单点在 XS_BASE_PATH（本文件），config 的 HANA_XS_BASE_PATH zod default 引用同一常量；
     // 这里保留兜底是因为 XsRestClient 要对"字段缺失的配置"也能给出可用行为，而不是 TypeError
     this.basePath = (config.xsBasePath ?? XS_BASE_PATH).replace(/\/+$/, '');
@@ -325,7 +377,12 @@ export class XsRestClient {
     await this.refreshCsrf();
   }
 
-  /** 从 dt 端点取写动词必需的 CSRF token（带 X-CSRF-Token: Fetch 时服务端会签发） */
+  /**
+   * 从 dt 端点取写动词必需的 CSRF token（带 X-CSRF-Token: Fetch 时服务端会签发）。
+   * 拿不到**新** token 时清掉旧值并抛错：被 403（x-csrf-token: Required）触发的"刷新"若在响应不带
+   * 新 token 时静默沿用那个刚被判失效的旧 token，重试必然再失败一次，调用方还会被引向「检查凭据」
+   * （凭据其实没问题）。
+   */
   async refreshCsrf(): Promise<string> {
     const resp = await this.request(
       `${this.restBase}/info`,
@@ -335,19 +392,31 @@ export class XsRestClient {
       },
       { timeoutMs: XS_LOGIN_TIMEOUT_MS },
     );
-    const token = resp.headers['x-csrf-token'] ?? resp.headers['X-CSRF-Token'];
+    // request() 已把响应头键统一小写，这里只按小写键取（不需要大小写回退）
+    const token = resp.headers['x-csrf-token'];
     if (token && token !== 'unsafe' && token !== 'Required') {
       this.csrfToken = token;
+      return token;
     }
-    if (!this.csrfToken) {
-      throw new XsAuthError(`无法获取 XS 写操作 CSRF token（/base/info 未返回 X-CSRF-Token）`);
-    }
-    return this.csrfToken;
+    // 未取到新 token：旧值已不可信（本次刷新正是因它失效而发起），清掉再报错——不沿用
+    this.csrfToken = undefined;
+    throw new XsAuthError(`无法获取 XS 写操作 CSRF token（/base/info 未返回新的 X-CSRF-Token，HTTP ${resp.status}）`);
   }
 
   /** 确保已登录（懒登录；MCP 工具首次写操作时触发） */
   private async ensureSession(): Promise<void> {
     if (this.cookies.size === 0) await this.login();
+  }
+
+  /**
+   * 会话失效恢复：清空 cookie/CSRF 缓存后重新登录。
+   * 唯一用途是 authed 的失败重试（各分支各自只重试一次，不无限循环）——没有它时，会话被服务端丢掉
+   * （重启/超时清理/网关回收）后 cookie 表只进不出，调用方只能看到 401/403 原文且不可自愈。
+   */
+  private async relogin(): Promise<void> {
+    this.cookies.clear();
+    this.csrfToken = undefined;
+    await this.login();
   }
 
   /**
@@ -402,7 +471,13 @@ export class XsRestClient {
     return { status: resp.status, headers: outHeaders, body };
   }
 
-  /** 带会话+写 CSRF 的请求（写动词由调用方决定是否需要 CSRF；write=true 时带上） */
+  /**
+   * 带会话+写 CSRF 的请求：非 GET 且 opts.csrf !== false、且已取得 token 时带上 X-CSRF-Token
+   * （GET 不需要写 token；opts.csrf:false 可显式关断）。
+   * 失效恢复（两级各重试**一次**，不无限循环）：
+   * ① CSRF token 失效（403 + x-csrf-token: Required）⇒ 重取 token 重试；
+   * ② 仍 401、或刷新后仍被要求 CSRF ⇒ 清空会话重登（relogin）再重试。
+   */
   private async authed(
     url: string,
     init: RequestInit & { redirect?: NonNullable<RequestInit['redirect']> },
@@ -416,18 +491,36 @@ export class XsRestClient {
     if (opts.csrf !== false && this.csrfToken && init.method !== 'GET') {
       headers['X-CSRF-Token'] ??= this.csrfToken;
     }
-    let resp = await this.request(url, { ...init, headers }, { raw: opts.raw, timeoutMs: opts.timeoutMs });
-    // CSRF token 失效（403 + x-csrf-token: Required）→ 重取一次并重试
-    if (resp.status === 403 && resp.headers['x-csrf-token'] === 'Required') {
-      await this.refreshCsrf();
+    const send = (): Promise<XsResponse> =>
+      this.request(url, { ...init, headers }, { raw: opts.raw, timeoutMs: opts.timeoutMs });
+    let resp = await send();
+    // ① CSRF token 失效（403 + x-csrf-token: Required）→ 重取 token 重试。
+    //    取不到新 token（refreshCsrf 抛 XsAuthError）说明会话本身大概率已失效 ⇒ 不做这次重试，
+    //    直接落到 ② 的会话重建（网络/超时等其它错误如实上抛，不掩盖）；该路径下 resp 未被改写、
+    //    仍是 403 + x-csrf-token: Required，② 的 isCsrfRequired(resp) 自会触发重登。
+    if (isCsrfRequired(resp)) {
+      try {
+        await this.refreshCsrf();
+        headers['X-CSRF-Token'] = this.csrfToken!;
+        resp = await send();
+      } catch (e) {
+        // XsAuthError（刷新取不到新 token）：真伪由 ② 的判据按未改写的 resp 识别；其余错误如实上抛
+        if (!(e instanceof XsAuthError)) throw e;
+      }
+    }
+    // ② 会话失效（401 / 仍被要求 CSRF）→ 清空会话、重登一次并重试。
+    //    判据在**每次 send 之后**重新求值（不预取一次 401 判定）：否则「首次 403+Required →
+    //    刷新 CSRF 成功 → 重试返回 401」这条路径不会被识别，调用方将拿到不可自愈的裸 401。
+    if (resp.status === 401 || isCsrfRequired(resp)) {
+      await this.relogin();
       headers['X-CSRF-Token'] = this.csrfToken!;
-      resp = await this.request(url, { ...init, headers }, { raw: opts.raw, timeoutMs: opts.timeoutMs });
+      resp = await send();
     }
     return resp;
   }
 
   /**
-   * 写回执的新基线 = 写响应的响应头 ETag（实测 §4.9#A：与随后 fileMeta 读值逐字一致）。
+   * 写回执的新基线 = 写响应的响应头 ETag（实测：与随后 fileMeta 读值逐字一致）。
    * 响应头缺失时**删除**响应体里可能携带的 ETag 并标 etagSource:'unavailable'——禁止补读 fileMeta
    * 冒充新基线：PUT 与补读之间的第三方写入会被谎报为"本次写的新基线"（下游补偿会静默覆盖）。
    */
@@ -443,7 +536,7 @@ export class XsRestClient {
   }
 
   /**
-   * 412 冲突载荷的补读（P5 §4.2）：实测 412 响应**不带** ETag 头，只能立刻再读一次 fileMeta，
+   * 412 冲突载荷的补读：实测 412 响应**不带** ETag 头，只能立刻再读一次 fileMeta，
    * 把「冲突时点」的当前版本带进 ConflictInfo 供调用方自我诊断——currentETag 不是本次写的新基线。
    * 补读失败绝不掩盖 412：原因写进 currentUnavailable（如对象已被并发删除），不静默成 undefined。
    */
@@ -474,10 +567,10 @@ export class XsRestClient {
   /**
    * 断言 2xx 且返回体非空合法 JSON（写操作响应体可为空，如 204）。
    *
-   * 非 2xx 统一经 XsWriteError 抛出（P5 §4.9#E 后续修复）：文案保持 describeError 原样不变（人读），
-   * 同时把 HTTP 状态 + 截断后的响应体落进 rawDetail → envelope.raw.errorDetail（机读）——实测并发
-   * DELETE/PUT 会被服务端以 555 写错误拒绝，此前只把状态写进散文，调用方无法机读分流。
-   * 412/404 等已有专门机读分类的语义在各自调用方**先行**分流（那是 P5 冲突协议），不走这条出口。
+   * 非 2xx 统一经 XsWriteError 抛出：文案保持 describeError 原样不变（人读），同时把 HTTP 状态 +
+   * 截断后的响应体落进 rawDetail → envelope.raw.errorDetail（机读）——实测并发 DELETE/PUT 会被服务端
+   * 以 555 写错误拒绝，只写进散文时调用方无法机读分流。
+   * 412/404 等已有专门机读分类的语义在各自调用方**先行**分流（冲突协议），不走这条出口。
    */
   private assertOk(resp: XsResponse, action: string, allowEmpty = false): void {
     if (resp.status < 200 || resp.status >= 300) {
@@ -495,22 +588,11 @@ export class XsRestClient {
     }
   }
 
-  /** GET /base/info：版本与命令清单（自检用） */
-  async info(): Promise<unknown> {
-    const resp = await this.authed(`${this.restBase}/info`, { method: 'GET' });
-    this.assertOk(resp, 'info');
-    return safeJson(resp.body);
-  }
-
-  /** GET /base/workspace：当前用户 workspace 列表（含 Id） */
-  async listWorkspaces(): Promise<unknown> {
-    const resp = await this.authed(`${this.restBase}/workspace`, { method: 'GET' });
-    this.assertOk(resp, 'workspace 列表');
-    return {
-      workspaces: safeJson<{ UserName?: string; Id?: string; Workspaces?: unknown[] }>(resp.body),
-    };
-  }
-  /** GET /base/workspace 原始体（当前用户 workspace 列表） */
+  /**
+   * GET /base/workspace 原始体（当前用户 workspace 列表）。
+   * 仅本地实机探针（test-verification/，不入库）使用，**不是产品路径**：本 SPS 写入即激活、
+   * 无 inactive 暂存，workspace 上下文对写结果无影响（见文件头实测契约第 6 条）。
+   */
   async workspace(): Promise<{ UserName?: string; Id?: string; Workspaces?: Array<{ Name?: string; Id?: string }> }> {
     const resp = await this.authed(`${this.restBase}/workspace`, { method: 'GET' });
     this.assertOk(resp, 'workspace 列表');
@@ -523,11 +605,14 @@ export class XsRestClient {
    * POST /base/workspace：建立 workspace（XS 会话级）。官方语义是「写 inactive 版本的前置上下文」，
    * 但本 SPS 写入即激活、无 inactive 暂存（实测带 Workspace 的写照样自动激活），该通道对写结果无影响。
    * 实测：201，JSON 体 {"Name":…} + Slug 头。
+   * 仅本地实机探针（test-verification/，不入库）使用，**不是产品路径**。
    */
   async createWorkspace(name: string): Promise<unknown> {
     const resp = await this.authed(`${this.restBase}/workspace`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Slug: name },
+      // JSON 文本显式声明 charset=utf-8（与 importFile 同一口径）：缺省时 XS 对文本体的解码
+      // 口径未在本机复验，但 name/后续字段可能含非 ASCII，显式声明成本为零、避免同源风险
+      headers: { 'Content-Type': 'application/json; charset=utf-8', Slug: name },
       body: JSON.stringify({ Name: name }),
     });
     // 允许 200/201（部分 SPS 对已存在 workspace 返回 200）
@@ -539,6 +624,7 @@ export class XsRestClient {
 
   /**
    * get-or-create workspace：列表命中直接复用，否则创建。
+   * 仅本地实机探针（test-verification/，不入库）使用，**不是产品路径**。
    * @param name 建议名（如 'ZDEMO'）；按名字精确匹配复用，避免重复创建。
    */
   async getOrCreateWorkspace(name: string): Promise<string> {
@@ -558,7 +644,7 @@ export class XsRestClient {
     const resp = await this.authed(`${this.restBase}/file/${encodePath(path)}?parts=meta`, {
       method: 'GET',
     });
-    // 404 带机读码（P5 §4.2#3）：import 守卫据此把「读异常即当不存在」收紧为「仅 404 视为不存在」
+    // 404 带机读码：import 守卫据此把「读异常即当不存在」收紧为「仅 404 视为不存在」
     if (resp.status === 404) {
       throw new HanaBusinessError(`对象不存在：${path}`, 'OBJECT_NOT_FOUND');
     }
@@ -592,7 +678,8 @@ export class XsRestClient {
     const resp = await this.authed(`${this.restBase}/file/${encodePath(target)}/`, {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json',
+        // JSON 文本显式声明 charset=utf-8：description 可含中文，口径与 importFile 一致
+        'Content-Type': 'application/json; charset=utf-8',
         Slug: packageName,
       },
       body,
@@ -609,7 +696,7 @@ export class XsRestClient {
    * - opts.activate → SapBackPack {"Activate":true}，激活失败为 HTTP 555 + error_msg 明细
    * - opts.ifMatch → 乐观锁；不匹配返回 412（412 响应不带 ETag，冲突载荷经补读 fileMeta 取得）
    * - opts.workspace → SapBackPack {"Workspace":…}（实测本 SPS 不改变行为：合法模型照样自动激活）
-   * - **所有** PUT 都在激活信号量内执行（写入即激活，见文件头 §6）——带不带 activate 都触发服务端激活
+   * - **所有** PUT 都在激活信号量内执行（写入即激活，见文件头实测契约第 6 条）——带不带 activate 都触发服务端激活
    */
   async writeFile(
     packageId: string,
@@ -622,7 +709,10 @@ export class XsRestClient {
     if (opts.activate) {
       sapBackPack.Activate = true;
       if (opts.version !== undefined) sapBackPack.Version = opts.version;
-    } else if (opts.workspace) {
+    }
+    // workspace 独立判断（不挂在 activate 分支的 else 上）：两者同时给出时两个字段都要写，
+    // 不能因 activate 为真就把 Workspace 静默丢弃
+    if (opts.workspace) {
       sapBackPack.Workspace = opts.workspace;
     }
     const headers: Record<string, string> = {
@@ -668,13 +758,13 @@ export class XsRestClient {
         }
         throw new XsWriteError(this.describeError(resp, `写文件 ${path}`), resp.status, cr, capDetail(resp.body));
       }
-      // 成功回执的新基线 = 响应头 ETag（§4.2#1）；响应头缺失即标 unavailable，不补读拼装
+      // 成功回执的新基线 = 响应头 ETag；响应头缺失即标 unavailable，不补读拼装
       const meta = (parsed ?? {}) as FileMeta & { CheckResult?: WriteCheckResult };
       this.stampWriteEtag(meta, resp);
       return meta;
     };
-    // 本 SPS 写入即激活（见文件头 §6）：任何合法 PUT（裸 PUT / Check / Workspace / Activate）都会触发
-    // 服务端激活，所以**所有**写都过同一激活信号量，不再按 activate 参数分流；每次写恰好取一次。
+    // 本 SPS 写入即激活（见文件头实测契约第 6 条）：任何合法 PUT（裸 PUT / Check / Workspace / Activate）都会触发
+    // 服务端激活，所以**所有**写都过同一激活信号量（不按 activate 参数分流）；每次写恰好取一次。
     // 全局锁序 keyed lock → 信号量 → 网络/DB：信号量必须在 keyed lock 之内获取（服务层先包锁），
     // 否则与 update 的 lock→semaphore 构成锁序反转（T1 持信号量等锁、T2 持锁等信号量）= 死锁。
     // 调用方（如 activateCalculationView）**绝不**在顶层再包一层：许可已在这里取，重复取等于同一逻辑
@@ -701,32 +791,22 @@ export class XsRestClient {
         body: content,
       }),
     );
-    const j = safeJson<{
-      HttpCode?: number;
-      Message?: string;
-      CheckResult?: {
-        Operations?: { Write?: boolean; Activate?: boolean };
-        error_code?: number | string;
-        error_msg?: string;
-        errorCode?: number | string;
-        errorMsg?: string;
-      };
-    }>(resp.body);
+    const j = safeJson<{ Message?: string; CheckResult?: WriteCheckResult | string }>(resp.body);
     if (!j?.CheckResult && (resp.status < 200 || resp.status >= 300)) {
       throw new HanaBusinessError(this.describeError(resp, '校验'));
     }
-    const cr = j?.CheckResult;
-    const activated = cr?.Operations?.Activate === true;
-    const code = cr?.error_code ?? cr?.errorCode;
-    // 消息优先取结构化字段；取不到就退回完整响应体文本（含 Type/Procedure DDL 明细），不截断
-    const msg = cr?.error_msg ?? cr?.errorMsg ?? j?.Message ?? (activated ? undefined : extractErrorDetail(resp.body));
+    // 消息兜底链：CheckResult 结构化消息（extractCheckResult 单点判定）→ 响应体顶层 Message →
+    // 完整响应体文本（含 Type/Procedure DDL 明细，不截断）→ 状态码文案
+    const fallbackMessage = j?.Message ?? extractErrorDetail(resp.body);
+    const check = extractCheckResult(j, fallbackMessage);
+    const activated = check?.consistent === true;
     // 回执基线只认响应头（与 writeFile 的 stampWriteEtag 同规则）：缺失即缺省，不补读 fileMeta 拼装——
-    // 补读只能拿到「读那一刻」的版本，冒充本次写的新基线会让实例级验身份证到错对象
+    // 补读只能拿到「读那一刻」的版本，冒充本次写的新基线会让下游把它当成同刻读数
     const headerEtag = resp.headers['etag'];
     return {
       consistent: activated,
-      message: activated ? undefined : msg ? String(msg) : `校验未通过（HTTP ${resp.status}）`,
-      errorCode: code !== undefined ? String(code) : undefined,
+      message: activated ? undefined : check?.message || fallbackMessage || `校验未通过（HTTP ${resp.status}）`,
+      errorCode: check?.errorCode,
       ...(headerEtag ? { etag: headerEtag } : {}),
       raw: resp.body,
     };
@@ -734,7 +814,7 @@ export class XsRestClient {
 
   /**
    * DELETE /base/file/<path>：删除设计时对象/包（204 成功）。
-   * 实测（§4.9#C）：DELETE 执行 If-Match——正确基线 → 204、陈旧基线 → 412、对象已不存在 → 404
+   * 实测：DELETE 执行 If-Match——正确基线 → 204、陈旧基线 → 412、对象已不存在 → 404
    * （重复删为 404 而非 412）。412/404 必须先于通用 assertOk 分类，落到机读冲突形状（envelope.raw.conflict）。
    */
   async deleteFile(packageId: string, objectName?: string, opts: { ifMatch?: string } = {}): Promise<XsResponse> {
@@ -801,7 +881,7 @@ export class XsRestClient {
    * Transfer API 导入（官方 §8.2.5 + 实测定案）：POST 发起 + PUT 分片上传（本实现单分片整体上传）。
    * 【实测】POST 目标必须是**目录** `/xfer/import/<pkg>/`（带尾斜杠）+ `Slug: <文件名>`——
    * 目标含文件名（`/xfer/import/<pkg>/<file>`）会把文件写进 `<pkg>/<file>/<file>` 错误嵌套路径，
-   * 不注册为仓库对象；目录目标则正确落库（计划 §6 P0 ④ 实测：落库即激活 Activated=true / Version=1，
+   * 不注册为仓库对象；目录目标则正确落库（实测：落库即激活 Activated=true / Version=1，
    * **不存在 inactive 暂存**）。
    * POST（200 + Location）→ PUT <Location> 带 Content-Range: bytes 0-(n-1)/n → 201 + 'Upload finished'。
    * 【已知边界（有意）】本通道**不纳入**激活信号量：xfer 上传超时放宽到 300s，长期占许可会饿死其它写；
@@ -828,9 +908,9 @@ export class XsRestClient {
       },
       { timeoutMs: this.xferTimeoutMs },
     );
-    // 发起步骤成功即 200 + Location 头（响应体可为空）
+    // 发起步骤成功即 200 + Location 头（响应体可为空）；响应头键由 request() 统一小写，按小写键取
     this.assertOk(post, `发起导入 ${packageId}/${fileName}`, true);
-    const location = post.headers['location'] ?? post.headers['contentlocation'];
+    const location = post.headers['location'];
     if (!location) {
       throw new HanaBusinessError(
         `XS 导入 ${packageId}/${fileName} 未返回上传 Location（HTTP ${post.status}）：${post.body.slice(0, 200)}`,
@@ -838,12 +918,12 @@ export class XsRestClient {
     }
     const uploadUrl = /^https?:\/\//i.test(location) ? location : `${this.baseUrl}${location}`;
     // 实测：文本内容必须显式声明 charset=utf-8——缺省时 XS 层按 Latin-1 解码请求体，
-    // 中文等非 ASCII 描述会被双重编码成乱码
+    // 中文等非 ASCII 描述会被双重编码成乱码。
+    // 后缀白名单覆盖**全部设计时文本对象**：.calculationview 之外还有 .attributeview/.analyticview
+    // （hana_repo_import 不限制 fileName 后缀、断言只查字符集），漏掉它们时含中文的存量视图导入即乱码；
+    // .analyticprivilege 同为仓库 XML 文本对象，一并纳入。其余后缀（如 .zip）按二进制走 octet-stream。
     const contentType =
-      opts.contentType ??
-      (fileName.endsWith('.xml') || fileName.endsWith('.calculationview')
-        ? 'application/xml; charset=utf-8'
-        : 'application/octet-stream');
+      opts.contentType ?? (isTextObjectFile(fileName) ? 'application/xml; charset=utf-8' : 'application/octet-stream');
     const put = await this.authed(
       uploadUrl,
       {
@@ -878,12 +958,53 @@ export class XsRestClient {
   }
 }
 
-/** 路径片段 URL 编码（保留 '/'，'..' 等非法序列由上层白名单拦截） */
+/**
+ * 路径段是否为**纯点段**（'.' / '..' / '…'）。
+ * 为什么必须拦：encodeURIComponent 不转义点号，而 fetch/undici 会对 http(s) 路径做点段归一——
+ * 'file/' + encodePath('../info') 会被折叠成 'file/info'，请求落到同 base 下的**兄弟端点**
+ * （/info、/workspace、/change、/xfer/…），即请求目标漂移。SAFE_NAME_RE 放行 '..'（实测，
+ * 仓库侧宽松口径刻意不动）；入参面已由 PACKAGE_ID_RE 拒绝纯点串（core/sql.ts 的 `(?!\.+$)`），
+ * 读路径没有任何包边界——本出口是 URL 拼接层的兜底，并与 repository.service.isSafePackageName
+ * 共用（两处口径必须一致）。
+ */
+export function isDotOnlySegment(segment: string): boolean {
+  return /^\.+$/.test(segment);
+}
+
+/**
+ * 路径片段 URL 编码（保留 '/'）。纯点段（'.'/'..'）一律拒绝——URL 归一会把它们折叠成上级路径，
+ * 使请求落到同 base 下的另一个端点（见 isDotOnlySegment）；这是本仓对「点段归一」的唯一出口守卫。
+ */
 function encodePath(path: string): string {
   return path
     .split('/')
-    .map((s) => encodeURIComponent(s))
+    .map((s) => {
+      if (isDotOnlySegment(s)) {
+        throw new HanaBusinessError(`路径段 "${s}" 是纯点段（URL 归一化会把它折叠成上级路径），已拒绝：${path}`);
+      }
+      return encodeURIComponent(s);
+    })
     .join('/');
+}
+
+/**
+ * 文件后缀是否为仓库的**设计时文本对象**（PUT 时须声明 XML + charset=utf-8，见 importFile）。
+ * 三种视图后缀与 metadata.service.VIEW_SUFFIXES 同源（core 层不依赖 services，故在此显式列出并声明
+ * 来源——复制清单的那天，VIEW_SUFFIXES 改了这里就成了静默漏网）；.xml/.analyticprivilege 同为
+ * 仓库文本对象（授权文件等）。命不中即按二进制（octet-stream）处理，如 .zip 归档。
+ */
+const TEXT_OBJECT_SUFFIXES: readonly string[] = [
+  '.xml',
+  '.calculationview',
+  '.attributeview',
+  '.analyticview',
+  '.analyticprivilege',
+];
+
+/** 设计时文本对象判定（大小写不敏感：断言放行点号，文件名大小写由调用方决定） */
+function isTextObjectFile(fileName: string): boolean {
+  const lower = fileName.toLowerCase();
+  return TEXT_OBJECT_SUFFIXES.some((suffix) => lower.endsWith(suffix));
 }
 
 /** 安全 JSON 解析（失败返回 undefined，不抛） */

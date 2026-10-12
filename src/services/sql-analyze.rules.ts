@@ -11,7 +11,7 @@
  */
 
 import { randomBytes } from 'node:crypto';
-import { US_PER_SECOND } from '../core/num.js';
+import { US_PER_SECOND, formatMicros } from '../core/num.js';
 import { quoteLiteral } from '../core/sql.js';
 import { truncateWithNote } from '../core/text.js';
 import { stripSqlLiteralsAndComments } from '../write-plan.js';
@@ -37,28 +37,7 @@ export const MAX_OPERATOR_LIMIT = 1000;
  */
 export const HARD_OPERATOR_CAP = 5000;
 
-/**
- * analyze 模式护栏（服务层常量，不暴露为工具参数）：
- * 实际执行任意 SELECT 必须有硬边界，参数化只会把"跑飞"变成"可配置地跑飞"。
- */
-export const ANALYZE_MAX_ROWS = 100;
-
-/**
- * **实际执行**（analyze=true 真跑那条语句）的超时。
- * 大 CV 本身就要 2–3 min，30s 会把合法分析直接掐断；5 min 覆盖得住这类语句，
- * 同时把"整个调用"的墙钟压在一处：执行 5 min + 控制面各 30s ≈ 7.5 min 最坏，
- * 调用方只要留够这个数就一定是我们先返回，而不是被对方掐断。再长的语句该去查为什么慢。
- */
-export const ANALYZE_EXECUTION_TIMEOUT_MS = 300_000;
-
-/**
- * **控制面调用**（PlanViz 的建会话/编译/取计划 XML/关会话）的超时。
- * 都是元数据级操作，30s 足够；**不跟着执行一起放宽**——这类调用一挂住，池位（上限 4）就被占着，
- * 放宽它等于把"一次卡死拖垮全部工具调用"的时间窗放大 20 倍。
- */
-export const ANALYZE_CONTROL_TIMEOUT_MS = 30_000;
-
-/** statement_name 列上限 256，生成名留足余量 */
+/** statementName 仅作回显标签（不进 SQL），限长防响应膨胀；写库用的 STATEMENT_NAME 由 generateStatementName 生成，长度与本常量无关 */
 export const MAX_LABEL_LENGTH = 64;
 
 /** 可恢复的校验问题（handler 据此返回 mcpErrorText，服务层据此抛 HanaBusinessError） */
@@ -81,6 +60,19 @@ export interface SqlStatementInfo {
 const NAMED_PARAM_RE = /(?<!:):[A-Za-z_][A-Za-z0-9_]*/;
 
 /**
+ * 把 `"…"` 引号标识符段抹白（换成长度相同的空白，保住偏移），**仅用于语句级守卫判定**
+ * （分号/占位符/加锁读），送去 EXPLAIN/执行的仍是原文。
+ *
+ * 为什么必须屏蔽：stripSqlLiteralsAndComments 对引号标识符是**原样保留**的（扫描器要读它），
+ * 于是 `"a;b"` / `"A?B"` / `"X:ID"` / `"FOR UPDATE"` 这类合法标识符的内容会被守卫当成语句文本，
+ * 把一条完全合法的单条 SELECT 硬拒（实测：报"语句含多个分号分隔的语句"/"语句含绑定占位符"/
+ * "不接受加锁读"，理由与事实相反）。`""` 是引号标识符内的转义写法，按对处理。
+ */
+function maskQuotedIdentifiers(text: string): string {
+  return text.replace(/"(?:[^"]|"")*"/g, (m) => ' '.repeat(m.length));
+}
+
+/**
  * 解析并校验一条待分析语句。
  * 分号规则：**允许**结尾单独一个分号（剥离后只剩空白），**其余一律拒绝**（多语句）。
  * 注意此处不裁剪原文——`EXPLAIN PLAN … FOR <原样语句>` 里的尾分号只是终止符，无害；
@@ -93,20 +85,22 @@ const NAMED_PARAM_RE = /(?<!:):[A-Za-z_][A-Za-z0-9_]*/;
 export function parseSqlStatement(raw: string, opts: { allowPlaceholders?: boolean } = {}): SqlStatementInfo {
   const sql = String(raw ?? '').trim();
   const stripped = stripSqlLiteralsAndComments(sql);
-  // 剥离后的文本若去掉尾部一个分号后仍有分号 → 多语句
-  const body = stripped.replace(/;\s*$/, '');
-  const firstToken = (/[A-Za-z_][A-Za-z0-9_]*/.exec(body)?.[0] ?? '').toUpperCase();
+  // 分号/占位符守卫跑在**同时屏蔽引号标识符**的文本上：`"a;b"`/`"A?B"` 的内容不是语句文本，
+  // 但它们在剥离后的文本里原样保留（见 maskQuotedIdentifiers 的说明）。
+  // 尾部分号的剔除仍按原文做（`SELECT "x;"` 这种以引号标识符收尾的语句不受影响）
+  const guardText = maskQuotedIdentifiers(stripped.replace(/;\s*$/, ''));
+  const firstToken = (/[A-Za-z_][A-Za-z0-9_]*/.exec(stripped)?.[0] ?? '').toUpperCase();
   const kind = firstToken === 'SELECT' ? 'select' : firstToken === 'WITH' ? 'with' : 'other';
 
   const problems: RequestProblem[] = [];
   if (sql === '') {
     problems.push({ message: 'sql 为空', hint: '请提供一条 SELECT/WITH 查询语句' });
-  } else if (body.includes(';')) {
+  } else if (guardText.includes(';')) {
     problems.push({
       message: '语句含多个分号分隔的语句（只允许结尾一个分号）',
       hint: '本工具一次只分析一条语句；请去掉多余的分号与后续语句',
     });
-  } else if (!opts.allowPlaceholders && (NAMED_PARAM_RE.test(body) || body.includes('?'))) {
+  } else if (!opts.allowPlaceholders && (NAMED_PARAM_RE.test(guardText) || guardText.includes('?'))) {
     problems.push({
       message: '语句含绑定占位符（? 或 :name）',
       hint: 'EXPLAIN/执行都需要具体参数值才能定计划；请把参数替换为字面量后再分析',
@@ -174,7 +168,8 @@ export function validateAnalyzeRequest(opts: AnalyzeRequestLike): RequestProblem
   }
   // 加锁读（FOR UPDATE / FOR SHARE）：EXPLAIN 只编译无妨，但 analyze=true 会**真的加行锁**，
   // 而结果集取满 100 行就关闭——锁的持有时间取决于驱动/事务处理，可能挡住别人的 DML。
-  if (opts.analyze && LOCKING_READ_RE.test(stripSqlLiteralsAndComments(info.sql))) {
+  // 判定前同样屏蔽引号标识符：`SELECT "FOR UPDATE" …` 是合法标识符，不是加锁子句
+  if (opts.analyze && LOCKING_READ_RE.test(maskQuotedIdentifiers(stripSqlLiteralsAndComments(info.sql)))) {
     return {
       message: 'analyze=true 不接受加锁读（FOR UPDATE / FOR SHARE）',
       hint: '执行会对数据行加锁、可能阻塞其他会话；去掉加锁子句，或改用 analyze=false 只编译不执行',
@@ -320,7 +315,7 @@ function isRoot(row: PlanRow): boolean {
  * 反推且用可达性判孤儿（见 planviz.rules 的 parsePlanVizXml），两者对畸形计划的计数本就会不同，
  * 强行统一 = 静默改变某条通道报出的数字。
  */
-export function analyzePlanStructure(rows: PlanRow[]): { rootCount: number; orphanCount: number } {
+function analyzePlanStructure(rows: PlanRow[]): { rootCount: number; orphanCount: number } {
   const ids = new Set(rows.map((r) => r.OPERATOR_ID));
   return {
     rootCount: rows.filter(isRoot).length,
@@ -542,7 +537,8 @@ function descendants(rows: PlanRow[], rootId: number | null): PlanRow[] {
   return out;
 }
 
-const LEVEL_ORDER: Record<FindingLevel, number> = { risk: 0, warn: 1, info: 2 };
+/** findings 的严重度排序（risk 最前）——EXPLAIN 与 PlanViz 两条结论通道共用的唯一一份（planviz.rules 直接复用，不各持副本） */
+export const LEVEL_ORDER: Record<FindingLevel, number> = { risk: 0, warn: 1, info: 2 };
 
 /**
  * 计划行 → 可读结论。**纯函数**：只做识别与措辞，不查任何东西。
@@ -556,6 +552,8 @@ export function analyzePlan(rows: PlanRow[], ctx: PlanAnalysisContext): PlanConc
   // "涉及 2 张表"（其实是 1 张）并输出重复发现；扫描次数另用 scans 单独统计
   const tableMap = new Map<string, PlanTableRef>();
   let scans = 0;
+  /** 其中解析出了表名的扫描次数——"未解析出表名"的条数要用它算，不能拿**去重后**的表数凑 */
+  let scansWithTable = 0;
   let joins = 0;
   let aggregations = 0;
 
@@ -566,6 +564,7 @@ export function analyzePlan(rows: PlanRow[], ctx: PlanAnalysisContext): PlanConc
     if (SCAN_RE.test(name)) {
       scans++;
       if (row.TABLE_NAME) {
+        scansWithTable++;
         const qualified = row.SCHEMA_NAME ? `${row.SCHEMA_NAME}.${row.TABLE_NAME}` : row.TABLE_NAME;
         const ref: PlanTableRef = {
           ...(row.SCHEMA_NAME ? { schema: row.SCHEMA_NAME } : {}),
@@ -600,14 +599,16 @@ export function analyzePlan(rows: PlanRow[], ctx: PlanAnalysisContext): PlanConc
     const text = stripSqlLiteralsAndComments(ctx.statement);
     const hasFilter = /\b(WHERE|ON|HAVING)\b/i.test(text);
     if (realTables.length > 0 && !hasFilter) {
+      // 逐算子计数与去重表数**不能混用**：同一张表被扫 ≥2 次时（自连接/UNION ALL），
+      // `scans - named.length` 会把已解析出表名的重复扫描虚报成"未解析出表名"
       const named = tables.map((t) => t.access).filter((a): a is string => Boolean(a));
-      const unnamed = Math.max(0, scans - named.length);
+      const unnamed = Math.max(0, scans - scansWithTable);
       findings.push({
         level: 'warn',
         title: `语句未见过滤条件，扫描算子会读取整表（扫描 ${scans} 次）`,
         evidence:
           '语句文本中没有 WHERE/ON/HAVING（文本启发式）；扫描算子：' +
-          `${named.join('、') || '(未记录表名)'}` +
+          `${named.join('、')}` +
           (unnamed > 0 ? `，另有 ${unnamed} 个扫描算子未解析出表名` : ''),
         advice: '确认是否必须全表；能加过滤条件（时间范围/分区键/状态）就先加，再对比结论里的规模变化',
       });
@@ -656,16 +657,14 @@ export function analyzePlan(rows: PlanRow[], ctx: PlanAnalysisContext): PlanConc
   }
 
   // ── 2. 引擎切换 ──
+  // engines 已按出现顺序去重：length > 1 时至少有一个非 HEX 引擎，switchable 恒非空（无需空值分支）
   if (engines.length > 1) {
     const switchable = engines.filter((e) => e !== 'HEX');
     findings.push({
       level: 'warn',
       title: `计划跨越多个执行引擎（${engines.join(' → ')}），存在引擎切换开销`,
       evidence: `算子的 EXECUTION_ENGINE 取值：${engines.join(', ')}`,
-      advice:
-        switchable.length > 0
-          ? `重点看 ${switchable.join('/')} 与其它引擎的衔接处：行表/计算视图混用时切换代价明显，必要时统一存储类型或拆开计算`
-          : '切换到列/行引擎的边界通常在大表读取处，可结合上面的表规模一起看',
+      advice: `重点看 ${switchable.join('/')} 与其它引擎的衔接处：行表/计算视图混用时切换代价明显，必要时统一存储类型或拆开计算`,
     });
   }
 
@@ -725,14 +724,14 @@ export function analyzePlan(rows: PlanRow[], ctx: PlanAnalysisContext): PlanConc
     if (avg != null && avg >= US_PER_SECOND) {
       findings.push({
         level: 'warn',
-        title: `已执行 ${execCount} 次，平均耗时约 ${(avg / US_PER_SECOND).toFixed(1)} 秒（HANA 列定义单位为微秒）`,
+        title: `已执行 ${execCount} 次，平均耗时约 ${formatMicros(avg)}（HANA 列定义单位为微秒）`,
         evidence: `M_SQL_PLAN_CACHE：EXECUTION_COUNT=${execCount}，AVG_EXECUTION_TIME=${avg}`,
         advice: '这是热点语句；结合上面的扫描/连接结论定位瓶颈，或先用 hana_data_preview 核对数据量级',
       });
     } else {
       findings.push({
         level: 'info',
-        title: `运行时统计：执行 ${execCount} 次${avg != null ? `，平均 ${avg} 微秒` : ''}`,
+        title: `运行时统计：执行 ${execCount} 次${avg != null ? `，平均 ${formatMicros(avg)}` : ''}`,
         evidence: `M_SQL_PLAN_CACHE：EXECUTION_COUNT=${execCount}${avg != null ? `，AVG_EXECUTION_TIME=${avg}` : ''}`,
       });
     }

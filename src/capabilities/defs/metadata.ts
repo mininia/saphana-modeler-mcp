@@ -1,17 +1,17 @@
 /**
- * 读取类清单条目，按新的 AI 能力分类落在两域：`browse`（浏览与查找：看定义/字段/表结构）
- * 与 `analysis`（结构与血缘分析：字段级逻辑/影响面）。
+ * 读取类清单条目，按 AI 能力分类分属 `discovery`（浏览与查找：看定义/字段/表结构）
+ * 与 `insights`（结构与血缘分析：字段级逻辑/影响面）两域。
  *
- * 视图定义/字段/字段逻辑/血缘、对象搜索、表清单与表结构；全部 kind=read、gate=none
- * （仅注册期可见性过滤，无调用期闸门），故不声明 effects.plan——读路径不参与写预检。
+ * 全部 kind=read，调用期同样过统一闸门（authorizeCall）；资源维度由 effects.plan 的有无表达——
+ * hana_table_list / hana_table_columns 声明读 schema 规划器（把 schema 入参纳入读范围判定），
+ * 其余读 _SYS_REPO 固定面的工具不声明（无资源维度）。
  */
 
 import { z } from 'zod';
 import { tagResource } from '../resources.js';
 import { cap, type Capability } from '../types.js';
 import { planTableColumns, planTableList } from '../planners.js';
-import { VIEW_KIND, zObjectName } from '../schemas.js';
-import { zReadPackageId } from '../schemas.js';
+import { VIEW_KIND, zObjectName, zReadPackageId } from '../schemas.js';
 
 export const metadataCapabilities = {
   hana_metadata_get_view: cap({
@@ -49,7 +49,8 @@ export const metadataCapabilities = {
       'by=field 反过来找「**哪些视图的输出里含某字段**」（field 为字段 ID 片段）——候选视图逐个按需解析设计时 XML，' +
       '受候选上限（maxCandidates，默认 100）与 limit 双重约束，回执带 candidatesScanned/truncated/asOf；' +
       'by=field 时 pattern 可选，用于收窄对象名候选。默认只搜三种视图类型（排除 UI5 仓库资源）；kind 可限定类型。' +
-      '典型场景：hana_metadata_list_fields / hana_metadata_get_field_logic 报「未找到视图」时，先用本工具按片段定位',
+      '典型场景：hana_metadata_list_fields / hana_metadata_get_field_logic 报「未找到视图」时，先用本工具按片段定位。' +
+      '字段级反查与依赖口径见 rules=metadata_graph（hana_system_get_info(rules=metadata_graph)）',
     inputSchema: z.object({
       pattern: z
         .string()
@@ -108,9 +109,9 @@ export const metadataCapabilities = {
       '字段元数据（中文描述/类型/长度）。SqlScriptView（SQL 脚本）节点返回脚本源码（script），脚本即该字段的逻辑来源。' +
       '回答「某视图某字段什么逻辑/公式怎么写的/怎么算出来的」用本工具，一次调用即可，' +
       '不返回整份视图定义，结果精准聚焦单字段。' +
-      '**字段级下游血缘**（谁引用了这个字段）用 includeUsage=true：扫下游候选视图的输入映射，' +
-      '逐列归因的命中在 usage.downstream（含消费方节点与目标列）；列名对齐型输入（Union 无映射）另列 usage.nameAlignedConsumers；' +
-      '带 viewsScanned/truncated/asOf 扫描口径。' +
+      '**字段级下游血缘**（谁引用了这个字段）用 includeUsage=true；命中归属与扫描口径（usage.downstream、' +
+      'usage.nameAlignedConsumers、viewsScanned/truncated/failedCandidates/asOf）见 rules=metadata_graph' +
+      '（hana_system_get_info(rules=metadata_graph)）。' +
       '功能边界：字段的来源映射（节点.列）看 hana_metadata_list_fields 的 source，视图的上游/下游依赖看 hana_metadata_where_used；' +
       '字段 ID 不确定时先用 hana_metadata_list_fields 按名称片段模糊搜索',
     inputSchema: z.object({
@@ -145,12 +146,9 @@ export const metadataCapabilities = {
     effects: { destructive: false, idempotent: true },
     title: '血缘/依赖关系搜索',
     description:
-      '查询视图的依赖关系（来源：_SYS_REPO.ACTIVE_OBJECTCROSSREF）：' +
-      'upstream=该视图引用了哪些对象（数据源/上游视图）；downstream=哪些对象引用了该视图（下游视图/运行时目录视图）。' +
-      'downstream 中 isRuntime=true 表示激活后的运行时对象（_SYS_BIC）对仓库视图的引用。' +
-      '多跳波及面用 depth>1（返回 closure/depthReached/truncated/asOf；' +
-      '截断时以 truncated=true 如实告知，不静默丢）。' +
-      '修改/删除视图前用本工具评估影响面',
+      '查询视图的依赖关系：upstream=该视图引用了哪些对象（数据源/上游视图），downstream=哪些对象引用了该视图。' +
+      '多跳波及面用 depth>1；返回口径（isRuntime、closure/depthReached/truncated/asOf）与使用时机见 ' +
+      'rules=metadata_graph（hana_system_get_info(rules=metadata_graph)）',
     inputSchema: z.object({
       packageId: zReadPackageId('包名，层级用 . 分隔，如 ZDEMO.ZDEMO_MKC'),
       objectName: zObjectName('视图对象名'),
@@ -159,11 +157,11 @@ export const metadataCapabilities = {
         .enum(['upstream', 'downstream', 'both'])
         .default('both')
         .describe('血缘方向：upstream=依赖谁，downstream=谁依赖'),
-      // P4：depth 是"宽松 schema 契约"的例外（数值参数用严格联合类型，非法值走协议层拒绝）
+      // depth 是"宽松 schema 契约"的例外（数值参数用严格联合类型，非法值走协议层拒绝）
       depth: z
         .union([z.number().int().min(1).max(50), z.literal('all')])
         .optional()
-        .describe('跳数：默认 1=直接依赖（原行为）；>1 或 all 追加多跳闭包 closure（可能 truncated）'),
+        .describe('跳数：默认 1=直接依赖（单跳）；>1 或 all 追加多跳闭包 closure（可能 truncated）'),
     }),
     annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   }),
@@ -179,7 +177,7 @@ export const metadataCapabilities = {
       '支持名称模糊匹配与条数限制。建模选数据源时用 hana_table_columns 查看具体列结构',
     inputSchema: z.object({
       schema: tagResource(
-        z.string().optional().describe('schema 名（默认当前用户 schema；如 SAPABAP1/_SYS_BIC）'),
+        z.string().trim().optional().describe('schema 名（默认当前用户 schema；如 SAPABAP1/_SYS_BIC）'),
         'readSchema',
       ),
       pattern: z.string().optional().describe('表名模糊匹配（LIKE %pattern%，大小写敏感）'),
@@ -198,7 +196,7 @@ export const metadataCapabilities = {
       '返回指定表的列结构：列名/位置/数据类型/长度/精度/可空/默认值/注释（来源：SYS.TABLE_COLUMNS）。' +
       '表不存在或当前用户无权限时返回 isError 并提示用 hana_table_list 确认可访问的表',
     inputSchema: z.object({
-      schema: tagResource(z.string().describe('schema 名，如 SAPABAP1 / _SYS_BIC'), 'readSchema'),
+      schema: tagResource(z.string().trim().describe('schema 名，如 SAPABAP1 / _SYS_BIC'), 'readSchema'),
       table: z.string().describe('表名，如 /BIC/AZDEMO001'),
       limit: z.number().int().min(1).max(500).default(200).describe('返回列数上限，默认 200，最大 500'),
     }),

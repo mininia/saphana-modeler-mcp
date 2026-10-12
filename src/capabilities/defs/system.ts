@@ -1,9 +1,9 @@
 /**
  * 系统信息域（`category: 'system'`）的清单条目。
  *
- * 两条能力（hana_system_get_info / hana_check_privileges）都是对 SYS.M_* 的只读查询，
- * 归 read、gate=none（仅注册期可见性过滤，无调用期闸门）——与 tools/system.tools.ts 一一对应。
- * 原 groups.ts 分组表中这两条工具没有说明性注释（只有「数据读取」分组标题），故无需回填。
+ * 两条能力（hana_system_get_info / hana_check_privileges）都是对 SYS.M_* 的只读查询，归 read——
+ * 与 tools/system.tools.ts 一一对应。所有能力经 capabilityRegistrar 统一过 authorizeCall 调用期闸门；
+ * 读固定系统 schema 的能力不声明 effects.plan（没有资源维度）。
  */
 
 import { z } from 'zod';
@@ -26,6 +26,10 @@ export const systemCapabilities = {
         .string()
         .optional()
         .describe('规则库查询：省略=目录（id+title）；all=全部规则全文；或规则 id（逗号分隔多个）'),
+      refreshProfile: z
+        .boolean()
+        .optional()
+        .describe('true=强制重探环境档案（默认走进程内缓存）：HANA 侧补授权后想看新档位时用'),
     }),
     annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   }),

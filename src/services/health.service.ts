@@ -15,18 +15,20 @@ import { classifyHanaError } from '../core/hana-errors.js';
 import { logger } from '../core/logger.js';
 import { probeVisibility, type Visibility } from './visibility.service.js';
 import {
+  adviceByReason,
   ALL_CHECKS,
   DEFAULT_CHECKS,
   DEFAULT_THRESHOLDS,
   HEALTH_RULES,
+  LEVEL_ORDER,
   reportCheckedAt,
+  titleByReason,
   type DiagnosticReportBase,
   type FindingLevel,
   type HealthCategory,
   type HealthFinding,
   type HealthMetric,
   type HealthRule,
-  type UnknownReason,
   type HealthThresholds,
 } from './health.rules.js';
 
@@ -34,7 +36,7 @@ import {
 export type HealthVerdict =
   /** 全部检查项都有结论且都正常 */
   | 'ok'
-  /** 有 warning 级发现，且无 critical、无 unknown */
+  /** 有 warning 级发现，且无 critical（可同时有 unknown——判定顺序里 warn 优先于 unknown） */
   | 'warn'
   /** 有 critical 级发现 */
   | 'critical'
@@ -80,7 +82,7 @@ export interface HealthRequest {
 }
 
 /**
- * 探测规则上下文所需的库信息。可见性单独由 visibility.service 提供（三个诊断工具共用同一判定，
+ * 探测规则上下文所需的库信息。可见性单独由 visibility.service 提供（四个诊断工具共用同一判定，
  * 避免出现"健康检查认为全量可见、活动工具认为被过滤"这类自相矛盾的输出）。
  *
  * 返回 `empty` 标记供上层留 caveat：取不到行时字段全是空串，若不说明，
@@ -105,17 +107,6 @@ async function probeDatabase(pool: HanaPool): Promise<{ info: HealthReport['data
 /** 把规则执行中的异常转成一条 unknown 结论（不让单个规则炸掉整份报告） */
 function errorToFinding(rule: HealthRule, e: unknown): HealthFinding {
   const { reason, detail } = classifyHanaError(e);
-  const titleByReason: Record<UnknownReason, string> = {
-    view_missing: '无法判定：该 HANA 版本没有此视图（换实例也不会出现，属版本差异）',
-    permission_denied: '无法判定：权限不足（语句被拒）',
-    filtered: '无法判定：视图对当前用户不可见',
-    not_configured: '未配置',
-    error: '无法判定：执行出错',
-  };
-  const adviceByReason: Partial<Record<UnknownReason, string>> = {
-    view_missing: '这是版本能力差异，不是故障。如确需该项，请对照目标 HANA 版本的监视视图清单。',
-    permission_denied: '为该 HANA 用户授予 MONITORING 角色（含 CATALOG READ）或 CATALOG READ 系统权限后重试。',
-  };
   return {
     id: rule.id,
     category: rule.category,
@@ -138,9 +129,12 @@ function errorToFinding(rule: HealthRule, e: unknown): HealthFinding {
  * 抽成纯函数以便单测直接锁住这条不变式。
  */
 export function computeVerdict(levels: readonly FindingLevel[]): HealthVerdict {
-  if (levels.includes('critical')) return 'critical';
-  if (levels.includes('warn')) return 'warn';
-  if (levels.includes('unknown')) return 'indeterminate';
+  // 顺序取自 health.rules 的 LEVEL_ORDER（与规则内聚合的 worst() 共用同一份全序）——
+  // 两处各写一份优先级时只靠注释同步，改一处就会让分项级别与整体 verdict 口径矛盾。
+  const worst = levels.reduce<FindingLevel>((a, b) => (LEVEL_ORDER.indexOf(b) > LEVEL_ORDER.indexOf(a) ? b : a), 'ok');
+  if (worst === 'critical') return 'critical';
+  if (worst === 'warn') return 'warn';
+  if (worst === 'unknown') return 'indeterminate';
   return 'ok';
 }
 

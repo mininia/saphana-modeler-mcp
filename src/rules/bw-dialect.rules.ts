@@ -3,13 +3,9 @@ import type { RuleObject } from './index.js';
 /**
  * BW / Studio 方言规则（join 重命名、聚合两形态、schema 别名、读数新鲜度口径）。
  *
- * 来源（搬迁自，保留原文措辞与实测注记）：
- * - src/capabilities/defs/modeling.ts 的 hana_view_update.description（op=add_join「自动按 BW 同款
- *   「join 输入映射重命名」接线」）；
- * - src/model/view-edit.ts 的头注（目标形态与范本、锚点字符串手术）；
- * - src/model/view-types.ts 的注释（聚合两种方言、schemaName="ABAP" 是源系统名）；
- * - src/model/view-diff.ts 的头注（聚合方言归一、BW schema 归一）；
- * - src/model/view-cache.ts 与 src/services/catalog.service.ts 的头注（asOf / TTL+VERSION_ID 口径）。
+ * 这些方言契约与实测注记的权威落点（hana_system_get_info(rules=bw_dialect)）：改契约先改这里。
+ * 相关代码路径（view-edit / view-builder / view-diff / view-cache 等）的头注可给指针、也可为解释
+ * 自身行为复述个别口径（如聚合归一化基准、缓存新鲜度校验），但都不作权威——完整契约以本文件为准。
  */
 
 export const bwDialectRules: readonly RuleObject[] = [
@@ -24,7 +20,7 @@ export const bwDialectRules: readonly RuleObject[] = [
       '新增 Projection 把源视图字段取出来 → 新增 Join（左输入=原输出节点全字段透传，右输入=条件/带出字段映射）→',
       'logicalModel 的 id 与**全部** keyMapping/measureMapping 的 columnObjectName 重接线到新 Join 节点、',
       '并为带出字段追加 attribute（order 顺延，带源字段中文描述）。',
-      '变换实现为对 XML 的「锚点字符串手术」（</dataSources>、</calculationViews>、</logicalModel>、<attributes>',
+      '变换实现为对 XML 的「锚点字符串手术」（</dataSources>、</calculationViews>、</logicalModel>、</attributes>',
       '等锚点实测各恰好 1 个），除插入/替换外逐字节保留（informationModelLayout、layout shapes、hidden 零损耗）。',
       '',
       'Aggregation 节点的两种方言（解析 / 比对 / 生成共用同一归一，禁止各写一份）：',

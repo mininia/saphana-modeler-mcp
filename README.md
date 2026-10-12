@@ -2,7 +2,7 @@
 
 > 🌐 中文 | [English](README.en.md)
 
-SAP HANA 经典 Modeler 能力的 MCP 服务器（TypeScript，Node >= 20.12）。面向本地部署 HANA 2.0
+SAP HANA 经典 Modeler 能力的 MCP 服务器（TypeScript，Node >= 24.18.1；过旧版本可能在依赖加载期即崩溃，请先升级）。面向本地部署 HANA 2.0
 （经典 `_SYS_REPO` 仓库建模），提供信息视图（计算视图/属性视图/分析视图）与仓库对象的
 **元数据浏览、数据预览、血缘查询与建模写操作**。
 
@@ -22,7 +22,7 @@ SAP HANA 经典 Modeler 能力的 MCP 服务器（TypeScript，Node >= 20.12）�
 | 分类 | 能力 | 工具 |
 | --- | --- | --- |
 | 系统 | 版本信息、用户权限与建模能力自检 | `hana_system_get_info`、`hana_check_privileges` |
-| 稳定性诊断 | 实例体检（**读数层**：内存%/磁盘与卷 IO/备份距今/内存分配失败率… + **结论层**：磁盘/服务/备份/内存/CPU/告警/阻塞/长事务/复制/配置/弃用特性/加密**十二项**，**三态**：正常/异常/看不见）、会话与阻塞深潜（谁堵谁）、表存储画像（内存/磁盘/碎片/热度/分区/列级/索引级）、历史趋势（过去 N 天的 CPU/内存/磁盘/网络） | `hana_system_health`、`hana_system_activity`、`hana_table_storage`、`hana_system_trend` |
+| 稳定性诊断 | 实例体检（**读数层**：内存%/磁盘与卷 IO/备份距今/内存分配失败率… + **结论层**：磁盘/服务/备份/内存/CPU/告警/阻塞/长事务/复制/配置/弃用特性/加密**十二项**，**三态**：正常/异常/看不见）、会话与阻塞深潜（谁堵谁）、表存储画像（内存/磁盘/碎片/热度/分区/列级/索引级）、历史趋势（过去 N 小时的 CPU/内存/磁盘/网络） | `hana_system_health`、`hana_system_activity`、`hana_table_storage`、`hana_system_trend` |
 | 包 | 包清单/包树、包内对象（含激活状态）、新建包 | `hana_package_list`、`hana_package_list_objects`、`hana_package_create` |
 | 元数据 | 完整定义读取、对象搜索、字段清单、单字段逻辑溯源、血缘 | `hana_metadata_get_view`、`hana_metadata_search_objects`、`hana_metadata_list_fields`、`hana_metadata_get_field_logic`、`hana_metadata_where_used` |
 | 表目录 | 可访问表清单、表列结构 | `hana_table_list`、`hana_table_columns` |
@@ -48,11 +48,15 @@ npx github:mininia/saphana-modeler-mcp   # 自动 clone + 构建 + 启动
 ```bash
 git clone https://github.com/mininia/saphana-modeler-mcp.git
 cd saphana-modeler-mcp
-npm install          # 首次安装后需 npm approve-scripts @sap/hana-client（预编译二进制）
+npm install          # @sap/hana-client 的安装脚本许可已随 package.json 的 allowScripts 提交；仅当本地 npm 仍提示未复核脚本时才需 npm approve-scripts
 cp .env.example .env # 填写真实 HANA 连接
 npm run build
 node scripts/smoke-stdio.mjs   # 冒烟：握手 + 工具注册（无需真实 HANA）
 ```
+
+> 克隆安装属于**源码构建**路径：`prepare` 会在安装后立即构建，构建工具链（`typescript`、`@types/node`）
+> 位于 `optionalDependencies`；因此**不要**用 `--omit=optional` 安装（`NODE_ENV=production` 与
+> `--omit=dev` 不受影响）。
 
 MCP 接入：将 `mcp.json.example` 复制为 `mcp.json` 并填入真实连接（`mcp.json` 与 `.env` 均已 gitignore，
 **请勿提交**）。各客户端接入要点见下方「MCP 客户端接入」。
@@ -81,16 +85,16 @@ MCP 接入：将 `mcp.json.example` 复制为 `mcp.json` 并填入真实连接�
 | `HANA_SSL_VALIDATE` | 可选 | TLS 下校验证书，默认 `true`；自签证书环境显式 `false` | `true` |
 | `HANA_TIMEZONE` | 可选 | 进程时区（设置 `TZ`，影响日志时间戳与本地时间语义）；**不下发 HANA 会话**。默认 `Asia/Shanghai` | `Asia/Shanghai` |
 | `HANA_SCHEMA_ALLOW` | 可选 | 追加允许查询的 schema（逗号分隔，追加到内置白名单） | `SAPABAP1,OTHER_SCHEMA` |
-| `HANA_WRITE_PACKAGES` | 可选 | 允许写操作的仓库包前缀（逗号分隔，含子包）。**空 = 未启用写边界**：声明写包的请求会被运行期闸门以 `boundary_off` 硬拦（要写就必须显式配置；只有服务层那一层是 fail-open，见下方「写操作安全边界」）；填写后仅允许配置包及其下级子包写操作 | `ZDEMO1,ZDEMO2.ZDEMO_SD` |
+| `HANA_WRITE_PACKAGES` | 可选 | 允许写操作的仓库包前缀（逗号分隔，含子包）。**空 = 未启用写边界**：声明写包的请求会被运行期闸门以 `boundary_off` 硬拦（要写就必须显式配置）；填写后仅允许配置包及其下级子包写操作；分层语义与服务层例外见下方「写操作安全边界」 | `ZDEMO1,ZDEMO2.ZDEMO_SD` |
 | `HANA_XS_PORT` | 可选 | XS Classic 设计时 REST 端口（写路径）；省略按实例号推导 `80<instance>` | `8010` |
 | `HANA_XS_BASE_PATH` | 可选 | XS 设计时 REST 基础路径，默认 `/sap/hana/xs/dt/base` | — |
-| `HANA_POOL_MAX` | 可选 | HANA 连接池并发上限，默认 `4`。**部署建议：每个代理一个进程，N 个代理 = N×该值条 HANA 连接** | `8` |
-| `HANA_POOL_WAIT_MS` | 可选 | 池满后的排队等待超时（ms），默认 `30000`；到时仍拿不到连接即以可读错误失败，不会无限期挂住 | `60000` |
-| `HANA_POOL_MAX_WAITERS` | 可选 | 排队上限（个），默认 `64`；超出立即失败，防请求无限堆积 | `128` |
-| `HANA_SQL_TIMEOUT_MS` | 可选 | 写路径五条 SQL 语句（存在性检查/兜底直写/行探测/影响半径的下游查询/REPOSITORY_REST 调用）的语句超时，默认 `60000`。**不设全局默认是有意的**：`hana_sql_analyze`（最长 5 分钟）与元数据搜索是合法长语句 | `120000` |
-| `HANA_XS_TIMEOUT_MS` | 可选 | XS REST 请求默认超时（ms），默认 `30000`；覆盖全部走该出口的调用（含读内容/读元数据；登录/取 CSRF 另有更短的固定超时） | `60000` |
-| `HANA_XS_XFER_TIMEOUT_MS` | 可选 | XS Transfer（xfer）导入/导出超时（ms），默认 `300000`（整包上传/下载天然慢，单独放宽） | `600000` |
-| `HANA_ACTIVATION_CONCURRENCY` | 可选 | 服务端激活的并发上限（进程内信号量），默认 `2`。**本 SPS 写入即激活**，故保护面是**所有会触发激活的写**（xs_rest 通道的 create/update/activate 文件写，以及设计时校验的临时副本写），不只是显式 `activate=true`；**已知边界（不在覆盖内）：import 走 Transfer API 上传通道**（其超时按 xfer 放宽，长期占用许可会饿死其它写），**建包 POST 与 DELETE 也不在内**（只建目录 / 只删除，不触发服务端激活）。激活是重操作（2–10s/次），多代理并发激活需限流 | `4` |
+| `HANA_POOL_MAX` | 可选 | HANA 连接池并发上限，默认 `4`（池满行为与部署建议见「传输方式 → 超时与资源治理」） | `8` |
+| `HANA_POOL_WAIT_MS` | 可选 | 池满后的排队等待超时（ms），默认 `30000` | `60000` |
+| `HANA_POOL_MAX_WAITERS` | 可选 | 排队上限（个），默认 `64` | `128` |
+| `HANA_SQL_TIMEOUT_MS` | 可选 | 写路径五条 SQL 语句（存在性检查/兜底直写/行探测/影响半径的下游查询/REPOSITORY_REST 调用）的语句超时，默认 `60000`；为何不设全局默认见「传输方式 → 超时与资源治理」 | `120000` |
+| `HANA_XS_TIMEOUT_MS` | 可选 | XS REST 请求默认超时（ms），默认 `30000`；覆盖范围（含登录/取 CSRF 的更短固定超时）见「传输方式 → 超时与资源治理」 | `60000` |
+| `HANA_XS_XFER_TIMEOUT_MS` | 可选 | XS Transfer（xfer）导入/导出超时（ms），默认 `300000`（相对默认 XS 超时单独放宽） | `600000` |
+| `HANA_ACTIVATION_CONCURRENCY` | 可选 | 服务端激活的并发上限（进程内信号量），默认 `2`。**本 SPS 写入即激活**，保护面是**所有会触发激活的写**；覆盖范围与已知边界见「传输方式 → 超时与资源治理」 | `4` |
 | `MCP_TOOL_GROUPS` | 可选 | 启用的工具功能分组（逗号分隔 `read`/`write`/`admin`）；**空=不限制（全部分组启用）** | `read` |
 | `MCP_TOOL_ALLOW` | 可选 | 强制启用的工具名 glob（即便其分组未启用也注册；逗号分隔，支持 `*` 通配） | `hana_view_validate` |
 | `MCP_TOOL_DENY` | 可选 | 强制禁用的工具名 glob（优先级最高，覆盖 allow 与分组；逗号分隔，支持 `*` 通配） | `hana_data_preview*` |
@@ -122,8 +126,8 @@ HTTP 模式要点：
 - **会话与隔离**：本服务**无会话**——每个请求新建协议实例、无 `Mcp-Session-Id`、无会话级状态，因此不存在跨会话串扰与会话劫持面；相应地也没有会话级配额/取消。隔离粒度 = 单个服务进程：所有客户端共享同一连接池、同一工具可见性配置、同一可写包白名单
 - **安全默认（fail-closed）**：
   - 仅绑定 `127.0.0.1`，Host/Origin 白名单默认仅本机名（DNS rebinding 防护）。对外暴露需同时：`MCP_HTTP_HOST=0.0.0.0` + `MCP_HTTP_ALLOWED_HOSTS` 放行对外主机名（浏览器类客户端再放行 `MCP_HTTP_ALLOWED_ORIGINS`）
-  - **认证**：设置 `MCP_HTTP_TOKEN`（≥16 字符）后所有请求强制 Bearer Token 校验（缺失/不匹配 → 401）；未设置时回环监听即为访问边界。**对外监听且无 Token 时默认拒绝启动**（配置自检的阻断级不变量，见下），确需如此须显式 `MCP_HTTP_ALLOW_ANONYMOUS=true`，届时启动日志每次都会告警
-  - 请求体上限 10MB（超限 413）；chunked 流式上传无 Content-Length 头，请交由反向代理限长
+  - **认证**：设置 `MCP_HTTP_TOKENS`（或向后兼容的 `MCP_HTTP_TOKEN`）后所有请求强制 Bearer Token 校验（缺失/不匹配 → 401）；未设置时回环监听即为访问边界。**对外监听且无 Token 时默认拒绝启动**（配置自检的阻断级不变量，见下），确需如此须显式 `MCP_HTTP_ALLOW_ANONYMOUS=true`，届时启动日志每次都会告警
+  - 请求体上限 10MB（按字节计）：声明的 `Content-Length` 超限直接 413；流式（chunked）上传同样按字节计数、在本地拦截（超量时服务端拒绝并关闭连接），不需要依赖反向代理限长
 - **客户端身份归因**：`MCP_HTTP_TOKENS` 把每个 Token 映射为独立 `clientId`，随请求上下文贯穿到工具层——
   - 每次工具调用返回的 envelope 带 `clientId`（stdio 模式无此字段，形态与既有版本一致）
   - 每个写操作在服务端日志留一条审计记录（`clientId` + 包 + 对象）；stdio 模式日志不含 `clientId`
@@ -139,12 +143,12 @@ HTTP 模式要点：
     - **导入**（`hana_repo_import`）：按目标文件名（剥掉设计时后缀）加锁；存在性检查**仅把 404 视为不存在**（403/网络错误一律不吞）；写入后回读校验。**跨进程竞态无服务端前置**，属已知例外
   - **冲突回执（对调用方是破坏性变化）**：412 与 delete 的 404 不再返回 MCP 硬错误文本，而是**业务失败信封**——`success=false`、`messages` 里的 id 为 `'412'` 或 `'OBJECT_NOT_FOUND'`；其中 412 与 **DELETE 动词返回的 404**（对象在删除前读之后才被并发删除）带 `raw.conflict = { httpStatus, providedEtag?, currentETag?, currentVersion?, activatedAt?, currentUnavailable? }`；**删除前置存在性读的 404**（对象本就不存在）只有机读码、不带该载荷。`currentETag` 是**冲突时点补读**得到的当前 ETag（实测 412 响应本身不带 ETag 头），不是本次写的新基线。成功回执带新基线：create/update/activate 的 `etag` 来自**写响应头**（`etagSource=response-header`；响应头缺失时省略 `etag` 并标 `etagSource=unavailable`，**不补读冒充**）——该基线**仅 xs_rest 通道有**：走 repo_rest / inactive_object 通道的 create 不经过 XS 写响应头，回执不带 `etag`/`etagSource`；delete 的来自删除前的基线读、import 的来自写入后的回读（`etagSource=read-back`）。代理可据此「自动重读 → 重放意图」，不必把冲突抛给人
   - **已知边界（实测）**：同一设计时文件的**并发写**在服务端可能以写错误被拒（HTTP **555**、`raw.errorDetail.checkResult.Operations.Write=false`、**写未发生**），而不是 412 前置条件失败。该路径的回执**不带** `raw.conflict`（缺省是刻意的——不拼装伪冲突载荷），但 `raw.errorDetail.httpStatus` 与 `checkResult.Operations.Write` 可机读。调用方应**重读最新版本后重放**——不要把它当冲突自解，也不要当作已写入
-  - **预演与破坏性判定（P6）**：`hana_view_update` 支持 `dryRun=true` **只读预演**——读取当前设计时定义、应用本次 xml/operations 变换后返回**归一化结构 diff + 影响半径（直接下游（单跳）；需要传递影响面用 `hana_metadata_where_used(depth)`）+ 破坏性判定**，**一次写都不发生**（不 PUT、不激活、不发 probe），回执以 `mode=dryRun` 与成功写入区分。破坏性变更（判定表：该视图**有下游引用**时的改输出字段类型 / 删字段 / 改名 / 改输出节点接线 / 改数据源）**必须**经 `migration`（`{ strategy: cast | preserve_column | move | acknowledge_dependents }`）显式声明策略才放行（前三个是**字段级迁移策略**——描述下游字段怎么迁：重铸 / 保列新建 / 随改名迁移；`acknowledge_dependents` 是**调用方显式承担下游破坏、不做字段级迁移**的声明位，三种字段级策略都不适用时用它，如整段回退）；未声明 ⇒ 服务端在写入前拒绝（机读码 `migration_required`、破坏项明细 `raw.errorDetail.breaking.items` 随回执给出），**一次写都不发生**。声明只被服务端记录（审计），**不触发任何自动迁移动作**——下游视图的处理交给编排层按影响半径（单跳）决定。删除同理：`hana_view_delete` 对被下游引用的视图要求声明 `migration.strategy=acknowledge_dependents`；无下游引用时**放行语义**与既有版本一致，但删除前会多一次跨引用查询（`_SYS_REPO.ACTIVE_OBJECTCROSSREF` 的影响半径）——该查询失败（无权限/超时）会让删除失败，P6 之前的版本没有这个依赖。另注意一条**判定豁免通道**：`hana_repo_import(overwrite=true)` 可整文件覆盖已有视图定义（备份恢复用的逃生舱），**不做破坏性判定**（不经 dryRun / migration 闸门）；要评估影响请先对目标跑 `dryRun` 或改用 `hana_view_update`
+  - **预演与破坏性判定**：`hana_view_update` 支持 `dryRun=true` **只读预演**——读取当前设计时定义、应用本次 xml/operations 变换后返回**归一化结构 diff + 影响半径（直接下游（单跳）；需要传递影响面用 `hana_metadata_where_used(depth)`）+ 破坏性判定**，**一次写都不发生**（不 PUT、不激活、不发 probe），回执以 `mode=dryRun` 与成功写入区分。破坏性变更（判定表：该视图**有下游引用**时的改输出字段类型 / 删字段 / 改名 / 改输出节点接线 / 改数据源）**必须**经 `migration`（`{ strategy: cast | preserve_column | move | acknowledge_dependents }`）显式声明策略才放行（前三个是**字段级迁移策略**——描述下游字段怎么迁：重铸 / 保列新建 / 随改名迁移；`acknowledge_dependents` 是**调用方显式承担下游破坏、不做字段级迁移**的声明位，三种字段级策略都不适用时用它，如整段回退）；未声明 ⇒ 服务端在写入前拒绝（机读码 `migration_required`、破坏项明细 `raw.errorDetail.breaking.items` 随回执给出），**一次写都不发生**。声明只被服务端记录（审计），**不触发任何自动迁移动作**——下游视图的处理交给编排层按影响半径（单跳）决定。删除同理：`hana_view_delete` 对被下游引用的视图要求声明 `migration.strategy=acknowledge_dependents`；无下游引用时**放行语义**与既有版本一致，但删除前会多一次跨引用查询（`_SYS_REPO.ACTIVE_OBJECTCROSSREF` 的影响半径）——该查询失败（无权限/超时）会让删除失败。另注意一条**判定豁免通道**：`hana_repo_import(overwrite=true)` 可整文件覆盖已有视图定义（备份恢复用的逃生舱），**不做破坏性判定**（不经 dryRun / migration 闸门）；要评估影响请先对目标跑 `dryRun` 或改用 `hana_view_update`
   - **超时与资源治理**（防一个代理拖垮全池）：
     - XS REST 的**全部**请求都有超时——含读内容/读元数据/登录（登录与取 CSRF 用更短的固定超时），xfer 导入导出单独放宽：`HANA_XS_TIMEOUT_MS` / `HANA_XS_XFER_TIMEOUT_MS`
     - 写路径五条 SQL 语句有语句超时（存在性检查/兜底直写/行探测/影响半径的下游查询/`REPOSITORY_REST` 调用），`HANA_SQL_TIMEOUT_MS`；**不设全局默认是有意的**：`hana_sql_analyze`（最长 5 分钟）与元数据搜索是合法长语句
     - 连接池上限 / 排队超时 / 排队上限可配（`HANA_POOL_MAX` / `HANA_POOL_WAIT_MS` / `HANA_POOL_MAX_WAITERS`，默认 4 / 30s / 64）：池满时排队，超限/超时以可读错误返回而不是无限期挂住。**部署建议：每个代理一个进程，N 个代理 = N×`HANA_POOL_MAX` 条 HANA 连接**（⚠ `hana_sql_analyze` 的 `analyze=true` 单次最多执行 5 分钟，期间占住一个池位：并发跑大语句时，其他调用可能等不到连接）
-    - 服务端激活有进程内并发信号量（`HANA_ACTIVATION_CONCURRENCY`，默认 2）：**本 SPS 写入即激活**（任何合法 PUT 都会被服务端激活，`activate` 参数只决定失败是否透出），故保护面是**所有会触发服务端激活的写**——xs_rest 通道的 create/update/activate 文件写与设计时校验的临时副本写，不只是显式 `activate=true`；**已知边界（不在覆盖内）**：import 走 Transfer API 上传通道（其超时按 xfer 放宽，长期占用许可会饿死其它写），建包 POST 与 DELETE 也不在内——无实测证据表明它们触发服务端激活（前者只建目录、后者只删除），故不按激活限流。keyed lock 管「同对象」、信号量管「全局并发」，不可互相替代
+    - 服务端激活有进程内并发信号量（`HANA_ACTIVATION_CONCURRENCY`，默认 2）：激活是重操作（2–10s/次），多代理并发激活需限流；**本 SPS 写入即激活**（任何合法 PUT 都会被服务端激活，`activate` 参数只决定失败是否透出），故保护面是**所有会触发服务端激活的写**——xs_rest 通道的 create/update/activate 文件写与设计时校验的临时副本写，不只是显式 `activate=true`；**已知边界（不在覆盖内）**：import 走 Transfer API 上传通道（其超时按 xfer 放宽，长期占用许可会饿死其它写），建包 POST 与 DELETE 也不在内——无实测证据表明它们触发服务端激活（前者只建目录、后者只删除），故不按激活限流。keyed lock 管「同对象」、信号量管「全局并发」，不可互相替代
     - keyed lock 有排队等待超时（默认 60s）：超时者**不执行**该次写——不会出现「报超时但写已经发生」
   - 视图定义缓存：TTL 60s + 容量 200 条 LRU，防止多客户端拉取把内存撑大；写路径成功后**立即失效本进程缓存**（跨进程由 `VERSION_ID` 轻校验兜底）——它只是把「最多 60s 后自愈」变成「立即」，**不是正确性依赖**
   - 上述锁均为**进程内**：多进程/多实例部署同一 HANA 时需外部串行化（本服务设计为单实例）
@@ -154,23 +158,23 @@ HTTP 模式要点：
     - **写者数量有天花板**：实证与生产观察都是 2–4 个并发写者之后集成开销上升、稳定性下降；写操作宁可串行化在少量写者上
     - **冲突后的动作顺序**：REFRESH（用 412 回执的 `raw.conflict.currentETag` 重读最新）→ REPLAN（基于最新版本重放意图），**优先于**任何盲目合并；重读后重放即可，不必把冲突抛给人
     - **写者的"影响面"自知**：破坏性判定与变更集回执都带影响半径/下游清单，编排层可据此把「谁碰了谁」对齐到分量划分上；`changeset` 模式内的**对象级读/写集相交**已在服务端整批拒绝，编排层的跨代理切分与它是互补关系（服务端管一次调用内，编排层管多次调用之间）
-- 未内置 OAuth 等完整认证体系：暴露到网络时请配置 `MCP_HTTP_TOKEN` / `MCP_HTTP_TOKENS` 并置于反向代理 / VPN / 防火墙之后
+- 未内置 OAuth 等完整认证体系：暴露到网络时请配置 `MCP_HTTP_TOKENS`（或向后兼容的 `MCP_HTTP_TOKEN`）并置于反向代理 / VPN / 防火墙之后
 - 日志仍走 stderr，不污染 HTTP 协议通道；401 日志不记录 Authorization 头内容；Token 原文不驻留于比对结构、不回显到错误信息
 
 ```bash
-MCP_HTTP_PORT=3000 MCP_HTTP_TOKEN='your-long-random-token' node dist/index.js
+MCP_HTTP_PORT=3000 MCP_HTTP_TOKENS='shared:your-long-random-token' node dist/index.js
 # → 已就绪（streamable HTTP transport，端点 /mcp），监听 http://127.0.0.1:3000/mcp
 ```
 
 ## 工具分组与可见性控制
 
-30 个业务能力（28 + 异步任务查询/取消）按功能划分为三组。**注意（2026-10-09 起，门面制）：注册面上只有六个分类门面**——具体能力不进 `tools/list`，经门面索引 + 门面路由调用（见「动态调用面」）。本节的可见性配置管的是**可触达上限**（哪些能力"存在且有权用"），不等于注册面。可经 mcp.json / .env 的环境变量控制可见性（不可见的工具不出现在 `tools/list`、不可被直调、门面索引里也查不到）。
+30 个业务能力（28 + 异步任务查询/取消）按功能划分为三组。**注意（门面制）：注册面上只有六个分类门面**——具体能力不进 `tools/list`，经门面索引 + 门面路由调用（见「动态调用面」）。本节的可见性配置管的是**可触达上限**（哪些能力"存在且有权用"），不等于注册面。可经 mcp.json / .env 的环境变量控制可见性（不可见的工具不出现在 `tools/list`、不可被直调、门面索引里也查不到）。
 
 ### 三类分组
 
 | 分组 | 说明 | 能力 |
 | --- | --- | --- |
-| **read** 数据读取 | 访问 HANA 数据/元数据/系统信息，不改动仓库 | `hana_system_get_info`、`hana_check_privileges`、`hana_package_list`、`hana_package_list_objects`、`hana_metadata_get_view`、`hana_metadata_search_objects`、`hana_metadata_list_fields`、`hana_metadata_get_field_logic`、`hana_metadata_where_used`、`hana_table_list`、`hana_table_columns`、`hana_data_preview`、`hana_data_preview_diagnose` |
+| **read** 数据读取 | 访问 HANA 数据/元数据/系统信息与异步任务状态，不改动仓库 | `hana_system_get_info`、`hana_check_privileges`、`hana_package_list`、`hana_package_list_objects`、`hana_metadata_get_view`、`hana_metadata_search_objects`、`hana_metadata_list_fields`、`hana_metadata_get_field_logic`、`hana_metadata_where_used`、`hana_table_list`、`hana_table_columns`、`hana_data_preview`、`hana_data_preview_diagnose`、`hana_task_get` |
 | **write** 写操作 | 改动仓库设计时对象/包（create/activate/update/delete/设计时校验）、接受任意 SQL 的分析、取消异步任务 | `hana_package_create`、`hana_view_create`、`hana_view_activate`、`hana_view_update`、`hana_view_delete`、`hana_view_validate`、`hana_view_check_actions`、`hana_sql_analyze`、`hana_task_cancel` |
 | **admin** 管理操作 | Transfer / Change-Tracking API 与系统监视面（暴露面收敛的一档） | `hana_repo_export`、`hana_repo_import`、`hana_repo_changelist`、`hana_system_health`、`hana_system_activity`、`hana_table_storage`、`hana_system_trend` |
 
@@ -181,13 +185,13 @@ MCP_HTTP_PORT=3000 MCP_HTTP_TOKEN='your-long-random-token' node dist/index.js
 > `hana_view_validate` 的 `design` 模式会短暂写入临时校验对象 `_CHKTMP`，故整工具归 `write`；不按 design/runtime 模式做混合划分，只读部署（`MCP_TOOL_GROUPS=read`）不暴露此工具。
 >
 > 每个非 read 档能力都显式声明了 `effects.plan`（资源计划）：读能力不落写兜底（`packageId` 是"读哪个包"，不是写包），
-> 行为只读但归 write/admin 档的能力同样显式声明——否则会把 `packageId` 误判成写包。清单完整性测试钉住这条（`tests/unit/capability-manifest.test.ts`）。
+> 行为只读但归 write/admin 档的能力同样显式声明——否则会把 `packageId` 误判成写包。清单完整性由单测钉住（测试不入库）。
 >
-> **门面层不做限制（2026-10-09 定稿）。** 权限只有**一层 group（能力层）**：六个门面是**入口**，任何分组配置下都常驻 `tools/list`（只有显式 `MCP_TOOL_DENY` 命中门面 id、或 deny 掉它全部成员才会消失）。分组开关只决定**能力层**——索引 / 路由 / 提升 / 调用一律按**目标能力**的 kind 判。所以只读部署照样看得到 `hana_modeling` / `hana_diagnostics`，只是它们的索引为空（入口在、里面没有你可用的能力）。
+> **门面层不做限制。** 权限只有**一层 group（能力层）**：六个门面是**入口**，任何分组配置下都常驻 `tools/list`（只有显式 `MCP_TOOL_DENY` 命中门面 id、或 deny 掉它全部成员才会消失）。分组开关只决定**能力层**——索引 / 路由 / 提升 / 调用一律按**目标能力**的 kind 判。所以只读部署照样看得到 `hana_modeling` / `hana_diagnostics`，只是它们的索引里几乎没有可用能力——`hana_diagnostics` 索引为空，`hana_modeling` 只剩 read 档的 `hana_task_get`（异步任务轮询）。
 
 ### 三个配置变量（优先级：`MCP_TOOL_DENY` > `MCP_TOOL_ALLOW` > `MCP_TOOL_GROUPS`）
 
-> **改名（2026-10-08）**：这三项管的是 **MCP 服务端的暴露策略**，与 HANA 连接无关，故前缀从 `HANA_` 改为 `MCP_`。
+> **改名说明**：这三项管的是 **MCP 服务端的暴露策略**，与 HANA 连接无关，故前缀从 `HANA_` 改为 `MCP_`。
 > 旧名 `HANA_TOOL_GROUPS` / `HANA_TOOL_ALLOW` / `HANA_TOOL_DENY` **仍然生效**（启动时告警提示迁移）；
 > 新旧两名同时给出且取值不同会**启动失败**（避免"生效的是哪一个"含糊）。
 > 另外：任何未识别的 `HANA_*` / `MCP_*` / `LOG_*` 变量现在都会在启动日志里告警——
@@ -205,7 +209,7 @@ MCP_HTTP_PORT=3000 MCP_HTTP_TOKEN='your-long-random-token' node dist/index.js
 
 **典型部署形态：**
 
-- **只读分析师**：`MCP_TOOL_GROUPS=read` —— 可触达上限收窄到 13 个 read 档能力，全部 write/admin 档能力连门面索引里都看不到。注册面仍是六个门面（门面层不做限制），但 `hana_modeling` / `hana_diagnostics` 的**索引为空**——入口可见、里面没有你可用的能力。
+- **只读分析师**：`MCP_TOOL_GROUPS=read` —— 可触达上限收窄到 14 个 read 档能力，全部 write/admin 档能力连门面索引里都看不到。注册面仍是六个门面（门面层不做限制），但门面索引里几乎没有可用能力——`hana_diagnostics` 索引为空，`hana_modeling` 只剩 `hana_task_get`（异步任务轮询是 read 档）。
 - **建模开发者**：`MCP_TOOL_GROUPS=read,write` —— 上限为 read+write 档，六个门面全在注册面上（admin 档的 `hana_repo_export`、诊断四件套等不可达，索引里也不出现）。
 - **关闭特定能力**：`MCP_TOOL_DENY=hana_view_delete` —— 仅禁用删除（索引里列不出来、按 id 路由也拒），其余不受影响。
 
@@ -229,7 +233,7 @@ MCP_HTTP_TOKENS="alice:<token>:dev,bob:<token>:analyst"        # 第三段 = 该
 - 每次调用都会落地 `capability-audit`（含 `profileId` / `clientId` / `agentLabel` / `resources` / `codes`），放行记 info、拦截记 warn。
 - 档案名解析失败（配了档案却查不到条目）→ **空档案 = 全拒**（fail-closed）。
 
-实机验收：`npm run smoke:http`（用两个档案演示隔离：只读档案调用写能力得到 `kind_not_allowed_by_profile`，默认档案落回部署边界 `boundary_off`）。
+实机验收：`npm run smoke:http`（用两个档案演示隔离：只读档案的 `hana_modeling` 索引只剩 `['hana_task_get']`、路由写能力得到统一「未知能力」文案；默认档案的写调用落回部署边界 `boundary_off`）。
 
 ## 动态调用面（分类门面 + 按分类提升）
 
@@ -274,7 +278,7 @@ MCP_HTTP_TOKENS="alice:<token>:dev,bob:<token>:analyst"        # 第三段 = 该
 
 实机验收：`npm run verify:authz`（覆盖上表全部语义）。
 
-## 环境档案与规则目录（P9）
+## 环境档案与规则目录
 
 `hana_system_get_info` 在基础信息之外还返回两样**按需读取**的东西（零新增工具）：
 
@@ -283,20 +287,20 @@ MCP_HTTP_TOKENS="alice:<token>:dev,bob:<token>:analyst"        # 第三段 = 该
   档案是附加信息，不是任何调用的前置条件。
 - **`rules`（规则目录）**：规则对象集的查询入口——**不传 `rules`** 只给**目录**（id + title，省 token）；
   传 `'all'` 或逗号分隔的规则 id 给**规则全文**（未知 id 立即硬错误并列出合法值，不会静默给空）。
-  方言/边界/踩坑这类细则已从工具描述与会话指令里搬到规则对象，需要时按 id 查。14 个规则 id
-  （前 9 个冻结、后 5 个为同批补充）：
+  方言/边界/踩坑这类细则已从工具描述与会话指令里搬到规则对象，需要时按 id 查。16 个规则 id
+  （前 9 个冻结）：
   - `sql_mode`、`activation_measure`、`write_boundary`、`write_transport`、`write_receipt`、`preview`、`sql_analyze`、`metadata_graph`、`bw_dialect`
-  - `model_basics`、`health_check`、`activity_locks`、`storage_profile`、`trend_timeline`
+  - `model_basics`、`health_check`、`activity_locks`、`storage_profile`、`trend_timeline`、`view_ops`、`async_task`
 
-> **指令瘦身（刻意的）**：工具描述与会话 instructions 里的散文知识已逐条搬进规则对象——instructions 与最长
-> 5 个描述的字数合计从约 1.39 万字降到 **≤6251**（由单测锁定上限）。**知识总量没有减**，只是从「每次会话
+> **指令瘦身（刻意的）**：工具描述与会话 instructions 里的散文知识已逐条搬进规则对象——instructions 与
+> 常驻门面描述的字数合计 **≤3800**（由单测锁定上限；当前实测 3614）。**知识总量没有减**，只是从「每次会话
 > 都注入」改为「按需查询」（多代理下收益 ×N，N 个子代理不必各背一份细则）——别把瘦身读成能力缩水。
 
 ## 工具速查
 
 下表按**能力 id** 编排（30 个业务能力；另有 8 条 `hana_view_update#<op>` 操作级别名见「动态调用面」），全部带 annotations（`readOnlyHint` / `destructiveHint` / `idempotentHint`）以便 host 自动审批与危险操作确认。
 
-> **这些能力不在注册面上**（2026-10-09 起）：`tools/list` 里只有六个分类门面，本表的每一项都经
+> **这些能力不在注册面上**：`tools/list` 里只有六个分类门面，本表的每一项都经
 > 「调门面不带参数 → 取本类索引 → 调门面带 `capability` + `args`」到达。表里的"工具名"是能力 id，
 > 也是路由时 `capability` 的取值。
 
@@ -328,20 +332,20 @@ MCP_HTTP_TOKENS="alice:<token>:dev,bob:<token>:analyst"        # 第三段 = 该
 | `hana_repo_import` | `hana_modeling` | 管理 | 导入设计时文件（Transfer API 目录目标+分片上传，**落库即激活**（实测，无 inactive 暂存），目标须在可写包范围，导入后回读状态；修改已有对象走 `hana_view_update`） |
 | `hana_repo_changelist` | `hana_diagnostics` | 管理 | 仓库变更列表审计（GET /base/change，需系统启用 Change Tracking） |
 | `hana_sql_analyze` | `hana_diagnostics` | 写 | SQL 分析：**默认返回可读结论**（一句话结论 + 逐条发现[风险/关注/信息，带依据与建议] + 统计），**默认不给原始计划**（`raw=true` 才返回算子行与文本树）；`sql`=只编译不执行（估计计划）；`planId`=分析计划缓存条目并附运行时统计（需 OPTIMIZER ADMIN）；`sql`+`analyze=true`=先真执行，**默认走 PlanViz 通道**拿与官方 Executed Plan(F8) 同款的**逐算子实测**（`panels` 六栏 + 实测结论；通道不可用时降级为估计计划 + 语句级统计，notes 说明）。执行受硬护栏：只允许 SELECT、单次执行最多 5 分钟、最多取 100 行、**不返回数据行** |
-| `hana_system_health` | `hana_diagnostics` | 管理 | 稳定性体检，返回**读数 + 结论**两层。`metrics` 给具体占用（实例内存已用/配额/峰值及百分比、主机物理内存、**数据库与主机驻留内存**、**主机与数据库 CPU**、各挂载点使用率、**各用途卷大小 Data/Log/Trace**、**卷 IO 失败读写/阻塞写/软异常**、**内存对象层：不可换出内存/分配失败率/命中率/收缩失败/可回收性梯度**、备份距今天数、阻塞/长事务/告警数、参数违规与待重启数、在用弃用特性数、加密状态…），**无论判定正常与否都会给**——问"当前内存多少"直接读这里；`findings` 给整体 verdict + 逐项级别/结论/证据/建议。**12 项检查**：磁盘（容量 + IO 两个正交口径）/服务/备份/内存（主机+实例+内存对象层）/CPU/告警/阻塞/长事务/复制/**配置**（违反限制/改了未重启/非默认层覆盖，**不做"参数该设成多少"的比对**）/ **弃用特性**（升级前风险，非当前故障）/ **加密**（恒为 info——是否要求加密是合规决策，只进读数不参与判定）。**三态**：ok / 异常 / `unknown`（看不见）—— 监视视图按权限行级过滤，权限不足时静默返回空集，本工具绝不把它当"正常"；每项要么给读数、要么给一条带成因的 `unknown`，**不得静默消失**。容量单位统一 **GiB**，与 HANA Cockpit 一致 |
+| `hana_system_health` | `hana_diagnostics` | 管理 | 稳定性体检，返回**读数 + 结论**两层。`metrics` 给具体占用（实例内存已用/配额/峰值及百分比、主机物理内存、**数据库与主机驻留内存**、**主机与数据库 CPU**、各挂载点使用率、**各用途卷大小 Data/Log/Trace**、**卷 IO 失败读写/阻塞写/软异常**、**内存对象层：不可换出内存/分配失败率/命中率/收缩失败/可回收性梯度**、备份距今天数、阻塞/长事务/告警数、参数违规与待重启数、在用弃用特性数、加密状态…），**无论判定正常与否都会给**——问"当前内存多少"直接读这里；`findings` 给整体 verdict + 逐项级别/结论/证据/建议。**12 项检查**：磁盘（容量 + IO 两个正交口径）/服务/备份/内存（主机+实例+内存对象层）/CPU/告警/阻塞/长事务/复制/**配置**（违反限制/改了未重启/非默认层覆盖，**不做"参数该设成多少"的比对**）/ **弃用特性**（升级前风险，非当前故障）/ **加密**（有数据时恒为 info——是否要求加密是合规决策，只进读数不参与判定；但视图不可见/取不到时标 unknown，整体结论不能为 ok）。**三态**：ok / 异常 / `unknown`（看不见）—— 监视视图按权限行级过滤，权限不足时静默返回空集，本工具绝不把它当"正常"；每项要么给读数、要么给一条带成因的 `unknown`，**不得静默消失**。容量单位统一 **GiB**，与 HANA Cockpit 一致 |
 | `hana_system_activity` | `hana_diagnostics` | 管理 | 会话与阻塞深潜：被阻塞事务（含**谁堵谁**的连接画像）、长事务（含 undo/版本/持锁，用于判断是否阻碍 MVCC 回收）、长语句。`sections` 选段落、`minDurationSec` 设时长下限 |
-| `hana_table_storage` | `hana_diagnostics` | 管理 | 表存储画像，每行带**内存占用 / 磁盘占用 / 分区数 / 碎片率 / 读写次数 / 上次 merge / BW 分类**。**7 种口径**：`memory` 内存 TOP / `disk` 磁盘 TOP（`M_TABLE_PERSISTENCE_STATISTICS.DISK_SIZE`）/ `fragmentation` delta 占比 TOP / `hotness` 读写 TOP / `partition` 分区数 TOP。`schema`/`table` 是**过滤器**，给 `table` 即返回该表的完整画像；`partition` + `schema` + `table` 还会**额外**返回逐分区明细。`partition` 模式**默认只看 BW 活动数据表**（`subtype` 可切换 QUEUE/CHANGE_LOG/PSA/…/ALL）——同一 BW 对象在 HANA 上是一组物理表（活动表/入站队列/变更日志/PSA），表名只差后缀。按 (schema, table) 聚合后再排序——该视图一行是一个分区。另有两种**下钻口径**（单元不是"表"）：`column` 列级内存 TOP（`M_CS_ALL_COLUMNS`，带压缩类型/行数/不同值数/索引类型/最后访问时间；**刻意不返回 `COMPRESSION_RATIO_IN_PERCENTAGE`**——实测该列在本版本会出现 361890% 这种不可能的值）、`index` 索引内存 TOP（`M_CS_INDEXES`，带**该索引占所属表内存的百分比**，实测 73%~83%——只看表内存会把真实成本少算近一半）。体量单位 **MiB**（与 Cockpit 同为 1024 进制） |
+| `hana_table_storage` | `hana_diagnostics` | 管理 | 表存储画像，每行带**内存占用 / 磁盘占用 / 分区数 / 碎片率 / 读写次数 / 上次 merge / BW 分类**。**7 种口径**：`memory` 内存 TOP / `disk` 磁盘 TOP（`M_TABLE_PERSISTENCE_STATISTICS.DISK_SIZE`）/ `fragmentation` delta 占比 TOP / `hotness` 读写 TOP / `partition` 分区数 TOP。`schema`/`table` 是**过滤器**，给 `table` 即返回该表的完整画像；`partition` + `schema` + `table` 还会**额外**返回逐分区明细。`partition` 模式**默认按 ACTIVE 过滤 BW 活动数据表**（未分类/非 BW 表照常列出；`subtype` 可显式切换 QUEUE/CHANGE_LOG/PSA/…/ALL）——同一 BW 对象在 HANA 上是一组物理表（活动表/入站队列/变更日志/PSA），表名只差后缀。按 (schema, table) 聚合后再排序——该视图一行是一个分区。另有两种**下钻口径**（单元不是"表"）：`column` 列级内存 TOP（`M_CS_ALL_COLUMNS`，带压缩类型/行数/不同值数/索引类型/最后访问时间；**刻意不返回 `COMPRESSION_RATIO_IN_PERCENTAGE`**——实测该列在本版本会出现 361890% 这种不可能的值）、`index` 索引内存 TOP（`M_CS_INDEXES`，带**该索引占所属表内存的百分比**，实测 73%~83%——只看表内存会把真实成本少算近一半）。体量单位 **MiB**（与 Cockpit 同为 1024 进制） |
 | `hana_system_trend` | `hana_diagnostics` | 管理 | 历史趋势，回答"**这周比上周差了吗**"——前面三个工具都是"此刻的快照"，没有一个能回答变化。数据源 `_SYS_STATISTICS.HOST_LOAD_HISTORY_HOST`（一份同时带 CPU/内存/磁盘/网络/swap，不必跨视图对齐时间轴）。`hours` 回溯窗口、`bucketMinutes` 桶宽、`metrics` 选指标组（cpu/memory/disk/network/swap），每桶给 **min/max/avg** 与采样点数。**实测结构**：约 **10 秒一个采样点**、36 万行跨约 42 天；**`SERVER_TIMESTAMP` 是快照写入时刻，`TIME` 才是采样时刻**（同一 SERVER_TIMESTAMP 下有 358 行不同 TIME——用前者做时间轴会把一小时压成一个点），本工具用 `TIME`；`INDEX` 是行唯一键不是服务维度。**保留期有限**：窗口超出时 `retention.coversWindow=false` 且 caveats 说明只回溯到何时——**未覆盖的那段不等于"正常"，只是没有数据**。刻意不给"上升就是坏"的结论，只给首尾桶变化率 |
 
 ### 六个分类门面（这些才是 `tools/list` 里看到的工具）
 
-| 门面 | 分类 | 方向 | 成员数 |
+| 门面 | 分类 | 方向 | 成员数（不含操作级别名） |
 | --- | --- | --- | --- |
 | `hana_system` | system | 连接与环境：当前连接是谁、连到哪（版本、权限档位、规则库） | 2 |
 | `hana_discovery` | discovery | 浏览与查找：找包/对象/表，读定义与字段结构 | 7 |
 | `hana_data` | data | 取数预览：看已激活视图/基表的数据（含预览诊断） | 2 |
 | `hana_insights` | insights | 结构与血缘分析：影响面（谁依赖它）、字段级计算逻辑 | 2 |
-| `hana_modeling` | modeling | 建模与仓库变更：创建/修改/校验/激活/删除设计时对象，导入导出 | 9 |
+| `hana_modeling` | modeling | 建模与仓库变更：创建/修改/校验/激活/删除设计时对象，导入导出 | 11 |
 | `hana_diagnostics` | diagnostics | 运维与性能：健康/会话/存储/趋势、SQL 分析与仓库变更审计 | 6 |
 
 每个门面的**描述里带成员清单**（`- <能力 id>：<标题>`），模型不进任何调用就能看出本类有哪些能力——这是"零发现调用"成立的前提（描述只给抽象概括时，模型得先调一次索引才知道里面有什么，那就把省下的往返又还回去了）。**参数名与一句话摘要不写进描述**：它们属于"已经选中之后"的信息，由索引回执给。
@@ -349,9 +353,8 @@ MCP_HTTP_TOKENS="alice:<token>:dev,bob:<token>:analyst"        # 第三段 = 该
 调用形态 `{ capability?, args? }`：**不带参数** → 返回本类索引（id / 标题 / kind / 一句话摘要 / 参数名）；**带 `capability` + `args`** → 直接调用该能力（不经过提升也能调）。两种形式都会把**该分类提升进工具面**——此后它们带完整 schema、可平铺直调（见「动态调用面」）。索引按当前调用方的权限范围过滤——看不到即无权，与不存在不可区分。
 
 
-> **字段逻辑类回执修正（P6）**：属性列的公式/类型（`formula`/`datatype`）此前恒缺，现在按定义带值——
-> `hana_metadata_list_fields` 的 `hasFormula` 与 `hana_metadata_get_field_logic` 的 `formula`/`sourceColumns`
-> 取值会随之变化；**这不是回归**，是解析器前置修复的结果。
+> **属性列的公式/类型按定义带值**：`hana_metadata_list_fields` 的 `hasFormula` 与
+> `hana_metadata_get_field_logic` 的 `formula`/`sourceColumns` 对属性列同样给出取值。
 
 > **写操作安全边界**：写工具（create/activate/update/delete/package_create/import）的可写包范围由
 > `HANA_WRITE_PACKAGES` 配置控制——**空 = 未启用写边界**：声明写包的请求会被运行期闸门以 `boundary_off`
@@ -362,7 +365,16 @@ MCP_HTTP_TOKENS="alice:<token>:dev,bob:<token>:analyst"        # 第三段 = 该
 > 同名对象拒绝覆盖；update/delete/activate 带 If-Match 乐观锁（create/import 跨进程无服务端前置的
 > 已知例外见「传输方式 → 并发与锁」）。
 >
-> **多对象变更集（`hana_view_update` 的 `changeset` 模式，P7）**：与 operations / xml 三选一的第三种模式，
+> **本地文件边界（导出/导入）**：`hana_repo_export` 的 `saveTo` 与 `hana_repo_import` 的 `filePath`
+> 直通服务器本地文件系统，不在任何 HANA 边界内。未配置 `MCP_LOCAL_ROOT` 时只允许**服务器工作目录内的
+> 相对路径**（绝对路径与含 `..` 的路径一律拒绝）；配置后路径须落在该根内，越根一律拒绝。需要更强隔离
+> （例如只允许专用导出目录）请配置本地根。
+> **XS 写通道为明文 HTTP**：XS REST（写/激活/导入/导出实际使用的通道）默认是 `http://`，HANA 账号密码、
+> 会话 Cookie 与 CSRF token 全部明文传输；`HANA_TLS`/`HANA_SSL_VALIDATE` 只作用于 SQL 通道，**不覆盖**
+> 该通道——必须由网络侧隔离（仅可信网段/本机可达）。XS 端点支持 TLS 时置 `HANA_XS_TLS=true` 并把
+> `HANA_XS_PORT` 指向 HTTPS 端口。
+>
+> **多对象变更集（`hana_view_update` 的 `changeset` 模式）**：与 operations / xml 三选一的第三种模式，
 > 把多个对象的改动收进**单次调用内闭合**的批次——① **整体预检**：逐动作规划 + **对象级**读写集相交检测
 > （同包多对象正常批次不误报）+ 破坏性判定，任一被拦或相交 ⇒ **整批拒绝、零写入**（判定在任何写之前完成）；
 > ② **逐项执行**：按 (packageId, objectName) 字典序（防 ABBA 死锁），每项各自完成**含激活**；
@@ -373,7 +385,7 @@ MCP_HTTP_TOKENS="alice:<token>:dev,bob:<token>:analyst"        # 第三段 = 该
 > 批**不提供跨项快照隔离**：逐项提交、各自取锁，期间的批外读写对本批可见（回执 `concurrencyNote` 同样写明）。
 > changeset 模式下顶层 `packageId`/`objectName` 被忽略（仅供单对象通道；批次目标由各 action 自带）。
 >
-> **长批次走异步任务（`async=true`，2026-10-10）**：批内每项写入含 2–10s 服务端激活，10 项可到分钟级——
+> **长批次走异步任务（`async=true`）**：批内每项写入含 2–10s 服务端激活，10 项可到分钟级——
 > 同步调用可能被 MCP 客户端**自身**的超时掐断（服务端无从得知客户端超时配置）。`changeset` + `async=true`
 > 把批次交给**进程内任务**跑并立即返回 `{ taskId, status: 'working', label, hint }`：
 > - 轮询 `hana_task_get({ taskId })` → `status ∈ working/completed/failed/cancelled`、`progress` 与终态 `result`
@@ -382,7 +394,7 @@ MCP_HTTP_TOKENS="alice:<token>:dev,bob:<token>:analyst"        # 第三段 = 该
 >   相同的**逆序补偿**（已执行项回批前状态），报告 `raw.code=changeset_cancelled` 带完整现场；
 > - 任务体就是 `applyChangeset` 本体（同一实现/锁/信号量/补偿）：整体预检仍在任何写入之前
 >   （预检不通过 ⇒ 整批拒绝、零写入 ⇒ 任务直接落 `failed` 终态）；
-> - 边界如实说：同时运行上限 4（超出提交即拒、未发生任何写）、终态保留 30 分钟、注册表上限 100 条；
+> - 边界如实说：同时运行上限 4（超出提交即拒、未发生任何写）、终态保留 30 分钟（惰性清扫：仅在下一次提交时清理）、注册表上限 100 条；
 >   **进程内状态、服务重启即丢**（重启后旧 taskId 回"未知任务"）；任务只对**本调用方**可见
 >   （他人任务与不存在的任务回同一句"未知任务"）；未配 Token 的 HTTP 部署按单租户假设（互相可见）。
 > 为什么不做协议原生 MCP Tasks（SEP-2663）：本机 SDK（2.3.1）只有线协议词汇、无运行期，且 2026-era
@@ -439,7 +451,7 @@ MCP_HTTP_TOKENS="alice:<token>:dev,bob:<token>:analyst"        # 第三段 = 该
 >
 > **读工具确实受调用期保护了，但边界要说清**：受约束的是「**按名指定 schema 去读**」这类调用
 > （`schema` 不在 `HANA_SCHEMA_ALLOW` 即被拦在 handler 之前）；**不约束**的是：
-> ① 已激活视图**自身定义**的读取（`hana_metadata_get_view` 等读 `_SYS_REPO`，属 D-12 的显式决策）；
+> ① 已激活视图**自身定义**的读取（`hana_metadata_get_view` 等读 `_SYS_REPO`，为显式决策）；
 > ② `hana_data_preview` 视图预览模式（运行时对象恒在 `_SYS_BIC`）；
 > ③ **仓库包维度**——权限配置里没有"可读包"这一项，`packageId` 既不受写包边界约束、也不受任何读包边界约束
 > （跨包只读引用只进报告、不拦截：加白名单会破坏既有的跨包 join 用法）；
@@ -447,8 +459,8 @@ MCP_HTTP_TOKENS="alice:<token>:dev,bob:<token>:analyst"        # 第三段 = 该
 >
 > 判定用服务已加载的配置（不重新解析 env），不存在"判定用的值 ≠ 运行用的值"。
 > service 层的 `assertWritePackageAllowed` / `assertSchemaAllowed` 保留为纵深防御
-> （脚本/内部调用不经过工具层），并复用同一批判定叶子——注意：**写包白名单为空时这一层是
-> fail-open**（`boundary_off` 的硬拦在工具层闸门，见上方「写操作安全边界」）。
+> （脚本/内部调用不经过工具层），并复用同一批判定叶子——它与工具层闸门的分工与
+> 白名单为空时的放行语义见上方「写操作安全边界」。
 > **每次调用**都会落地一条 `capability-audit`（`{capabilityId, verdict, clientId?, transport, resources, codes}`，
 > 放行记 info、拦截记 warn）——归因不随入口变化。
 > 执行任务前可先自检：`npm run preflight -- <包名...> [--tool <工具名>] [--schema <schema>]`，
@@ -458,7 +470,8 @@ MCP_HTTP_TOKENS="alice:<token>:dev,bob:<token>:analyst"        # 第三段 = 该
 > **部署级不变量（启动即拒绝）**：单项合法但组合起来构成安全暴露的配置，在启动自检中被拒绝而非只告警
 > （对照 tableau-mcp 在 Config 构造期 throw 的做法）。当前规则：① HTTP 非回环监听且无任何 Bearer Token →
 > **拒绝启动**（除非显式 `MCP_HTTP_ALLOW_ANONYMOUS=true`）；② `HANA_TLS=false` 明文连接、③ 加密但
-> `HANA_SSL_VALIDATE=false`（不防中间人）→ 告警放行，但每次启动都在日志中可见。
+> `HANA_SSL_VALIDATE=false`（不防中间人）、④ XS 写通道为明文 HTTP（未置 `HANA_XS_TLS=true`，见
+> `xs_plaintext` 告警）→ 告警放行，但每次启动都在日志中可见。
 
 ## 数据预览
 
@@ -480,12 +493,14 @@ MCP_HTTP_TOKENS="alice:<token>:dev,bob:<token>:analyst"        # 第三段 = 该
 
 ## 常用命令
 
+> `npm test`（及包含它的 `npm run check`）依赖的测试文件在本地 `tests/`，`verify:*` / `probe:*` 的脚本在本地 `test-verification/`——**均不入库**，克隆本仓后这些命令不可运行；实机验收/探针另需真实 HANA 与对应权限。
+
 | 命令 | 说明 |
 | --- | --- |
 | `npm run dev` | tsx 直接运行（开发调试） |
 | `npm run build` | tsc 构建到 dist |
 | `npm start` | 运行 dist/index.js（stdio） |
-| `npm test` | 单元测试（node --test + tsx；测试文件本地保留，未入库） |
+| `npm test` | 单元测试（node --test + tsx） |
 | `npm run smoke` | 构建 + stdio 冒烟测试 |
 | `npm run smoke:http` | 构建 + Streamable HTTP 冒烟测试（握手/工具注册/Host 防护，无需真实 HANA） |
 | `npm run typecheck` | 仅类型检查（同时承担死代码检测：`noUnusedLocals` 会拦下未使用的导入与变量） |
@@ -493,17 +508,17 @@ MCP_HTTP_TOKENS="alice:<token>:dev,bob:<token>:analyst"        # 第三段 = 该
 | `npm run check` | `typecheck` + `test`（提交前跑这个） |
 | `npm run verify:system` | 构建 + 真实 HANA 系统工具验收 |
 | `npm run verify:p1-5` | 构建 + 读路径/预览/字段逻辑黑盒验收 |
-| `npm run verify:lifecycle` | 构建 + 写路径全生命周期验收（create→validate→activate→preview→update冲突→delete→import；脚本在本地 `test-verification/`，不入库） |
-| `npm run verify:add-join` | 构建 + 声明式加 join（`op=add_join`）实机验收（含 BW 方言视图场景；脚本在本地 `test-verification/`，不入库） |
-| `npm run verify:sql-mode` | 构建 + SQL 模式视图（`mode=sql` 的 `script`/`scriptColumns`）实机验收（脚本在本地 `test-verification/`，不入库） |
+| `npm run verify:lifecycle` | 构建 + 写路径全生命周期验收（create→validate→activate→preview→update冲突→delete→import） |
+| `npm run verify:add-join` | 构建 + 声明式加 join（`op=add_join`）实机验收（含 BW 方言视图场景） |
+| `npm run verify:sql-mode` | 构建 + SQL 模式视图（`mode=sql` 的 `script`/`scriptColumns`）实机验收 |
 | `npm run verify:health` | 构建 + 稳定性诊断四件套验收（**192 项断言**）。含多条回归护栏：防止误用 `M_DISK_USAGE` 的 `FILE_SIZE` 口径导致整机误报；防止卷文件用量（预分配写满属常态）被当成磁盘告警；防止 `COMPRESSION_RATIO_IN_PERCENTAGE` 与 `HASH_COLLISION_COUNT` 这两个**实测不可用**的列被透出；防止趋势时间轴误用 `SERVER_TIMESTAMP`（会把一小时压成一个点）；以及「每一项要么给读数、要么给一条带成因的 unknown」这条纪律 |
 | `npm run verify:catalog` | 构建 + 关系图/血缘验收。只读段：`where_used(depth)` 的闭包 ⊇ 单跳、带 `asOf`/`truncated` 且截断时规模受限；`search_objects(by=field)` 的候选口径字段与 `matchedFields`；「无平行工具」否定断言；`depth=1` 形状与旧版逐字段一致、`objectSuffix` 不回 `?`。另有 **A/B 对比段**（同对象在 `cac5d60` 构建的基线 dist 与本 dist 各跑一次 `where_used`，逐字段 diff，两侧 VERSION_ID 一致才继续）与**写型段**（create B → create A → A 加 join 指向 B → 目录现算可见 → 改 A（VERSION_ID 前进）→ 删 A → 目录不再列出 A；含 `runPreflight` 自守卫与收尾清理，`VERIFY_CATALOG_SKIP_WRITE=1` 可跳过）。目标对象用 `VERIFY_CATALOG_PACKAGE/OBJECT` 覆盖；写型包用 `VERIFY_CATALOG_WRITE_PACKAGE` |
 | `npm run verify:authz` | 构建 + 调用期闸门验收（阶段一：读路径与写路径的统一闸门）。护栏：读范围越界（`schema` 不在 `HANA_SCHEMA_ALLOW`）在 **handler 之前**被拦、回执含机读码与本次调用预规划且**不含补救路径**；读能力的 `packageId` 不受写包边界约束（读某包里的视图 ≠ 写那个包）；写闸门既有行为不变；未注册工具 = **协议层错误**（与"已注册被拦"的 `isError` 两态可分）；每次调用落地 `capability-audit` 审计事件（放行与拦截都记，含 `resources`/`codes`）|
-| `npm run verify:concurrency` | 构建 + 并发语义实机验收（**双进程**并发操作同一对象）。护栏：update 报成功 ⇒ 终态 = 它写入的内容（不静默回退）；每个 412 都带机读载荷 `raw.conflict.currentETag`（陈旧 `ifMatch` 确定性构造）；双删一方成功、另一方得到可机读的 `412`/`OBJECT_NOT_FOUND`；activate/update 交错后 meta 读出的 ETag = 最近一次成功写回执给出的 ETag。脚本在本地 `test-verification/`，不入库 |
-| `npm run verify:dry-run` | 构建 + 预演与破坏性判定验收（dryRun 零写入 + 判定表 + migration 闸门）。护栏：预演/被拒调用后 **ACTIVE 与 `_SYS_REPO.INACTIVE_OBJECT`（inactive 侧）**的版本读数均不变（只查 ACTIVE 会漏判「555：文件已写、激活失败」）；未改动对象原样预演 ⇒ 结构 diff 为空（归一化生效，xml 与 operations 两条通道各一条）；未声明 migration 的破坏性变更被拒（机读码 `migration_required`、`raw.errorDetail.breaking.items` 破坏项明细、一次写都没发生；判定表最隐蔽的**改数据源**行单独钉：有下游时经 xml 全量通道改指同样被拒、零写入）；声明策略 ⇒ 放行且回执记录（**只记录、不做自动迁移**）；删除闸门（有下游引用未声明被拒；无下游照常成功）。脚本在本地 `test-verification/`，不入库 |
-| `npm run verify:changeset` | 构建 + 变更集（多对象事务）实机验收（SSD §6.6 四场景，确定性构造不依赖随机失败）。护栏：① 3 对象 update 一次 changeset 调用全成功（逐项 `ok`、每项带写回执基线 `etagSource='response-header'`——按代码口径断言，SSD §6.4 的下划线写法属口径差、脚本里点名、`partial=false`）；② 第 3 项 create 已存在对象确定性失败 ⇒ 前 2 项 `compensated` 且内容**逐字回到原文**（get_view 读回比对，不是永真式；出现 `compensation_failed` 即实现缺陷、打印结构化现场 `currentETag/currentVersion`）；③ 有下游对象删列未声明 migration ⇒ **整批拒绝零写入**（D 与同批无害动作的 VERSION_ID + inactive 侧指纹均未变）；④ 批内「写 A + 读 A 作 join 源」⇒ 整批拒绝且拒绝载荷可读出**冲突对象名与两个动作下标**、反例护栏（同包两个不同对象不被判成冲突，包级误拒在此变红）。脚本在本地 `test-verification/`，不入库 |
-| `npm run verify:tasks` | 构建 + 异步任务实机验收（`changeset` + `async=true`）。护栏：提交立即返回 `taskId`（未等批次跑完）；轮询到 `completed` 且 `result` 与同步调用同形（`applied` 含 etag/activated）；提交后立即取消的两种时序都断言其一致性（`requested` ⇒ 终态 `cancelled` + 未执行项 `reason=cancelled`；`terminal` ⇒ hint 如实说明「取消未生效」）；未知 taskId 回同一句「未知任务」。脚本在本地 `test-verification/`，不入库 |
-| `npm run verify:ops` | 构建 + 操作集实机验收（P8；**8 个 op**）。主用例（`set_description`）：改描述走 operations 通道（模型零 XML）后回执 `applied` 如实给出该 op 及其 `changed`；**其余内容逐字节未变**（读回 XML 把验收标记还原后与改前原文完全相等）；dryRun 联动且预演零写入。后半批（2026-10-10）：`add_calculated_column` / `set_attribute_filter`（含替换路径）/ `set_variable`（先经 xml 通道注入变量）/ `rename_field`（含重名与不存在负例）/ `drop_field`（含删最后一个度量负例）逐个走真实写入并断言**激活通过**（XML 形态与 SAP 方言相符的实机证明）+ 参数守卫全拒且零写入。脚本在本地 `test-verification/`，不入库 |
+| `npm run verify:concurrency` | 构建 + 并发语义实机验收（**双进程**并发操作同一对象）。护栏：update 报成功 ⇒ 终态 = 它写入的内容（不静默回退）；每个 412 都带机读载荷 `raw.conflict.currentETag`（陈旧 `ifMatch` 确定性构造）；双删一方成功、另一方得到可机读的 `412`/`OBJECT_NOT_FOUND`；activate/update 交错后 meta 读出的 ETag = 最近一次成功写回执给出的 ETag |
+| `npm run verify:dry-run` | 构建 + 预演与破坏性判定验收（dryRun 零写入 + 判定表 + migration 闸门）。护栏：预演/被拒调用后 **ACTIVE 与 `_SYS_REPO.INACTIVE_OBJECT`（inactive 侧）**的版本读数均不变（只查 ACTIVE 会漏判「555：文件已写、激活失败」）；未改动对象原样预演 ⇒ 结构 diff 为空（归一化生效，xml 与 operations 两条通道各一条）；未声明 migration 的破坏性变更被拒（机读码 `migration_required`、`raw.errorDetail.breaking.items` 破坏项明细、一次写都没发生；判定表最隐蔽的**改数据源**行单独钉：有下游时经 xml 全量通道改指同样被拒、零写入）；声明策略 ⇒ 放行且回执记录（**只记录、不做自动迁移**）；删除闸门（有下游引用未声明被拒；无下游照常成功） |
+| `npm run verify:changeset` | 构建 + 变更集（多对象事务）实机验收（四场景，确定性构造不依赖随机失败）。护栏：① 3 对象 update 一次 changeset 调用全成功（逐项 `ok`、每项带写回执基线 `etagSource='response-header'`（按代码实际拼写断言）、`partial=false`）；② 第 3 项 create 已存在对象确定性失败 ⇒ 前 2 项 `compensated` 且内容**逐字回到原文**（get_view 读回比对，不是永真式；出现 `compensation_failed` 即实现缺陷、打印结构化现场 `currentETag/currentVersion`）；③ 有下游对象删列未声明 migration ⇒ **整批拒绝零写入**（目标对象与同批无害动作的 VERSION_ID + inactive 侧指纹均未变）；④ 批内「写 A + 读 A 作 join 源」⇒ 整批拒绝且拒绝载荷可读出**冲突对象名与两个动作下标**、反例护栏（同包两个不同对象不被判成冲突，包级误拒在此变红） |
+| `npm run verify:tasks` | 构建 + 异步任务实机验收（`changeset` + `async=true`）。护栏：提交立即返回 `taskId`（未等批次跑完）；轮询到 `completed` 且 `result` 与同步调用同形（`applied` 含 etag/activated）；提交后立即取消的两种时序都断言其一致性（`requested` ⇒ 终态 `cancelled` + 未执行项 `reason=cancelled`；`terminal` ⇒ hint 如实说明「取消未生效」）；未知 taskId 回同一句「未知任务」 |
+| `npm run verify:ops` | 构建 + 操作集实机验收（**8 个 op**）。主用例（`set_description`）：改描述走 operations 通道（模型零 XML）后回执 `applied` 如实给出该 op 及其 `changed`；**其余内容逐字节未变**（读回 XML 把验收标记还原后与改前原文完全相等）；dryRun 联动且预演零写入。其余 op：`add_calculated_column` / `set_attribute_filter`（含替换路径）/ `set_variable`（先经 xml 通道注入变量）/ `rename_field`（含重名与不存在负例）/ `drop_field`（含删最后一个度量负例）逐个走真实写入并断言**激活通过**（XML 形态与 SAP 方言相符的实机证明）+ 参数守卫全拒且零写入 |
 | `npm run probe:health` | 只读探针：枚举监视视图的可用性/列名/取值域（换环境后先跑它，勿按文档猜） |
 | `npm run probe:repo` | 只读探针：仓库读路径（`_SYS_REPO` 对象/属性查询）可用性 |
 | `npm run probe:xfer` | 只读探针：CHECK 与 xfer（Transfer API）能力探测 |
@@ -521,6 +536,9 @@ src/
                       XML 工具、XS REST 客户端（统一超时）、
                       数值/文本/错误码判定的公共实现（num/text/hana-errors）、时区与时间格式化
   model/              视图 TS 类型、XML 双向解析、最小 CV 的 XML 构造
+  capabilities/       能力清单（kind / effects / schema）+ 分类门面 + authorizeCall 闸门
+  rules/              返回给模型的规则正文目录（方言/边界/踩坑，按 id 查）
+  write-plan.ts       WritePlan：一次调用实际读写什么（运行期闸门与变更集消费）
   services/
     metadata.service        只读：包/对象搜索/字段/血缘/表目录
     preview.service         数据预览（直查/节点中间视图/XML 推导）+ 权限失败自动诊断
@@ -533,7 +551,7 @@ src/
     sql-analyze.service     SQL 分析（执行计划）主流程：同连接内 EXPLAIN → 按唯一名回读 → 用完即清
     sql-analyze.rules      上述的纯规则层：语句分类/白名单/分析结论（默认输出）与算子渲染
     read-scope.service      未限定表名的读取范围校验（SQL 模式视图与 SQL 分析共用一份判定）
-  tools/               MCP 工具薄壳（system/package/metadata/preview/modeling/sql-analyze）
+  tools/               MCP 工具薄壳（capability/health/task/…：各域 handler + capabilityRegistrar）
   types/               统一返回信封 Envelope 等
 scripts/               通用冒烟脚本（smoke-stdio）；实机验收/探针脚本在本地 test-verification/（不入库）
 ```
@@ -542,8 +560,8 @@ scripts/               通用冒烟脚本（smoke-stdio）；实机验收/探针
 >
 > 分层与依赖方向、错误处理约定、公共实现该放哪、"哪些看起来一样但语义不同不能合并"——见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
-每个工具统一返回信封 `{ success, data?, messages[], raw? }`（HTTP 模式下另带 `clientId` = 由 `MCP_HTTP_TOKENS` 解析出的调用方身份）：硬错误（参数非法/对象不存在）通过 MCP
-`isError` 返回并附恢复提示；HANA 业务失败（如激活报错明细）走 `success:false`。
+每个工具统一返回信封 `{ success, data?, messages[], raw? }`（HTTP 模式下另带 `clientId` = 由 `MCP_HTTP_TOKENS` 解析出的调用方身份）：参数非法等协议级硬错误通过 MCP
+`isError` 返回并附恢复提示；HANA 业务失败（如激活报错明细）走 `success:false`。**写路径的 412 冲突与删除的 404（对象已不存在）属业务信封**（`success=false` + 机读码，见「传输方式 → 并发与锁」），不走 `isError`。
 
 ## HANA 授权要求
 
@@ -570,11 +588,12 @@ scripts/               通用冒烟脚本（smoke-stdio）；实机验收/探针
 
 **稳定性诊断（`hana_system_health` / `hana_system_activity` / `hana_table_storage` / `hana_system_trend`）**
 
-- **无需额外权限即可用**：`SYS.M_SERVICES`、`M_DATABASES`、`M_CS_TABLES`、`M_TABLES`、
+- **无需额外权限即可用**：`SYS.M_SERVICES`、`M_CS_TABLES`、`M_TABLES`、
   `M_SQL_PLAN_CACHE` 等实例内视图，任何用户都能查（表画像与部分体检项因此始终可用）。
 - **`CATALOG READ`（或含它的 `MONITORING` 角色）**：解锁**基础设施类**监视视图 ——
   `M_DISKS`/`M_DISK_USAGE`、`M_HOST_RESOURCE_UTILIZATION`、`M_BACKUP_CATALOG`、
-  `M_SERVICE_REPLICATION`、`M_MEMORY_OBJECTS`，以及他人会话的完整可见性。
+  `M_SERVICE_REPLICATION`、`M_MEMORY_OBJECTS`、`M_VOLUME_IO_TOTAL_STATISTICS`、
+  `M_ENCRYPTION_OVERVIEW`，以及他人会话的完整可见性。
   这些视图**权限不足时不报错、只返回空集**，因此缺权限时体检会把对应项标为 `unknown`（而非"正常"）。
 - **`_SYS_STATISTICS` 的 SELECT**：告警项（`STATISTICS_CURRENT_ALERTS`）与**整个趋势工具**需要它；
   缺权限时报 258，同样标记为 `unknown`。**趋势的保留期实测约 42 天**（可配置），窗口超出时如实说明只回溯到何时。
@@ -645,14 +664,14 @@ scripts/               通用冒烟脚本（smoke-stdio）；实机验收/探针
   "mcpServers": {
     "saphana-modeler-mcp": {
       "url": "http://127.0.0.1:3000/mcp",
-      "headers": { "Authorization": "Bearer <MCP_HTTP_TOKEN 值>" }
+      "headers": { "Authorization": "Bearer <MCP_HTTP_TOKENS 中该客户端对应的 Token>" }
     }
   }
 }
 ```
 
 > HTTP 模式下连接信息等环境变量配置在**服务端**（服务启动的 shell / .env），客户端只填 `url`；
-> 服务端配置了 `MCP_HTTP_TOKEN` 时，客户端经 `headers` 携带 Bearer Token（各客户端对 headers 的支持以自身文档为准）。
+> 服务端配置了 `MCP_HTTP_TOKENS`（或向后兼容的 `MCP_HTTP_TOKEN`）时，客户端经 `headers` 携带 Bearer Token（各客户端对 headers 的支持以自身文档为准）。
 
 > **工具调用超时要自行调大（`hana_sql_analyze` 的 `analyze=true`）**：该模式会**真执行**语句，服务端给执行留的上限是 **5 分钟**（最坏再加约 2.5 分钟的排队与控制面调用）。多数客户端会远早于此掐断调用——例如 Claude Code 默认 **60 秒**——大 CV 会在客户端先被中止，服务端那条语句却还在跑，结果拿不到。请把客户端的单次工具调用超时调到 **600000 ms（10 分钟）**：
 > - **按 server 配**：在 `mcp.json` 该 server 条目下加 `"timeout": 600000`（毫秒，覆盖 `MCP_TOOL_TIMEOUT`；小于 1000 的值被忽略）

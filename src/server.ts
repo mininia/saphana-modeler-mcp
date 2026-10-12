@@ -11,11 +11,11 @@ import { SERVER_NAME, SERVER_VERSION } from './version.js';
  * 写法：**一行一个数组元素、join('\n')**（而不是一整块模板串）——超长单行在源码里
  * 无法审阅也无法 diff；按句拆行后仍由 '\n' 连接，正文内容与顺序保持不变。
  *
- * **P9 瘦身（SSD §9）**：这里只留每次会话都必须知道的骨架（服务是什么/对象与引用约定/
+ * **只留骨架**：这里只留每次会话都必须知道的骨架（服务是什么/对象与引用约定/
  * 工具族/写操作一句话/envelope/规则库指针）。方言、边界、通道、回执、预览与分析的
  * 解释性段落**已逐句搬进规则库**（src/rules/*.rules.ts），需要时经
  * hana_system_get_info(rules=…) 按需查询——砍下的每一句都能在对应规则的 detail 里找到原文。
- * 字数硬指标见 tests/unit/instructions-budget.test.ts（instructions + 描述 top5 ≤ 6251）。
+ * 字数硬指标见本地保留的 tests/unit/instructions-budget.test.ts（该测试不入库）的 BUDGET（口径与数值的单一事实源）。
  */
 export const SERVER_INSTRUCTIONS = [
   'saphana-modeler-mcp：SAP HANA 经典 Modeler（HANA 2.0 本地部署，仓库建模）的 MCP 服务。',
@@ -41,7 +41,7 @@ export const SERVER_INSTRUCTIONS = [
  * 只做纯构建 —— 一次性启动日志（工具过滤摘要等）由入口负责。
  */
 export function createServer(ctx: ToolContext): McpServer {
-  // 面（P10-e）：**每次构建钉住一份**——HTTP 按请求构建，于是每个身份看到自己的面（门面 ∩ 授权）；
+  // 调用方面：**每次构建钉住一份**——HTTP 按请求构建，于是每个身份看到自己的面（门面 ∩ 授权）；
   // stdio 单实例。纯函数，不含跨调用状态。见 tools/surface.ts。
   const server = new McpServer(
     // 版本号取自 package.json（src/version.ts），不在此硬编码：发版时不会漏改而报旧版本

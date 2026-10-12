@@ -8,7 +8,7 @@ import type { RuleObject } from './index.js';
  * - src/capabilities/defs/preview.ts 的 hana_data_preview.description（两模式与节点通道一段）
  *   与 hana_data_preview_diagnose.description（通道语义与 brief 字段）；
  * - src/services/preview.service.ts 与 preview-diagnose.service.ts 的头注（中间视图命名/释放口径、
- *   权限类失败自动诊断的码集 258/259）。
+ *   访问类失败自动诊断的码集 10/258/259/2950（或权限消息正则））。
  */
 
 export const previewRules: readonly RuleObject[] = [
@@ -34,7 +34,7 @@ export const previewRules: readonly RuleObject[] = [
       '- 中间视图名固定为「包/对象/dp/节点」（在 _SYS_BIC 内，人工可直接定位）；',
       '- 已存在同名视图即复用、不重复创建（并发调用、上次残留、他人建的都走这条）；**复用不校验新鲜度**——',
       '  CV 重新激活后同名视图仍是旧定义，需要最新数据时先删掉该视图或改用 forceDerive；',
-      '  **但回执附新鲜度判据**（D1）：复用路径的 intermediate.freshness = { createdAt（中间视图创建时间）、',
+      '  **但回执附新鲜度判据**：复用路径的 intermediate.freshness = { createdAt（中间视图创建时间）、',
       '  activatedAt（源对象最近一次激活时间）、stale（createdAt 早于 activatedAt ⇒ 复用到旧定义）}；',
       '  stale=true 时自行决定「先删该视图 / 改 forceDerive / 接受旧数据」——服务端只给判据、不改行为；',
       '- 查询结束后，仅在本进程已无调用占用且视图由本服务创建时才 DROP（结果里 intermediate 回报 reused/dropped），',
@@ -43,14 +43,14 @@ export const previewRules: readonly RuleObject[] = [
       '只读 XML 推导模式（forceDerive=true，需显式启用）：支持 Projection/Join/Aggregation/Union/Rank，',
       'SqlScriptView/变量/复杂节点不支持；节点预览复用旧定义时也用它绕开。',
       '',
-      '权限诊断：权限类失败（缺 EXECUTE/SELECT、_SYS_BIC 对象不可见的 258/259）会自动附带权限诊断报告',
+      '权限诊断：访问类失败（错误码 10/258/259/2950，或 not authorized / insufficient privilege / 无权限 消息）会自动附带权限诊断报告',
       '（envelope.raw.diagnosis），无需额外调用即可定位阻塞点；hana_data_preview_diagnose 可手动前置排查或',
       '区分「权限缺失」与「对象未激活」：channel=direct（只测当前 CV + 分析权限）；channel=intermediate',
       '（节点预览场景，额外检查中间视图过程 EXECUTE 权限）；channel=derived（默认，追溯并实测上游数据源可达性）；',
       '默认精简只给 brief（upstreamInaccessible / analyticPrivilege / runtimeAccessible / canPreview），',
       'verbose=true 才给完整 checks/baseTables 明细。',
     ].join('\n'),
-    errorCodes: ['258', '259'],
+    errorCodes: ['10', '258', '259', '2950'],
     tools: ['hana_data_preview', 'hana_data_preview_diagnose'],
   },
 ];

@@ -44,6 +44,8 @@ export type UnknownReason =
   | 'permission_denied'
   /** 权限不足导致视图静默返回空集（无报错，最危险的一类） */
   | 'filtered'
+  /** 查询成功、但关键读数为 0/NULL 等不可用形态（数据形状问题，不是执行出错） */
+  | 'read_unavailable'
   /** 功能未启用（如未配系统复制）——这是"确实没有"，不是"看不见" */
   | 'not_configured'
   /** 执行出错 */

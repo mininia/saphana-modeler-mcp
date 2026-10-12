@@ -3,7 +3,8 @@
  *
  * 设计原则：宽容结构化——只提取「理解视图逻辑」所需的核心结构
  * （数据源/节点树/字段映射/公式/变量/输出字段），未知节点原样透传（raw），
- * 不做严格 schema 校验（不同 SPS 的 XML 方言差异大，见方案 §8）。
+ * 不做严格 schema 校验（不同 SPS 的 XML 方言差异大；严格校验会把真实语料整片拒掉，
+ * 未知结构一律透传才是本层的契约）。
  */
 
 export type ViewKind = 'calculationview' | 'attributeview' | 'analyticview';
@@ -11,11 +12,11 @@ export type ViewKind = 'calculationview' | 'attributeview' | 'analyticview';
 /**
  * 判定某列是否按默认策略当作**度量**的数值类型表。
  *
- * 单点定义的原因：这张表曾在 view-builder（生成 XML 时选度量）与 repository.service
- * （创建后重算 measureCount 做回执）各存一份，两边注释都写着"要保持一致"却靠人工同步 ——
- * 一旦漂移，回执里的度量数会与生成的 XML 不符，而两者都"看起来对"。
+ * 单点定义的原因：度量判定同时被 XML 生成（view-builder 选度量）与回执统计
+ * （repository.service 重算 measureCount）使用——两处各存一份时，漂移的表现是
+ * 「回执里的度量数与生成的 XML 不符」，而两边都"看起来对"。
  */
-export const NUMERIC_TYPES: ReadonlySet<string> = new Set([
+const NUMERIC_TYPES: ReadonlySet<string> = new Set([
   'TINYINT',
   'SMALLINT',
   'INTEGER',
@@ -74,6 +75,17 @@ export function aggMeasures(node: ViewNode): ViewNodeMeasure[] {
  */
 export function normalizeBwSchema(schemaName: string): string {
   return schemaName === 'ABAP' ? 'SAPABAP1' : schemaName;
+}
+
+/**
+ * 图论汇点：没有任何节点通过 input 引用它的节点（`#` 前缀是 XML 引用语法糖，比较前去掉）。
+ * 单点定义的原因：view-diff（输出换人判定）与 view-edit（add_join 挂载点判定）都枚举汇点，
+ * 引用集合的构造语法各写一份必然漂移。返回原顺序；「恰好一个才可判」「多汇点如何降级」
+ * 等策略由各自调用方决定。
+ */
+export function sinkNodes(nodes: ViewNode[]): ViewNode[] {
+  const referenced = new Set(nodes.flatMap((n) => n.inputs.map((i) => i.node.replace(/^#/, ''))));
+  return nodes.filter((n) => !referenced.has(n.id));
 }
 
 /** 数据源：计算视图引用 / 数据库表 / 数据库视图 */
@@ -164,7 +176,7 @@ export interface ViewNode {
   attributeAggregations: Array<{ id: string; aggregationType: string }>;
   /** 属性级过滤器（viewAttribute 上的 filter，如排除删除标记）；推导时生成 WHERE 条件 */
   attributeFilters: Array<{ id: string; filters: ViewAttributeFilter[] }>;
-  /** 节点内 viewAttribute 自带的类型声明（BW/Studio 方言；缺省 = 未声明）。P6 的 diff 据此判定节点级类型变更。 */
+  /** 节点内 viewAttribute 自带的类型声明（BW/Studio 方言；缺省 = 未声明）。结构 diff 据此判定节点级类型变更。 */
   attributeTypes?: Array<{ id: string; datatype?: string; length?: string }>;
   /** Rank 节点定义（windowFunction）；非 Rank 节点为 undefined */
   rank?: ViewRankDefinition;
