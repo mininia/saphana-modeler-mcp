@@ -682,9 +682,9 @@ function renderLeafTraversalVerbose(
     if (leaf.type === 'DATA_BASE_TABLE') {
       let detail: string;
       if (!leaf.allowed) {
-        detail = `schema ${leaf.schema} 不在白名单（系统 schema 或 HANA_SCHEMA_ALLOW 配置）`;
+        detail = `schema ${leaf.schema} 不在白名单（系统 schema 或 HANA_READ_SCHEMA 配置）`;
         blockers.push(`基表 ${leaf.schema}.${leaf.table} 不可访问：${detail}`);
-        hints.push(`在 .env / mcp.json 设置 HANA_SCHEMA_ALLOW=${leaf.schema} 追加允许的 schema`);
+        hints.push(`在 .env / mcp.json 设置 HANA_READ_SCHEMA=${leaf.schema} 追加允许的 schema`);
       } else if (!leaf.granted) {
         detail = '缺失';
         blockers.push(`基表 ${leaf.schema}.${leaf.table} 缺少 SELECT 权限`);

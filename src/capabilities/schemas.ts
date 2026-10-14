@@ -53,7 +53,7 @@ export function zReadPackageId(usage: string) {
 
 /**
  * 只读的 schema（读该 schema 下的表/视图/元数据）。进 `WritePlan.readSchemas`，
- * 受 `HANA_SCHEMA_ALLOW` 与调用方档案的约束（系统 schema 恒可读，无需配置）。
+ * 受 `HANA_READ_SCHEMA` 与调用方档案的约束（系统 schema 恒可读，无需配置）。
  *
  * 各处 schema 参数的**约束并不相同**（有的带 min/max、有的纯 string），故这里不提供构造器，
  * 由声明处用 `tagResource(z.string()…, 'readSchema')` 就地打标——**保持已发布的约束与描述逐字不变**。

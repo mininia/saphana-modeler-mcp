@@ -11,9 +11,9 @@
  * - admin 管理操作：高权限/管理类（传输/变更追踪 API、仓库变更审计，以及监视视图读权限档的稳定性诊断）
  *
  * 可见性由 mcp.json / .env 的三个变量控制（详见 README「工具分组与可见性控制」）：
- * - MCP_TOOL_GROUPS  启用的分组（逗号分隔）；空=全启用（默认，向后兼容）
- * - MCP_TOOL_ALLOW   强制启用的工具名 glob（即便其分组未启用也注册）
- * - MCP_TOOL_DENY    强制禁用的工具名 glob（优先级最高，覆盖 allow 与分组）；
+ * - HANA_TOOL_GROUPS  启用的分组（逗号分隔）；空=全启用（默认，向后兼容）
+ * - HANA_TOOL_ALLOW   强制启用的工具名 glob（即便其分组未启用也注册）
+ * - HANA_TOOL_DENY    强制禁用的工具名 glob（优先级最高，覆盖 allow 与分组）；
  *                    命中父工具名会连带关闭它的操作级别名（`父名#<op>`），见 shouldRegisterTool
  * 优先级：deny > allow > 分组开关。
  *
@@ -110,7 +110,7 @@ export function parseToolFilter(rawGroups: string, rawAllow: string, rawDeny: st
   if (groups.length > 0) {
     const invalid = groups.filter((g) => !ALL_TOOL_GROUPS.includes(g as ToolGroup));
     if (invalid.length > 0) {
-      throw new Error(`MCP_TOOL_GROUPS 含未知分组：${invalid.join(', ')}；合法值：${ALL_TOOL_GROUPS.join(', ')}`);
+      throw new Error(`HANA_TOOL_GROUPS 含未知分组：${invalid.join(', ')}；合法值：${ALL_TOOL_GROUPS.join(', ')}`);
     }
   }
   return {

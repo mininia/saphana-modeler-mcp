@@ -35,7 +35,7 @@ export interface ToolContext {
   /** 已校验配置（含脱敏后摘要供 ping 类工具展示） */
   config: HanaConfig;
   /**
-   * 工具可见性过滤配置（由 mcp.json 的 MCP_TOOL_GROUPS/MCP_TOOL_ALLOW/MCP_TOOL_DENY 解析而来）。
+   * 工具可见性过滤配置（由 mcp.json 的 HANA_TOOL_GROUPS/HANA_TOOL_ALLOW/HANA_TOOL_DENY 解析而来）。
    * 各 register* 模块经 capabilityRegistrar 按能力清单注册，注册出去的是这次连接的**面**（可触达上限（部署策略 ∩ 档案）∩（门面 ∪ 已提升分类的成员），见 surface.ts）：未进面的能力不出现在 tools/list——具体能力恒为动态调用，仍可经门面路由（判定走同一套闸门）。全空配置=不按分组/名称过滤（面的其余部分照常生效）。
    */
   toolFilter: ToolFilterConfig;
@@ -251,7 +251,7 @@ export function unregisterCapabilities(server: McpServer, toolNames: readonly st
  * 启动时打印工具可见性摘要（不泄露敏感信息）。
  * 仅在配置了过滤变量时输出，便于排查「为何某工具没注册」。
  *
- * 这里只按**工具过滤变量**（MCP_TOOL_GROUPS/ALLOW/DENY）列被关闭的条目；操作级别名（routeOnly）
+ * 这里只按**工具过滤变量**（HANA_TOOL_GROUPS/ALLOW/DENY）列被关闭的条目；操作级别名（routeOnly）
  * 不是工具（任何配置下都不注册），不列入。零工具可见的告警不在这里——那由 `registerAllTools`
  * 按**实际构建的面**（含档案维度）发出，避免同一问题出现两套口径。
  */
@@ -267,7 +267,7 @@ export function logToolFilterSummary(filter: ToolFilterConfig): void {
           .join(' ');
   logger.info(
     { enabledGroups: groupSummary, allow: filter.allowPatterns, deny: filter.denyPatterns },
-    '工具可见性过滤已启用（MCP_TOOL_GROUPS/MCP_TOOL_ALLOW/MCP_TOOL_DENY）',
+    '工具可见性过滤已启用（HANA_TOOL_GROUPS/HANA_TOOL_ALLOW/HANA_TOOL_DENY）',
   );
   // 列出被关闭的工具名（帮助确认配置符合预期）
   const allNames = CAPABILITY_LIST.filter((c) => c.routeOnly !== true).map((c) => c.id);
@@ -319,7 +319,7 @@ export function registerAllTools(server: McpServer, ctx: ToolContext): void {
   if (!anyVisible) {
     logger.warn(
       '当前配置未启用任何工具：SDK 不会声明 tools 能力，客户端调 tools/list 将得到 -32601。' +
-        '请检查 MCP_TOOL_GROUPS/MCP_TOOL_ALLOW/MCP_TOOL_DENY（空=全部启用）。',
+        '请检查 HANA_TOOL_GROUPS/HANA_TOOL_ALLOW/HANA_TOOL_DENY（空=全部启用）。',
     );
   }
 }

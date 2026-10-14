@@ -10,10 +10,10 @@
  * 三个用例（分类门面制）：
  *   A. **注册面**：tools/list 应恰好是六个分类门面（顺序固定），占位工具不出现；annotations 透出。
  *   B. **门面行为 + 可见性过滤自检**：每个门面的索引条数与可见成员数一致、不含门面自己；
- *      未知能力与跨类路由回**同一句**未知能力；若另配了 MCP_TOOL_GROUPS / MCP_TOOL_ALLOW /
- *      MCP_TOOL_DENY（旧名 HANA_TOOL_* 同义），额外校验**能力层**收窄结果（门面层不做限制，
+ *      未知能力与跨类路由回**同一句**未知能力；若另配了 HANA_TOOL_GROUPS / HANA_TOOL_ALLOW /
+ *      HANA_TOOL_DENY（旧名 HANA_TOOL_* 同义），额外校验**能力层**收窄结果（门面层不做限制，
  *      六个入口恒在；索引可能为空——入口在、里面没有你可用的能力）：
- *        MCP_TOOL_GROUPS=read node scripts/smoke-stdio.mjs   # 只读部署：六门面恒在；modeling 索引只剩 hana_task_get（read 档），diagnostics 索引为空
+ *        HANA_TOOL_GROUPS=read node scripts/smoke-stdio.mjs   # 只读部署：六门面恒在；modeling 索引只剩 hana_task_get（read 档），diagnostics 索引为空
  *   C. **提升**：调门面 → 该分类能力进入 tools/list（带完整 schema、可平铺直调）+ list_changed 通知。
  */
 import { spawn } from 'node:child_process';
@@ -37,9 +37,9 @@ if (!existsSync(SERVER_ENTRY)) {
 
 /** 面相关环境变量：用例 A 剥离（保证断言与调用方 shell 环境无关），用例 B 读调用方配置做自检 */
 const SURFACE_ENV_KEYS = [
-  'MCP_TOOL_GROUPS',
-  'MCP_TOOL_ALLOW',
-  'MCP_TOOL_DENY',
+  'HANA_TOOL_GROUPS',
+  'HANA_TOOL_ALLOW',
+  'HANA_TOOL_DENY',
   'HANA_TOOL_GROUPS',
   'HANA_TOOL_ALLOW',
   'HANA_TOOL_DENY',
@@ -232,12 +232,12 @@ async function caseFacadeBehaviour() {
   const env = { ...BASE_ENV };
   for (const k of SURFACE_ENV_KEYS) delete env[k];
   // 保留调用方 shell 里的过滤配置（本用例据此做自检）
-  const groups = (process.env.MCP_TOOL_GROUPS ?? process.env.HANA_TOOL_GROUPS ?? '').trim();
-  const allow = (process.env.MCP_TOOL_ALLOW ?? process.env.HANA_TOOL_ALLOW ?? '').trim();
-  const deny = (process.env.MCP_TOOL_DENY ?? process.env.HANA_TOOL_DENY ?? '').trim();
-  if (groups) env.MCP_TOOL_GROUPS = groups;
-  if (allow) env.MCP_TOOL_ALLOW = allow;
-  if (deny) env.MCP_TOOL_DENY = deny;
+  const groups = (process.env.HANA_TOOL_GROUPS ?? process.env.HANA_TOOL_GROUPS ?? '').trim();
+  const allow = (process.env.HANA_TOOL_ALLOW ?? process.env.HANA_TOOL_ALLOW ?? '').trim();
+  const deny = (process.env.HANA_TOOL_DENY ?? process.env.HANA_TOOL_DENY ?? '').trim();
+  if (groups) env.HANA_TOOL_GROUPS = groups;
+  if (allow) env.HANA_TOOL_ALLOW = allow;
+  if (deny) env.HANA_TOOL_DENY = deny;
 
   const matchGlob = (name, patterns) =>
     patterns.some((p) =>

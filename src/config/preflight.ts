@@ -22,7 +22,6 @@ import {
 } from '../tools/groups.js';
 import { CONCRETE_CAPABILITY_IDS, findCapability, planFor } from '../capabilities/manifest.js';
 import { describeProfiles, matchedCapabilities, type CallerProfile } from './profiles.js';
-import { resolveEnvAliases } from './config.js';
 
 /**
  * 权限策略层 —— 能力级 + 资源级两类权限的唯一判定入口。
@@ -31,8 +30,8 @@ import { resolveEnvAliases } from './config.js';
  *
  * | 维度 | 管什么 | 配置项 | 参考 |
  * |---|---|---|---|
- * | **能力级** | 哪些工具对外暴露 | MCP_TOOL_GROUPS / ALLOW / DENY | tableau 的 INCLUDE/EXCLUDE_TOOLS（组展开）；dataworks 的 TOOL_CATEGORIES/NAMES |
- * | **资源级** | 能操作哪些资源 | HANA_WRITE_PACKAGES（可写包）/ HANA_SCHEMA_ALLOW（可读 schema） | tableau 的 BoundedContext；dataworks 交给平台 |
+ * | **能力级** | 哪些工具对外暴露 | HANA_TOOL_GROUPS / ALLOW / DENY | tableau 的 INCLUDE/EXCLUDE_TOOLS（组展开）；dataworks 的 TOOL_CATEGORIES/NAMES |
+ * | **资源级** | 能操作哪些资源 | HANA_WRITE_PACKAGES（可写包）/ HANA_READ_SCHEMA（可读 schema） | tableau 的 BoundedContext；dataworks 交给平台 |
  * | （部署级） | 连接侧约束，非任务级 | HANA_TLS / MCP_HTTP_* | —— 两家的 Config 构造期 fail-closed |
  *
  * ## 结构
@@ -192,17 +191,17 @@ function deploymentFromEnvValues(env: Record<string, unknown>): DeploymentPostur
 
 /** 从一组原始 env 值构造策略（三条来源路径共用） */
 function policyFromEnvValues(env: Record<string, unknown>, source: string): Policy {
-  // 旧名归一（HANA_TOOL_* → MCP_TOOL_*）：与 loadConfig 同一实现，避免两条解析路径分叉
-  const e = resolveEnvAliases(env);
+  // 无别名层（2026-10-14）：直接按正名读取。旧名/已删名在这里**取不到值**（等价于未配置），
+  // 与 loadConfig 的硬切换同口径——不静默拿旧名当新名用
   return {
     capability: parseToolFilter(
-      String(e.MCP_TOOL_GROUPS ?? ''),
-      String(e.MCP_TOOL_ALLOW ?? ''),
-      String(e.MCP_TOOL_DENY ?? ''),
+      String(env.HANA_TOOL_GROUPS ?? ''),
+      String(env.HANA_TOOL_ALLOW ?? ''),
+      String(env.HANA_TOOL_DENY ?? ''),
     ),
     resource: {
       writePackages: splitPackages(env.HANA_WRITE_PACKAGES),
-      schemaAllow: splitList(env.HANA_SCHEMA_ALLOW),
+      schemaAllow: splitList(env.HANA_READ_SCHEMA),
     },
     deployment: deploymentFromEnvValues(env),
     source,

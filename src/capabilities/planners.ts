@@ -51,7 +51,7 @@ function add(list: string[], ...items: (string | undefined)[]): void {
  *
  * 为什么必须做：xml（hana_view_update）与 content（hana_repo_import）这两条**全量载荷**通道
  * 只扫 resourceUri 时（readPackages 是可见性信息、不参与拦截）readSchemas 恒空 ⇒
- * HANA_SCHEMA_ALLOW 对它们静默不生效；而载荷里的基表坐标是**静态可解析**的
+ * HANA_READ_SCHEMA 对它们静默不生效；而载荷里的基表坐标是**静态可解析**的
  * （真实 CV：`<DataSource …><columnObject schemaName="…" columnObjectName="…"/></DataSource>`），
  * 服务端"写入即激活"会按该 schema 编译视图——不判等于把读取范围静默放开。
  *
@@ -267,7 +267,7 @@ export function planViewUpdate(args: Record<string, unknown>): WritePlan {
   if (xml) {
     add(p.readPackages, ...scanXmlPackageRefs(xml));
     // 全量 XML 里的基表数据源 schemaName 是**静态可解析**的读取面——只扫 resourceUri 时
-    // readSchemas 恒空 ⇒ HANA_SCHEMA_ALLOW 对 xml 通道静默不生效。与 set_script 的脚本扫描
+    // readSchemas 恒空 ⇒ HANA_READ_SCHEMA 对 xml 通道静默不生效。与 set_script 的脚本扫描
     // 同一方向：扫出来就进读取范围核对；解析不出的落 uncertain（不假装"没有引用"）。
     const xmlSchemas = scanXmlBaseTableSchemas(xml);
     add(p.readSchemas, ...xmlSchemas.schemas);
@@ -357,7 +357,7 @@ export function planViewUpdate(args: Record<string, unknown>): WritePlan {
           const source = asObj(rec.source);
           const schema = asStr(source?.schema);
           if (schema) {
-            // 与单对象 create 通道同一语义：源 schema 走 HANA_SCHEMA_ALLOW 判定（服务层另有 assertSchemaAllowed 兜底）
+            // 与单对象 create 通道同一语义：源 schema 走 HANA_READ_SCHEMA 判定（服务层另有 assertSchemaAllowed 兜底）
             add(p.readSchemas, schema);
             p.steps.push(
               `变更集第 ${i} 项（从 0 数，create）：读取源 ${schema}.${asStr(source?.name) ?? '?'} 的列定义` +
@@ -532,7 +532,7 @@ export function planRepoImport(args: Record<string, unknown>): WritePlan {
   if (content) {
     add(p.readPackages, ...scanXmlPackageRefs(content));
     // 与 update 的 xml 通道同一处理——导入内容里的基表数据源 schemaName 是静态可解析的读取面
-    // （只扫 resourceUri 时 readSchemas 恒空 ⇒ HANA_SCHEMA_ALLOW 对此通道静默不生效）。
+    // （只扫 resourceUri 时 readSchemas 恒空 ⇒ HANA_READ_SCHEMA 对此通道静默不生效）。
     const contentSchemas = scanXmlBaseTableSchemas(content);
     add(p.readSchemas, ...contentSchemas.schemas);
     if (contentSchemas.schemas.length > 0) {
@@ -635,7 +635,7 @@ export function planFallback(toolName: string, args: Record<string, unknown>): W
 // ── 读能力规划器（planRead）────────────────────────────────
 //
 // 读能力的计划用**同一形状**：`writePackages` 恒空（读能力不写仓库包），
-// 重点在 `readSchemas`——它决定 `HANA_SCHEMA_ALLOW` 在**调用期**怎么判。
+// 重点在 `readSchemas`——它决定 `HANA_READ_SCHEMA` 在**调用期**怎么判。
 // 只声明**能从入参静态确定**的资源；确定不了的进 `uncertain`（与写侧同一口径：不假装完整）。
 
 /** 只有叙述的计划（资源由参数声明派生，此处不声明任何资源——避免两个真值源） */

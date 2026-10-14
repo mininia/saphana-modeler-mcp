@@ -1,5 +1,5 @@
 /**
- * 稳定性诊断工具（分组 **admin**，可见性由 MCP_TOOL_GROUPS 控制）。
+ * 稳定性诊断工具（分组 **admin**，可见性由 HANA_TOOL_GROUPS 控制）。
  *
  * 四个工具对应四种形状，刻意不合并：
  *  - hana_system_health   —— 阈值判定，回答「有没有问题」（结论 + 覆盖度）

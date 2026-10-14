@@ -7,7 +7,7 @@
  * 故 hana_data_preview 的注解是 readOnlyHint=false（注解静态，不能随参数切换）。
  * 两能力均为 read：注册经 capabilityRegistrar，调用期统一过 authorizeCall（闸门恒在，
  * 差异只在资源维度由 effects.plan 有无表达）——hana_data_preview 声明了资源计划
- * （inspect 的 schema 经 tagResource('readSchema') 进读范围判定，受 HANA_SCHEMA_ALLOW 约束）；
+ * （inspect 的 schema 经 tagResource('readSchema') 进读范围判定，受 HANA_READ_SCHEMA 约束）；
  * diagnose 未声明资源计划，其 packageId 进「跨包只读引用」（报告用，不拦截）。
  */
 

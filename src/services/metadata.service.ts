@@ -156,7 +156,7 @@ export async function listTables(
 ): Promise<TableListResult> {
   const limit = clampLimit(opts.limit, 50, 1, 200);
   const schema = opts.schema ?? (await currentSchema(pool));
-  // 纵深防御：显式传入的 schema 走白名单（系统 schema + HANA_SCHEMA_ALLOW 追加），
+  // 纵深防御：显式传入的 schema 走白名单（系统 schema + HANA_READ_SCHEMA 追加），
   // 防任意 schema 枚举；默认当前 schema 已由数据库权限约束
   if (opts.schema) assertSchemaAllowed(opts.schema);
   const where = ['SCHEMA_NAME = ?'];

@@ -43,7 +43,7 @@ async function main(): Promise<void> {
         '请核对这些变量确实指向同一套环境（清掉多余的环境变量，或全部集中到三者之一）',
     );
   }
-  // 接线 schema 白名单扩展（HANA_SCHEMA_ALLOW），使配置项真正生效
+  // 接线 schema 白名单扩展（HANA_READ_SCHEMA），使配置项真正生效
   configureExtraSchemas(config.schemaAllow);
   // 接线写操作包白名单（HANA_WRITE_PACKAGES）——两层口径（与 config/write-boundary.ts 头注一致）：
   // 服务层空白名单是 fail-open（isPackageAllowed 放行一切）；端到端不是「所有包可写」——写工具已暴露时，
@@ -51,7 +51,7 @@ async function main(): Promise<void> {
   configureWritePackages(config.writePackages);
   // 进程级归因标签（MCP_AGENT_LABEL）：写进 envelope 与每条 capability-audit，未配置时不产生该字段
   setProcessAgentLabel(config.agentLabel);
-  // 解析工具可见性过滤（MCP_TOOL_GROUPS/MCP_TOOL_ALLOW/MCP_TOOL_DENY，旧名 HANA_TOOL_* 仍生效）；无效分组名在此抛错
+  // 解析工具可见性过滤（HANA_TOOL_GROUPS/HANA_TOOL_ALLOW/HANA_TOOL_DENY，旧名 HANA_TOOL_* 仍生效）；无效分组名在此抛错
   const toolFilter = buildToolFilter(config);
   // 安全要求：连接信息/用户名/密码不得以任何形式出现，不落日志
   logger.info('saphana-modeler-mcp 配置加载完成（连接信息与凭据不落日志）');

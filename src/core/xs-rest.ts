@@ -59,7 +59,7 @@ import { truncateWithNote } from './text.js';
  * XS Classic 设计时 REST 基础路径的默认值（官方默认安装路径）。
  *
  * 定义在这里而非 config，是因为构造 XsRestClient 时要对**任何** HanaConfig 都成立 ——
- * 包括单元测试里刻意构造的极简桩（只有 host/instance/user/password）。缺了兜底，
+ * 包括单元测试里刻意构造的极简桩（只有 host/port/user/password）。缺了兜底，
  * 一个传了不完整配置的调用方会在构造器里拿到 `undefined.replace` 的 TypeError，
  * 而那个报错完全指不出"少了哪个字段"。
  * config.ts 的 HANA_XS_BASE_PATH 默认值引用本常量，故默认值全仓只有这一份定义。
@@ -67,12 +67,22 @@ import { truncateWithNote } from './text.js';
 export const XS_BASE_PATH = '/sap/hana/xs/dt/base';
 
 /**
- * XS 设计时 REST 端口的默认推导：实例号 → `80<instance>`（如 '10' → 8010）。
- * 与 XS_BASE_PATH 同属「默认值单点」：config.ts 的 HANA_XS_PORT 缺省与构造器兜底都调它，
- * 抄第二份会让「配置里的值」与「运行时兜底值」在规则变化时分叉。
+ * 解析 XS 端口（构造 XsRestClient 时调用）。**没有推导兜底**：2026-10-14 起 HANA_INSTANCE 已删除，
+ * `80<instance>` 那条唯一推导规则随之取消——端口只能由部署方显式给出。
+ *
+ * 未配置时**响亮失败并给出改法**，而不是退回某个猜出来的端口：猜错的表现是连到另一台/另一实例
+ * 的 XS 端点（明文 HTTP 上把 HANA 账号与会话交出去），比"写不了"严重得多。
+ * 文案面向调用方，故只说"服务端未启用该通道"，不写变量名（写明改哪项配置等于教它绕过；同
+ * services/repo-transfer.service.ts 的拦截文案口径）。
  */
-export function deriveXsPort(instance: string): number {
-  return Number(`80${instance}`);
+function resolveXsPort(config: HanaConfig): number {
+  if (config.xsPort === undefined) {
+    throw new Error(
+      '服务端未启用 XS 通道：写入/激活/导入导出等能力依赖 XS 设计时 REST 端点，' +
+        '而该端点未配置（本版本不再按实例号推导端口，缺失时不做任何猜测）',
+    );
+  }
+  return config.xsPort;
 }
 
 /** SapBackPack 头 JSON 的字段（集中在常量表，便于按 SPS 调字段名/大小写） */
@@ -319,7 +329,7 @@ export class XsRestClient {
 
   constructor(config: HanaConfig) {
     const host = config.host;
-    const port = config.xsPort ?? deriveXsPort(config.instance);
+    const port = resolveXsPort(config);
     // scheme：默认明文 http（XS 端点未开 TLS 时唯一可用）；HANA_XS_TLS=true 显式切 https
     this.baseUrl = `${xsSchemeFromEnv()}://${host}:${port}`;
     // 默认值单点在 XS_BASE_PATH（本文件），config 的 HANA_XS_BASE_PATH zod default 引用同一常量；

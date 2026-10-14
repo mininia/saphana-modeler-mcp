@@ -5,17 +5,17 @@
       "args": ["dist/index.js"],
       "env": {
         "HANA_HOST": "hana-host.example",
-        "HANA_INSTANCE": "00",
-        "HANA_PORT": "",
+        "HANA_PORT": "31015",
         "HANA_USER": "YOUR_USERNAME",
         "HANA_PASSWORD": "YOUR_PASSWORD",
-        "HANA_LOCALE": "zh_CN",
+        "HANA_LOCALE": "zh",
         "HANA_DB_NAME": "SYSTEMDB",
         "HANA_TLS": "true",
         "HANA_SSL_VALIDATE": "true",
         "HANA_TIMEZONE": "Asia/Shanghai",
-        "HANA_SCHEMA_ALLOW": "",
+        "HANA_READ_SCHEMA": "",
         "HANA_WRITE_PACKAGES": "ZDEMO1,ZDEMO2.ZDEMO_SD",
+        "HANA_XS_PORT": "8010",
         "LOG_LEVEL": "info"
       }
     }

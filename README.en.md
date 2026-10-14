@@ -76,18 +76,17 @@ Connection info is only allowed from environment variables / `mcp.json` `env` (*
 | Option | Required | Description | Example |
 | --- | --- | --- | --- |
 | `HANA_HOST` | ✅ | HANA hostname/IP | `hana-host.example` |
-| `HANA_INSTANCE` | optional | Instance number (00–99), default `00` | `10` |
-| `HANA_PORT` | optional | SQL port; auto-derived from instance number if empty | `31015` |
+| `HANA_PORT` | ✅ | SQL port (**required**; no longer derived from an instance number — `3<instance>13/15` cannot express non-default tenants; digits only) | `31015` / `31041` |
 | `HANA_USER` | ✅ | Database username | — |
 | `HANA_PASSWORD` | ✅ | Password | — |
-| `HANA_LOCALE` | optional | Connection locale, default `zh_CN` | `zh_CN` |
+| `HANA_LOCALE` | optional | Connection locale, default `zh` | `zh` |
 | `HANA_DB_NAME` | optional | Tenant database name (required for MDC) | `SYSTEMDB` / tenant name |
 | `HANA_TLS` | optional | TLS encryption, default `true` (fail-closed; set `false` only on trusted links) | `true` |
 | `HANA_SSL_VALIDATE` | optional | Validate certificate under TLS, default `true`; set `false` for self-signed certs | `true` |
 | `HANA_TIMEZONE` | optional | Process timezone (sets `TZ`, affecting log timestamps and local-time semantics); **not pushed down to the HANA session**. Default `Asia/Shanghai` | `Asia/Shanghai` |
-| `HANA_SCHEMA_ALLOW` | optional | Extra queryable schemas (comma-separated, appended to built-in allowlist) | `SAPABAP1,OTHER_SCHEMA` |
+| `HANA_READ_SCHEMA` | optional | Extra queryable schemas (comma-separated, appended to built-in allowlist) | `SAPABAP1,OTHER_SCHEMA` |
 | `HANA_WRITE_PACKAGES` | optional | Writable repository package prefixes (comma-separated, incl. sub-packages). **Empty = write boundary not enabled**: requests that declare write packages are hard-blocked by the runtime gate with `boundary_off` (writing requires an explicit configuration; only the service layer is fail-open — see the write-boundary note below); when set, only configured packages and their sub-packages are writable | `ZDEMO1,ZDEMO2.ZDEMO_SD` |
-| `HANA_XS_PORT` | optional | XS Classic design-time REST port (write path); auto-derived as `80<instance>` if omitted | `8010` |
+| `HANA_XS_PORT` | optional | XS Classic design-time REST port (**required** for XS-channel capabilities: writes, imports/exports); no longer derived as `80<instance>`, and XS-channel calls fail outright when unset (read-only deployments may omit it) | `8010` |
 | `HANA_XS_BASE_PATH` | optional | XS design-time REST base path, default `/sap/hana/xs/dt/base` | — |
 | `HANA_POOL_MAX` | optional | HANA connection pool size, default `4` (saturation behavior and deployment sizing: see "Transports → Timeouts & resource governance") | `8` |
 | `HANA_POOL_WAIT_MS` | optional | Queue wait timeout when the pool is saturated (ms), default `30000` | `60000` |
@@ -96,9 +95,9 @@ Connection info is only allowed from environment variables / `mcp.json` `env` (*
 | `HANA_XS_TIMEOUT_MS` | optional | Default XS REST request timeout (ms), default `30000`; coverage — including the shorter fixed login/CSRF timeout — is described in "Transports → Timeouts & resource governance" | `60000` |
 | `HANA_XS_XFER_TIMEOUT_MS` | optional | XS Transfer (xfer) import/export timeout (ms), default `300000` (transfers are relaxed separately from the default XS timeout) | `600000` |
 | `HANA_ACTIVATION_CONCURRENCY` | optional | Server-side activation concurrency limit (in-process semaphore), default `2`; what it covers, and its known boundaries (import via the Transfer API channel, package-create POST / DELETE): see "Transports → Timeouts & resource governance" | `4` |
-| `MCP_TOOL_GROUPS` | optional | Enabled tool groups (comma-separated `read`/`write`/`admin`); **empty = no restriction (all enabled)** | `read` |
-| `MCP_TOOL_ALLOW` | optional | Force-enabled tool name globs (registered even if their group is disabled; comma-separated, supports `*`) | `hana_view_validate` |
-| `MCP_TOOL_DENY` | optional | Force-disabled tool name globs (highest priority, overrides allow & groups; comma-separated, supports `*`) | `hana_data_preview*` |
+| `HANA_TOOL_GROUPS` | optional | Enabled tool groups (comma-separated `read`/`write`/`admin`); **empty = no restriction (all enabled)** | `read` |
+| `HANA_TOOL_ALLOW` | optional | Force-enabled tool name globs (registered even if their group is disabled; comma-separated, supports `*`) | `hana_view_validate` |
+| `HANA_TOOL_DENY` | optional | Force-disabled tool name globs (highest priority, overrides allow & groups; comma-separated, supports `*`) | `hana_data_preview*` |
 | `MCP_PROFILES` | optional | **Caller profiles** (`name=kinds[:glob\|glob][;…]`, kinds joined by `+`). Profiles can only *tighten* the deployment policy; defining any profile requires a `default` one | `analyst=read;dev=read+write:hana_view_*;default=read` |
 | `MCP_PROFILE` | optional | Profile used by this process (stdio) and by callers without a profile in their token; must be defined in `MCP_PROFILES` | `default` |
 | `MCP_AGENT_LABEL` | optional | Process-level attribution label, written into the envelope and every `capability-audit` record; empty = the field is not emitted | `prod-cn-01` |
@@ -193,9 +192,9 @@ The model sees three layers and needs **zero discovery calls**:
 | Call a capability without promoting | `hana_modeling({ capability: 'hana_view_update', args: { … } })` |
 | Issue a single op via its alias | `hana_modeling({ capability: 'hana_view_update#rename_field', args: { packageId, objectName, field: 'A', newName: 'B' } })` — fully equivalent to `hana_view_update({ operations: [{ op: 'rename_field', … }] })` (same handler, same gate); aliases never enter `tools/list` (their registered name would collide with the parent tool) |
 | Promote a whole category | call `hana_modeling` (with or without arguments) → its capabilities enter `tools/list`; afterwards call them flat: `hana_view_update({ … })` |
-| Remove a whole category entry | `MCP_TOOL_DENY=hana_modeling`, or deny all of its members |
-| Remove a single capability | `MCP_TOOL_DENY=hana_view_delete` — it disappears from the index, from routing and from promotion |
-| Narrow by group | `MCP_TOOL_GROUPS=read` — narrows the **capability layer** only (the six entrances stay; indexes are filtered by kind), see "Tool Groups" |
+| Remove a whole category entry | `HANA_TOOL_DENY=hana_modeling`, or deny all of its members |
+| Remove a single capability | `HANA_TOOL_DENY=hana_view_delete` — it disappears from the index, from routing and from promotion |
+| Narrow by group | `HANA_TOOL_GROUPS=read` — narrows the **capability layer** only (the six entrances stay; indexes are filtered by kind), see "Tool Groups" |
 | Promotion budget | `MCP_CAPABILITY_SURFACE_MAX` (default 50, same value as hana-cli's `MAX_DYNAMIC_TOOLS`): counted in **tools**; when exceeded the **oldest whole category** is evicted (FIFO). With 30 concrete capabilities this never fires |
 
 **A facade's kind is a summary, not a permission**: `hana_modeling` and `hana_diagnostics` are both `admin` (the strictest
@@ -203,7 +202,7 @@ member), but whether they *appear* does not depend on groups at all — **the fa
 entrances are always resident. Permissions are judged solely by the **target** capability: out-of-scope members never show
 up in an index, and routing/promotion cannot reach them either.
 
-**Security semantics (not relaxed by the dynamic layer)**: ① facades, routing and promotion **never override** `MCP_TOOL_DENY` or a caller profile ("dynamic surface ⊆ static policy") — promotion only moves **entitled** members into the surface; ② routing and the flat call of a promoted tool go through the **same** `authorizeCall` — same verdict, same wording; ③ unknown capability, unauthorized capability, **cross-category routing**, and routing to another facade all reply **verbatim identically** (error wording is not an existence oracle); ④ routed `args` are validated server-side against the target's schema (the schema the client sees is only a convenience); ⑤ every call — including rejected route probes — emits a `capability-audit`; promotion emits an additional `capability-promotion` record.
+**Security semantics (not relaxed by the dynamic layer)**: ① facades, routing and promotion **never override** `HANA_TOOL_DENY` or a caller profile ("dynamic surface ⊆ static policy") — promotion only moves **entitled** members into the surface; ② routing and the flat call of a promoted tool go through the **same** `authorizeCall` — same verdict, same wording; ③ unknown capability, unauthorized capability, **cross-category routing**, and routing to another facade all reply **verbatim identically** (error wording is not an existence oracle); ④ routed `args` are validated server-side against the target's schema (the schema the client sees is only a convenience); ⑤ every call — including rejected route probes — emits a `capability-audit`; promotion emits an additional `capability-promotion` record.
 
 > **Promotion is in-process state** (invariant F: the surface is a *presentation* facility, not a correctness one): keyed by caller (HTTP = authenticated `clientId`; stdio = `(stdio)`); a restart falls back to "facades only" without errors and never changes an authorization result.
 > **Without `MCP_HTTP_TOKENS` configured**: every HTTP caller is `anonymous` and promotions would leak across callers, so **promotion is disabled entirely** (index and routing still work) — a single-tenant assumption.
@@ -223,18 +222,20 @@ Live verification: `npm run verify:authz` (covers all of the above).
 | **write** (write ops) | Modifies design-time repository objects/packages (create/activate/update/delete/design-time validate) plus arbitrary-SQL analysis and cancelling async tasks | `hana_package_create`, `hana_view_create`, `hana_view_activate`, `hana_view_update`, `hana_view_delete`, `hana_view_validate`, `hana_view_check_actions`, `hana_sql_analyze`, `hana_task_cancel` |
 | **admin** (admin ops) | Transfer / Change-Tracking APIs and the system-monitoring surface (the tightened exposure tier) | `hana_repo_export`, `hana_repo_import`, `hana_repo_changelist`, `hana_system_health`, `hana_system_activity`, `hana_table_storage`, `hana_system_trend` |
 
-> **The facade layer is unrestricted.** There is exactly **one permission layer — the capability layer**: the six facades are *entrances* and stay resident in `tools/list` under any group configuration (they disappear only via an explicit `MCP_TOOL_DENY` on the facade id, or on all of its members). The group switch only decides the **capability layer** — index / routing / promotion / calls are all judged by the **target** capability's kind. A read-only deployment therefore still sees `hana_modeling` / `hana_diagnostics`, but their indexes list only what you are entitled to — `hana_modeling` keeps its read-tier `hana_task_get` (async-task polling), `hana_diagnostics` is empty (the entrance is there, only what you may use appears inside).
+> **The facade layer is unrestricted.** There is exactly **one permission layer — the capability layer**: the six facades are *entrances* and stay resident in `tools/list` under any group configuration (they disappear only via an explicit `HANA_TOOL_DENY` on the facade id, or on all of its members). The group switch only decides the **capability layer** — index / routing / promotion / calls are all judged by the **target** capability's kind. A read-only deployment therefore still sees `hana_modeling` / `hana_diagnostics`, but their indexes list only what you are entitled to — `hana_modeling` keeps its read-tier `hana_task_get` (async-task polling), `hana_diagnostics` is empty (the entrance is there, only what you may use appears inside).
 
-> The `design` mode of `hana_view_validate` briefly writes a temporary validation object `_CHKTMP`, so the whole tool is classified as `write`; there is no mixed split by design/runtime mode — a read-only deployment (`MCP_TOOL_GROUPS=read`) does not expose this tool.
+> The `design` mode of `hana_view_validate` briefly writes a temporary validation object `_CHKTMP`, so the whole tool is classified as `write`; there is no mixed split by design/runtime mode — a read-only deployment (`HANA_TOOL_GROUPS=read`) does not expose this tool.
 >
-> `hana_sql_analyze` is `write`: it **writes no business data and never touches the repository**, but it accepts arbitrary SELECT/WITH query text (`analyze=true` really executes it — execution is restricted to SELECT) and its `planId` mode needs the `OPTIMIZER ADMIN` privilege — it shares the write tier with modeling. **Deployments enabling only read cannot see it** (`MCP_TOOL_GROUPS=read` excludes write/admin).
+> `hana_sql_analyze` is `write`: it **writes no business data and never touches the repository**, but it accepts arbitrary SELECT/WITH query text (`analyze=true` really executes it — execution is restricted to SELECT) and its `planId` mode needs the `OPTIMIZER ADMIN` privilege — it shares the write tier with modeling. **Deployments enabling only read cannot see it** (`HANA_TOOL_GROUPS=read` excludes write/admin).
 >
 > Groups (kind) are a **permission tier**, not a behavioural profile: the matrix holds "behaviourally read-only but admin-tier" capabilities (the four stability diagnostics, `hana_repo_changelist`, and `hana_repo_export` — which only writes a **local** `saveTo` file) as well as the "arbitrary SQL but write-tier" `hana_sql_analyze`. Client annotations (`readOnlyHint`) describe **behaviour**; the two axes are not derived from each other. Every non-read capability declares an explicit `effects.plan` so that a read-only package parameter (`packageId`) is never misread as a write target.
 
-> **Renamed**: these three control the **MCP-side exposure policy** (nothing to do with the HANA connection),
-> so the prefix changed from `HANA_` to `MCP_`. The old names (`HANA_TOOL_GROUPS` / `HANA_TOOL_ALLOW` / `HANA_TOOL_DENY`)
-> still work (with a startup warning); giving both with *different* values fails startup. Unrecognised `HANA_*` / `MCP_*` /
-> `LOG_*` variables are now reported in the startup log — a typo used to be silently ignored (e.g. `HANA_WRITE_PACKAGE`
+> **Naming**: these three belong with `HANA_WRITE_PACKAGES` / `HANA_READ_SCHEMA` — all four declare how much of
+> the HANA surface this deployment exposes/permits, so they share the `HANA_` prefix (2026-10-14 review reverted
+> the 2026-10-08 rename to `MCP_TOOL_*`).
+> **There is no alias layer**: `MCP_TOOL_*` is no longer recognised — keeping the old name now shows up in the
+> "unrecognised environment variable" startup warning instead of working silently. Unrecognised `HANA_*` / `MCP_*` /
+> `LOG_*` variables are reported in the startup log — a typo used to be silently ignored (e.g. `HANA_WRITE_PACKAGE`
 > without the trailing `S` left the write boundary wide open with no diagnostic).
 
 ### Caller profiles (`MCP_PROFILES`)
@@ -248,7 +249,7 @@ MCP_PROFILE=default                                            # profile used by
 MCP_HTTP_TOKENS="alice:<token>:dev,bob:<token>:analyst"        # third segment = that identity's profile
 ```
 
-- **Tighten only, never widen**: a profile can never bring back a capability removed by deployment-level `MCP_TOOL_DENY`, nor extend writable packages / readable schemas. An out-of-scope combination (e.g. `dev=read+write` inside a `MCP_TOOL_GROUPS=read` deployment) **fails startup** — that is not a loophole but a divergence between "the permissions you think you have" and the real ones.
+- **Tighten only, never widen**: a profile can never bring back a capability removed by deployment-level `HANA_TOOL_DENY`, nor extend writable packages / readable schemas. An out-of-scope combination (e.g. `dev=read+write` inside a `HANA_TOOL_GROUPS=read` deployment) **fails startup** — that is not a loophole but a divergence between "the permissions you think you have" and the real ones.
 - **Defining `MCP_PROFILES` requires a `default` entry**: HTTP tokens without a third segment and the stdio process both fall back to it; omitting it would misread "no profile specified" as "no restriction".
 - Enforcement happens at **call time** (`authorizeCall`); a blocked reply has the same shape as any other policy block ("blocked by the MCP security policy" + machine-readable codes, **no remediation hints**).
 - Every call emits a `capability-audit` record (`profileId` / `clientId` / `agentLabel` / `resources` / `codes`; allows at info, blocks at warn).
@@ -256,25 +257,25 @@ MCP_HTTP_TOKENS="alice:<token>:dev,bob:<token>:analyst"        # third segment =
 
 Live verification: `npm run smoke:http` (two profiles demonstrate isolation: a read-only profile calling a write capability is answered **verbatim identically to an unknown capability** — index and routing cannot even reach it — while the default profile falls back to the deployment boundary `boundary_off`).
 
-### Three config variables (priority: `MCP_TOOL_DENY` > `MCP_TOOL_ALLOW` > `MCP_TOOL_GROUPS`)
+### Three config variables (priority: `HANA_TOOL_DENY` > `HANA_TOOL_ALLOW` > `HANA_TOOL_GROUPS`)
 
 | Variable | Semantics | Example |
 | --- | --- | --- |
-| `MCP_TOOL_GROUPS` | Enabled groups (comma-separated); empty = no restriction | `read` exposes only data-read tools, disables all write tools |
-| `MCP_TOOL_ALLOW` | Force-enabled tools — supports both **group names** and tool-name globs (`*`); registered even if their group is disabled | `hana_some_tool` / `write` (whole group) |
-| `MCP_TOOL_DENY` | Force-disabled tools (highest priority) — also supports **group names** and globs | `hana_data_preview*` disables all preview tools; `write` disables the whole write group |
+| `HANA_TOOL_GROUPS` | Enabled groups (comma-separated); empty = no restriction | `read` exposes only data-read tools, disables all write tools |
+| `HANA_TOOL_ALLOW` | Force-enabled tools — supports both **group names** and tool-name globs (`*`); registered even if their group is disabled | `hana_some_tool` / `write` (whole group) |
+| `HANA_TOOL_DENY` | Force-disabled tools (highest priority) — also supports **group names** and globs | `hana_data_preview*` disables all preview tools; `write` disables the whole write group |
 
 > **Group names can be used directly in allow/deny** (`read` / `write` / `admin`): they expand to every tool name in that
 > group — the same shape as tableau-mcp's `INCLUDE_TOOLS`/`EXCLUDE_TOOLS` and dataworks-mcp's `TOOL_CATEGORIES`.
-> Example: `MCP_TOOL_GROUPS=read,write` + `MCP_TOOL_DENY=write` ⇒ equivalent to a read-only deployment, without listing every `hana_view_*`.
+> Example: `HANA_TOOL_GROUPS=read,write` + `HANA_TOOL_DENY=write` ⇒ equivalent to a read-only deployment, without listing every `hana_view_*`.
 
 **Typical deployment shapes:**
 
-- **Read-only analyst**: `MCP_TOOL_GROUPS=read` — narrows the reachable ceiling to 14 read-tier capabilities; every write/admin-tier capability is invisible even to a facade index. All six facades stay on the registered surface (the facade layer is unrestricted), but `hana_diagnostics`' index is **empty** and `hana_modeling`'s keeps only the read-tier `hana_task_get` (async-task polling) — the entrance is there, only what you may use appears inside.
-- **Modeling developer**: `MCP_TOOL_GROUPS=read,write` — ceiling of read+write tiers; all six facades are on the registered surface (admin-tier capabilities such as `hana_repo_export` or the four stability diagnostics stay unreachable and never appear in an index).
-- **Disable specific capabilities**: `MCP_TOOL_DENY=hana_view_delete` — disables delete entirely (it disappears from the index and routing rejects it); the rest are unaffected.
+- **Read-only analyst**: `HANA_TOOL_GROUPS=read` — narrows the reachable ceiling to 14 read-tier capabilities; every write/admin-tier capability is invisible even to a facade index. All six facades stay on the registered surface (the facade layer is unrestricted), but `hana_diagnostics`' index is **empty** and `hana_modeling`'s keeps only the read-tier `hana_task_get` (async-task polling) — the entrance is there, only what you may use appears inside.
+- **Modeling developer**: `HANA_TOOL_GROUPS=read,write` — ceiling of read+write tiers; all six facades are on the registered surface (admin-tier capabilities such as `hana_repo_export` or the four stability diagnostics stay unreachable and never appear in an index).
+- **Disable specific capabilities**: `HANA_TOOL_DENY=hana_view_delete` — disables delete entirely (it disappears from the index and routing rejects it); the rest are unaffected.
 
-On startup, if filter variables are configured, the log prints the enabled groups and the list of disabled tools for confirmation. An unknown group name (e.g. `MCP_TOOL_GROUPS=read,bogus`) fails fast on startup (fail-closed).
+On startup, if filter variables are configured, the log prints the enabled groups and the list of disabled tools for confirmation. An unknown group name (e.g. `HANA_TOOL_GROUPS=read,bogus`) fails fast on startup (fail-closed).
 
 ## Environment profile & rules catalog
 
@@ -360,7 +361,7 @@ Every facade takes `{ capability?, args? }`: **with no arguments** → the categ
 > Only the **service** layer is fail-open (`assertWritePackageAllowed` passes when the allowlist is empty) — scripts/internal calls do not go through the tool-layer gate and are not stopped by `boundary_off`.
 > Same-name objects are rejected from overwrite; update/delete/activate carry If-Match optimistic locking (the known exceptions for create/import — no server-side guard across processes — are in "Transports → Concurrency & locking").
 >
-> **Local file boundary (export/import)**: `hana_repo_export`'s `saveTo` and `hana_repo_import`'s `filePath` go straight to the server's local filesystem, outside any HANA boundary. With no `MCP_LOCAL_ROOT` configured only **relative paths inside the server working directory** are allowed (absolute paths and `..` escapes are always rejected); once configured, paths must fall inside that root, and anything escaping it is always rejected. For stronger isolation (e.g. allowing only a dedicated export directory) configure the local root.
+> **Local file boundary (export/import)**: `hana_repo_export`'s `saveTo` and `hana_repo_import`'s `filePath` go straight to the server's local filesystem, outside any HANA boundary. Only **relative paths inside the server working directory** are allowed (absolute paths and `..` escapes are always rejected) — as of 2026-10-14 there is no configurable local root (`MCP_LOCAL_ROOT` has been removed): for stronger isolation (e.g. allowing only a dedicated export directory) start the server process with that directory as its working directory.
 > **The XS write channel is plaintext HTTP**: XS REST (the channel the write/activate/import/export paths actually use) defaults to `http://` — the HANA account password, session Cookie and CSRF token all travel in cleartext; `HANA_TLS`/`HANA_SSL_VALIDATE` only apply to the SQL channel and **do not cover** this one — it must be isolated at the network side (reachable only from trusted segments / the local machine). When the XS endpoint supports TLS, set `HANA_XS_TLS=true` and point `HANA_XS_PORT` at the HTTPS port.
 >
 > **Multi-object changeset (`changeset` mode of `hana_view_update`)**: the third mode alongside operations / xml; it closes changes to multiple objects **within a single call** — (1) **whole-batch preflight**: per-action planning + **object-level** read/write-set intersection detection (same-package multi-object batches are not falsely flagged) + destructive-change assessment; if anything is blocked or intersects ⇒ **the whole batch is rejected with zero writes** (the decision happens before any write); (2) **per-item execution** in (packageId, objectName) lexicographic order (ABBA-deadlock safe), each item completing **including activation**; (3) on any item failure ⇒ **reverse-order compensation** (update writes the original text back / create deletes the new object / delete writes the original text back); (4) **honest report**: with partial=true every item's status is enumerated (ok / failed / compensated / compensation_failed / conflict_external) and `notExecuted` explicitly lists the unfinished items — a partial completion is never packaged as success. Up to **10** actions; **each** destructive action (update/delete) declares its own `migration` on the action — without it the whole-batch preflight decides **before any write** ⇒ whole batch rejected, zero writes (no compensation). The batch provides **no cross-item snapshot isolation**: items commit one by one, each taking its own lock, so concurrent reads/writes outside the batch are visible to it (the receipt's `concurrencyNote` says the same). In `changeset` mode the top-level `packageId`/`objectName` are ignored (single-object channel only; batch targets come with each action).
@@ -423,7 +424,7 @@ You can also use `hana_data_preview_diagnose` to pre-check manually, focusing on
 | `npm run verify:sql-mode` | Build + SQL-mode view (`mode=sql` with `script`/`scriptColumns`) verification (scripts in local `test-verification/`, not in repo) |
 | `npm run verify:health` | Build + stability-diagnostics verification (**192 assertions**), including regression guards against using the `M_DISK_USAGE` `FILE_SIZE` account for capacity (whole-machine false alarms), against treating volume-file usage (pre-allocated and often full) as a disk alarm, against exposing `COMPRESSION_RATIO_IN_PERCENTAGE` and `HASH_COLLISION_COUNT` (both unusable on this revision), against using `SERVER_TIMESTAMP` as the trend time axis, and for the rule that every item yields either a reading or an `unknown` with its cause |
 | `npm run verify:catalog` | Build + relationship-graph / lineage verification. Read-only part: `where_used(depth)` closure ⊇ single hop with `asOf`/`truncated`; `search_objects(by=field)` accounting fields; a "no parallel tools" negative assertion; `depth=1` shape compatible with the old version and `objectSuffix` never reverting to `?`. Plus an **A/B section** (the same object queried through a baseline dist built from `cac5d60` and through this dist, field-by-field diff, both sides must report the same VERSION_ID) and a **write section** (create B → create A → add a join from A to B → the catalog lists it immediately → modify A (VERSION_ID advances) → delete A → the catalog no longer lists it; guarded by `runPreflight` and with cleanup; skip via `VERIFY_CATALOG_SKIP_WRITE=1`). Overridables: `VERIFY_CATALOG_PACKAGE/OBJECT`, `VERIFY_CATALOG_WRITE_PACKAGE` |
-| `npm run verify:authz` | Build + call-time gate verification (one unified gate for the read and write paths). Guards: an out-of-scope read (`schema` not in `HANA_SCHEMA_ALLOW`) is blocked **before the handler**, with a machine-readable code and this call's pre-plan in the receipt and **no remediation hints**; a read capability's `packageId` is not constrained by the write boundary (reading a view in a package ≠ writing that package); the write gate's existing behavior is unchanged; an unregistered tool yields a **protocol-level error** (distinguishable from the `isError` of a registered-but-blocked call); every call emits a `capability-audit` event (allows and blocks both logged, with `resources` / `codes`) |
+| `npm run verify:authz` | Build + call-time gate verification (one unified gate for the read and write paths). Guards: an out-of-scope read (`schema` not in `HANA_READ_SCHEMA`) is blocked **before the handler**, with a machine-readable code and this call's pre-plan in the receipt and **no remediation hints**; a read capability's `packageId` is not constrained by the write boundary (reading a view in a package ≠ writing that package); the write gate's existing behavior is unchanged; an unregistered tool yields a **protocol-level error** (distinguishable from the `isError` of a registered-but-blocked call); every call emits a `capability-audit` event (allows and blocks both logged, with `resources` / `codes`) |
 | `npm run verify:concurrency` | Build + live concurrency verification (**two processes** contending on the same object). Guards: an update that reports success is the final state (no silent revert); every 412 carries the machine-readable `raw.conflict.currentETag` (built deterministically with a stale `ifMatch`); a double-delete leaves one winner and one machine-readable `412`/`OBJECT_NOT_FOUND`; after activate/update interleaving, the ETag read from metadata equals the one returned by the last successful write. Script lives in local `test-verification/`, not in repo |
 | `npm run verify:dry-run` | Build + dry-run & destructive-assessment verification (zero-write dryRun + assessment table + migration gate). Guards: after a dry run (or a rejected call) **both the ACTIVE side and the inactive side (`_SYS_REPO.INACTIVE_OBJECT`)** keep identical version readings (checking ACTIVE alone misses "555: file written, activation failed"); a dry run that re-submits an unchanged object yields an empty structural diff (normalization works — one case per channel, xml and operations); a breaking change without a declared `migration` is rejected (`migration_required` code, `raw.errorDetail.breaking.items`, not a single write; the table's most insidious **data-source change** row is pinned separately: retargeting via the full-XML channel with downstream present is likewise rejected, with zero writes); a declared strategy is admitted and recorded (**recorded only — no automatic migration**); delete gate (with downstream references an undeclared delete is rejected; with none it succeeds as before). Script lives in local `test-verification/`, not in repo |
 | `npm run verify:changeset` | Build + changeset (multi-object transaction) verification (four deterministic scenarios — no random failures). Guards: ① three updates in one changeset call all succeed (each item `ok`, each carrying the write-receipt baseline with `etagSource='response-header'` — asserted per the **code** spelling — `partial=false`); ② a third action `create` on an existing object fails deterministically ⇒ the first two items are `compensated` with their content **byte-for-byte back to the original** (verified by reading back via get_view — not a tautology; a `compensation_failed` outcome is an implementation defect and the script prints the structured `currentETag/currentVersion` evidence); ③ dropping a column on an object with downstream, no declared `migration` ⇒ **whole batch rejected, zero writes** (VERSION_ID and the inactive-side fingerprint of both the target and the harmless same-batch action unchanged); ④ same batch "write A" + "read A as join source" ⇒ whole batch rejected with the conflicting **object name and both action indices** readable from the rejection payload, plus a counter-guard (two different objects in the same package must NOT be reported as conflicting — a package-level false rejection turns this red). Script lives in local `test-verification/`, not in repo |
@@ -488,7 +489,7 @@ The connecting user needs corresponding privileges on the following objects (che
 - Repository write/activate privileges: `REPO.EDIT_NATIVE_OBJECTS` / `REPO.ACTIVATE_NATIVE_OBJECTS`
   (or equivalent: package privilege on the target package root + MODELING role)
 - `REPO.MODIFY_CHANGE` / `REPO.MODIFY_OWN_CONTRIBUTION`: change-session (workspace) operations
-- XS session (`http://<host>:80<instance>/sap/hana/xs/formLogin`): the user must be able to log in to XS Classic
+- XS session (`http://<host>:<HANA_XS_PORT>/sap/hana/xs/formLogin`): the user must be able to log in to XS Classic
   (`PUBLIC` + the session capability contained in application privilege `sap.hana.xs.admin.roles::RuntimeConfOperator`; verify with `hana_check_privileges`)
 - Write-target package: `REPO.EDIT_NATIVE_OBJECTS` + owner of the package or package-level write privilege
 
@@ -518,12 +519,13 @@ Point to the local build artifact, stdio transport:
       "args": ["<absolute-repo-path>/dist/index.js"],
       "env": {
         "HANA_HOST": "hana-host.example",
-        "HANA_INSTANCE": "10",
+        "HANA_PORT": "31015",
         "HANA_USER": "YOUR_USERNAME",
         "HANA_PASSWORD": "YOUR_PASSWORD",
         "HANA_DB_NAME": "SYSTEMDB",
         "HANA_TLS": "false",
-        "HANA_WRITE_PACKAGES": "ZDEMO1"
+        "HANA_WRITE_PACKAGES": "ZDEMO1",
+        "HANA_XS_PORT": "8010"
       }
     }
   }
@@ -540,12 +542,13 @@ Point to the local build artifact, stdio transport:
       "args": ["github:mininia/saphana-modeler-mcp"],
       "env": {
         "HANA_HOST": "hana-host.example",
-        "HANA_INSTANCE": "10",
+        "HANA_PORT": "31015",
         "HANA_USER": "YOUR_USERNAME",
         "HANA_PASSWORD": "YOUR_PASSWORD",
         "HANA_DB_NAME": "SYSTEMDB",
         "HANA_TLS": "false",
-        "HANA_WRITE_PACKAGES": "ZDEMO1"
+        "HANA_WRITE_PACKAGES": "ZDEMO1",
+        "HANA_XS_PORT": "8010"
       }
     }
   }

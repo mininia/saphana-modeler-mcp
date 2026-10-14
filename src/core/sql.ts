@@ -3,7 +3,7 @@ import { HanaBusinessError } from './errors.js';
 /**
  * SQL 标识符与字面量防护：
  * - 所有拼进 SQL 的标识符必须经 quoteIdentifier / assertSafeObjectName 处理
- * - schema 名走白名单（系统 schema + 配置项 HANA_SCHEMA_ALLOW 追加）
+ * - schema 名走白名单（系统 schema + 配置项 HANA_READ_SCHEMA 追加）
  * - 值一律优先参数绑定；确需内联时用 quoteLiteral
  *
  * 错误出口：本模块的断言一律抛 HanaBusinessError（带 code），**不抛裸 Error**。
@@ -15,7 +15,7 @@ import { HanaBusinessError } from './errors.js';
 const SYSTEM_SCHEMAS = new Set(['_SYS_BIC', '_SYS_BI', '_SYS_REPO', 'SYS', '_SYS_XS', 'SAPABAP1']);
 
 /** 白名单不可枚举时的兜底文案（正常情况下由 describeSchemaWhitelist 生成） */
-const SCHEMA_HINT = '或通过 HANA_SCHEMA_ALLOW 配置追加';
+const SCHEMA_HINT = '或通过 HANA_READ_SCHEMA 配置追加';
 
 /**
  * 设计时对象名（包/视图）允许的字符集：字母/数字/_/$/#/./-，禁止引号与分号。
@@ -44,7 +44,7 @@ export const PACKAGE_ID_RE = /^(?!\.+$)[A-Za-z0-9_.\-]+$/;
 const TOOL_SCHEMA_ID_RE = /^[A-Za-z_][A-Za-z0-9_$#]{0,126}$/;
 const TOOL_TABLE_NAME_RE = /^[A-Za-z_/][A-Za-z0-9_$#/]{0,255}$/;
 
-/** 追加配置允许的 schema（来自 HANA_SCHEMA_ALLOW），大小写不敏感 */
+/** 追加配置允许的 schema（来自 HANA_READ_SCHEMA），大小写不敏感 */
 const extraSchemas = new Set<string>();
 export function configureExtraSchemas(schemas: string[]): void {
   extraSchemas.clear();

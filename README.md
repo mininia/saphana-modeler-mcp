@@ -75,18 +75,17 @@ MCP 接入：将 `mcp.json.example` 复制为 `mcp.json` 并填入真实连接�
 | 配置项 | 必填 | 说明 | 示例 |
 | --- | --- | --- | --- |
 | `HANA_HOST` | ✅ | HANA 主机名/IP | `hana-host.example` |
-| `HANA_INSTANCE` | 可选 | 实例号（00–99），默认 `00` | `10` |
-| `HANA_PORT` | 可选 | SQL 端口；留空按实例号自动推导 | `31015` |
+| `HANA_PORT` | ✅ | SQL 端口（**必填**，不再由实例号推导——`3<实例>13/15` 推不出非默认租户；只接受纯数字） | `31015` / `31041` |
 | `HANA_USER` | ✅ | 数据库用户名 | — |
 | `HANA_PASSWORD` | ✅ | 密码 | — |
-| `HANA_LOCALE` | 可选 | 连接语言，默认 `zh_CN` | `zh_CN` |
+| `HANA_LOCALE` | 可选 | 连接语言，默认 `zh` | `zh` |
 | `HANA_DB_NAME` | 可选 | 租户数据库名（MDC 必填） | `SYSTEMDB` / 业务租户名 |
 | `HANA_TLS` | 可选 | TLS 加密，默认 `true`（fail-closed；仅可信链路显式 `false`） | `true` |
 | `HANA_SSL_VALIDATE` | 可选 | TLS 下校验证书，默认 `true`；自签证书环境显式 `false` | `true` |
 | `HANA_TIMEZONE` | 可选 | 进程时区（设置 `TZ`，影响日志时间戳与本地时间语义）；**不下发 HANA 会话**。默认 `Asia/Shanghai` | `Asia/Shanghai` |
-| `HANA_SCHEMA_ALLOW` | 可选 | 追加允许查询的 schema（逗号分隔，追加到内置白名单） | `SAPABAP1,OTHER_SCHEMA` |
+| `HANA_READ_SCHEMA` | 可选 | 追加允许查询的 schema（逗号分隔，追加到内置白名单） | `SAPABAP1,OTHER_SCHEMA` |
 | `HANA_WRITE_PACKAGES` | 可选 | 允许写操作的仓库包前缀（逗号分隔，含子包）。**空 = 未启用写边界**：声明写包的请求会被运行期闸门以 `boundary_off` 硬拦（要写就必须显式配置）；填写后仅允许配置包及其下级子包写操作；分层语义与服务层例外见下方「写操作安全边界」 | `ZDEMO1,ZDEMO2.ZDEMO_SD` |
-| `HANA_XS_PORT` | 可选 | XS Classic 设计时 REST 端口（写路径）；省略按实例号推导 `80<instance>` | `8010` |
+| `HANA_XS_PORT` | 可选 | XS Classic 设计时 REST 端口（写路径/导入导出等 XS 通道能力**必需**）；不再按实例号推导 `80<instance>`，未配置时这些能力直接失败（只读部署可留空） | `8010` |
 | `HANA_XS_BASE_PATH` | 可选 | XS 设计时 REST 基础路径，默认 `/sap/hana/xs/dt/base` | — |
 | `HANA_POOL_MAX` | 可选 | HANA 连接池并发上限，默认 `4`（池满行为与部署建议见「传输方式 → 超时与资源治理」） | `8` |
 | `HANA_POOL_WAIT_MS` | 可选 | 池满后的排队等待超时（ms），默认 `30000` | `60000` |
@@ -95,9 +94,9 @@ MCP 接入：将 `mcp.json.example` 复制为 `mcp.json` 并填入真实连接�
 | `HANA_XS_TIMEOUT_MS` | 可选 | XS REST 请求默认超时（ms），默认 `30000`；覆盖范围（含登录/取 CSRF 的更短固定超时）见「传输方式 → 超时与资源治理」 | `60000` |
 | `HANA_XS_XFER_TIMEOUT_MS` | 可选 | XS Transfer（xfer）导入/导出超时（ms），默认 `300000`（相对默认 XS 超时单独放宽） | `600000` |
 | `HANA_ACTIVATION_CONCURRENCY` | 可选 | 服务端激活的并发上限（进程内信号量），默认 `2`。**本 SPS 写入即激活**，保护面是**所有会触发激活的写**；覆盖范围与已知边界见「传输方式 → 超时与资源治理」 | `4` |
-| `MCP_TOOL_GROUPS` | 可选 | 启用的工具功能分组（逗号分隔 `read`/`write`/`admin`）；**空=不限制（全部分组启用）** | `read` |
-| `MCP_TOOL_ALLOW` | 可选 | 强制启用的工具名 glob（即便其分组未启用也注册；逗号分隔，支持 `*` 通配） | `hana_view_validate` |
-| `MCP_TOOL_DENY` | 可选 | 强制禁用的工具名 glob（优先级最高，覆盖 allow 与分组；逗号分隔，支持 `*` 通配） | `hana_data_preview*` |
+| `HANA_TOOL_GROUPS` | 可选 | 启用的工具功能分组（逗号分隔 `read`/`write`/`admin`）；**空=不限制（全部分组启用）** | `read` |
+| `HANA_TOOL_ALLOW` | 可选 | 强制启用的工具名 glob（即便其分组未启用也注册；逗号分隔，支持 `*` 通配） | `hana_view_validate` |
+| `HANA_TOOL_DENY` | 可选 | 强制禁用的工具名 glob（优先级最高，覆盖 allow 与分组；逗号分隔，支持 `*` 通配） | `hana_data_preview*` |
 | `MCP_PROFILES` | 可选 | **调用方档案**（`name=kinds[:glob\|glob][;…]`，kinds 用 `+` 连接）。档案**只能收紧**部署策略；配了就必须定义 `default` | `analyst=read;dev=read+write:hana_view_*;default=read` |
 | `MCP_PROFILE` | 可选 | 本进程（stdio）与"无档案身份的调用方"使用的档案名，须在 `MCP_PROFILES` 中定义 | `default` |
 | `MCP_AGENT_LABEL` | 可选 | 进程级归因标签：写进 envelope 与每条 `capability-audit`；空 = 不产生该字段 | `prod-cn-01` |
@@ -182,38 +181,39 @@ MCP_HTTP_PORT=3000 MCP_HTTP_TOKENS='shared:your-long-random-token' node dist/ind
 > `hana_repo_changelist`，以及 `hana_repo_export`——它只往**本地**写 saveTo 文件），也有"接受任意 SQL 但归 write 档"的
 > `hana_sql_analyze`。客户端注解（`readOnlyHint`）描述的是**行为**，两者不互相推导。
 >
-> `hana_view_validate` 的 `design` 模式会短暂写入临时校验对象 `_CHKTMP`，故整工具归 `write`；不按 design/runtime 模式做混合划分，只读部署（`MCP_TOOL_GROUPS=read`）不暴露此工具。
+> `hana_view_validate` 的 `design` 模式会短暂写入临时校验对象 `_CHKTMP`，故整工具归 `write`；不按 design/runtime 模式做混合划分，只读部署（`HANA_TOOL_GROUPS=read`）不暴露此工具。
 >
 > 每个非 read 档能力都显式声明了 `effects.plan`（资源计划）：读能力不落写兜底（`packageId` 是"读哪个包"，不是写包），
 > 行为只读但归 write/admin 档的能力同样显式声明——否则会把 `packageId` 误判成写包。清单完整性由单测钉住（测试不入库）。
 >
-> **门面层不做限制。** 权限只有**一层 group（能力层）**：六个门面是**入口**，任何分组配置下都常驻 `tools/list`（只有显式 `MCP_TOOL_DENY` 命中门面 id、或 deny 掉它全部成员才会消失）。分组开关只决定**能力层**——索引 / 路由 / 提升 / 调用一律按**目标能力**的 kind 判。所以只读部署照样看得到 `hana_modeling` / `hana_diagnostics`，只是它们的索引里几乎没有可用能力——`hana_diagnostics` 索引为空，`hana_modeling` 只剩 read 档的 `hana_task_get`（异步任务轮询）。
+> **门面层不做限制。** 权限只有**一层 group（能力层）**：六个门面是**入口**，任何分组配置下都常驻 `tools/list`（只有显式 `HANA_TOOL_DENY` 命中门面 id、或 deny 掉它全部成员才会消失）。分组开关只决定**能力层**——索引 / 路由 / 提升 / 调用一律按**目标能力**的 kind 判。所以只读部署照样看得到 `hana_modeling` / `hana_diagnostics`，只是它们的索引里几乎没有可用能力——`hana_diagnostics` 索引为空，`hana_modeling` 只剩 read 档的 `hana_task_get`（异步任务轮询）。
 
-### 三个配置变量（优先级：`MCP_TOOL_DENY` > `MCP_TOOL_ALLOW` > `MCP_TOOL_GROUPS`）
+### 三个配置变量（优先级：`HANA_TOOL_DENY` > `HANA_TOOL_ALLOW` > `HANA_TOOL_GROUPS`）
 
-> **改名说明**：这三项管的是 **MCP 服务端的暴露策略**，与 HANA 连接无关，故前缀从 `HANA_` 改为 `MCP_`。
-> 旧名 `HANA_TOOL_GROUPS` / `HANA_TOOL_ALLOW` / `HANA_TOOL_DENY` **仍然生效**（启动时告警提示迁移）；
-> 新旧两名同时给出且取值不同会**启动失败**（避免"生效的是哪一个"含糊）。
-> 另外：任何未识别的 `HANA_*` / `MCP_*` / `LOG_*` 变量现在都会在启动日志里告警——
+> **命名说明**：这三项与 `HANA_WRITE_PACKAGES` / `HANA_READ_SCHEMA` 同类，都是「这个 HANA 面向客户端
+> 暴露/放行多少」的部署级范围声明，故统一用 `HANA_` 前缀（2026-10-14 复核回退：曾于 2026-10-08 改名
+> `MCP_TOOL_*`，现改回）。
+> **没有别名层**：`MCP_TOOL_*` 不再识别，仍写旧名会命中「未识别环境变量」告警（启动日志里可见）。
+> 另外：任何未识别的 `HANA_*` / `MCP_*` / `LOG_*` 变量都会在启动日志里告警——
 > 此前拼错的变量名会被静默忽略（例如把 `HANA_WRITE_PACKAGES` 写成单数，写边界就悄悄失效了）。
 
 | 变量 | 语义 | 例 |
 | --- | --- | --- |
-| `MCP_TOOL_GROUPS` | 启用的分组（逗号分隔）；空=不限制 | `read` 仅暴露数据读取，关闭全部写工具 |
-| `MCP_TOOL_ALLOW` | 强制启用的工具（即便其分组未启用也注册），支持**组名**与工具名 glob（`*`），用于分组开关外单独放行 | `hana_some_tool` / `write`（整组放行） |
-| `MCP_TOOL_DENY` | 强制禁用的工具（优先级最高），同样支持**组名**与 glob | `hana_data_preview*` 关闭所有预览工具；`write` 关闭整组写工具 |
+| `HANA_TOOL_GROUPS` | 启用的分组（逗号分隔）；空=不限制 | `read` 仅暴露数据读取，关闭全部写工具 |
+| `HANA_TOOL_ALLOW` | 强制启用的工具（即便其分组未启用也注册），支持**组名**与工具名 glob（`*`），用于分组开关外单独放行 | `hana_some_tool` / `write`（整组放行） |
+| `HANA_TOOL_DENY` | 强制禁用的工具（优先级最高），同样支持**组名**与 glob | `hana_data_preview*` 关闭所有预览工具；`write` 关闭整组写工具 |
 
 > **组名可直接用于 allow/deny**（`read` / `write` / `admin`），会展开为该组全部工具名——与 tableau-mcp 的
 > `INCLUDE_TOOLS`/`EXCLUDE_TOOLS` 组展开、dataworks-mcp 的 `TOOL_CATEGORIES` 同形。
-> 例：`MCP_TOOL_GROUPS=read,write` + `MCP_TOOL_DENY=write` ⇒ 等价于只读部署，且不必逐个写 `hana_view_*`。
+> 例：`HANA_TOOL_GROUPS=read,write` + `HANA_TOOL_DENY=write` ⇒ 等价于只读部署，且不必逐个写 `hana_view_*`。
 
 **典型部署形态：**
 
-- **只读分析师**：`MCP_TOOL_GROUPS=read` —— 可触达上限收窄到 14 个 read 档能力，全部 write/admin 档能力连门面索引里都看不到。注册面仍是六个门面（门面层不做限制），但门面索引里几乎没有可用能力——`hana_diagnostics` 索引为空，`hana_modeling` 只剩 `hana_task_get`（异步任务轮询是 read 档）。
-- **建模开发者**：`MCP_TOOL_GROUPS=read,write` —— 上限为 read+write 档，六个门面全在注册面上（admin 档的 `hana_repo_export`、诊断四件套等不可达，索引里也不出现）。
-- **关闭特定能力**：`MCP_TOOL_DENY=hana_view_delete` —— 仅禁用删除（索引里列不出来、按 id 路由也拒），其余不受影响。
+- **只读分析师**：`HANA_TOOL_GROUPS=read` —— 可触达上限收窄到 14 个 read 档能力，全部 write/admin 档能力连门面索引里都看不到。注册面仍是六个门面（门面层不做限制），但门面索引里几乎没有可用能力——`hana_diagnostics` 索引为空，`hana_modeling` 只剩 `hana_task_get`（异步任务轮询是 read 档）。
+- **建模开发者**：`HANA_TOOL_GROUPS=read,write` —— 上限为 read+write 档，六个门面全在注册面上（admin 档的 `hana_repo_export`、诊断四件套等不可达，索引里也不出现）。
+- **关闭特定能力**：`HANA_TOOL_DENY=hana_view_delete` —— 仅禁用删除（索引里列不出来、按 id 路由也拒），其余不受影响。
 
-启动时若配置了过滤变量，日志会打印启用分组与被关闭的工具清单，便于确认配置符合预期。未知分组名（如 `MCP_TOOL_GROUPS=read,bogus`）启动即失败（fail-closed）。
+启动时若配置了过滤变量，日志会打印启用分组与被关闭的工具清单，便于确认配置符合预期。未知分组名（如 `HANA_TOOL_GROUPS=read,bogus`）启动即失败（fail-closed）。
 
 ### 调用方档案（MCP_PROFILES）
 
@@ -226,8 +226,8 @@ MCP_PROFILE=default                                            # stdio 进程用
 MCP_HTTP_TOKENS="alice:<token>:dev,bob:<token>:analyst"        # 第三段 = 该身份的档案
 ```
 
-- **只能收紧、不能放宽**：档案永远不能把部署级 `MCP_TOOL_DENY` 掉的能力变回来，也不能扩大可写包/可读 schema 的范围。
-  越界组合（如 `MCP_TOOL_GROUPS=read` 的只读部署里写了 `dev=read+write`）**启动即拒绝**——不是漏洞，而是"以为的权限"与"实际权限"分叉。
+- **只能收紧、不能放宽**：档案永远不能把部署级 `HANA_TOOL_DENY` 掉的能力变回来，也不能扩大可写包/可读 schema 的范围。
+  越界组合（如 `HANA_TOOL_GROUPS=read` 的只读部署里写了 `dev=read+write`）**启动即拒绝**——不是漏洞，而是"以为的权限"与"实际权限"分叉。
 - **配了 `MCP_PROFILES` 就必须定义 `default`**：HTTP 里不带第三段的 Token 与 stdio 进程都落它，缺了会把"没指定档案"误读成"没有限制"。
 - 判定发生在**调用期**（`authorizeCall`），拦截回执与其它策略拦截同形（「被 MCP 安全策略拦截」+ 机读码，**不含**补救路径）。
 - 每次调用都会落地 `capability-audit`（含 `profileId` / `clientId` / `agentLabel` / `resources` / `codes`），放行记 info、拦截记 warn。
@@ -259,14 +259,14 @@ MCP_HTTP_TOKENS="alice:<token>:dev,bob:<token>:analyst"        # 第三段 = 该
 | 调具体能力（不提升） | `hana_modeling({ capability: 'hana_view_update', args: { … } })` |
 | 单发一个操作（别名） | `hana_modeling({ capability: 'hana_view_update#rename_field', args: { packageId, objectName, field: 'A', newName: 'B' } })` —— 与 `hana_view_update({ operations: [{ op: 'rename_field', … }] })` 完全等价（同一 handler、同一闸门）；别名**不进 tools/list**（注册名会与父工具撞名），只经门面路由 |
 | 提升整类 | 调 `hana_modeling`（带不带参数都算）→ 该类能力进 `tools/list`，此后可 `hana_view_update({ … })` 平铺直调 |
-| 拿掉一整类入口 | `MCP_TOOL_DENY=hana_modeling`，或 deny 掉它全部成员 |
-| 拿掉个别能力 | `MCP_TOOL_DENY=hana_view_delete` —— 索引里列不出来，路由与提升也够不着 |
-| 按分组收窄 | `MCP_TOOL_GROUPS=read` —— 只收窄**能力层**（六个入口常驻，索引按 kind 过滤），见「工具分组」 |
+| 拿掉一整类入口 | `HANA_TOOL_DENY=hana_modeling`，或 deny 掉它全部成员 |
+| 拿掉个别能力 | `HANA_TOOL_DENY=hana_view_delete` —— 索引里列不出来，路由与提升也够不着 |
+| 按分组收窄 | `HANA_TOOL_GROUPS=read` —— 只收窄**能力层**（六个入口常驻，索引按 kind 过滤），见「工具分组」 |
 | 提升预算 | `MCP_CAPABILITY_SURFACE_MAX`（默认 50，与 hana-cli 的 `MAX_DYNAMIC_TOOLS` 同值）：按**工具数**算，超出时**最旧的那个分类整体**淘汰（FIFO）。本仓只有 30 条具体能力，实际不会触发 |
 
 **门面的 kind 只是摘要，不是权限**：`hana_modeling` 与 `hana_diagnostics` 都是 admin（成员里最严的一档），但它们**是否出现**与 group 无关——**门面层不做限制**，六个入口常驻；权限只按**目标能力**判（越界成员在索引里不出现、路由与提升也够不着）。
 
-**安全语义（不因动态化而放松）**：① 门面、路由与提升**永远越不过** `MCP_TOOL_DENY` 与调用方档案（"动态面 ⊆ 静态策略"）——提升只把**可触达**的成员搬进面（不变量 A）；
+**安全语义（不因动态化而放松）**：① 门面、路由与提升**永远越不过** `HANA_TOOL_DENY` 与调用方档案（"动态面 ⊆ 静态策略"）——提升只把**可触达**的成员搬进面（不变量 A）；
 ② 路由与提升后的平铺直调走**同一条** `authorizeCall`，同一条结论、同一段文案；
 ③ 未知能力、无权能力、**跨类路由**、路由到另一个门面——四者**逐字同形**（错误文案不是存在性探针）；
 ④ 路由的 `args` 在服务端按目标能力的 schema 校验（客户端看到的 schema 只是便利）；
@@ -366,9 +366,9 @@ MCP_HTTP_TOKENS="alice:<token>:dev,bob:<token>:analyst"        # 第三段 = 该
 > 已知例外见「传输方式 → 并发与锁」）。
 >
 > **本地文件边界（导出/导入）**：`hana_repo_export` 的 `saveTo` 与 `hana_repo_import` 的 `filePath`
-> 直通服务器本地文件系统，不在任何 HANA 边界内。未配置 `MCP_LOCAL_ROOT` 时只允许**服务器工作目录内的
-> 相对路径**（绝对路径与含 `..` 的路径一律拒绝）；配置后路径须落在该根内，越根一律拒绝。需要更强隔离
-> （例如只允许专用导出目录）请配置本地根。
+> 直通服务器本地文件系统，不在任何 HANA 边界内。只允许**服务器工作目录内的相对路径**（绝对路径与含
+> `..` 的路径一律拒绝）——2026-10-14 起没有可配的本地根（`MCP_LOCAL_ROOT` 已删除）：需要更强隔离
+> （例如只允许专用导出目录）请让服务进程以该目录为工作目录启动。
 > **XS 写通道为明文 HTTP**：XS REST（写/激活/导入/导出实际使用的通道）默认是 `http://`，HANA 账号密码、
 > 会话 Cookie 与 CSRF token 全部明文传输；`HANA_TLS`/`HANA_SSL_VALIDATE` 只作用于 SQL 通道，**不覆盖**
 > 该通道——必须由网络侧隔离（仅可信网段/本机可达）。XS 端点支持 TLS 时置 `HANA_XS_TLS=true` 并把
@@ -412,8 +412,8 @@ MCP_HTTP_TOKENS="alice:<token>:dev,bob:<token>:analyst"        # 第三段 = 该
 >
 > | 维度 | 管什么 | 配置项 | 参考 |
 > |---|---|---|---|
-> | **能力级** | 哪些工具对外暴露 | `MCP_TOOL_GROUPS` / `ALLOW` / `DENY`（支持组名） | tableau 的 INCLUDE/EXCLUDE_TOOLS；dataworks 的 TOOL_CATEGORIES/NAMES |
-> | **资源级** | 能操作哪些资源 | `HANA_WRITE_PACKAGES`（可写包）/ `HANA_SCHEMA_ALLOW`（可读 schema） | tableau 的 BoundedContext；dataworks 交给平台 |
+> | **能力级** | 哪些工具对外暴露 | `HANA_TOOL_GROUPS` / `ALLOW` / `DENY`（支持组名） | tableau 的 INCLUDE/EXCLUDE_TOOLS；dataworks 的 TOOL_CATEGORIES/NAMES |
+> | **资源级** | 能操作哪些资源 | `HANA_WRITE_PACKAGES`（可写包）/ `HANA_READ_SCHEMA`（可读 schema） | tableau 的 BoundedContext；dataworks 交给平台 |
 > | （部署级） | 连接侧约束，非任务级 | `HANA_TLS` / `MCP_HTTP_*` | 两家均在 Config 构造期 fail-closed |
 >
 > 结构是**一个策略对象 + 一组判定器**：`resolvePolicy(source)` 从 env / mcp.json / 已加载 config 取出生效
@@ -450,7 +450,7 @@ MCP_HTTP_TOKENS="alice:<token>:dev,bob:<token>:analyst"        # 第三段 = 该
 > 让调用方看清"本来会发生什么"再决定怎么改。
 >
 > **读工具确实受调用期保护了，但边界要说清**：受约束的是「**按名指定 schema 去读**」这类调用
-> （`schema` 不在 `HANA_SCHEMA_ALLOW` 即被拦在 handler 之前）；**不约束**的是：
+> （`schema` 不在 `HANA_READ_SCHEMA` 即被拦在 handler 之前）；**不约束**的是：
 > ① 已激活视图**自身定义**的读取（`hana_metadata_get_view` 等读 `_SYS_REPO`，为显式决策）；
 > ② `hana_data_preview` 视图预览模式（运行时对象恒在 `_SYS_BIC`）；
 > ③ **仓库包维度**——权限配置里没有"可读包"这一项，`packageId` 既不受写包边界约束、也不受任何读包边界约束
@@ -513,7 +513,7 @@ MCP_HTTP_TOKENS="alice:<token>:dev,bob:<token>:analyst"        # 第三段 = 该
 | `npm run verify:sql-mode` | 构建 + SQL 模式视图（`mode=sql` 的 `script`/`scriptColumns`）实机验收 |
 | `npm run verify:health` | 构建 + 稳定性诊断四件套验收（**192 项断言**）。含多条回归护栏：防止误用 `M_DISK_USAGE` 的 `FILE_SIZE` 口径导致整机误报；防止卷文件用量（预分配写满属常态）被当成磁盘告警；防止 `COMPRESSION_RATIO_IN_PERCENTAGE` 与 `HASH_COLLISION_COUNT` 这两个**实测不可用**的列被透出；防止趋势时间轴误用 `SERVER_TIMESTAMP`（会把一小时压成一个点）；以及「每一项要么给读数、要么给一条带成因的 unknown」这条纪律 |
 | `npm run verify:catalog` | 构建 + 关系图/血缘验收。只读段：`where_used(depth)` 的闭包 ⊇ 单跳、带 `asOf`/`truncated` 且截断时规模受限；`search_objects(by=field)` 的候选口径字段与 `matchedFields`；「无平行工具」否定断言；`depth=1` 形状与旧版逐字段一致、`objectSuffix` 不回 `?`。另有 **A/B 对比段**（同对象在 `cac5d60` 构建的基线 dist 与本 dist 各跑一次 `where_used`，逐字段 diff，两侧 VERSION_ID 一致才继续）与**写型段**（create B → create A → A 加 join 指向 B → 目录现算可见 → 改 A（VERSION_ID 前进）→ 删 A → 目录不再列出 A；含 `runPreflight` 自守卫与收尾清理，`VERIFY_CATALOG_SKIP_WRITE=1` 可跳过）。目标对象用 `VERIFY_CATALOG_PACKAGE/OBJECT` 覆盖；写型包用 `VERIFY_CATALOG_WRITE_PACKAGE` |
-| `npm run verify:authz` | 构建 + 调用期闸门验收（阶段一：读路径与写路径的统一闸门）。护栏：读范围越界（`schema` 不在 `HANA_SCHEMA_ALLOW`）在 **handler 之前**被拦、回执含机读码与本次调用预规划且**不含补救路径**；读能力的 `packageId` 不受写包边界约束（读某包里的视图 ≠ 写那个包）；写闸门既有行为不变；未注册工具 = **协议层错误**（与"已注册被拦"的 `isError` 两态可分）；每次调用落地 `capability-audit` 审计事件（放行与拦截都记，含 `resources`/`codes`）|
+| `npm run verify:authz` | 构建 + 调用期闸门验收（阶段一：读路径与写路径的统一闸门）。护栏：读范围越界（`schema` 不在 `HANA_READ_SCHEMA`）在 **handler 之前**被拦、回执含机读码与本次调用预规划且**不含补救路径**；读能力的 `packageId` 不受写包边界约束（读某包里的视图 ≠ 写那个包）；写闸门既有行为不变；未注册工具 = **协议层错误**（与"已注册被拦"的 `isError` 两态可分）；每次调用落地 `capability-audit` 审计事件（放行与拦截都记，含 `resources`/`codes`）|
 | `npm run verify:concurrency` | 构建 + 并发语义实机验收（**双进程**并发操作同一对象）。护栏：update 报成功 ⇒ 终态 = 它写入的内容（不静默回退）；每个 412 都带机读载荷 `raw.conflict.currentETag`（陈旧 `ifMatch` 确定性构造）；双删一方成功、另一方得到可机读的 `412`/`OBJECT_NOT_FOUND`；activate/update 交错后 meta 读出的 ETag = 最近一次成功写回执给出的 ETag |
 | `npm run verify:dry-run` | 构建 + 预演与破坏性判定验收（dryRun 零写入 + 判定表 + migration 闸门）。护栏：预演/被拒调用后 **ACTIVE 与 `_SYS_REPO.INACTIVE_OBJECT`（inactive 侧）**的版本读数均不变（只查 ACTIVE 会漏判「555：文件已写、激活失败」）；未改动对象原样预演 ⇒ 结构 diff 为空（归一化生效，xml 与 operations 两条通道各一条）；未声明 migration 的破坏性变更被拒（机读码 `migration_required`、`raw.errorDetail.breaking.items` 破坏项明细、一次写都没发生；判定表最隐蔽的**改数据源**行单独钉：有下游时经 xml 全量通道改指同样被拒、零写入）；声明策略 ⇒ 放行且回执记录（**只记录、不做自动迁移**）；删除闸门（有下游引用未声明被拒；无下游照常成功） |
 | `npm run verify:changeset` | 构建 + 变更集（多对象事务）实机验收（四场景，确定性构造不依赖随机失败）。护栏：① 3 对象 update 一次 changeset 调用全成功（逐项 `ok`、每项带写回执基线 `etagSource='response-header'`（按代码实际拼写断言）、`partial=false`）；② 第 3 项 create 已存在对象确定性失败 ⇒ 前 2 项 `compensated` 且内容**逐字回到原文**（get_view 读回比对，不是永真式；出现 `compensation_failed` 即实现缺陷、打印结构化现场 `currentETag/currentVersion`）；③ 有下游对象删列未声明 migration ⇒ **整批拒绝零写入**（目标对象与同批无害动作的 VERSION_ID + inactive 侧指纹均未变）；④ 批内「写 A + 读 A 作 join 源」⇒ 整批拒绝且拒绝载荷可读出**冲突对象名与两个动作下标**、反例护栏（同包两个不同对象不被判成冲突，包级误拒在此变红） |
@@ -582,7 +582,7 @@ scripts/               通用冒烟脚本（smoke-stdio）；实机验收/探针
 - 仓库写/激活权限：`REPO.EDIT_NATIVE_OBJECTS` / `REPO.ACTIVATE_NATIVE_OBJECTS`
   （或等价：目标包 root 的 package 权限 + MODELING 角色）
 - `REPO.MODIFY_CHANGE` / `REPO.MODIFY_OWN_CONTRIBUTION`：变更会话（workspace）操作
-- XS 会话（`http://<host>:80<instance>/sap/hana/xs/formLogin`）：用户须可登录 XS Classic
+- XS 会话（`http://<host>:<HANA_XS_PORT>/sap/hana/xs/formLogin`）：用户须可登录 XS Classic
   （`PUBLIC` + 应用特权 `sap.hana.xs.admin.roles::RuntimeConfOperator` 所含会话能力；实测以 `hana_check_privileges` 排查）
 - 写目标包：`REPO.EDIT_NATIVE_OBJECTS` + 包的 owner 或 package 级写特权
 
@@ -623,12 +623,13 @@ scripts/               通用冒烟脚本（smoke-stdio）；实机验收/探针
       "args": ["<仓库绝对路径>/dist/index.js"],
       "env": {
         "HANA_HOST": "hana-host.example",
-        "HANA_INSTANCE": "10",
+        "HANA_PORT": "31015",
         "HANA_USER": "YOUR_USERNAME",
         "HANA_PASSWORD": "YOUR_PASSWORD",
         "HANA_DB_NAME": "SYSTEMDB",
         "HANA_TLS": "false",
-        "HANA_WRITE_PACKAGES": "ZDEMO1"
+        "HANA_WRITE_PACKAGES": "ZDEMO1",
+        "HANA_XS_PORT": "8010"
       }
     }
   }
@@ -645,12 +646,13 @@ scripts/               通用冒烟脚本（smoke-stdio）；实机验收/探针
       "args": ["github:mininia/saphana-modeler-mcp"],
       "env": {
         "HANA_HOST": "hana-host.example",
-        "HANA_INSTANCE": "10",
+        "HANA_PORT": "31015",
         "HANA_USER": "YOUR_USERNAME",
         "HANA_PASSWORD": "YOUR_PASSWORD",
         "HANA_DB_NAME": "SYSTEMDB",
         "HANA_TLS": "false",
-        "HANA_WRITE_PACKAGES": "ZDEMO1"
+        "HANA_WRITE_PACKAGES": "ZDEMO1",
+        "HANA_XS_PORT": "8010"
       }
     }
   }

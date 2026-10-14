@@ -34,7 +34,7 @@
  * 4. `dataSourceRefs` = 对**跨对象数据源引用**的访问方向，与 planViewUpdate 的既有实读声明同口径
  *    （单一事实源在那里；本字段只是把「这个 op 属于哪一类」提前写成静态声明）：
  *      · 'read'  = 变换要读外部对象/范围——add_join 读 join 源视图（跨包只读引用，planViewUpdate 并进
- *                  readPackages）；set_script 的脚本 schema 限定名进 readSchemas（HANA_SCHEMA_ALLOW 面）。
+ *                  readPackages）；set_script 的脚本 schema 限定名进 readSchemas（HANA_READ_SCHEMA 面）。
  *      · 'write' = 会写外部数据源——当前**无 op 如此**（所有 op 只写目标对象自身的 XML；该值留给将来的 op）。
  *      · 'none'  = 不涉及任何跨对象引用（其余 op 都只改目标对象自身的 XML）。
  *

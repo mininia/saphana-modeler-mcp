@@ -25,7 +25,7 @@ export interface WritePlan {
   steps: string[];
   /** 将写入 / 创建 / 删除的仓库包（判定依据：HANA_WRITE_PACKAGES） */
   writePackages: string[];
-  /** 将读取的 schema（判定依据：HANA_SCHEMA_ALLOW） */
+  /** 将读取的 schema（判定依据：HANA_READ_SCHEMA） */
   readSchemas: string[];
   /**
    * 跨包只读引用（如 join 源所在包）。当前权限配置没有"可读包"这一项，

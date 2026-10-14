@@ -4,7 +4,7 @@
  * ## 它解决什么
  *
  * 所有能力都过同一个调用期闸门（见 config/authorize.ts 的 authorizeCall），但闸门只知道
- * **部署级策略**（进程的 `MCP_TOOL_GROUPS/ALLOW/DENY` + `HANA_WRITE_PACKAGES` + `HANA_SCHEMA_ALLOW`）。
+ * **部署级策略**（进程的 `HANA_TOOL_GROUPS/ALLOW/DENY` + `HANA_WRITE_PACKAGES` + `HANA_READ_SCHEMA`）。
  * 多客户端共享一个进程时（HTTP），每个调用方需要**自己的**面：只读的数据分析师、
  * 能建模但只能碰自己包的开发者、完全只读的 CI 探针。
  *

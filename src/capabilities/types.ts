@@ -31,7 +31,7 @@ import type { ToolAnnotations } from '@modelcontextprotocol/server';
 import type { z } from 'zod';
 import type { WritePlan } from '../write-plan.js';
 
-/** 能力的可见性归属（= 原 TOOL_GROUPS 的分组语义；由 MCP_TOOL_GROUPS 过滤） */
+/** 能力的可见性归属（= 原 TOOL_GROUPS 的分组语义；由 HANA_TOOL_GROUPS 过滤） */
 export type ToolKind = 'read' | 'write' | 'admin';
 
 /**
@@ -125,7 +125,7 @@ export interface Capability<S extends z.ZodType = z.ZodType> {
   module: string;
   /** 分类（= 入口模块域；搜索/晋升按它分组） */
   category: CapabilityCategory;
-  /** 可见性归属（MCP_TOOL_GROUPS 过滤依据） */
+  /** 可见性归属（HANA_TOOL_GROUPS 过滤依据） */
   kind: ToolKind;
   effects: CapabilityEffects;
   /**

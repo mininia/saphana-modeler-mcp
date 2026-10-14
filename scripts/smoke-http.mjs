@@ -8,7 +8,7 @@
  * （档案改的是索引内容，不是注册面；路由的写调用仍落回部署边界 boundary_off）。
  *
  * 不调用任何触库工具（dummy 配置仅用于通过 config 校验；被拦/被拒都发生在 handler 之前）；
- * 调用方 shell 的面/边界策略环境变量（MCP_TOOL_GROUPS 等三个过滤项与旧名 HANA_TOOL_ 系列、
+ * 调用方 shell 的面/边界策略环境变量（HANA_TOOL_GROUPS 等三个过滤项与旧名 HANA_TOOL_ 系列、
  * MCP_CAPABILITY_SURFACE_MAX 提升预算、HANA_WRITE_PACKAGES、MCP_HTTP_ALLOWED_HOSTS/ORIGINS 等）
  * 在 spawn 前剥离（见 STRIPPED_ENV_KEYS）
  * ——继承的部署档位会造成假失败，最坏时让写调用越过边界被派发进 handler（破坏"不触库"承诺）；
@@ -55,7 +55,7 @@ const BETA_TOKEN = 'smoke-http-beta-token-0123456789';
 /**
  * 面/边界相关的策略环境变量：spawn 前从继承环境剥离，只保留本脚本自设值
  * （与 smoke-stdio 的 SURFACE_ENV_KEYS 同口径）。不剥离的后果（实测）：
- * ① 只读分组（MCP_TOOL_GROUPS=read 等）与脚本自设的 MCP_PROFILES(read+write) 冲突 →
+ * ① 只读分组（HANA_TOOL_GROUPS=read 等）与脚本自设的 MCP_PROFILES(read+write) 冲突 →
  *    启动自检 profile_kind_not_in_policy 拒绝启动 → 报「服务进程提前退出（code=1）」；
  *    继承的 MCP_PROFILE 指向脚本档案表外的名字同样触发启动失败；
  * ② HANA_WRITE_PACKAGES 非空 → boundary_off 断言假失败；若恰覆盖目标包，平铺写调用会
@@ -65,9 +65,9 @@ const BETA_TOKEN = 'smoke-http-beta-token-0123456789';
  */
 const STRIPPED_ENV_KEYS = [
   // 工具面过滤（HANA_TOOL_* 为已弃用的同义旧名，resolveEnvAliases 仍生效）
-  'MCP_TOOL_GROUPS',
-  'MCP_TOOL_ALLOW',
-  'MCP_TOOL_DENY',
+  'HANA_TOOL_GROUPS',
+  'HANA_TOOL_ALLOW',
+  'HANA_TOOL_DENY',
   'HANA_TOOL_GROUPS',
   'HANA_TOOL_ALLOW',
   'HANA_TOOL_DENY',
@@ -79,7 +79,7 @@ const STRIPPED_ENV_KEYS = [
   'MCP_PROFILE',
   // 资源边界（写包白名单 / 读 schema 白名单）
   'HANA_WRITE_PACKAGES',
-  'HANA_SCHEMA_ALLOW',
+  'HANA_READ_SCHEMA',
   // HTTP 守卫放行项（Host / Origin）
   'MCP_HTTP_ALLOWED_HOSTS',
   'MCP_HTTP_ALLOWED_ORIGINS',

@@ -3,10 +3,10 @@
  *
  * 分工：
  * - 工具层预检（src/capabilities/planners.ts 的规划器 + config/preflight.ts）负责**限定名**：
- *   扫描 `SCHEMA."表"` 后按 HANA_SCHEMA_ALLOW 判定，并把扫描盲区写进计划；
+ *   扫描 `SCHEMA."表"` 后按 HANA_READ_SCHEMA 判定，并把扫描盲区写进计划；
  * - 本模块负责**未限定表名**（`FROM MARA`）：它由 HANA 按当前用户的默认 schema 解析，
  *   扫描器无从得知，只能查 CURRENT_SCHEMA 再判。没有这一步时 `SELECT * FROM MARA`
- *   会完全绕过 HANA_SCHEMA_ALLOW。
+ *   会完全绕过 HANA_READ_SCHEMA。
  *
  * 为什么由调用方注入"怎么读当前 schema"：SQL 分析工具必须把这条查询放在**已持有的连接**上
  * （它的执行计划缓冲按连接隔离），不能走 pool.query 另取一条连接；存储过程那条路径则没这约束。

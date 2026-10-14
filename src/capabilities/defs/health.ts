@@ -157,7 +157,7 @@ export const healthCapabilities = {
   // 权限层级归 admin（监视视图读权限档；与 hana_sql_analyze 同域的暴露面收敛），
   // 但它们**行为只读**（不接受任意 SQL，也不写任何东西）——故各自显式声明叙述型规划器，
   // 不落写兜底（写兜底会把参数表面的 packageId 当写包，凭空造出资源结论）。
-  // 需要收敛时用 MCP_TOOL_DENY="hana_system_health,..."。
+  // 需要收敛时用 HANA_TOOL_DENY="hana_system_health,..."。
   hana_system_health: cap({
     id: 'hana_system_health',
     category: 'diagnostics',

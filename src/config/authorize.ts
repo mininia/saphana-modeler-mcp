@@ -15,9 +15,9 @@
  * 一次 `authorizeCall` = ①「这次调用会触碰什么」由清单的 `effects.plan` 规划出来（`planFor`）；
  * ② 交给**同一个** `runPreflight`（它组合 `checkCapability` + `checkResource` + `checkDeployment`），
  * 只额外附一行"本次调用的资源计划"进报告。因此两个入口（写预检 / 统一闸门）：
- * - 能力级（`MCP_TOOL_GROUPS/ALLOW/DENY`）：工具是否对客户端暴露；
+ * - 能力级（`HANA_TOOL_GROUPS/ALLOW/DENY`）：工具是否对客户端暴露；
  * - 资源级：`HANA_WRITE_PACKAGES`（写包，来自计划 `writePackages`）与
- *   `HANA_SCHEMA_ALLOW`（读 schema，来自计划 `readSchemas`）；
+ *   `HANA_READ_SCHEMA`（读 schema，来自计划 `readSchemas`）；
  * - 部署级：与具体请求无关的姿态项（明文连接等，只出警告）。
  *
  * **规则粒度由清单决定**：能力声明了 `effects.plan` 才有资源维度；读能力不声明就没有资源结论

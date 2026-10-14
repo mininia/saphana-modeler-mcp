@@ -578,7 +578,7 @@ function buildParameters(parameters: Record<string, string>): string {
  *
  * 统计口径：**只基于采样行**（默认 200 行）。不跑 COUNT(*)/COUNT(DISTINCT) 这类全表操作——
  * BW 大表上代价不可控，而"值形态"（补零、长度、号码列）看采样就够。
- * schema 走白名单（HANA_SCHEMA_ALLOW），列名/表名走运行时名校验，值一律参数绑定。
+ * schema 走白名单（HANA_READ_SCHEMA），列名/表名走运行时名校验，值一律参数绑定。
  */
 
 /** 值样例最多返回个数 */

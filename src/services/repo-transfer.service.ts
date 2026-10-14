@@ -28,34 +28,29 @@ import { definitionScriptsOf, isObjectNotFoundError } from './view-write.service
  * （HTTP 多客户端下持 Token 即可）都能覆盖写服务器上任意可写文件（如 ../../.env、C:\...\mcp.json）
  * 或读取任意文件字节发往 HANA。
  *
- * 两档口径：
- * - 配置了本地根（环境变量 MCP_LOCAL_ROOT）⇒ 以它为唯一范围：相对路径按根解析、绝对路径必须落在根内，
- *   解析后一律用 path.relative 复核不含 '..' 逃逸；
- * - 未配置（默认）⇒ 收紧为「**服务器工作目录内的相对路径**」：绝对路径一律拒绝、'..' 逃逸一律拒绝
- *   （即审查口径的最低要求：拒绝绝对路径与含 '..' 的路径）。注意默认档**不覆盖**「工作目录内的
- *   同名文件」（如 cwd 下的 .env/mcp.json）——需要更强的隔离（只允许专用导出目录）请配置本地根。
+ * 单一口径（2026-10-14 起）：根 = **服务器工作目录**（MCP 客户端拉起时即客户端默认工作区），
+ * 只接受落在其内的**相对路径**——绝对路径一律拒绝、'..' 逃逸一律拒绝，解析后用 path.relative 复核。
+ * 原先的「配置本地根」档（环境变量 MCP_LOCAL_ROOT）已删除：多一档可配范围就多一处「以为隔离了、
+ * 其实没配」的空间，而绝大多数部署要的就是工作区内相对路径。注意本档**不覆盖**「工作目录内的
+ * 同名文件」（如 cwd 下的 .env/mcp.json），该范围内的覆盖写由调用方自行避免。
  * 纯点段在 core 侧的 encodePath 也有同口径拦截（URL 拼接的纵深层）。
  * 错误信息只陈述拦截事实与可用替代（如改取 base64），**不写**开启方式（配置标识符）——
  * 本消息会随 envelope 返回给调用方，写明"改哪项配置可放行"等于教它绕过（同 assertWritePackageAllowed）。
  */
 function resolveLocalPath(inputPath: string, param: string): string {
-  const rawRoot = process.env.MCP_LOCAL_ROOT;
-  const configuredRoot = rawRoot && rawRoot.trim() !== '' ? resolve(rawRoot.trim()) : undefined;
-  if (configuredRoot === undefined && isAbsolute(inputPath)) {
+  const root = process.cwd();
+  if (isAbsolute(inputPath)) {
     throw new HanaBusinessError(
-      `${param} 未配置本地文件根时不接受绝对路径：请改传服务器工作目录内的相对路径（请求未执行）；` +
+      `${param} 不接受绝对路径：请改传服务器工作目录内的相对路径（请求未执行）；` +
         (param === 'saveTo' ? '省略 saveTo 可改为返回 base64 内容' : '或改用 content 内联提供内容'),
     );
   }
-  const root = configuredRoot ?? process.cwd();
   const abs = resolve(root, inputPath);
   const rel = relative(root, abs);
   // 逃逸判定按**路径段**：'..' 或 '..<分隔符>…' 才算逃逸（'..foo/x' 是合法目录名，不误拒）
   if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
     throw new HanaBusinessError(
-      `${param} 超出允许的本地范围：解析后的路径不在${
-        configuredRoot === undefined ? '服务器工作目录' : '服务端配置的本地根'
-      }之内（请求未执行）；请使用范围内的相对路径`,
+      `${param} 超出允许的本地范围：解析后的路径不在服务器工作目录之内（请求未执行）；请使用范围内的相对路径`,
     );
   }
   return abs;
@@ -95,9 +90,8 @@ export interface ExportPackageResult {
 /**
  * 导出包为 zip（GET /base/xfer/export，官方 Transfer API）。
  * 导出是读操作：不限制包（与读侧工具同一边界）；saveTo 落盘为本地备份文件。
- * saveTo 的本地路径边界：未配置本地根（MCP_LOCAL_ROOT）时只允许**服务器工作目录内的相对路径**
- * （绝对路径与 '..' 逃逸一律拒绝）；配置了本地根则限定在该根之内（见 resolveLocalPath 的两档口径）——
- * 不设边界时 saveTo 可覆盖写服务器上任意可写文件。
+ * saveTo 的本地路径边界：只允许**服务器工作目录内的相对路径**（绝对路径与 '..' 逃逸一律拒绝；
+ * 没有可配的本地根，口径见 resolveLocalPath）——否则 saveTo 可覆盖写服务器上任意可写文件。
  */
 export async function exportPackageViaRest(
   config: HanaConfig,
@@ -216,7 +210,7 @@ async function assertImportPayloadReadScopes(
   }
   for (const script of scripts) {
     for (const schema of scanSqlSchemaRefs(script)) {
-      // 限定名越界：与工具层规划器同一判定（HANA_SCHEMA_ALLOW），此处是脚本/绕过工具面调用的兜底
+      // 限定名越界：与工具层规划器同一判定（HANA_READ_SCHEMA），此处是脚本/绕过工具面调用的兜底
       assertSchemaAllowed(schema);
     }
   }
@@ -239,9 +233,9 @@ async function assertImportPayloadReadScopes(
  * 【默认拒绝覆盖】目标文件已存在时抛错并指引改用 hana_view_update（已有对象的修改走更新通道，
  * 禁止 delete+重建或静默覆盖）；确需覆盖导入（如备份恢复）须显式 overwrite=true。
  * 来源：content 内联内容（须配 fileName），或 filePath 本地文件（默认取 basename 做目标文件名）。
- * filePath 的本地路径边界：未配置本地根（MCP_LOCAL_ROOT）时只允许**服务器工作目录内的相对路径**
- * （绝对路径与 '..' 逃逸一律拒绝）；配置了本地根则限定在该根之内——不设边界时可直接读取服务器
- * 任意可读文件并把字节发往 HANA。读文件失败（不存在/不可读）归一为可修正的中文业务错误，不包装成「内部错误」。
+ * filePath 的本地路径边界：只允许**服务器工作目录内的相对路径**（绝对路径与 '..' 逃逸一律拒绝；
+ * 没有可配的本地根）——否则可直接读取服务器任意可读文件并把字节发往 HANA。读文件失败（不存在/不可读）
+ * 归一为可修正的中文业务错误，不包装成「内部错误」。
  * 内容预扫：写入前解析 SQL 模式视图的 <definition> 脚本，跑与 create/set_script 同一份
  * 读取范围判定（限定名 + 未限定名），命中即拒绝且零写入；无法解析的载荷（zip 等）在回执如实标注。
  * 并发（§4.1 import 行）：整段「存在性检查 → 导入 → 回读」在同一把 keyed lock 内；锁键用

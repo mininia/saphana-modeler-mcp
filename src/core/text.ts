@@ -7,7 +7,7 @@
 
 /**
  * 逗号分隔列表 → 去空白 → 去空串。
- * 用于环境变量（HANA_SCHEMA_ALLOW / MCP_HTTP_ALLOWED_HOSTS / HANA_TOOL_DENY 等）的统一解析。
+ * 用于环境变量（HANA_READ_SCHEMA / MCP_HTTP_ALLOWED_HOSTS / HANA_TOOL_DENY 等）的统一解析。
  */
 export function splitList(raw: unknown): string[] {
   if (raw == null) return [];

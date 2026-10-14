@@ -242,7 +242,7 @@ function leafSql(ds: ViewDataSource, need: string[] | undefined): string {
   const cols = need && need.length > 0 ? need.map((c) => quoteIdentifier(c)).join(', ') : '*';
   if (ds.type === 'DATA_BASE_TABLE' && ds.schemaName && ds.columnObjectName) {
     // 纵深防御：叶子表 schema 走白名单（SAPABAP1 等）。不在白名单时 assertSchemaAllowed 直接抛
-    // HanaBusinessError（文案由 core/sql 用 describeSchemaWhitelist 生成，含 HANA_SCHEMA_ALLOW 指引），
+    // HanaBusinessError（文案由 core/sql 用 describeSchemaWhitelist 生成，含 HANA_READ_SCHEMA 指引），
     // 此处不再包一层改写文案——改写只会让白名单变更时漏改这份副本。
     const schema = normalizeBwSchema(ds.schemaName);
     assertSchemaAllowed(schema);

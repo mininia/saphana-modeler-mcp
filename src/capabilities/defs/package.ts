@@ -81,11 +81,11 @@ export const packageCapabilities = {
     title: '导出包为 zip 备份（Transfer API）',
     description:
       '把仓库包导出为 zip 归档（XS REST Transfer API：GET /base/xfer/export），用于设计时对象备份与迁移。' +
-      "导出是读操作，不限制包。saveTo 提供时把 zip 写到该本地路径：未配置本地文件根（MCP_LOCAL_ROOT）时只接受服务器工作目录内的相对路径（绝对路径与含 '..' 的路径一律拒绝）；配置了本地文件根时，路径（含绝对路径）必须落在该根之内，越根一律拒绝，" +
+      "导出是读操作，不限制包。saveTo 提供时把 zip 写到该本地路径：只接受服务器工作目录内的相对路径（绝对路径与含 '..' 的路径一律拒绝；没有可配的本地根），" +
       '省略时返回 base64 内容（小包适用，大包建议 saveTo）。' +
       '**对 HANA 仓库只读**：唯一的写入是 saveTo 指定的本地文件（因此注解 readOnlyHint=false）；' +
-      '权限层级归 admin（暴露面收敛，与 Transfer API 其余两条同档）——只读部署（MCP_TOOL_GROUPS=read）' +
-      '不再直接看见它，需要导出时把它加进 MCP_TOOL_ALLOW（或启用 admin 组）。',
+      '权限层级归 admin（暴露面收敛，与 Transfer API 其余两条同档）——只读部署（HANA_TOOL_GROUPS=read）' +
+      '不再直接看见它，需要导出时把它加进 HANA_TOOL_ALLOW（或启用 admin 组）。',
     inputSchema: z.object({
       packageId: zReadPackageId('要导出的包名（完整路径），如 ZDEMO 或 ZDEMO.SUB'),
       saveTo: z
@@ -93,7 +93,7 @@ export const packageCapabilities = {
         .max(500)
         .optional()
         .describe(
-          'zip 落盘路径（本地文件；默认仅允许服务器工作目录内的相对路径，配置本地文件根后须落在根内）；省略=返回 base64',
+          'zip 落盘路径（本地文件；只接受服务器工作目录内的相对路径，绝对路径与 .. 一律拒绝）；省略=返回 base64',
         ),
     }),
     annotations: { readOnlyHint: false, idempotentHint: true, openWorldHint: false, destructiveHint: false },
@@ -120,7 +120,7 @@ export const packageCapabilities = {
         .max(1000)
         .optional()
         .describe(
-          '本地源文件路径（xml/zip）；与 content 二选一。默认仅允许服务器工作目录内的相对路径（绝对路径与 .. 拒绝）；配置本地文件根后须落在根内',
+          '本地源文件路径（xml/zip）；与 content 二选一。只接受服务器工作目录内的相对路径（绝对路径与 .. 一律拒绝）',
         ),
       content: z.string().optional().describe('内联文件内容（xml 文本）；须同时提供 fileName'),
       fileName: z

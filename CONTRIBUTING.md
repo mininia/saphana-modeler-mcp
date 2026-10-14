@@ -93,7 +93,7 @@ types ← core ← model ← services ← tools ← server ← index
 
 ## 涉及 HANA 写路径时
 
-写路径（`hana_view_*` / `hana_package_create` / `hana_repo_import` 等）已有实机验证与硬边界。改动前先跑 `hana-write-preflight` 预检（按 `HANA_WRITE_PACKAGES` / `MCP_TOOL_GROUPS` / `HANA_SCHEMA_ALLOW` 判定），不要绕过。
+写路径（`hana_view_*` / `hana_package_create` / `hana_repo_import` 等）已有实机验证与硬边界。改动前先跑 `hana-write-preflight` 预检（按 `HANA_WRITE_PACKAGES` / `HANA_TOOL_GROUPS` / `HANA_READ_SCHEMA` 判定），不要绕过。
 
 ## 新增一个能力时（三件"税"）
 

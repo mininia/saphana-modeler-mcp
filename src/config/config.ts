@@ -12,13 +12,13 @@ import {
   XS_XFER_TIMEOUT_MS_DEFAULT,
 } from '../core/limits.js';
 import { IDENTITY_NAME_HINT, IDENTITY_NAME_RE, splitList } from '../core/text.js';
-import { XS_BASE_PATH, deriveXsPort } from '../core/xs-rest.js';
+import { XS_BASE_PATH } from '../core/xs-rest.js';
 import { findInvalidWritePackages } from './write-boundary.js';
 import { IMPLICIT_DEFAULT_PROFILE_ID, parseProfiles, type CallerProfile } from './profiles.js';
 import { DEFAULT_HTTP_HOST, DEFAULT_SSL_VALIDATE, DEFAULT_TLS } from './deployment.js';
 
-/** 默认 Locale，与 HANA Studio 登录页默认值一致（仅本文件使用） */
-const DEFAULT_LOCALE = 'zh_CN';
+/** 默认 Locale（仅本文件使用）。2026-10-14 起由 zh_CN 改为 zh（不带国家码） */
+const DEFAULT_LOCALE = 'zh';
 
 /**
  * 布尔环境变量的真值集合（其余取值在 boolSchema 下 fail-fast 拒绝）。
@@ -104,12 +104,6 @@ const trimmedOrUnset = (v: unknown): unknown => {
 const intEnvSchema = (defaultValue: number, min: number, max: number) =>
   z.preprocess(emptyAsUnset, z.coerce.number().int().min(min).max(max).default(defaultValue));
 
-/** 实例号校验（00-99） */
-const instanceSchema = z
-  .string()
-  .regex(/^[0-9]{2}$/, '实例号必须是两位数字（00-99）')
-  .default('00');
-
 /** 提升预算默认值（zod default 与 parseSurfaceMax 的错误消息共用，防两处字面量漂移） */
 const SURFACE_MAX_DEFAULT = 50;
 
@@ -117,9 +111,11 @@ const envSchema = z.object({
   // 安全要求：连接信息（主机/端口/库名/用户名/密码）一律只允许来自环境变量 / mcp.json，
   // 禁止默认值或硬编码真实环境值
   HANA_HOST: z.string().min(1),
-  HANA_INSTANCE: instanceSchema,
   /**
-   * SQL 端口（可选）。若留空，按实例号自动推导：3<instance>13/15。
+   * SQL 端口（**必填**）。2026-10-14 起不再有实例号（HANA_INSTANCE 已删除）：
+   * 端口一律由部署方显式给出，服务端不按 `3<实例>13/15` 推导——那条规则只覆盖默认实例与
+   * 首个租户，非默认租户（如 `3<实例>4<序号>` 这类）推不出来，猜错的表现是连到另一套库或
+   * 直接连不上（本机 31041 即属此类），而报错发生在首次工具调用时。宁要一行配置，不要猜。
    * 只接受纯数字（空串/纯空白按未设置，见 emptyAsUnset）：'3.5'/'30115abc'/'30,015'
    * 这类笔误在 parseInt 下会被静默截断成 3 / 30115 / 30 并连到从未配置过的端口，失败要拖到
    * 首次工具调用才暴露、报错里的端口还与会话里写的对不上——故格式校验与 HANA_XS_PORT 同口径。
@@ -127,13 +123,12 @@ const envSchema = z.object({
   HANA_PORT: z.preprocess(
     trimmedOrUnset,
     z
-      .string()
-      .regex(/^[0-9]+$/, '无效的 SQL 端口：必须是纯数字（如 30015；不含小数点/千分位等其它字符）')
-      .optional(),
+      .string({ error: 'HANA_PORT 必填：请给出 SQL 端口（如 30015 / 31041）' })
+      .regex(/^[0-9]+$/, '无效的 SQL 端口：必须是纯数字（如 30015；不含小数点/千分位等其它字符）'),
   ),
   HANA_USER: z.string().min(1),
   HANA_PASSWORD: z.string().min(1),
-  /** 连接 Locale（默认 zh_CN），影响服务器端语言/错误消息 */
+  /** 连接 Locale（默认 zh），影响服务器端语言/错误消息 */
   HANA_LOCALE: z.string().min(1).default(DEFAULT_LOCALE),
   /** 租户数据库名（MDC 环境必填，如 SYSTEMDB / 业务租户名） */
   HANA_DB_NAME: z.string().min(1).optional(),
@@ -151,26 +146,28 @@ const envSchema = z.object({
   /**
    * 启用的工具功能分组（逗号分隔：read/write/admin）。
    * 空/未填 = 不限制（全部分组启用，向后兼容默认）。
-   * 例：MCP_TOOL_GROUPS="read" → 仅暴露数据读取，关闭全部写工具（含校验）。
+   * 例：HANA_TOOL_GROUPS="read" → 仅暴露数据读取，关闭全部写工具（含校验）。
    * 合法值校验在 src/tools/groups.ts 的 parseToolFilter 完成（启动即失败）。
    *
-   * 名称：MCP_ 前缀——它管的是 **MCP 服务端的暴露策略**，与 HANA 连接无关。
-   * 旧名 `HANA_TOOL_GROUPS` 仍生效（见 resolveEnvAliases），但已弃用。
+   * 名称：HANA_ 前缀——与 HANA_WRITE_PACKAGES / HANA_READ_SCHEMA 同类，都是「这个 HANA 面
+   * 向客户端暴露/放行多少」的部署级范围声明（2026-10-14 复核回退：曾于 2026-10-08 改名
+   * MCP_TOOL_*，现改回 HANA_ 前缀并与其余两个范围声明对齐）。**无别名层**：MCP_TOOL_* 不再识别，
+   * 仍写旧名会命中「未识别 HANA_/MCP_/LOG_ 环境变量」启动告警（见 warnUnknownEnvKeys）。
    */
-  MCP_TOOL_GROUPS: z
+  HANA_TOOL_GROUPS: z
     .string()
     .default('')
     .transform((s) => s.trim()),
   /**
    * 强制启用的工具名 glob（逗号分隔，支持 * 通配；即便其分组未启用也注册）。
-   * 用于在分组开关之外单独放行个别工具。例：MCP_TOOL_ALLOW="hana_some_tool"
+   * 用于在分组开关之外单独放行个别工具。例：HANA_TOOL_ALLOW="hana_some_tool"
    */
-  MCP_TOOL_ALLOW: z.string().default('').transform(splitList),
+  HANA_TOOL_ALLOW: z.string().default('').transform(splitList),
   /**
    * 强制禁用的工具名 glob（逗号分隔，支持 * 通配；优先级最高，覆盖 allow 与分组）。
-   * 例：MCP_TOOL_DENY="hana_data_preview_*" 关闭所有预览工具。
+   * 例：HANA_TOOL_DENY="hana_data_preview_*" 关闭所有预览工具。
    */
-  MCP_TOOL_DENY: z.string().default('').transform(splitList),
+  HANA_TOOL_DENY: z.string().default('').transform(splitList),
   /**
    * 调用方档案定义：`name=kinds[:glob|glob][;name2=…]`，kinds 用 + 连接。
    * 例：MCP_PROFILES="analyst=read;dev=read+write:hana_view_*|hana_metadata_*;default=read"
@@ -209,8 +206,10 @@ const envSchema = z.object({
       .default(String(SURFACE_MAX_DEFAULT))
       .transform((s) => s.trim()),
   ),
-  /** 额外允许的 SQL 查询 schema（逗号分隔，追加到 core/sql.ts 白名单；默认仅系统 schema） */
-  HANA_SCHEMA_ALLOW: z.string().default('').transform(splitList),
+  /** 额外允许的 SQL 查询 schema（逗号分隔，追加到 core/sql.ts 白名单；默认仅系统 schema）。
+   *  2026-10-14 由 HANA_SCHEMA_ALLOW 改名而来（原名只说明「allow」，看不出 allow 什么）；
+   *  **无别名层**：旧名不再识别，仍写旧名会命中未识别环境变量启动告警。 */
+  HANA_READ_SCHEMA: z.string().default('').transform(splitList),
   /**
    * 允许写操作的仓库包（逗号分隔的包前缀；含子包）。
    * 填写后仅允许指定包及其下级子包写操作。
@@ -239,10 +238,11 @@ const envSchema = z.object({
     }),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
   /**
-   * XS Classic 设计时 REST 端口（直连 HTTP）。
-   * 缺省按实例号推导 `80<instance>`（实机一致）；与 HANA_PORT 同口径：空串按未设置、
-   * 纯数字校验在装载时做，越界（如 '0'/'99999'）在 loadConfig 统一收口——不让坏值拖到首次
-   * XS REST 调用才以驱动层错误暴露。
+   * XS Classic 设计时 REST 端口（直连 HTTP）。**写/导出等走 XS 通道的能力必需**：
+   * 2026-10-14 起不再按实例号推导 `80<instance>`（HANA_INSTANCE 已删除），未配置时 XS 出口
+   * 会在构造客户端处直接报「未配置」并说明改法，不静默退回某个猜出来的端口。
+   * 与 HANA_PORT 同口径：空串按未设置、纯数字校验在装载时做，越界（如 '0'/'99999'）在
+   * loadConfig 统一收口——不让坏值拖到首次 XS REST 调用才以驱动层错误暴露。
    */
   HANA_XS_PORT: z.preprocess(
     trimmedOrUnset,
@@ -255,7 +255,7 @@ const envSchema = z.object({
   HANA_XS_BASE_PATH: z.string().min(1).default(XS_BASE_PATH),
   /* ── 并发与超时旋钮：池、SQL/XS 超时、激活并发 ──
    * 全部为 intEnvSchema（数字型、可留空、留空 = 默认值；非法值启动即失败）；
-   * 前缀 HANA_ 的理由：这些都是与 HANA 连接侧资源相关的运行参数（与 HANA_XS_PORT/HANA_SCHEMA_ALLOW 同类），
+   * 前缀 HANA_ 的理由：这些都是与 HANA 连接侧资源相关的运行参数（与 HANA_XS_PORT/HANA_READ_SCHEMA 同类），
    * 不属 MCP_ 工具面/传输面。默认值与运行时兜底值同源（core/limits.js）。 */
   /** 连接池上限 HANA_POOL_MAX：每代理进程的 HANA 连接数上限（N 个代理进程 = N×该值条连接） */
   HANA_POOL_MAX: intEnvSchema(POOL_MAX_DEFAULT, 1, 256),
@@ -405,9 +405,7 @@ export function parseHttpClients(raw: string, singleToken?: string): HttpClientI
 export interface HanaConfig {
   /** HANA 主机名/IP（真实值仅存在于本地 mcp.json/.env） */
   host: string;
-  /** 实例号（00-99） */
-  instance: string;
-  /** SQL 端口 */
+  /** SQL 端口（来自必填的 HANA_PORT；2026-10-14 起不再由实例号推导） */
   port: number;
   user: string;
   password: string;
@@ -421,7 +419,7 @@ export interface HanaConfig {
   sslValidate: boolean;
   /** 默认时区（IANA 名称） */
   timezone: string;
-  /** 额外允许的查询 schema（追加到 sql.ts 白名单） */
+  /** 额外允许的查询 schema（来自 HANA_READ_SCHEMA，追加到 sql.ts 白名单） */
   schemaAllow: string[];
   /**
    * 允许写操作的仓库包前缀（大写）。非空=仅允许这些包及其下级子包；**空数组=本判定层不限制**，
@@ -437,7 +435,7 @@ export interface HanaConfig {
   toolGroups: string;
   /** 强制启用的工具名 glob 列表（覆盖分组开关；来自 HANA_TOOL_ALLOW） */
   toolAllow: string[];
-  /** 强制禁用的工具名 glob 列表（最高优先级；来自 MCP_TOOL_DENY，旧名 HANA_TOOL_DENY 仍生效） */
+  /** 强制禁用的工具名 glob 列表（最高优先级；来自 HANA_TOOL_DENY） */
   toolDeny: string[];
   /**
    * 调用方档案表（来自 MCP_PROFILES；空表 = 只有隐式 default 档案，不额外收紧）。
@@ -474,8 +472,9 @@ export interface HanaConfig {
    */
   connectionSourceMixed: boolean;
   /**
-   * XS Classic 设计时 REST 直连端口。loadConfig 恒赋值（显式配置或按实例号推导 80<instance>）；
-   * 可选只为容纳手搭的残缺配置——运行时兜底用 core/xs-rest.js 的同一推导函数（防两处规则分叉）。
+   * XS Classic 设计时 REST 直连端口（来自 HANA_XS_PORT）。**不再有推导兜底**（2026-10-14 起
+   * 实例号已删除）：未配置即 undefined，由 XsRestClient 在构造处报「未配置 HANA_XS_PORT」，
+   * 可选类型保留给"不用 XS 通道的部署"与手搭的残缺配置。
    */
   xsPort?: number;
   /** XS 设计时 REST 基础路径（默认 /sap/hana/xs/dt/base） */
@@ -497,18 +496,6 @@ export interface HanaConfig {
 }
 
 /**
- * 根据实例号和是否有租户库推导 SQL 端口：
- * - 单容器 / SYSTEMDB: 3<instance>13
- * - 租户数据库 (MDC): 3<instance>15
- */
-function derivePort(instance: string, dbName?: string): number {
-  const prefix = `3${instance}`;
-  // 如果有租户库名且不是 SYSTEMDB，使用 15 端口；否则 13 端口
-  const suffix = dbName && dbName.toUpperCase() !== 'SYSTEMDB' ? '15' : '13';
-  return parseInt(prefix + suffix, 10);
-}
-
-/**
  * 连接目标与凭据：这组变量决定「连到哪个库、以谁的身份」，跨来源混用会导致静默误连
  * （例：shell 里残留的 HANA_USER 覆盖 .env 里的用户名，其余变量仍来自 .env）。
  * 仅这组参与「来源一致性」判定——日志级别/工具分组/HTTP 端口等调优项混用无此风险。
@@ -518,7 +505,6 @@ function derivePort(instance: string, dbName?: string): number {
  */
 const CONNECTION_KEYS = [
   'HANA_HOST',
-  'HANA_INSTANCE',
   'HANA_PORT',
   'HANA_XS_PORT',
   'HANA_DB_NAME',
@@ -593,57 +579,19 @@ export function tryLoadDotEnv(env: NodeJS.ProcessEnv = process.env): DotEnvLoadR
   return { loadedFiles, sources };
 }
 
-/** 已改名的环境变量：旧名 → 新名。旧名仍生效（启动告警），但两者同时给出且取值不同 = 启动失败 */
-const RENAMED_ENV_KEYS: ReadonlyArray<readonly [oldName: string, newName: string]> = [
-  ['HANA_TOOL_GROUPS', 'MCP_TOOL_GROUPS'],
-  ['HANA_TOOL_ALLOW', 'MCP_TOOL_ALLOW'],
-  ['HANA_TOOL_DENY', 'MCP_TOOL_DENY'],
-];
-
-/**
- * 环境变量**旧名归一**：把已弃用的旧名映射到新名，返回新对象（不改调用方的对象）。
- *
- * 三条规则：
- * 1. 只有旧名 → 用旧名的值 + **告警**（仍生效，给迁移留时间）；
- * 2. 只有新名 → 原样（不告警）；
- * 3. 两名并存且**取值不同** → 启动失败。取舍理由：静默偏向任一边都会造成
- *    「运维以为生效的是 A，实际生效的是 B」——这正是本仓库最要防的一类问题。
- *    取值相同则只提示可删除旧名。
- *
- * 为什么必须在 zod parse **之前**做：envSchema 是普通 z.object（未知键被剥离），
- * 旧名若留在 schema 里会变成"两个真值源"；归一后 schema 只认新名，判定路径单一。
- * 服务进程（loadConfig）与脚本/CLI 路径（preflight 的 policyFromEnvValues）共用本函数。
- */
-export function resolveEnvAliases(env: Record<string, unknown>): Record<string, unknown> {
-  const out: Record<string, unknown> = { ...env };
-  for (const [oldName, newName] of RENAMED_ENV_KEYS) {
-    const oldVal = nonEmptyEnvValue(env[oldName]);
-    if (oldVal === undefined) continue;
-    const newVal = nonEmptyEnvValue(env[newName]);
-    if (newVal === undefined) {
-      out[newName] = oldVal;
-      logger.warn(`${oldName} 已弃用（仍生效）：请改用 ${newName}（两者语义等价；同时给出且取值不同会启动失败）`);
-    } else if (newVal !== oldVal) {
-      throw new Error(
-        `${oldName} 与 ${newName} 同时给出且取值不同：请只保留 ${newName}（旧名已弃用，保留两个来源会让"生效值"不明确）`,
-      );
-    } else {
-      logger.warn(`${oldName} 是 ${newName} 的弃用旧名且取值相同：可安全删除旧名`);
-    }
-  }
-  return out;
-}
-
 /**
  * 不经 envSchema、由运行期直读 process.env 的受支持变量：它们同样"生效"，必须进 known 集合，
  * 否则启动告警会把它们误报成「不生效（拼写错误？已改名？已移除？）」——运维按服务自己的处置建议
  * 设置了变量，反而被劝退（如撤回 HANA_XS_TLS 会静默退回 XS 明文通道）。
  * - HANA_XS_TLS：XS 写通道 scheme（core/xs-rest.ts 的 xsSchemeFromEnv 直读；core 层不依赖 config
- *   运行时模块，走不了 zod。deployment.ts 的 xs_plaintext 处置建议与 preflight 判定都指向它）；
- * - MCP_LOCAL_ROOT：本地文件读写边界根（services/repository.service.ts 的 resolveLocalPath 直读）。
+ *   运行时模块，走不了 zod。deployment.ts 的 xs_plaintext 处置建议与 preflight 判定都指向它）。
  * 新增这类运行期直读变量时同步登记于此（与运行期直读点必须同名）。
+ *
+ * MCP_LOCAL_ROOT 已于 2026-10-14 删除（本地文件根的旋钮取消：导入/导出一律以客户端工作目录
+ * 为根、只接受其内的相对路径，见 services/repo-transfer.service.ts）。它不再进 known 集合，
+ * 存量配置里残留该键会命中未识别告警。
  */
-const RUNTIME_DIRECT_ENV_KEYS = ['HANA_XS_TLS', 'MCP_LOCAL_ROOT'] as const;
+const RUNTIME_DIRECT_ENV_KEYS = ['HANA_XS_TLS'] as const;
 
 /**
  * 未识别的 HANA_/MCP_/LOG_ 环境变量告警（拼错、已改名、已被删除的名字）。
@@ -652,15 +600,13 @@ const RUNTIME_DIRECT_ENV_KEYS = ['HANA_XS_TLS', 'MCP_LOCAL_ROOT'] as const;
  * 「该项配置没生效」，而运维看到的值与生效值不一致——本仓库已经踩过一次
  * （`.dsh/mcp.json` 里写成 `HANA_WRITE_PACKAGE`（少一个 S），写边界因此静默失效）。
  * 只对这三个前缀告警，避免把 PATH/无关变量卷进来。
- * known 集合 = envSchema 键 + 弃用旧名 + 运行期直读键（见 RUNTIME_DIRECT_ENV_KEYS）：
+ * known 集合 = envSchema 键 + 运行期直读键（见 RUNTIME_DIRECT_ENV_KEYS）：
  * **生效的**变量一个都不许进这条告警，否则就是反方向的「生效值 ≠ 运维以为的值」。
+ * 2026-10-14 起本仓**没有别名层**（HANA_TOOL_* 回退正名、HANA_SCHEMA_ALLOW → HANA_READ_SCHEMA、
+ * HANA_INSTANCE / MCP_LOCAL_ROOT 删除都是硬切换），所以这条告警也是旧名/已删名唯一的提示处。
  */
 function warnUnknownEnvKeys(env: Record<string, unknown>): void {
-  const known = new Set<string>([
-    ...Object.keys(envSchema.shape),
-    ...RENAMED_ENV_KEYS.map(([o]) => o),
-    ...RUNTIME_DIRECT_ENV_KEYS,
-  ]);
+  const known = new Set<string>([...Object.keys(envSchema.shape), ...RUNTIME_DIRECT_ENV_KEYS]);
   const suspicious = Object.keys(env).filter((k) => /^(HANA_|MCP_|LOG_)/.test(k) && !known.has(k));
   if (suspicious.length > 0) {
     logger.warn(
@@ -748,32 +694,38 @@ function parseSurfaceMax(raw: string): number {
 }
 
 /**
- * 加载并校验配置。HANA_HOST/HANA_INSTANCE/HANA_USER/HANA_PASSWORD 必填（无默认值），
+ * 加载并校验配置。HANA_HOST/HANA_PORT/HANA_USER/HANA_PASSWORD 必填（无默认值），
  * 缺失或非法抛 zod 校验错误（服务启动即失败，不给半配置运行的机会）。
  */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): HanaConfig {
   const dotenv = tryLoadDotEnv(env);
-  // 旧名 → 新名（MCP_ 前缀）：在 parse 之前归一，让 schema 只认新名（别名仍生效并告警）
-  const resolvedEnv = resolveEnvAliases(env);
-  warnUnknownEnvKeys(resolvedEnv);
-  const parsed = envSchema.parse(resolvedEnv);
+  // 无别名层（2026-10-14）：envSchema 是唯一真值源，旧名/已删名一律不认，
+  // 由 warnUnknownEnvKeys 以「未识别环境变量」告警兜住（不再做旧名归一）
+  warnUnknownEnvKeys(env);
+  const parsed = envSchema.parse(env);
   const profiles = parseProfiles(parsed.MCP_PROFILES);
   assertProfileConfig(profiles, parsed.MCP_PROFILE, parsed.MCP_HTTP_TOKENS, parsed.MCP_HTTP_TOKEN);
 
-  // 解析端口：显式配置优先，否则按实例号推导
-  const derivedPort = derivePort(parsed.HANA_INSTANCE, parsed.HANA_DB_NAME);
-  const explicitPort = parsed.HANA_PORT?.trim();
-  const port = explicitPort ? parseInt(explicitPort, 10) : derivedPort;
-
-  if (isNaN(port) || port < 1 || port > 65535) {
-    throw new Error(`无效的 SQL 端口: ${explicitPort || derivedPort}`);
+  // SQL 端口：schema 已保证非空且为纯数字，这里只做范围收口
+  const port = parseInt(parsed.HANA_PORT, 10);
+  if (port < 1 || port > 65535) {
+    throw new Error(`无效的 SQL 端口: ${parsed.HANA_PORT}`);
   }
 
-  // XS 端口同口径收口：'0'/'99999' 这类越界值若放行，要到首次 XS REST 调用才以驱动层错误暴露
+  // XS 端口：可留空（不用 XS 通道的部署无需配）。'0'/'99999' 这类越界值若放行，要到首次
+  // XS REST 调用才以驱动层错误暴露，故在装载时收口；未配置时不再推导（HANA_INSTANCE 已删除），
+  // 由 XsRestClient 在构造处报「未启用 XS 通道」
   const explicitXsPort = parsed.HANA_XS_PORT;
-  const xsPort = explicitXsPort ? parseInt(explicitXsPort, 10) : deriveXsPort(parsed.HANA_INSTANCE);
-  if (xsPort < 1 || xsPort > 65535) {
-    throw new Error(`无效的 XS 端口: ${explicitXsPort || xsPort}`);
+  const xsPort = explicitXsPort ? parseInt(explicitXsPort, 10) : undefined;
+  if (xsPort !== undefined && (xsPort < 1 || xsPort > 65535)) {
+    throw new Error(`无效的 XS 端口: ${explicitXsPort}`);
+  }
+  if (xsPort === undefined) {
+    // 启动即告知（而不是等首次写/导出才暴露）：与「不让坏值拖到首次调用」同一口径。
+    // 措辞含"只读部署可忽略"，避免把不需要 XS 的部署吓一跳
+    logger.warn(
+      'HANA_XS_PORT 未配置：写入/激活/导入导出等走 XS 通道的能力将不可用（本版本不再按实例号推导端口；只读部署可忽略本条）',
+    );
   }
 
   // 将解析后的时区应用到整个进程（影响 new Date() 等本地时间语义）
@@ -800,7 +752,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HanaConfig {
 
   return {
     host: parsed.HANA_HOST,
-    instance: parsed.HANA_INSTANCE,
     port,
     user: parsed.HANA_USER,
     password: parsed.HANA_PASSWORD,
@@ -809,11 +760,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HanaConfig {
     tls: parsed.HANA_TLS,
     sslValidate: parsed.HANA_SSL_VALIDATE,
     timezone: parsed.HANA_TIMEZONE,
-    schemaAllow: parsed.HANA_SCHEMA_ALLOW,
+    schemaAllow: parsed.HANA_READ_SCHEMA,
     writePackages: parsed.HANA_WRITE_PACKAGES,
-    toolGroups: parsed.MCP_TOOL_GROUPS,
-    toolAllow: parsed.MCP_TOOL_ALLOW,
-    toolDeny: parsed.MCP_TOOL_DENY,
+    toolGroups: parsed.HANA_TOOL_GROUPS,
+    toolAllow: parsed.HANA_TOOL_ALLOW,
+    toolDeny: parsed.HANA_TOOL_DENY,
     profiles,
     profileId: parsed.MCP_PROFILE,
     agentLabel: parsed.MCP_AGENT_LABEL,

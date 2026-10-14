@@ -235,7 +235,7 @@ async function probeIfActivated(
  * SQL 模式的读取范围校验（读边界的最后一道）。
  * 脚本里**限定 schema** 的引用由工具层写计划扫描判定；**未限定**表名（`FROM MARA`）按当前用户的
  * 默认 schema 解析——扫描器无从得知，故这里查出 CURRENT_SCHEMA 再判它是否在允许范围内。
- * 没有这一步时 `SELECT * FROM MARA` 这类写法会完全绕过 HANA_SCHEMA_ALLOW。
+ * 没有这一步时 `SELECT * FROM MARA` 这类写法会完全绕过 HANA_READ_SCHEMA。
  *
  * 判定规则已提取到 read-scope.service（SQL 分析工具要在**已持有连接**上做同一件事），此处只注入读法。
  */
@@ -759,7 +759,7 @@ export async function updateCalculationView(
         // SQL 读取范围兜底（与 set_script / create(mode=sql) / import 同一实现，不给全量覆盖留旁路）：
         // 工具层扫描器只认**限定名**；<definition> 里的**未限定表名**按当前用户的默认 schema 解析，
         // 只有服务层查得到 CURRENT_SCHEMA——不补这一道，`SELECT * FROM MARA` 可经本通道把默认 schema
-        // 的取数写进仓库（写入即激活），HANA_SCHEMA_ALLOW 对未限定表名的兜底在此半边落空。
+        // 的取数写进仓库（写入即激活），HANA_READ_SCHEMA 对未限定表名的兜底在此半边落空。
         // 首次解析（guardFullXmlUpdate 内）已通过，这里对同一输入二次解析必然成功（同一解析器、确定性）。
         for (const script of definitionScriptsOf(parseViewDefinition(input.xml!))) {
           await assertScriptReadScopes(pool, script);
