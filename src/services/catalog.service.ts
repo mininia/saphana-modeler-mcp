@@ -1,12 +1,16 @@
 import type { HanaPool } from '../core/hana-client.js';
 import { nowIso } from '../core/datetime.js';
+import { quoteIdentifier } from '../core/sql.js';
 import { suffixInClause, suffixesOf } from '../model/view-suffixes.js';
+import { CROSSREF_TABLE, type VersionScope } from '../model/view-scope.js';
 
 /**
  * 关系图（catalog）：对象级多跳遍历与影响半径（P4 交付，只读零风险）。
  *
  * 设计口径（SSD §3.2/§3.3，2026-10-08 侦察定）：
  * - 对象图**直查** `_SYS_REPO.ACTIVE_OBJECTCROSSREF`（不做启动期全量索引、不做持久化）；
+ *   version=inactive 时改查 `_SYS_REPO.INACTIVE_OBJECTCROSSREF`（未激活/挂起版本的血缘），
+ *   默认 active（既有行为不变）；
  * - 遍历按层 BFS：每层一次批量 SQL（frontier 分块，避免参数上限），visited-set 用
  *   `(packageId, objectName, objectSuffix)` 三元组去重（CV 理论无环，防御性保留）；
  * - **只沿设计时视图类型继续展开**（calculationview/attributeview/analyticview，与
@@ -50,6 +54,8 @@ export interface ClosureOptions {
   depth?: number | 'all';
   /** 闭包成员上限，默认 500；触达即截断并置 truncated */
   maxNodes?: number;
+  /** 版本视角：active（默认）= ACTIVE_OBJECTCROSSREF；inactive = INACTIVE_OBJECTCROSSREF */
+  version?: VersionScope;
 }
 
 export const DEFAULT_MAX_NODES = 500;
@@ -89,11 +95,14 @@ export async function expandLevel(
   pool: HanaPool,
   frontier: readonly GraphNode[],
   direction: 'upstream' | 'downstream',
+  opts: { version?: VersionScope } = {},
 ): Promise<Array<Omit<GraphEdge, 'via' | 'level'>>> {
   if (frontier.length === 0) return [];
   // 后缀集合与 IN 占位符走单点实现（model/view-suffixes；kind 口径与 whereUsed 逐字一致）
   const suffixes = suffixesOf();
   const suffixIn = suffixInClause(suffixes);
+  // 表名来自 model/view-scope 的字面量映射（非用户输入）
+  const crossRefTable = quoteIdentifier(CROSSREF_TABLE[opts.version ?? 'active']);
   const out: Array<Omit<GraphEdge, 'via' | 'level'>> = [];
 
   for (const part of chunk(frontier, FRONTIER_CHUNK)) {
@@ -104,10 +113,10 @@ export async function expandLevel(
     const sql =
       direction === 'upstream'
         ? `SELECT TO_PACKAGE_ID AS PACKAGE_ID, TO_OBJECT_NAME AS OBJECT_NAME, TO_OBJECT_SUFFIX AS OBJECT_SUFFIX, REF_TYPE
-             FROM "_SYS_REPO"."ACTIVE_OBJECTCROSSREF"
+             FROM "_SYS_REPO".${crossRefTable}
              WHERE (${wherePairs}) AND FROM_OBJECT_SUFFIX IN ${suffixIn}`
         : `SELECT FROM_PACKAGE_ID AS PACKAGE_ID, FROM_OBJECT_NAME AS OBJECT_NAME, FROM_OBJECT_SUFFIX AS OBJECT_SUFFIX, REF_TYPE
-             FROM "_SYS_REPO"."ACTIVE_OBJECTCROSSREF"
+             FROM "_SYS_REPO".${crossRefTable}
              WHERE (${wherePairsTo}) AND TO_OBJECT_SUFFIX IN ${suffixIn}`;
 
     // 写路径 SQL 超时（§4.3）：P6 起本查询进了写路径（update 判定在锁内、delete 判定在锁外，每次写前各查一次），
@@ -139,6 +148,7 @@ export async function closure(pool: HanaPool, seed: GraphNode, opts: ClosureOpti
   const direction = opts.direction ?? 'both';
   const depth = opts.depth ?? 1;
   const maxNodes = opts.maxNodes ?? DEFAULT_MAX_NODES;
+  const version = opts.version ?? 'active';
   const dirs: Array<'upstream' | 'downstream'> = direction === 'both' ? ['upstream', 'downstream'] : [direction];
 
   const frontiers: Record<'upstream' | 'downstream', GraphNode[]> = {
@@ -159,7 +169,7 @@ export async function closure(pool: HanaPool, seed: GraphNode, opts: ClosureOpti
       const frontier = frontiers[dir];
       if (frontier.length === 0) continue;
       const seen = visited[dir];
-      const edges = await expandLevel(pool, frontier, dir);
+      const edges = await expandLevel(pool, frontier, dir, { version });
       const next: GraphNode[] = [];
       for (const e of edges) {
         const k = keyOf(e);

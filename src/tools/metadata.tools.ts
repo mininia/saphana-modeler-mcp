@@ -29,14 +29,14 @@ import type { Envelope } from '../types/hana.js';
 export function registerMetadataTools(server: McpServer, ctx: ToolContext): void {
   const regCap = capabilityRegistrar(server, ctx);
 
-  regCap(CAP.hana_metadata_get_view, async ({ packageId, objectName, kind, format }) => {
+  regCap(CAP.hana_metadata_get_view, async ({ packageId, objectName, kind, format, version }) => {
     const envelope: Envelope = await withErrorEnvelope(() =>
-      getViewDefinition(ctx.pool, packageId, objectName, { kind, format }),
+      getViewDefinition(ctx.pool, packageId, objectName, { kind, format, version }),
     );
     return toToolResult(envelope);
   });
 
-  regCap(CAP.hana_metadata_search_objects, async ({ pattern, by, field, kind, limit, maxCandidates }) => {
+  regCap(CAP.hana_metadata_search_objects, async ({ pattern, by, field, kind, limit, maxCandidates, version }) => {
     // 跨字段条件必填：zod 表达不了（既有约定：handler 级硬错误 + 可恢复指引）
     const mode = by ?? 'name';
     if (mode === 'name' && !pattern) {
@@ -52,17 +52,18 @@ export function registerMetadataTools(server: McpServer, ctx: ToolContext): void
             ...(pattern ? { pattern } : {}),
             kind,
             limit,
+            version,
             // 未给就用服务默认（100）：不在这里抄第二份默认值
             ...(maxCandidates !== undefined ? { maxCandidates } : {}),
           })
-        : searchObjects(ctx.pool, { pattern: pattern as string, kind, limit }),
+        : searchObjects(ctx.pool, { pattern: pattern as string, kind, limit, version }),
     );
     return toToolResult(envelope);
   });
 
   regCap(
     CAP.hana_metadata_list_fields,
-    async ({ packageId, objectName, pattern, exact, kind, includeNodeCalculated }) => {
+    async ({ packageId, objectName, pattern, exact, kind, includeNodeCalculated, version }) => {
       // exact=true 必须配 pattern：exact 配空 pattern 会按空串精确匹配 → **返回空清单**（不报错也非全量），
       // 调用方只会以为"这个视图没有字段"，故 handler 直接报参数错误。
       if (exact && !pattern) {
@@ -72,7 +73,7 @@ export function registerMetadataTools(server: McpServer, ctx: ToolContext): void
         );
       }
       const envelope: Envelope = await withErrorEnvelope(() =>
-        getViewFieldList(ctx.pool, packageId, objectName, { kind, pattern, exact, includeNodeCalculated }),
+        getViewFieldList(ctx.pool, packageId, objectName, { kind, pattern, exact, includeNodeCalculated, version }),
       );
       return toToolResult(envelope);
     },
@@ -80,19 +81,21 @@ export function registerMetadataTools(server: McpServer, ctx: ToolContext): void
 
   regCap(
     CAP.hana_metadata_get_field_logic,
-    async ({ packageId, objectName, fieldId, kind, includeUsage, usageMaxViews }) => {
+    async ({ packageId, objectName, fieldId, kind, includeUsage, usageMaxViews, version }) => {
       const envelope: Envelope = await withErrorEnvelope(async () => {
-        const base = await getViewFieldLogic(ctx.pool, packageId, objectName, fieldId, { kind });
+        const base = await getViewFieldLogic(ctx.pool, packageId, objectName, fieldId, { kind, version });
         if (!includeUsage) return base;
         const lineage = await fieldLineage(ctx.pool, packageId, objectName, fieldId, {
           direction: 'downstream',
-          // 复用上面已取到的种子对象：避免对同一视图再发一次 ACTIVE_OBJECT 查询
+          version,
+          // 复用上面已取到的种子对象：避免对同一视图再发一次对象表查询
           seedObject: base.object,
           ...(usageMaxViews !== undefined ? { maxViews: usageMaxViews } : {}),
         });
         return {
           ...base,
           usage: {
+            version: lineage.version,
             downstream: lineage.downstream,
             nameAlignedConsumers: lineage.nameAlignedConsumers,
             viewsScanned: lineage.viewsScanned,
@@ -107,9 +110,14 @@ export function registerMetadataTools(server: McpServer, ctx: ToolContext): void
     },
   );
 
-  regCap(CAP.hana_metadata_where_used, async ({ packageId, objectName, kind, direction, depth }) => {
+  regCap(CAP.hana_metadata_where_used, async ({ packageId, objectName, kind, direction, depth, version }) => {
     const envelope: Envelope = await withErrorEnvelope(() =>
-      whereUsed(ctx.pool, packageId, objectName, { kind, direction, ...(depth !== undefined ? { depth } : {}) }),
+      whereUsed(ctx.pool, packageId, objectName, {
+        kind,
+        direction,
+        version,
+        ...(depth !== undefined ? { depth } : {}),
+      }),
     );
     return toToolResult(envelope);
   });

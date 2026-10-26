@@ -29,6 +29,14 @@ export function zObjectName(usage: string) {
 /** 视图类型（calculationview / attributeview / analyticview）：三个模块共用一份，避免枚举漂移 */
 export const VIEW_KIND = z.enum(['calculationview', 'attributeview', 'analyticview']);
 
+/**
+ * 仓库对象版本视角（读类工具共用）：
+ * - active（默认）：已激活版本（_SYS_REPO.ACTIVE_OBJECT / ACTIVE_OBJECTCROSSREF）；
+ * - inactive：未激活/有挂起改动的版本（_SYS_REPO.INACTIVE_OBJECT / INACTIVE_OBJECTCROSSREF）。
+ * 默认值写在这里而不是各 handler：入参口径只有一种答案。
+ */
+export const VERSION_SCOPE = z.enum(['active', 'inactive']);
+
 // ── 资源形参（P10-c）────────────────────────────────────────────
 //
 // 下面三个构造器与普通入参的唯一区别是**带资源角色**（见 capabilities/resources.ts 的说明）：

@@ -269,6 +269,24 @@ async function objectExists(pool: HanaPool, packageId: string, objectName: strin
 }
 
 /**
+ * 是否存在**已激活版本**（ACTIVE_OBJECT 命中行）。
+ *
+ * 用途：写侧影响半径/破坏性判定只查 ACTIVE_OBJECTCROSSREF——目标没有已激活版本时，该图里没有
+ * 本对象节点，判定结果天然为空，且不含未激活侧（INACTIVE_OBJECTCROSSREF）的下游引用。
+ * 本函数只负责把这一事实查出来供回执如实标注，**不改变判定口径**（不自动改查 inactive 图）。
+ */
+async function hasActiveVersion(pool: HanaPool, packageId: string, objectName: string): Promise<boolean> {
+  // 表名是字面量；写路径 SQL 超时（与 objectExists 同为写前必经腿）
+  const rows = await pool.query<{ C: number }>(
+    `SELECT COUNT(*) AS C FROM "_SYS_REPO"."ACTIVE_OBJECT"
+     WHERE PACKAGE_ID = ? AND OBJECT_NAME = ? AND OBJECT_SUFFIX = 'calculationview'`,
+    [packageId, objectName],
+    { timeoutMs: pool.statementTimeoutMs },
+  );
+  return (rows[0]?.C ?? 0) > 0;
+}
+
+/**
  * 「仅 404（OBJECT_NOT_FOUND）才算不存在、其余错误 rethrow」的 fail-closed 判定（全文单点实现）。
  * 多处用它守「把读异常当成『不存在』会静默覆盖/删除他人对象」的语义（导入存在性守卫、临时副本
  * 探测/清理、三个补偿函数的探测）——各写一份时，任一处被顺手放松都不会在别处显形。
@@ -581,6 +599,12 @@ export interface DryRunReport {
    * 与本仓探测类失败的既有口径一致（fail-open + 响亮标注，warnings 里有一句），不拿假基线拦人。
    */
   baselineUnavailable?: boolean;
+  /**
+   * 目标对象**没有已激活版本**（仅在该情形产生）：影响半径/破坏性判定基于 ACTIVE_OBJECTCROSSREF，
+   * 该图中没有本对象节点，结果不含未激活侧（INACTIVE_OBJECTCROSSREF）的下游引用。
+   * 与 warnings 里同一句提示配套（机读位 + 可读句）。
+   */
+  noActiveVersion?: boolean;
   /** 诚实性提示（有则列、无则空数组）：如影响半径被截断、归一化后文本差异不判为变更、基线不可用 */
   warnings: string[];
 }
@@ -633,6 +657,12 @@ export interface UpdateCalculationViewResult {
    */
   baselineUnavailable?: boolean;
   /**
+   * 目标对象在本次写入**之前没有已激活版本**（仅在该情形产生）：影响半径/破坏性判定基于
+   * ACTIVE_OBJECTCROSSREF，该图中没有本对象节点，结果不含未激活侧（INACTIVE_OBJECTCROSSREF）的下游引用。
+   * 本 SPS 写入即激活：回执的 activated 反映写后状态，本字段反映写前判定输入的事实。
+   */
+  noActiveVersion?: boolean;
+  /**
    * 诚实性提示（仅在有值得标注的事实时产生该字段，不制造恒为空噪音）：
    * 基线不可用（BASELINE_UNAVAILABLE_WARNING）与影响半径被截断（IMPACT_TRUNCATED_WARNING）各一句——
    * 与 dryRun 回执共用同一份文案常量（两处各写一遍必然漂移）。
@@ -661,6 +691,8 @@ type UpdateLockOutcome =
       runtimeOnly: number;
       /** 基线不可用（未做判定）——写路径据此在回执里给 warnings 并（隐含）跳过闸门 */
       baselineUnavailable: boolean;
+      /** 目标对象写前没有已激活版本（回执标注；不改变判定口径） */
+      noActiveVersion: boolean;
     };
 
 /**
@@ -731,6 +763,10 @@ export async function updateCalculationView(
     writeLockKey(packageId, normalizeObjectName(objectName)),
     async (): Promise<UpdateLockOutcome> => {
       const baseMeta = await rest.fileMeta(packageId, designFile);
+      // 判定输入的事实（写前取）：目标没有已激活版本时，impact() 的 active 图里没有本对象节点，
+      // 回执需如实标注「本次影响面未含 inactive 侧下游」。必须在 PUT 之前取——本 SPS 写入即激活，
+      // 写后再查会得到「有激活版本」，把写前的事实抹掉。
+      const noActiveVersion = !(await hasActiveVersion(pool, packageId, objectName));
       // 设计时读取的 ETag 同样归一（空串/纯空白不当有值）：与入口归一同一口径，updateNote 的
       // === undefined 判断才不会漏报「本次没带 If-Match」
       const ifMatch = baseline ?? (baseMeta.ETag?.trim() || undefined);
@@ -806,6 +842,7 @@ export async function updateCalculationView(
             downstream,
             runtimeOnly,
             baselineUnavailable,
+            noActiveVersion,
             migration: opts.migration,
           }),
         };
@@ -828,6 +865,7 @@ export async function updateCalculationView(
         breaking,
         runtimeOnly,
         baselineUnavailable,
+        noActiveVersion,
       };
     },
   );
@@ -836,13 +874,24 @@ export async function updateCalculationView(
     // 预演到此为止：零副作用——缓存不失效（没写）、行探测不发起（没有「刚写入并激活」的前提）
     return outcome.report;
   }
-  const { meta, ifMatch, operationsResult, xmlVerification, breaking, runtimeOnly, baselineUnavailable } = outcome;
+  const {
+    meta,
+    ifMatch,
+    operationsResult,
+    xmlVerification,
+    breaking,
+    runtimeOnly,
+    baselineUnavailable,
+    noActiveVersion,
+  } = outcome;
   // 回执的诚实性提示（与 dryRun 回执共用同一份文案常量——两处各写一遍必然漂移）：
   // - 基线不可用：未判（breaking.level='unknown'，unknown ≠ 非破坏）；
-  // - 影响半径截断：breaking.impactTruncated 为真时附同一句警告（与 dryRun 回执一字不差）。
+  // - 影响半径截断：breaking.impactTruncated 为真时附同一句警告（与 dryRun 回执一字不差）；
+  // - 目标没有已激活版本：判定基于 active 图，未含 inactive 侧下游。
   const warnings: string[] = [];
   if (baselineUnavailable) warnings.push(BASELINE_UNAVAILABLE_WARNING);
   if (breaking.impactTruncated) warnings.push(IMPACT_TRUNCATED_WARNING);
+  if (noActiveVersion) warnings.push(NO_ACTIVE_VERSION_WARNING);
   // 写后失效视图缓存（§4.5）：紧贴写路径，把「最多 60s 后自愈」变成「立即」
   invalidateViewCache(packageId, objectName);
   const activated = meta.Attributes?.SapBackPack?.Activated === true;
@@ -877,6 +926,7 @@ export async function updateCalculationView(
     // 被过滤掉的运行时目录引用条数照实带出（>0 才产生，不制造恒为空噪音）：与删除回执同口径，不许静默过滤。
     ...(runtimeOnly > 0 ? { runtimeOnly } : {}),
     ...(baselineUnavailable ? { baselineUnavailable: true } : {}),
+    ...(noActiveVersion ? { noActiveVersion: true } : {}),
     ...(warnings.length > 0 ? { warnings } : {}),
     ...(operationsResult ? { operationsResult, elapsedMs: Date.now() - startedAt } : {}),
     ...(xmlVerification ? { xmlVerification } : {}),
@@ -920,6 +970,8 @@ export interface DeletionGateAssessment {
   runtimeOnly: number;
   /** 判定读取时点（impact().asOf）：判定与 DELETE 之间存在依赖新增窗口，调用方据此核对 */
   asOf: string;
+  /** 目标没有已激活版本（判定基于 active 图，未含 inactive 侧下游） */
+  noActiveVersion: boolean;
 }
 
 /**
@@ -938,7 +990,9 @@ export async function assessDeletionGate(
   const impactResult = await impact(pool, { packageId, objectName, objectSuffix: 'calculationview' }, { depth: 1 });
   const { downstream, runtimeOnly } = designTimeDownstream(impactResult);
   const breaking = assessViewDeletion({ packageId, objectName }, { downstream, truncated: impactResult.truncated });
-  return { breaking, runtimeOnly, asOf: impactResult.asOf };
+  // 判定输入的事实：没有已激活版本 ⇒ active 图里没有本对象节点，判定不含 inactive 侧下游（只标注，不改口径）
+  const noActiveVersion = !(await hasActiveVersion(pool, packageId, objectName));
+  return { breaking, runtimeOnly, asOf: impactResult.asOf, noActiveVersion };
 }
 
 /**
@@ -956,6 +1010,15 @@ const BASELINE_UNAVAILABLE_WARNING = '设计时内容为空，无法建立 diff 
  */
 const IMPACT_TRUNCATED_WARNING =
   '影响半径检索被截断（达到节点上限）：downstream 列表与 downstreamCount 只是下界，破坏性判定可能低估影响面';
+
+/**
+ * 目标对象没有已激活版本时的统一提示（update / dryRun / delete 三处共用同一句，各写一份必然漂移）。
+ * 只标注事实，不改变判定口径：影响半径/破坏性判定仍只查 ACTIVE_OBJECTCROSSREF，
+ * 未激活侧（INACTIVE_OBJECTCROSSREF）的下游引用**不在**本次判定内。
+ */
+const NO_ACTIVE_VERSION_WARNING =
+  '目标对象没有已激活版本：影响半径与破坏性判定基于 ACTIVE_OBJECTCROSSREF（该图中没有本对象节点），' +
+  '结果不含未激活侧 INACTIVE_OBJECTCROSSREF 的下游引用';
 
 /**
  * 无基线时的**空壳占位** diff 工厂：只在 baselineUnavailable=true 时使用（每次返回新对象，
@@ -1115,6 +1178,8 @@ function buildDryRunReport(args: {
   runtimeOnly: number;
   /** 基线不可用（未做判定；diff/breaking 为空壳占位） */
   baselineUnavailable: boolean;
+  /** 目标对象没有已激活版本（回执标注；不改变判定口径） */
+  noActiveVersion: boolean;
   migration: { strategy: string; note?: string } | undefined;
 }): DryRunReport {
   const base: DryRunReport['base'] = {};
@@ -1129,6 +1194,10 @@ function buildDryRunReport(args: {
   }
   if (args.impactResult.truncated) {
     warnings.push(IMPACT_TRUNCATED_WARNING);
+  }
+  // 目标没有已激活版本：影响半径/判定基于 active 图，未含 inactive 侧下游——如实标注（不改变判定口径）
+  if (args.noActiveVersion) {
+    warnings.push(NO_ACTIVE_VERSION_WARNING);
   }
   // 基线不可用时 diff 是空壳占位（empty=true 而非「比较结果」）：此时不许给出「文本有变化但不判为变更」的提示
   // （那句只在真的比较过、结论为「无结构差异」时才成立）——否则会把「未判」误读成「已判为无变更」。
@@ -1149,6 +1218,7 @@ function buildDryRunReport(args: {
     migration: migrationGateRecord(args.breaking, args.migration),
     warnings,
     ...(args.baselineUnavailable ? { baselineUnavailable: true } : {}),
+    ...(args.noActiveVersion ? { noActiveVersion: true } : {}),
   };
 }
 
@@ -1185,6 +1255,16 @@ export interface DeleteCalculationViewResult {
    * 与 update 回执同口径：downstreamCount + runtimeOnly = 本次单跳检索的原始节点数，过滤可复核、不静默。
    */
   runtimeOnly?: number;
+  /**
+   * 目标对象在删除前**没有已激活版本**（仅在该情形产生）：删除闸门的判定基于 ACTIVE_OBJECTCROSSREF，
+   * 该图中没有本对象节点，结果不含未激活侧（INACTIVE_OBJECTCROSSREF）的下游引用。
+   */
+  noActiveVersion?: boolean;
+  /**
+   * 诚实性提示（仅在有值得标注的事实时产生该字段，不制造恒为空噪音）：
+   * 目标没有已激活版本时给 NO_ACTIVE_VERSION_WARNING 一句（与 update/dryRun 共用同一份文案常量）。
+   */
+  warnings?: string[];
 }
 
 /**
@@ -1247,6 +1327,8 @@ export async function deleteCalculationView(
     impactAsOf: gate.asOf,
     // 被过滤掉的运行时目录引用条数照实带出（>0 才产生）：与 update 回执同口径，不许静默过滤。
     ...(gate.runtimeOnly > 0 ? { runtimeOnly: gate.runtimeOnly } : {}),
+    // 目标没有已激活版本：判定基于 active 图，未含 inactive 侧下游——机读位 + 同一句可读提示
+    ...(gate.noActiveVersion ? { noActiveVersion: true as const, warnings: [NO_ACTIVE_VERSION_WARNING] } : {}),
   };
   // 基线缺失是**静默退化**吗？不——与 activate 同形：回执给 deleteNote + 日志留痕（仅该情形产生字段）。
   if (baseline.ifMatchMissing) {

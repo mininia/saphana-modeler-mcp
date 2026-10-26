@@ -16,7 +16,7 @@ export const modelBasicsRules: readonly RuleObject[] = [
       '',
       '背景（仓库/运行时布局）：设计时对象（信息视图/权限/过程）以 XML 存储于 _SYS_REPO 仓库（Package 组织）；',
       '激活后生成运行时列视图到 _SYS_BIC schema；元数据可查 _SYS_BI.BIMC_*；对象血缘用 hana_metadata_where_used',
-      '（数据源 _SYS_REPO.ACTIVE_OBJECTCROSSREF）。',
+      '（数据源：已激活版本 _SYS_REPO.ACTIVE_OBJECTCROSSREF；未激活/挂起版本 _SYS_REPO.INACTIVE_OBJECTCROSSREF）。',
       '',
       '对象类型：',
       '- calculationview（Calculation View，图形化节点模型，HANA 2.0 推荐）',

@@ -7,6 +7,7 @@ import { HanaBusinessError } from '../core/errors.js';
 import { clampLimit } from '../core/num.js';
 import { assertSafeRuntimeName, assertSchemaAllowed, quoteIdentifier } from '../core/sql.js';
 import { suffixInClause, suffixesOf, VIEW_SUFFIXES } from '../model/view-suffixes.js';
+import { CROSSREF_TABLE, OBJECT_TABLE, type VersionScope } from '../model/view-scope.js';
 import { parseViewDefinition } from '../model/view-xml.js';
 import type {
   ViewCalculatedAttribute,
@@ -18,9 +19,13 @@ import type {
 
 /**
  * 只读元数据通道（实测结论）：
- * - 视图定义：_SYS_REPO.ACTIVE_OBJECT（CDATA 设计时 XML）
+ * - 视图定义：_SYS_REPO.ACTIVE_OBJECT（CDATA 设计时 XML）；version=inactive 时读
+ *   _SYS_REPO.INACTIVE_OBJECT（未激活/有挂起改动的版本，仅此类对象存在该行）
  * - 表列表：SYS.TABLES（按当前用户权限过滤）
  * - 表列：SYS.TABLE_COLUMNS（SYS.COLUMNS 对该环境用户 258 不可用）
+ *
+ * 版本视角（VersionScope）贯穿本模块：**默认 active**（既有行为不变），只有调用方显式传
+ * version=inactive 才读写未激活侧；active 与 inactive 互不回退（inactive 查不到就报未找到）。
  */
 
 /**
@@ -58,16 +63,27 @@ async function runPaged<T, K extends string>(
   return { count, limit, truncated: count > limit, [key]: items.slice(0, limit) } as PagedResult<T, K>;
 }
 
-export interface ViewDefinitionResult {
+/** 仓库对象信息（本次读取的版本视角 + 该视角的元数据） */
+export interface ViewObjectInfo {
   /** 仓库对象信息 */
-  object: {
-    packageId: string;
-    objectName: string;
-    objectSuffix: string;
-    versionId: number;
-    activatedAt?: string;
-    activatedBy?: string;
-  };
+  packageId: string;
+  objectName: string;
+  objectSuffix: string;
+  versionId: number;
+  /** 本次读取的版本视角：active=已激活；inactive=未激活/有挂起改动 */
+  status: VersionScope;
+  /** status=active：激活时间/人 */
+  activatedAt?: string;
+  activatedBy?: string;
+  /** status=inactive：最后变更时间 / OWNER / 是否为待删除标记 */
+  lastChangedAt?: string;
+  owner?: string;
+  isDeletion?: boolean;
+}
+
+export interface ViewDefinitionResult {
+  /** 仓库对象信息（含本次读取的版本视角） */
+  object: ViewObjectInfo;
   /** 结构化视图定义（format=json） */
   definition?: ViewDefinition;
   /** 原始 XML（format=xml） */
@@ -75,7 +91,9 @@ export interface ViewDefinitionResult {
 }
 
 /**
- * 读取视图定义。kind 省略时按三个类型逐一匹配（取最新激活）。
+ * 读取视图定义。kind 省略时按三个类型逐一匹配（取最新版本）。
+ * version 默认 active=已激活版本；显式传 inactive 读未激活/挂起版本（读取源为
+ * _SYS_REPO.INACTIVE_OBJECT）——该版本不存在时按「未找到」处理，**不回退读 active**。
  * format=json 返回解析后的结构化模型（含节点逻辑/公式/变量/输出字段）；
  * format=xml 返回原始 CDATA（备份/对比用）。
  */
@@ -83,20 +101,27 @@ export async function getViewDefinition(
   pool: HanaPool,
   packageId: string,
   objectName: string,
-  opts: { kind?: ViewKind; format?: 'json' | 'xml' } = {},
+  opts: { kind?: ViewKind; format?: 'json' | 'xml'; version?: VersionScope } = {},
 ): Promise<ViewDefinitionResult> {
   const suffixes = suffixesOf(opts.kind);
+  const version = opts.version ?? 'active';
+  // 表名来自 model/view-scope 的字面量映射（非用户输入）；列集合随版本切换：
+  // active 有 ACTIVATED_AT/ACTIVATED_BY，inactive 有 LAST_CHANGED_AT/OWNER/IS_DELETION
+  const versionColumns = version === 'active' ? 'ACTIVATED_AT, ACTIVATED_BY' : 'LAST_CHANGED_AT, OWNER, IS_DELETION';
   const rows = await pool.query<{
     PACKAGE_ID: string;
     OBJECT_NAME: string;
     OBJECT_SUFFIX: string;
     VERSION_ID: number;
-    ACTIVATED_AT: string;
-    ACTIVATED_BY: string;
     CDATA: string | null;
+    ACTIVATED_AT?: string | null;
+    ACTIVATED_BY?: string | null;
+    LAST_CHANGED_AT?: string | null;
+    OWNER?: string | null;
+    IS_DELETION?: number | boolean | null;
   }>(
-    `SELECT PACKAGE_ID, OBJECT_NAME, OBJECT_SUFFIX, VERSION_ID, ACTIVATED_AT, ACTIVATED_BY, CDATA
-     FROM "_SYS_REPO"."ACTIVE_OBJECT"
+    `SELECT PACKAGE_ID, OBJECT_NAME, OBJECT_SUFFIX, VERSION_ID, CDATA, ${versionColumns}
+     FROM "_SYS_REPO".${quoteIdentifier(OBJECT_TABLE[version])}
      WHERE PACKAGE_ID = ? AND OBJECT_NAME = ? AND OBJECT_SUFFIX IN ${suffixInClause(suffixes)}
      ORDER BY VERSION_ID DESC LIMIT 1`,
     [packageId, objectName, ...suffixes],
@@ -106,7 +131,10 @@ export async function getViewDefinition(
     // 必须抛 HanaBusinessError：普通 Error 会被 withErrorEnvelope 当成未知错误包成「内部错误」，
     // 用户无法据此修正包名/对象名（包名/对象名在 _SYS_REPO 中大小写敏感、存储为大写）
     throw new HanaBusinessError(
-      `未找到视图 ${packageId}/${objectName}（类型：${suffixes.join('/')}）。` +
+      `未找到视图 ${packageId}/${objectName}（类型：${suffixes.join('/')}；版本：${version === 'active' ? '已激活' : '未激活'}）。` +
+        (version === 'active'
+          ? '若该对象只有未激活版本，请传 version=inactive 查询；'
+          : '未激活行只存在于有挂起改动的对象——若对象已全部激活，请用默认 version=active；') +
         `可先用 hana_metadata_search_objects 按名称片段搜索定位；` +
         `包名/对象名大小写敏感（仓库内为大写存储），如 ZDEMO.ZDEMO_MGF/ZDEMO02_CV008`,
     );
@@ -117,8 +145,14 @@ export async function getViewDefinition(
       objectName: row.OBJECT_NAME,
       objectSuffix: row.OBJECT_SUFFIX as ViewKind,
       versionId: row.VERSION_ID,
-      activatedAt: row.ACTIVATED_AT,
-      activatedBy: row.ACTIVATED_BY,
+      status: version,
+      ...(version === 'active'
+        ? { activatedAt: row.ACTIVATED_AT ?? undefined, activatedBy: row.ACTIVATED_BY ?? undefined }
+        : {
+            lastChangedAt: row.LAST_CHANGED_AT ?? undefined,
+            owner: row.OWNER ?? undefined,
+            isDeletion: Number(row.IS_DELETION) === 1,
+          }),
     },
   };
   if (opts.format === 'xml' || !row.CDATA) {
@@ -291,6 +325,8 @@ export interface CrossRefItem {
 
 export interface WhereUsedResult {
   object: { packageId: string; objectName: string; objectSuffix: string };
+  /** 本次血缘的版本视角：active=已激活（默认）；inactive=未激活/挂起版本 */
+  version: VersionScope;
   /** 该对象依赖的对象（上游，被引用方）——**depth=1 的单跳结果**（兼容字段，形状不变） */
   upstream: CrossRefItem[];
   /** 依赖该对象的对象（下游，引用方）——**depth=1 的单跳结果**（兼容字段，形状不变） */
@@ -306,11 +342,13 @@ export interface WhereUsedResult {
 }
 
 /**
- * 血缘搜索（ACTIVE_OBJECTCROSSREF）：
+ * 血缘搜索：
+ * - 数据源随 version 切换：active（默认）= ACTIVE_OBJECTCROSSREF；inactive = INACTIVE_OBJECTCROSSREF
  * - upstream：该对象引用了谁（FROM = 本对象）
  * - downstream：谁引用了该对象（TO = 本对象）
  * kind 省略时匹配三种视图类型。
- * 说明：downstream 中 isRuntime=true 表示激活后的运行时目录视图（_SYS_BIC）对本仓库对象的引用。
+ * 说明：active 侧 downstream 中 isRuntime=true 表示激活后的运行时目录视图（_SYS_BIC）对本仓库对象的引用；
+ * inactive 侧没有运行时副本。
  *
  * `depth`（跳数，默认 1 = 单跳，upstream/downstream 两个兼容字段的形状不变）——depth>1 时在
  * 单跳结果之外追加 `closure`（多跳闭包，按方向拆分；visited-set 环防护；maxNodes 截断并置
@@ -325,12 +363,17 @@ export async function whereUsed(
     direction?: 'upstream' | 'downstream' | 'both';
     depth?: number | 'all';
     maxNodes?: number;
+    version?: VersionScope;
   } = {},
 ): Promise<WhereUsedResult> {
   const suffixes = suffixesOf(opts.kind);
   const suffixIn = suffixInClause(suffixes);
   const direction = opts.direction ?? 'both';
   const depth = opts.depth ?? 1;
+  const version = opts.version ?? 'active';
+  // 表名来自 model/view-scope 的字面量映射（非用户输入）
+  const crossRefTable = quoteIdentifier(CROSSREF_TABLE[version]);
+  const objectTable = quoteIdentifier(OBJECT_TABLE[version]);
 
   const mapRow = (r: {
     PACKAGE_ID: string;
@@ -350,7 +393,7 @@ export async function whereUsed(
     direction === 'both' || direction === 'upstream'
       ? await pool.query<{ PACKAGE_ID: string; OBJECT_NAME: string; OBJECT_SUFFIX: string; REF_TYPE: number }>(
           `SELECT TO_PACKAGE_ID AS PACKAGE_ID, TO_OBJECT_NAME AS OBJECT_NAME, TO_OBJECT_SUFFIX AS OBJECT_SUFFIX, REF_TYPE
-         FROM "_SYS_REPO"."ACTIVE_OBJECTCROSSREF"
+         FROM "_SYS_REPO".${crossRefTable}
          WHERE FROM_PACKAGE_ID = ? AND FROM_OBJECT_NAME = ? AND FROM_OBJECT_SUFFIX IN ${suffixIn}
          ORDER BY TO_OBJECT_SUFFIX, TO_OBJECT_NAME`,
           [packageId, objectName, ...suffixes],
@@ -360,7 +403,7 @@ export async function whereUsed(
     direction === 'both' || direction === 'downstream'
       ? await pool.query<{ PACKAGE_ID: string; OBJECT_NAME: string; OBJECT_SUFFIX: string; REF_TYPE: number }>(
           `SELECT FROM_PACKAGE_ID AS PACKAGE_ID, FROM_OBJECT_NAME AS OBJECT_NAME, FROM_OBJECT_SUFFIX AS OBJECT_SUFFIX, REF_TYPE
-         FROM "_SYS_REPO"."ACTIVE_OBJECTCROSSREF"
+         FROM "_SYS_REPO".${crossRefTable}
          WHERE TO_PACKAGE_ID = ? AND TO_OBJECT_NAME = ? AND TO_OBJECT_SUFFIX IN ${suffixIn}
          ORDER BY FROM_OBJECT_SUFFIX, FROM_OBJECT_NAME`,
           [packageId, objectName, ...suffixes],
@@ -372,7 +415,7 @@ export async function whereUsed(
   let seedSuffix = opts.kind ?? '?';
   if (!opts.kind) {
     const seedRows = await pool.query<{ OBJECT_SUFFIX: string }>(
-      `SELECT OBJECT_SUFFIX FROM "_SYS_REPO"."ACTIVE_OBJECT"
+      `SELECT OBJECT_SUFFIX FROM "_SYS_REPO".${objectTable}
        WHERE PACKAGE_ID = ? AND OBJECT_NAME = ? AND OBJECT_SUFFIX IN ${suffixIn}
        ORDER BY VERSION_ID DESC LIMIT 1`,
       [packageId, objectName, ...suffixes],
@@ -382,6 +425,7 @@ export async function whereUsed(
 
   const result: WhereUsedResult = {
     object: { packageId, objectName, objectSuffix: seedSuffix },
+    version,
     upstream: upstream.map(mapRow),
     downstream: downstream.map(mapRow),
   };
@@ -390,7 +434,7 @@ export async function whereUsed(
     const c = await closure(
       pool,
       { packageId, objectName, objectSuffix: seedSuffix },
-      { direction, depth, ...(opts.maxNodes !== undefined ? { maxNodes: opts.maxNodes } : {}) },
+      { direction, depth, version, ...(opts.maxNodes !== undefined ? { maxNodes: opts.maxNodes } : {}) },
     );
     const toItem = (e: (typeof c.nodes)[number]): CrossRefItem => ({
       packageId: e.packageId,
@@ -682,11 +726,16 @@ async function loadDesignTimeDefinition(
   packageId: string,
   objectName: string,
   purpose: string,
-  opts: { kind?: ViewKind } = {},
-): Promise<{ object: ViewDefinitionResult['object']; definition: ViewDefinition }> {
-  const result = await getViewDefinition(pool, packageId, objectName, { format: 'json', kind: opts.kind });
+  opts: { kind?: ViewKind; version?: VersionScope } = {},
+): Promise<{ object: ViewObjectInfo; definition: ViewDefinition }> {
+  const result = await getViewDefinition(pool, packageId, objectName, {
+    format: 'json',
+    kind: opts.kind,
+    version: opts.version,
+  });
   if (!result.definition) {
-    throw new HanaBusinessError(`视图 ${packageId}/${objectName} 无 CDATA，${purpose}`);
+    const versionLabel = opts.version === 'inactive' ? '（未激活版本）' : '';
+    throw new HanaBusinessError(`视图 ${packageId}/${objectName}${versionLabel} 无 CDATA，${purpose}`);
   }
   return { object: result.object, definition: result.definition };
 }
@@ -700,13 +749,14 @@ async function requireFieldLogic(
   packageId: string,
   objectName: string,
   fieldId: string,
-  opts: { kind?: ViewKind } = {},
-): Promise<{ object: ViewDefinitionResult['object']; logic: FieldLogic }> {
+  opts: { kind?: ViewKind; version?: VersionScope } = {},
+): Promise<{ object: ViewObjectInfo; logic: FieldLogic }> {
   const { object, definition } = await loadDesignTimeDefinition(pool, packageId, objectName, '无法解析字段逻辑', opts);
   const logic = getFieldLogic(definition, fieldId);
   if (!logic) {
+    const versionLabel = opts.version === 'inactive' ? '（未激活版本）' : '';
     throw new HanaBusinessError(
-      `视图 ${packageId}/${objectName} 中未找到字段 ${fieldId}。可先用 hana_metadata_list_fields 按名称片段模糊搜索确认字段 ID`,
+      `视图 ${packageId}/${objectName}${versionLabel} 中未找到字段 ${fieldId}。可先用 hana_metadata_list_fields 按名称片段模糊搜索确认字段 ID`,
     );
   }
   return { object, logic };
@@ -721,8 +771,8 @@ export async function getViewFieldLogic(
   packageId: string,
   objectName: string,
   fieldId: string,
-  opts: { kind?: ViewKind } = {},
-): Promise<{ object: ViewDefinitionResult['object']; logic: FieldLogic }> {
+  opts: { kind?: ViewKind; version?: VersionScope } = {},
+): Promise<{ object: ViewObjectInfo; logic: FieldLogic }> {
   return requireFieldLogic(pool, packageId, objectName, fieldId, opts);
 }
 
@@ -807,49 +857,64 @@ export async function getViewFieldList(
   objectName: string,
   opts: {
     kind?: ViewKind;
+    version?: VersionScope;
     pattern?: string;
     exact?: boolean;
     caseSensitive?: boolean;
     includeNodeCalculated?: boolean;
   } = {},
-): Promise<{ object: ViewDefinitionResult['object']; list: ListFieldsResult }> {
+): Promise<{ object: ViewObjectInfo; list: ListFieldsResult }> {
   const { object, definition } = await loadDesignTimeDefinition(pool, packageId, objectName, '无法解析字段清单', {
     kind: opts.kind,
+    version: opts.version,
   });
   return { object, list: listFields(definition, opts) };
 }
 
-/** 仓库对象搜索结果条目（ACTIVE_OBJECT 命中行） */
+/** 仓库对象搜索结果条目（所选版本视角的命中行） */
 export interface ObjectSearchItem {
   packageId: string;
   objectName: string;
   objectSuffix: string;
   versionId: number;
+  /** 命中行所属版本视角：active=已激活；inactive=未激活/挂起 */
+  status: VersionScope;
+  /** status=active：激活时间/人 */
   activatedAt?: string;
   activatedBy?: string;
+  /** status=inactive：最后变更时间 / OWNER / 待删除标记 */
+  lastChangedAt?: string;
+  owner?: string;
+  isDeletion?: boolean;
 }
 
 export type ObjectSearchResult = PagedResult<ObjectSearchItem, 'objects'>;
 
 /**
  * 按名称片段搜索仓库对象（视图定位用）：
- * - 来源：_SYS_REPO.ACTIVE_OBJECT，按 OBJECT_NAME 模糊匹配（UPPER 大小写不敏感）
+ * - 来源随 version 切换：active（默认）= _SYS_REPO.ACTIVE_OBJECT；
+ *   inactive = _SYS_REPO.INACTIVE_OBJECT（未激活/挂起版本，仅此类对象存在该行）
+ * - 按 OBJECT_NAME 模糊匹配（UPPER 大小写不敏感）
  * - 默认只搜三种视图类型（calculationview/attributeview/analyticview），排除 UI5 仓库资源
  * - kind 指定时只搜该类型；带截断（LIMIT）+ count，供 "Showing N of M" 提示
  * 典型用途：hana_metadata_list_fields 报"未找到视图"时，先用本工具按片段定位包名/对象名。
  */
 export async function searchObjects(
   pool: HanaPool,
-  opts: { pattern: string; kind?: ViewKind; limit?: number } = { pattern: '' },
+  opts: { pattern: string; kind?: ViewKind; limit?: number; version?: VersionScope } = { pattern: '' },
 ): Promise<ObjectSearchResult> {
   const limit = clampLimit(opts.limit, 20, 1, 100);
   const suffixes = suffixesOf(opts.kind);
   const suffixIn = suffixInClause(suffixes);
+  const version = opts.version ?? 'active';
+  // 表名来自 model/view-scope 的字面量映射（非用户输入）；列集合随版本切换
+  const table = quoteIdentifier(OBJECT_TABLE[version]);
+  const versionColumns = version === 'active' ? 'ACTIVATED_AT, ACTIVATED_BY' : 'LAST_CHANGED_AT, OWNER, IS_DELETION';
   return runPaged('objects', limit, {
     // 值一律参数绑定；pattern 仅作为 LIKE 片段，UPPER 两侧做大小写不敏感匹配
     count: async () => {
       const countRow = await pool.query<{ C: number }>(
-        `SELECT COUNT(*) AS C FROM "_SYS_REPO"."ACTIVE_OBJECT"
+        `SELECT COUNT(*) AS C FROM "_SYS_REPO".${table}
          WHERE UPPER(OBJECT_NAME) LIKE UPPER(?) AND OBJECT_SUFFIX IN ${suffixIn}`,
         [`%${opts.pattern}%`, ...suffixes],
       );
@@ -861,11 +926,14 @@ export async function searchObjects(
         OBJECT_NAME: string;
         OBJECT_SUFFIX: string;
         VERSION_ID: number;
-        ACTIVATED_AT: string | null;
-        ACTIVATED_BY: string | null;
+        ACTIVATED_AT?: string | null;
+        ACTIVATED_BY?: string | null;
+        LAST_CHANGED_AT?: string | null;
+        OWNER?: string | null;
+        IS_DELETION?: number | boolean | null;
       }>(
-        `SELECT PACKAGE_ID, OBJECT_NAME, OBJECT_SUFFIX, VERSION_ID, ACTIVATED_AT, ACTIVATED_BY
-         FROM "_SYS_REPO"."ACTIVE_OBJECT"
+        `SELECT PACKAGE_ID, OBJECT_NAME, OBJECT_SUFFIX, VERSION_ID, ${versionColumns}
+         FROM "_SYS_REPO".${table}
          WHERE UPPER(OBJECT_NAME) LIKE UPPER(?) AND OBJECT_SUFFIX IN ${suffixIn}
          ORDER BY PACKAGE_ID, OBJECT_NAME LIMIT ?`,
         [`%${opts.pattern}%`, ...suffixes, limit],
@@ -875,8 +943,14 @@ export async function searchObjects(
         objectName: r.OBJECT_NAME,
         objectSuffix: r.OBJECT_SUFFIX,
         versionId: r.VERSION_ID,
-        activatedAt: r.ACTIVATED_AT ?? undefined,
-        activatedBy: r.ACTIVATED_BY ?? undefined,
+        status: version,
+        ...(version === 'active'
+          ? { activatedAt: r.ACTIVATED_AT ?? undefined, activatedBy: r.ACTIVATED_BY ?? undefined }
+          : {
+              lastChangedAt: r.LAST_CHANGED_AT ?? undefined,
+              owner: r.OWNER ?? undefined,
+              isDeletion: Number(r.IS_DELETION) === 1,
+            }),
       }));
     },
   });
@@ -896,8 +970,13 @@ export interface FieldSearchItem {
   objectName: string;
   objectSuffix: string;
   versionId: number;
+  /** 命中行所属版本视角 */
+  status: VersionScope;
   activatedAt?: string;
   activatedBy?: string;
+  lastChangedAt?: string;
+  owner?: string;
+  isDeletion?: boolean;
   matchedFields: FieldSearchMatch[];
 }
 
@@ -913,6 +992,8 @@ export interface FieldSearchResult {
   truncated: boolean;
   candidatesScanned: number;
   maxCandidates: number;
+  /** 本次扫描的版本视角 */
+  version: VersionScope;
   asOf: string;
   objects: FieldSearchItem[];
 }
@@ -924,30 +1005,44 @@ const DEFAULT_MAX_FIELD_CANDIDATES = 100;
  * 按字段搜索视图："谁的输出里含匹配字段"。
  * 实现口径：对候选视图**按需 parse** 设计时 XML（不做全量索引——候选逐个解析，成本由
  * maxCandidates 护栏），复用 `searchFields`（= list_fields 的同一实现）。
- * 候选集 = `ACTIVE_OBJECT` 按 kind 过滤（可选 `pattern` 收窄对象名），
+ * 候选集 = 所选版本视角的对象表（active 默认 / inactive）按 kind 过滤（可选 `pattern` 收窄对象名），
  * 按 (PACKAGE_ID, OBJECT_NAME) 排序取前 `maxCandidates` 条。
  */
 export async function searchObjectsByField(
   pool: HanaPool,
-  opts: { field: string; pattern?: string; kind?: ViewKind; limit?: number; maxCandidates?: number },
+  opts: {
+    field: string;
+    pattern?: string;
+    kind?: ViewKind;
+    limit?: number;
+    maxCandidates?: number;
+    version?: VersionScope;
+  },
 ): Promise<FieldSearchResult> {
   const limit = clampLimit(opts.limit, 20, 1, 100);
   const maxCandidates = clampLimit(opts.maxCandidates, DEFAULT_MAX_FIELD_CANDIDATES, 1, 500);
   const suffixes = suffixesOf(opts.kind);
   const suffixIn = suffixInClause(suffixes);
   const nameFilter = opts.pattern ? 'AND UPPER(OBJECT_NAME) LIKE UPPER(?)' : '';
+  const version = opts.version ?? 'active';
+  // 表名来自 model/view-scope 的字面量映射（非用户输入）；列集合随版本切换
+  const table = quoteIdentifier(OBJECT_TABLE[version]);
+  const versionColumns = version === 'active' ? 'ACTIVATED_AT, ACTIVATED_BY' : 'LAST_CHANGED_AT, OWNER, IS_DELETION';
 
   const rows = await pool.query<{
     PACKAGE_ID: string;
     OBJECT_NAME: string;
     OBJECT_SUFFIX: string;
     VERSION_ID: number;
-    ACTIVATED_AT: string | null;
-    ACTIVATED_BY: string | null;
+    ACTIVATED_AT?: string | null;
+    ACTIVATED_BY?: string | null;
+    LAST_CHANGED_AT?: string | null;
+    OWNER?: string | null;
+    IS_DELETION?: number | boolean | null;
     CDATA: string | null;
   }>(
-    `SELECT PACKAGE_ID, OBJECT_NAME, OBJECT_SUFFIX, VERSION_ID, ACTIVATED_AT, ACTIVATED_BY, CDATA
-     FROM "_SYS_REPO"."ACTIVE_OBJECT"
+    `SELECT PACKAGE_ID, OBJECT_NAME, OBJECT_SUFFIX, VERSION_ID, ${versionColumns}, CDATA
+     FROM "_SYS_REPO".${table}
      WHERE OBJECT_SUFFIX IN ${suffixIn} ${nameFilter}
      ORDER BY PACKAGE_ID, OBJECT_NAME LIMIT ?`,
     // 参数顺序必须与占位符一致：IN (…) → LIKE ?（nameFilter）→ LIMIT ?；
@@ -972,8 +1067,14 @@ export async function searchObjectsByField(
       objectName: r.OBJECT_NAME,
       objectSuffix: r.OBJECT_SUFFIX,
       versionId: r.VERSION_ID,
-      activatedAt: r.ACTIVATED_AT ?? undefined,
-      activatedBy: r.ACTIVATED_BY ?? undefined,
+      status: version,
+      ...(version === 'active'
+        ? { activatedAt: r.ACTIVATED_AT ?? undefined, activatedBy: r.ACTIVATED_BY ?? undefined }
+        : {
+            lastChangedAt: r.LAST_CHANGED_AT ?? undefined,
+            owner: r.OWNER ?? undefined,
+            isDeletion: Number(r.IS_DELETION) === 1,
+          }),
       matchedFields: matches.map((m) => ({
         fieldId: m.field.id,
         location: m.location,
@@ -990,6 +1091,7 @@ export async function searchObjectsByField(
     truncated: objects.length >= limit || rows.length >= maxCandidates,
     candidatesScanned: rows.length,
     maxCandidates,
+    version,
     asOf: nowIso(),
     objects,
   };
@@ -1025,6 +1127,8 @@ export interface FieldLineageResult {
   /** 读取/解析失败而跳过的候选数（CDATA 坏 / 扫描期间被并发删除）；不静默丢，如实计数 */
   failedCandidates: number;
   truncated: boolean;
+  /** 本次扫描的版本视角：active=已激活（默认）；inactive=未激活/挂起版本 */
+  version: VersionScope;
   asOf: string;
 }
 
@@ -1033,11 +1137,12 @@ const DEFAULT_MAX_LINEAGE_VIEWS = 50;
 
 /**
  * 字段级血缘：
- * - **downstream（主打）**：沿对象图下游闭包找候选视图（`ACTIVE_OBJECTCROSSREF`），逐个按需 parse
- *   （走 `viewDefinitionCache`），在节点的输入映射里找 `mapping.source` == 被查字段的引用——
- *   回答"**谁用了这个字段**"；
+ * - **downstream（主打）**：沿对象图下游闭包找候选视图（active=ACTIVE_OBJECTCROSSREF /
+ *   inactive=INACTIVE_OBJECTCROSSREF），逐个按需 parse（走 `viewDefinitionCache`），
+ *   在节点的输入映射里找 `mapping.source` == 被查字段的引用——回答"**谁用了这个字段**"；
  * - **upstream**：本视图内的字段逻辑（公式/脚本/源列/溯源），复用 `getFieldLogic` 的既有口径；
  * - 归因不到列的输入（Union 无 mappings、列名对齐）**另列** `nameAlignedConsumers`，不假装逐列命中。
+ * - version 默认 active（既有行为）；显式 inactive 时种子定义、闭包、候选定义全部读未激活侧。
  */
 export async function fieldLineage(
   pool: HanaPool,
@@ -1048,25 +1153,28 @@ export async function fieldLineage(
     direction?: 'upstream' | 'downstream' | 'both';
     maxViews?: number;
     maxNodes?: number;
+    version?: VersionScope;
     /**
      * 已取好的种子对象信息：downstream 方向只需要种子的类型后缀，调用方（get_field_logic 的
-     * includeUsage 路径）已取过定义时传入它，可省掉对同一视图的第二次 ACTIVE_OBJECT 取数。
+     * includeUsage 路径）已取过定义时传入它，可省掉对同一视图的第二次对象表取数。
      */
-    seedObject?: ViewDefinitionResult['object'];
+    seedObject?: ViewObjectInfo;
   } = {},
 ): Promise<FieldLineageResult> {
   const direction = opts.direction ?? 'both';
   const maxViews = clampLimit(opts.maxViews, DEFAULT_MAX_LINEAGE_VIEWS, 1, 200);
+  const version = opts.version ?? 'active';
 
   let upstream: FieldLogic | undefined;
-  let seedObject: ViewDefinitionResult['object'];
+  let seedObject: ViewObjectInfo;
   if (direction !== 'downstream') {
     // upstream 需要本视图的字段逻辑：与 hana_metadata_get_field_logic 走同一取数 + 失败口径
-    const required = await requireFieldLogic(pool, packageId, objectName, fieldId);
+    const required = await requireFieldLogic(pool, packageId, objectName, fieldId, { version });
     upstream = required.logic;
     seedObject = required.object;
   } else {
-    seedObject = opts.seedObject ?? (await getViewDefinition(pool, packageId, objectName, { format: 'json' })).object;
+    seedObject =
+      opts.seedObject ?? (await getViewDefinition(pool, packageId, objectName, { format: 'json', version })).object;
   }
   const seedSuffix = seedObject.objectSuffix;
 
@@ -1080,7 +1188,12 @@ export async function fieldLineage(
     const c = await closure(
       pool,
       { packageId, objectName, objectSuffix: seedSuffix },
-      { direction: 'downstream', depth: 'all', ...(opts.maxNodes !== undefined ? { maxNodes: opts.maxNodes } : {}) },
+      {
+        direction: 'downstream',
+        depth: 'all',
+        version,
+        ...(opts.maxNodes !== undefined ? { maxNodes: opts.maxNodes } : {}),
+      },
     );
     const viewSuffixes = new Set(Object.values(VIEW_SUFFIXES));
     // 候选按**层优先**（最近的消费方先扫）再按名字稳定排序——按字母序会把"层级近但名字靠后"的真实消费方挤出上限
@@ -1097,7 +1210,7 @@ export async function fieldLineage(
     for (const cand of candidates.slice(0, maxViews)) {
       let def: ViewDefinitionResult;
       try {
-        def = await viewDefinitionCache.get(pool, cand.packageId, cand.objectName);
+        def = await viewDefinitionCache.get(pool, cand.packageId, cand.objectName, { version });
       } catch {
         // 单个候选不可读（CDATA 解析失败 / 扫描期间被并发删除）不拖垮整次扫描——与 by=field
         //（searchObjectsByField）的宽容策略一致；不静默：计入 failedCandidates 如实上报
@@ -1156,6 +1269,7 @@ export async function fieldLineage(
     maxViews,
     failedCandidates,
     truncated,
+    version,
     asOf: nowIso(),
   };
 }

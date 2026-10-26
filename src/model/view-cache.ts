@@ -1,7 +1,9 @@
 import type { HanaPool } from '../core/hana-client.js';
+import { quoteIdentifier } from '../core/sql.js';
 import { getViewDefinition, suffixInClause, suffixesOf } from '../services/metadata.service.js';
 import type { ViewDefinitionResult } from '../services/metadata.service.js';
 import type { ViewDefinition, ViewKind } from './view-types.js';
+import { OBJECT_TABLE, type VersionScope } from './view-scope.js';
 
 /**
  * 视图定义解析缓存（数据预览「XML 预处理」封装）。
@@ -17,9 +19,9 @@ import type { ViewDefinition, ViewKind } from './view-types.js';
  *   无上限的 Map 会被持续拉取的定义撑大内存
  * - 进程级单例（Map 插入序即 LRU 序）
  *
- * key 约定：key 必须覆盖「缓存值所依赖的全部维度」——当前只有包/对象/类型（同一份
- * _SYS_REPO.CDATA 对所有调用方相同）。若将来按客户端身份裁剪视图定义（多租户），
- * 必须把身份维度加进 key，否则会跨客户端串数据。
+ * key 约定：key 必须覆盖「缓存值所依赖的全部维度」——当前是包/对象/类型/**版本视角**
+ * （active 与 inactive 的 CDATA 来自两张不同的表，同一对象两侧可以同时存在且内容不同）。
+ * 若将来按客户端身份裁剪视图定义（多租户），必须把身份维度加进 key，否则会跨客户端串数据。
  *
  * 依赖例外：本模块 import services/metadata.service 取数与版本校验（model→services 的反向边，
  * 已登记在 CONTRIBUTING 的分层一节）。两模块互为运行时环，导入值只在函数体内使用（求值期不
@@ -36,23 +38,25 @@ export class ViewDefinitionCache {
     private readonly maxEntries = 200,
   ) {}
 
-  /** 取视图定义（优先缓存；版本变化自动失效重取） */
+  /** 取视图定义（优先缓存；版本变化自动失效重取）。version 默认 active（既有行为） */
   async get(
     pool: HanaPool,
     packageId: string,
     objectName: string,
-    opts: { kind?: ViewKind } = {},
+    opts: { kind?: ViewKind; version?: VersionScope } = {},
   ): Promise<ViewDefinitionResult> {
     // 后缀解析与 IN 占位符复用 metadata.service 的单点实现（suffixesOf / suffixInClause）：
-    // 与 getViewDefinition 是同一条 ACTIVE_OBJECT 查询口径，过滤语义演进时不会分叉。
+    // 与 getViewDefinition 是同一条对象表查询口径，过滤语义演进时不会分叉。
     const suffixes = suffixesOf(opts.kind);
-    const key = `${packageId}/${objectName}/${suffixes.join(',')}`;
+    const version = opts.version ?? 'active';
+    const key = `${packageId}/${objectName}/${suffixes.join(',')}/${version}`;
     const entry = this.entries.get(key);
 
     if (entry && Date.now() - entry.cachedAt < this.ttlMs) {
-      // 缓存命中：轻量版本校验（不取 CDATA），版本未变直接用缓存
+      // 缓存命中：轻量版本校验（不取 CDATA），版本未变直接用缓存；
+      // 校验表随版本视角切换（inactive 的挂起改动不会改变 ACTIVE_OBJECT 的版本号）
       const rows = await pool.query<{ VERSION_ID: number }>(
-        `SELECT VERSION_ID FROM "_SYS_REPO"."ACTIVE_OBJECT"
+        `SELECT VERSION_ID FROM "_SYS_REPO".${quoteIdentifier(OBJECT_TABLE[version])}
          WHERE PACKAGE_ID = ? AND OBJECT_NAME = ? AND OBJECT_SUFFIX IN ${suffixInClause(suffixes)}
          ORDER BY VERSION_ID DESC LIMIT 1`,
         [packageId, objectName, ...suffixes],
@@ -64,7 +68,7 @@ export class ViewDefinitionCache {
       this.entries.delete(key); // 版本变化：落空，走全量重取
     }
 
-    const result = await getViewDefinition(pool, packageId, objectName, { kind: opts.kind, format: 'json' });
+    const result = await getViewDefinition(pool, packageId, objectName, { kind: opts.kind, version, format: 'json' });
     if (result.definition) {
       this.entries.set(key, {
         versionId: result.object.versionId,

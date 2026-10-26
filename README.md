@@ -308,15 +308,15 @@ MCP_HTTP_TOKENS="alice:<token>:dev,bob:<token>:analyst"        # 第三段 = 该
 | --- | --- | --- | --- |
 | `hana_system_get_info` | `hana_system` | 只读 | 版本/SID/主机/实例/当前用户与 schema；另附环境档案 `profile` 与规则目录（`rules`：省略=目录，`all`/规则 id=全文） |
 | `hana_check_privileges` | `hana_system` | 只读 | 当前用户权限矩阵与建模能力摘要（排障入口） |
-| `hana_metadata_get_view` | `hana_discovery` | 只读 | 视图完整定义：json=结构化定义（节点/数据源/输出字段/变量），xml=原始设计时 XML |
+| `hana_metadata_get_view` | `hana_discovery` | 只读 | 视图完整定义：json=结构化定义（节点/数据源/输出字段/变量），xml=原始设计时 XML；`version` 默认 `active`=已激活版本，`inactive`=未激活/有挂起改动的版本 |
 | `hana_package_list` | `hana_discovery` | 只读 | 仓库包清单（含层级深度、负责人，支持片段过滤/截断） |
 | `hana_package_list_objects` | `hana_discovery` | 只读 | 包内对象清单（名称/类型/版本/激活状态，支持过滤/截断） |
-| `hana_metadata_search_objects` | `hana_discovery` | 只读 | 按名称片段搜索视图（默认 `by=name`）；`by=field` 时按**输出字段**反查"谁输出了匹配字段"（逐候选解析，`maxCandidates` 截断、逐条给 `matchedFields`） |
-| `hana_metadata_list_fields` | `hana_discovery` | 只读 | 视图输出字段清单（ID/描述/类型/聚合/来源/是否带公式） |
+| `hana_metadata_search_objects` | `hana_discovery` | 只读 | 按名称片段搜索视图（默认 `by=name`）；`by=field` 时按**输出字段**反查"谁输出了匹配字段"（逐候选解析，`maxCandidates` 截断、逐条给 `matchedFields`）；`version` 切换已激活/未激活对象 |
+| `hana_metadata_list_fields` | `hana_discovery` | 只读 | 视图输出字段清单（ID/描述/类型/聚合/来源/是否带公式）；`version` 切换版本视角 |
 | `hana_table_list` | `hana_discovery` | 只读 | 指定 schema 下可访问的表 |
 | `hana_table_columns` | `hana_discovery` | 只读 | 表的列结构（列名/类型/长度/精度/可空/注释） |
-| `hana_metadata_get_field_logic` | `hana_insights` | 只读 | 单字段计算逻辑：公式原文、引用的源字段与溯源、SQLScript 源码；`includeUsage` 时附**字段级下游血缘**（谁消费了这个字段，扫描预算 `usageMaxViews`，无映射消费方另列） |
-| `hana_metadata_where_used` | `hana_insights` | 只读 | 血缘/依赖：upstream（依赖谁）/ downstream（谁依赖，含运行时引用）；`depth` 多跳闭包（默认 1；`all` 受 maxNodes 截断，带 `depthReached`/`truncated`/`asOf`） |
+| `hana_metadata_get_field_logic` | `hana_insights` | 只读 | 单字段计算逻辑：公式原文、引用的源字段与溯源、SQLScript 源码；`includeUsage` 时附**字段级下游血缘**（谁消费了这个字段，扫描预算 `usageMaxViews`，无映射消费方另列）；`version` 同步作用于字段逻辑与血缘 |
+| `hana_metadata_where_used` | `hana_insights` | 只读 | 血缘/依赖：upstream（依赖谁）/ downstream（谁依赖，含运行时引用）；`depth` 多跳闭包（默认 1；`all` 受 maxNodes 截断，带 `depthReached`/`truncated`/`asOf`）；`version=inactive` 查未激活版本血缘（`INACTIVE_OBJECTCROSSREF`） |
 | `hana_view_check_actions` | `hana_modeling` | 写 | 查询 CHECK 过程支持的动作清单 |
 | `hana_data_preview` | `hana_data` | 只读 | 已激活视图数据预览：整体直查 / 节点中间视图 / XML 推导三通道，支持筛选与输入参数；权限类失败自动附带诊断报告 |
 | `hana_data_preview_diagnose` | `hana_data` | 只读 | 数据预览权限诊断：聚焦分析权限保护情况与上游数据源可达性，给出阻塞点与授权建议 |

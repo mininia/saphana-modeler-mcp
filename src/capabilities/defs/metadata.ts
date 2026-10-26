@@ -11,7 +11,7 @@ import { z } from 'zod';
 import { tagResource } from '../resources.js';
 import { cap, type Capability } from '../types.js';
 import { planTableColumns, planTableList } from '../planners.js';
-import { VIEW_KIND, zObjectName, zReadPackageId } from '../schemas.js';
+import { VIEW_KIND, VERSION_SCOPE, zObjectName, zReadPackageId } from '../schemas.js';
 
 export const metadataCapabilities = {
   hana_metadata_get_view: cap({
@@ -22,7 +22,9 @@ export const metadataCapabilities = {
     title: '读取视图完整定义',
     description:
       '读取指定视图的完整定义：format=json 返回解析后的结构化定义（数据源/节点/输出字段/变量/计算逻辑），' +
-      'format=xml 返回仓库原始设计时 XML（备份/人工编辑回传用）。' +
+      'format=xml 返回该版本的仓库原始设计时 XML（备份/人工编辑回传用）。' +
+      'version 默认 active=已激活版本；传 inactive 读取未激活/有挂起改动的版本' +
+      '（对象存在挂起改动时，默认读取拿到的是旧激活版，不含未激活修改）。' +
       '选择指引：理解视图逻辑/梳理字段用 format=json（更小更聚焦）；仅当要用 hana_view_update 的 xml 全量方式改造时才读 format=xml；' +
       '加 join 类修改优先直接用 hana_view_update 的 operations 声明式模式（免读 XML）。' +
       'kind 省略时自动匹配 calculationview/attributeview/analyticview 三种类型。' +
@@ -33,6 +35,9 @@ export const metadataCapabilities = {
       objectName: zObjectName('视图对象名，如 ZDEMO02_CV008'),
       kind: VIEW_KIND.optional().describe('视图类型；省略时自动匹配三种类型'),
       format: z.enum(['json', 'xml']).default('json').describe('返回格式：json=结构化定义；xml=仓库原始设计时 XML'),
+      version: VERSION_SCOPE.default('active').describe(
+        '版本视角：active=已激活版本（默认）；inactive=未激活/有挂起改动的版本（查不到时按未找到处理，不回退 active）',
+      ),
     }),
     annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   }),
@@ -44,8 +49,9 @@ export const metadataCapabilities = {
     effects: { destructive: false, idempotent: true },
     title: '搜索仓库视图（按名称 / 按字段）',
     description:
-      '两种模式（by）：by=name（默认）在 _SYS_REPO.ACTIVE_OBJECT 中按视图对象名片段模糊搜索（大小写不敏感），' +
+      '两种模式（by）：by=name（默认）在仓库对象表中按视图对象名片段模糊搜索（大小写不敏感），' +
       '返回包名/对象名/类型/版本/激活信息，用于定位视图的完整包名与对象名；' +
+      'version 默认 active=已激活对象，传 inactive 搜索未激活/有挂起改动的对象。' +
       'by=field 反过来找「**哪些视图的输出里含某字段**」（field 为字段 ID 片段）——候选视图逐个按需解析设计时 XML，' +
       '受候选上限（maxCandidates，默认 100）与 limit 双重约束，回执带 candidatesScanned/truncated/asOf；' +
       'by=field 时 pattern 可选，用于收窄对象名候选。默认只搜三种视图类型（排除 UI5 仓库资源）；kind 可限定类型。' +
@@ -64,6 +70,9 @@ export const metadataCapabilities = {
         .describe('搜索维度：name=按对象名（默认）；field=按输出字段（需同时给 field）'),
       field: z.string().min(1).max(100).optional().describe('字段 ID 片段（by=field 必填），如 MATERIAL'),
       kind: VIEW_KIND.optional().describe('视图类型；省略时搜全部三种视图'),
+      version: VERSION_SCOPE.default('active').describe(
+        '版本视角：active=已激活对象（默认）；inactive=未激活/有挂起改动的对象',
+      ),
       limit: z.number().int().min(1).max(100).default(20).describe('返回条数上限，默认 20，最大 100'),
       maxCandidates: z
         .number()
@@ -85,6 +94,7 @@ export const metadataCapabilities = {
     description:
       '梳理视图的字段清单：字段 ID、中文描述、类型（属性/度量）、聚合方式、来源（节点.列）、是否带计算逻辑。' +
       '默认只列输出字段（视图对外暴露的字段）；pattern 按字段 ID 片段模糊过滤，exact=true 精确匹配。' +
+      'version 默认 active=已激活版本；传 inactive 梳理未激活/有挂起改动的版本。' +
       '回答「某视图有哪些字段/梳理字段/有没有某字段」用本工具；' +
       '拿到字段 ID 后用 hana_metadata_get_field_logic 看该字段的完整计算逻辑',
     inputSchema: z.object({
@@ -93,6 +103,9 @@ export const metadataCapabilities = {
       pattern: z.string().optional().describe('字段 ID 过滤片段（如 ZDEMO_FLD）；省略=全部字段'),
       exact: z.boolean().default(false).describe('true=按字段 ID 精确匹配（pattern 必填）'),
       kind: VIEW_KIND.optional().describe('视图类型；省略时自动匹配三种类型'),
+      version: VERSION_SCOPE.default('active').describe(
+        '版本视角：active=已激活版本（默认）；inactive=未激活/有挂起改动的版本',
+      ),
       includeNodeCalculated: z.boolean().default(false).describe('true=附带节点内部的计算列（不进输出的中间计算字段）'),
     }),
     annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
@@ -107,6 +120,7 @@ export const metadataCapabilities = {
     description:
       '获取视图中指定字段的计算逻辑：公式原文（SQL/COLUMN_ENGINE）、公式引用的源字段、源字段沿节点映射的溯源、' +
       '字段元数据（中文描述/类型/长度）。SqlScriptView（SQL 脚本）节点返回脚本源码（script），脚本即该字段的逻辑来源。' +
+      'version 默认 active=已激活版本；传 inactive 读取未激活/有挂起改动的版本。' +
       '回答「某视图某字段什么逻辑/公式怎么写的/怎么算出来的」用本工具，一次调用即可，' +
       '不返回整份视图定义，结果精准聚焦单字段。' +
       '**字段级下游血缘**（谁引用了这个字段）用 includeUsage=true；命中归属与扫描口径（usage.downstream、' +
@@ -122,6 +136,9 @@ export const metadataCapabilities = {
         .min(1)
         .describe('字段 ID（精确），如 ZDEMO_FLD_NEW；不确定时先 hana_metadata_list_fields 搜索'),
       kind: VIEW_KIND.optional().describe('视图类型；省略时自动匹配三种类型'),
+      version: VERSION_SCOPE.default('active').describe(
+        '版本视角：active=已激活版本（默认）；inactive=未激活/有挂起改动的版本（字段逻辑与 includeUsage 血缘都按该视角）',
+      ),
       includeUsage: z
         .boolean()
         .default(false)
@@ -147,12 +164,17 @@ export const metadataCapabilities = {
     title: '血缘/依赖关系搜索',
     description:
       '查询视图的依赖关系：upstream=该视图引用了哪些对象（数据源/上游视图），downstream=哪些对象引用了该视图。' +
+      'version 默认 active=已激活版本的血缘（_SYS_REPO.ACTIVE_OBJECTCROSSREF）；传 inactive 查未激活/有挂起改动版本的血缘' +
+      '（_SYS_REPO.INACTIVE_OBJECTCROSSREF，与 active 互不回退）。' +
       '多跳波及面用 depth>1；返回口径（isRuntime、closure/depthReached/truncated/asOf）与使用时机见 ' +
       'rules=metadata_graph（hana_system_get_info(rules=metadata_graph)）',
     inputSchema: z.object({
       packageId: zReadPackageId('包名，层级用 . 分隔，如 ZDEMO.ZDEMO_MKC'),
       objectName: zObjectName('视图对象名'),
       kind: VIEW_KIND.optional().describe('视图类型；省略时匹配三种类型'),
+      version: VERSION_SCOPE.default('active').describe(
+        '版本视角：active=已激活版本的血缘（默认）；inactive=未激活/有挂起改动版本的血缘',
+      ),
       direction: z
         .enum(['upstream', 'downstream', 'both'])
         .default('both')
