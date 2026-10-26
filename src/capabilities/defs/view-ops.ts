@@ -1,25 +1,13 @@
 /**
- * 操作级能力条目（`<工具>#<op>`，2026-10-10）——**从父工具 schema 与 op 声明派生**，零手写副本。
+ * 操作级能力条目（`<工具>#<op>`）——从父工具 schema 与 VIEW_OPS 派生，零手写副本。
  *
- * ## 为什么是"派生"而不是"声明"
+ * - 参数面：身份字段取父 schema 同名字段，载荷字段取 operations 判别式 union 对应成员（去掉 op）；
+ * - effect 面：destructive 来自 services/view-ops.rules.ts（op 的唯一事实源）；
+ * - 计划面：planViewOpAlias 把入参还原成父工具的一次 operations 调用，交给父规划器。
  *
- * SSD §7.14 记过本轮不建它们的理由：手写一份「父工具身份参数 + op 载荷」的 schema = 同一份 schema
- * 再写一遍，两侧必然漂移（父工具改个参数名，别名那条静默失配）。本实现把漂移从"靠纪律"变成"结构上
- * 不可能"：
- *   - **参数面**：身份参数（清单 = planners 的 `VIEW_UPDATE_IDENTITY_FIELDS`，当前为 packageId/objectName/ifMatch/dryRun/migration）直接取父 schema 的同名字段；
- *     载荷字段直接取父 schema 的 `operations` 判别式 union 里对应成员的对象形状（去掉判别式 `op`）。
- *     任一侧改动都会在**构建期**（buildViewOpCapabilities 的守卫）或单测里当场暴露。
- *   - **effect 面**：destructive/摘要来自 `services/view-ops.rules.ts` 的 VIEW_OPS（op 的唯一事实源）。
- *   - **计划面**：`planViewOpAlias` 把入参还原成父工具的一次 operations 调用，交给**父工具的规划器**——
- *     读写集判定不另写一份（add_join 的源包照样进 readPackages）。
- *
- * ## 语义（routeOnly）
- *
- * 条目标 `routeOnly: true`：有清单声明、可授权、可出现在门面索引里，但**永不注册为工具**
- * （注册名 = module = 父工具名，注册即撞名）——调用方式是经门面路由：
- *   `hana_modeling({ capability: "hana_view_update#add_join", args: { packageId, objectName, …op 参数 } })`
- * 它与 `hana_view_update({ packageId, objectName, operations: [{ op: "add_join", … }] })` **完全等价**
- * （同一个父 handler、同一套闸门与破坏性判定），只是"任务形状的别名"。
+ * 条目标 routeOnly: true：可授权、可出现在门面索引，但永不注册为工具——调用方式：
+ *   hana_modeling({ capability: "hana_view_update#add_join", args: { packageId, objectName, … } })
+ * 与 hana_view_update({ …, operations: [{ op: "add_join", … }] }) 完全等价（同一 handler、同一闸门）。
  */
 
 import { z } from 'zod';
@@ -52,8 +40,7 @@ function operationsMemberShapes(parent: Capability): Map<string, Record<string, 
 /**
  * 派生一个父工具的全部操作级条目（键 = `<父 id>#<op>`）。
  *
- * @param parent 父工具能力（须含 `operations` 判别式 union 与身份字段 packageId/objectName/ifMatch/dryRun/migration）
- * @throws 声明与 schema 两侧漂移时（VIEW_OPS 有而 union 没有、或身份字段缺失）——构建期即失败，不静默少建条目
+ * @throws 声明与 schema 两侧漂移时（VIEW_OPS 有而 union 没有、或身份字段缺失）——构建期即失败
  */
 export function buildViewOpCapabilities(parent: Capability): Record<string, Capability<z.ZodType>> {
   const parentShape = (parent.inputSchema as unknown as { shape?: Record<string, z.ZodTypeAny> }).shape;
@@ -90,13 +77,12 @@ export function buildViewOpCapabilities(parent: Capability): Record<string, Capa
       title: decl.title,
       description:
         `op=${decl.id}：${decl.summary}。${decl.detail ?? ''}\n` +
-        `**经门面路由调用**（本条目不注册为工具）：args = 父工具身份参数（packageId / objectName 必填；` +
-        `ifMatch / dryRun / migration 可选）+ 本 op 参数（见 schema）。与 ` +
-        `${parent.id}({ operations: [{ op: "${decl.id}", … }] }) 完全等价——同一个 handler、同一套闸门与破坏性判定。`,
-      // 身份字段直接复用父 schema 的同名字段（保留其 .default()/.optional() 语义）；载荷字段来自 union 成员
+        `经门面路由调用（本条目不注册为工具）：args = 父工具身份参数（packageId / objectName 必填；` +
+        `ifMatch / dryRun / migration 可选）+ 本 op 参数。与 ` +
+        `${parent.id}({ operations: [{ op: "${decl.id}", … }] }) 完全等价（同一 handler、同一闸门与破坏性判定）。`,
+      // 身份字段复用父 schema 的同名字段（保留其 .default()/.optional() 语义）；载荷字段来自 union 成员
       inputSchema: z.object({ ...identity, ...payload }),
-      // 注解**从本条的 effects 派生**（不复制父注解）：set_description 这类非破坏 op 的
-      // destructiveHint 必须为 false——manifest 测试钉住"三个正交字段不许互相矛盾"。
+      // 注解从本条的 effects 派生（set_description 这类非破坏 op 的 destructiveHint 必须为 false）。
       annotations: {
         readOnlyHint: parent.kind === 'read',
         idempotentHint: parent.effects.idempotent,

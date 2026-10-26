@@ -12,10 +12,9 @@ import { toToolResult } from './common.js';
 import { CAP } from '../capabilities/manifest.js';
 import type { Envelope } from '../types/hana.js';
 
-/** 包/对象浏览工具：包树 + 包内对象清单（只读） */
+/** 包/对象浏览与仓库操作工具（声明见 capabilities/defs/package.ts） */
 export function registerPackageTools(server: McpServer, ctx: ToolContext): void {
-  // 注册器把每个 handler 套上统一的调用期闸门（authorizeCall）：判定不通过会在 handler 之前拦截、
-  // 不进 service（闸门实现与判定依据见 tools/index.ts 与 config/authorize.ts）。
+  // capabilityRegistrar 统一套调用期闸门，判定不通过不进 service。
   const regCap = capabilityRegistrar(server, ctx);
   regCap(CAP.hana_package_list, async ({ pattern, limit }) => {
     const envelope: Envelope = await withErrorEnvelope(() => listPackages(ctx.pool, { pattern, limit }));
@@ -40,8 +39,7 @@ export function registerPackageTools(server: McpServer, ctx: ToolContext): void 
   });
 
   regCap(CAP.hana_repo_import, async ({ targetPackageId, filePath, content, fileName, overwrite }) => {
-    // 来源二选一：两者同时给出时必须拒绝——若按任一优先静默取舍，另一份来源会被静默忽略，
-    // 调用方以为导入了本地文件，实际导入的是另一份内容，属最难查的一类回执。
+    // 来源二选一：同时给出必须拒绝——静默取舍会让调用方以为导入了文件、实际是另一份内容。
     if (filePath && content !== undefined) {
       return mcpErrorText(
         '导入来源二选一：filePath（本地文件）与 content（内联内容）不能同时提供。',

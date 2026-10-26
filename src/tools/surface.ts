@@ -1,33 +1,17 @@
 /**
- * 调用方面（surface）、可触达上限（entitlement）与**提升**。
+ * 调用方面（surface）、可触达上限（entitlement）与提升。
  *
- * ## 三个词，别混
+ * - entitlement = 部署静态面 ∩ 调用方档案，是天花板：门面索引、路由与提升都按它判定，
+ *   面外能力在三处都表现得与不存在完全一样（不变量 D）。
+ * - promoted = 该调用方调用过的分类；提升把该分类的具体能力搬进 surface，此后可按工具名平铺直调。
+ * - surface = (门面 ∪ 已提升分类的成员) ∩ entitlement，是本次连接实际注册的工具集。
+ * 关系：surface ⊆ entitlement ⊆ 部署策略（不变量 A）。
  *
- * - **entitlement（可触达上限）** = 部署静态面 ∩ 调用方档案。它是**天花板**：能力是否"存在且你有权用"。
- *   门面索引、路由与提升都按它判定——所以"面外"的能力在三处都表现得**与不存在完全一样**（不变量 D）。
- * - **promoted（已提升）** = 该调用方调用过的**分类**。提升把该分类的**具体能力**搬进 surface，
- *   此后它们是 `tools/list` 里的一等工具、可平铺直调、带完整 schema。
- * - **surface（静态面）** = `(门面 ∪ 已提升分类的成员) ∩ entitlement`。它是**这次连接实际注册出去的工具集**。
+ * 提升按分类（粒度对齐 hana-cli 的 Dynamic Tool Promotion）：淘汰单位与提升单位一致，
+ * 上限 MCP_CAPABILITY_SURFACE_MAX 按工具数算（routeOnly 不注册也不计），超出时最旧分类整体淘汰。
  *
- * 关系：`surface ⊆ entitlement ⊆ 部署策略`（不变量 A：动态面 ⊆ 静态策略）。
- *
- * ## 提升是**按分类**的（对齐 hana-cli 的 Dynamic Tool Promotion）
- *
- * 粒度取分类而不是单个能力，有两个理由：
- * 1. **对齐既有约定**：模型的动作本来就是"我要做建模"（选一个门面），按分类提升与这个粒度同形；
- * 2. **淘汰单位与提升单位一致**：上限 `MCP_CAPABILITY_SURFACE_MAX`（默认 50）按**工具数**算
- *    （只数能注册为工具的成员，`routeOnly` 操作级条目不注册也不计，见 `toolCountOf`），
- *    超出时**最旧的那个分类**整体淘汰（hana-cli 同款 FIFO）——单一能力的淘汰会让面里
- *    出现"同类里有一半在面上"的破碎状态，比整体进出更难解释。
- *    上限存在的意义是**能力增长时不静默失控**。
- *
- * ## 状态的范围（不变量 F：面是**呈现**设施，不是正确性设施）
- *
- * - 键 = 调用方：HTTP 用**已认证 clientId**；stdio 用 `(stdio)`（单客户端进程）。
- * - **未配 Token 的 HTTP 部署**（所有调用方都是 anonymous）→ 提升**整体关闭**：
- *   单租户假设，不能让一个调用方的提升改变另一个的可见面。
- * - **进程内状态、重启即退回**：重启后退回"只有门面"，不报错，也不改变任何授权结果
- *   （授权每次调用现算，见 `config/authorize.ts`）。
+ * 状态在进程内、重启即退回只有门面（不变量 F：面是呈现设施，不是正确性设施）：
+ * HTTP 键 = 已认证 clientId；stdio 键 = (stdio)。未配 Token 的 HTTP 部署提升整体关闭（单租户假设）。
  */
 
 import { CAPABILITY_LIST, findCapability, membersOfCategory } from '../capabilities/manifest.js';
@@ -38,9 +22,8 @@ import { ANONYMOUS_CLIENT_ID, currentIdentity } from '../core/request-context.js
 import { shouldRegisterTool, type ToolFilterConfig } from './groups.js';
 
 /**
- * 面的计算只需要"策略 + 配置"两件事。**刻意不 import `./index.js` 的 ToolContext**：
- * registrar 要用本模块（index → surface），反向 import 会成环。
- * `ToolContext` 在结构上满足本接口（鸭子类型），调用点无需转换。
+ * 面的计算只需要「策略 + 配置」。刻意不 import ./index.js 的 ToolContext（会成环）；
+ * ToolContext 在结构上满足本接口（鸭子类型）。
  */
 export interface SurfaceContext {
   config: HanaConfig;
@@ -53,7 +36,7 @@ const STDIO_SURFACE_KEY = '(stdio)';
 /** 提升注册表：调用方键 → 已提升的分类（按提升顺序，FIFO 淘汰用最旧在前） */
 const promotedByCaller = new Map<string, FacadeCategory[]>();
 
-/** 重置全部提升状态（测试隔离用；仓库约定：模块级可变状态必须配显式重置入口） */
+/** 重置全部提升状态（测试隔离用） */
 export function resetPromotedSurfaces(): void {
   promotedByCaller.clear();
 }
@@ -77,19 +60,16 @@ function surfaceKeyOf(identity: { clientId?: string } | undefined): string {
 }
 
 /**
- * 当前调用方的归属键（提升注册表与异步任务归属共用同一条派生）：HTTP 用已认证 clientId，
- * stdio 用 '(stdio)'。两处必须同源——异步任务的提交侧与查询/取消侧若各自现算，任一侧口径
- * 变化（如改取 profileId）都会让「自己提交的任务查不到」且没有任何报错。
- * 未配 Token 的 HTTP 部署所有调用方都是 anonymous：任务按单租户假设互相可见（写进 README）。
+ * 当前调用方的归属键（提升注册表与异步任务归属共用）：HTTP 用 clientId，stdio 用 (stdio)。
+ * 两处必须同源——各自现算会让「自己提交的任务查不到」且没有任何报错。
  */
 export function currentSurfaceKey(): string {
   return surfaceKeyOf(currentIdentity());
 }
 
 /**
- * 一批分类覆盖的**工具数**（提升预算按它算）。与 {@link computeSurface} 同口径：只数能注册为
- * 工具的成员——`routeOnly` 操作级别名永不进 `tools/list`，计入会让「面里从未超过上限」的部署
- * 被提前淘汰，而运维按 tools/list 数工具复现不出来，正是最难排查的一类现场。
+ * 一批分类覆盖的工具数（提升预算按它算）。与 computeSurface 同口径：只数可注册成员，
+ * routeOnly 别名不计入（计入会让「面从未超上限」的部署被提前淘汰）。
  */
 function toolCountOf(categories: readonly FacadeCategory[]): number {
   return categories.reduce((sum, c) => sum + membersOfCategory(c).filter((m) => m.routeOnly !== true).length, 0);
@@ -97,12 +77,9 @@ function toolCountOf(categories: readonly FacadeCategory[]): number {
 
 /**
  * 把一批分类提升到某调用方的面。返回本次实际新增与被 FIFO 淘汰的分类。
- *
- * 语义：
- * - 已提升的分类不重复计入，**也不刷新顺序**（顺序 = 首次提升时间）；
- * - 超出 `max` 时从**最旧**的一端整体淘汰；**刚提升的那个分类不参与本次淘汰**
- *   （否则"提升一个超大分类"会立刻把自己淘汰掉，面永远空转）；
- * - 不在此处做授权判定：调用方（门面）已按 entitlement 过滤过。
+ * - 已提升的分类不重复计入，也不刷新顺序；
+ * - 超出 max 时从最旧的一端整体淘汰，本次刚提升的分类不参与淘汰（否则会立刻淘汰自己）；
+ * - 不做授权判定：调用方已按 entitlement 过滤。
  */
 export function promoteCategories(
   key: string,
@@ -130,15 +107,8 @@ export function promoteCategories(
 }
 
 /**
- * 调用方的可触达能力（entitlement）：部署静态面 ∩ 档案。
- *
- * 注意它**包含**门面与非门面两类条目：门面是入口，非门面是路由/提升目标——路由目标虽然不一定进
- * `tools/list`，但必须"有权调用"，所以它们的资格也在这里判。
- *
- * **门面常驻（门面层不做限制）**：门面是入口，不参与能力层的权限判定——
- * 分组开关（`shouldRegisterTool`）与档案都只管**具体能力**。否则一个按 glob 收紧的档案
- * （如只允许 `hana_metadata_*`）会把六个门面全部拒掉，本次连接一个工具都注册不出来（自锁死）；
- * 入口常在、索引可能为空，才是"可用性收窄"的正确表达。
+ * 调用方的可触达能力（entitlement）：部署静态面 ∩ 档案，包含门面与非门面两类条目。
+ * 门面常驻：入口不参与能力层判定，否则按 glob 收紧的档案会把门面全拒、一个工具都注册不出来。
  */
 export function entitlementOf(
   ctx: SurfaceContext,
@@ -152,8 +122,7 @@ export function entitlementOf(
   const entitled = (c: Capability): boolean => {
     if (!shouldRegisterTool(c.id, ctx.toolFilter)) return false;
     if (c.facadeOf !== undefined) return true; // 门面：入口不参与能力层判定（分组/档案都不拦它）
-    // 档案维度与调用期闸门共用 config/profiles.ts 的 profileAllows（单点实现）：
-    // undefined 档案 → profile_unknown → false（空档案全拒）；『与 authorizeCall 同口径』由同一实现保证
+    // 档案维度与调用期闸门共用 profileAllows（单点实现）：undefined 档案 → profile_unknown → false
     return profileAllows(profile, c.id, c.kind).ok;
   };
   const ids = CAPABILITY_LIST.filter(entitled).map((c) => c.id);
@@ -189,8 +158,7 @@ export function computeSurface(
   const key = surfaceKeyOf(identity);
   const allowed = canPromote(identity);
   const promoted = allowed ? promotedCategoriesFor(key) : [];
-  // routeOnly 条目（操作级别名）不参与 surface：它们没有自己的注册名（= 父工具名，注册即撞名），
-  // 提升只把**可平铺直调**的成员搬进 tools/list；别名照旧经门面路由可用（entitlement 不受影响）。
+  // routeOnly 别名不进 surface：它们没有自己的注册名（注册即撞父工具名），只经门面路由可用。
   const promotedMembers = new Set(
     promoted.flatMap((c) =>
       membersOfCategory(c)
@@ -225,9 +193,7 @@ export function summaryOf(cap: Capability): string {
 
 /**
  * 能力的参数名清单（门面索引用；只给名字不给 schema）。
- *
- * 完整 schema **由提升给出**：提升后该能力是 `tools/list` 里的一等工具，客户端直接拿到它的
- * JSON Schema。索引里的参数名是"提升之前"的挑选依据——先给名字，决定要不要提升。
+ * 完整 schema 由提升给出（提升后它是 tools/list 的一等工具）。
  */
 export function paramNamesOf(cap: Capability): string[] {
   const shape = (cap.inputSchema as unknown as { shape?: Record<string, unknown> }).shape;

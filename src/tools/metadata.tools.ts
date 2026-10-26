@@ -1,11 +1,6 @@
 /**
- * 元数据读取工具（分组 **read**）：视图定义/字段/字段逻辑/血缘、对象搜索、表清单与表结构。
- *
- * 注册的工具：hana_metadata_get_view、hana_metadata_search_objects、hana_metadata_list_fields、
- * hana_metadata_get_field_logic、hana_metadata_where_used、hana_table_list、hana_table_columns。
- * 全部只读（不写仓库、不写任何表），经 capabilityRegistrar 按能力清单注册——所有能力都过
- * authorizeCall 调用期闸门，读能力与写能力的差别只在有无资源维度（effects.plan）：
- * hana_table_list / hana_table_columns 的 schema 参数进读范围判定，其余读 _SYS_REPO 固定面不声明资源。
+ * 元数据读取工具（分组 read）：视图定义/字段/字段逻辑/血缘、对象搜索、表清单与表结构。
+ * 全部只读，声明取自能力清单；表清单/列结构的 schema 参数进读范围判定，其余读固定仓库面。
  */
 
 import type { McpServer } from '@modelcontextprotocol/server';
@@ -37,7 +32,7 @@ export function registerMetadataTools(server: McpServer, ctx: ToolContext): void
   });
 
   regCap(CAP.hana_metadata_search_objects, async ({ pattern, by, field, kind, limit, maxCandidates, version }) => {
-    // 跨字段条件必填：zod 表达不了（既有约定：handler 级硬错误 + 可恢复指引）
+    // 跨字段条件必填：zod 表达不了（handler 级硬错误 + 可恢复指引）
     const mode = by ?? 'name';
     if (mode === 'name' && !pattern) {
       return mcpErrorText('by=name（默认）需要 pattern', '按对象名搜索请给 pattern；按字段搜索用 by=field + field');
@@ -64,8 +59,7 @@ export function registerMetadataTools(server: McpServer, ctx: ToolContext): void
   regCap(
     CAP.hana_metadata_list_fields,
     async ({ packageId, objectName, pattern, exact, kind, includeNodeCalculated, version }) => {
-      // exact=true 必须配 pattern：exact 配空 pattern 会按空串精确匹配 → **返回空清单**（不报错也非全量），
-      // 调用方只会以为"这个视图没有字段"，故 handler 直接报参数错误。
+      // exact=true 必须配 pattern：空 pattern 会按空串精确匹配并返回空清单，调用方会误以为视图没字段。
       if (exact && !pattern) {
         return mcpErrorText(
           'exact=true 需要同时提供 pattern（精确匹配的字段 ID）。',
@@ -88,7 +82,7 @@ export function registerMetadataTools(server: McpServer, ctx: ToolContext): void
         const lineage = await fieldLineage(ctx.pool, packageId, objectName, fieldId, {
           direction: 'downstream',
           version,
-          // 复用上面已取到的种子对象：避免对同一视图再发一次对象表查询
+          // 复用上面已取到的种子对象，避免再查一次对象表
           seedObject: base.object,
           ...(usageMaxViews !== undefined ? { maxViews: usageMaxViews } : {}),
         });
