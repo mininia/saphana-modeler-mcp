@@ -30,6 +30,7 @@ import { bwDialectRules } from './bw-dialect.rules.js';
 import { modelBasicsRules } from './model-basics.rules.js';
 import { stabilityRules } from './stability.rules.js';
 import { viewOpsRules } from './view-ops.rules.js';
+import { resultRules } from './result.rules.js';
 
 /**
  * 全部规则 id（顺序 = RULES 的对外列示顺序）。`as const` 的两个作用：
@@ -55,6 +56,8 @@ export const RULE_IDS = [
   // ── 视图操作（op 别名）与异步任务 API ────────────────────────────────
   'view_ops',
   'async_task',
+  // ── 回执结果契约（P0-1 / P0-2）────────────────────────────────────
+  'result_contract',
 ] as const;
 
 /** 规则 id 的字面量联合（编译期契约） */
@@ -103,6 +106,7 @@ export const RULES: readonly RuleObject[] = [
   ...modelBasicsRules,
   ...stabilityRules,
   ...viewOpsRules,
+  ...resultRules,
 ];
 
 /**

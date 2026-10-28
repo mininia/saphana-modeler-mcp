@@ -26,6 +26,7 @@ export const SERVER_INSTRUCTIONS = [
   '工具是**两层**：常驻的只有六个分类门面（hana_system / hana_discovery / hana_data / hana_insights / hana_modeling / hana_diagnostics），其余能力默认隐藏。',
   '用法：**不带参数**调门面 → 返回本类能力索引（id / 一句话摘要 / 参数名），据此挑具体能力；**带 capability + args** 调门面 → 直接调用该能力。',
   '调门面还会把**该分类的能力提升进工具面**：此后它们是 tools/list 里的一等工具（带完整参数 schema、可按工具名平铺调用）。未用到的分类不会占上下文。',
+  '工具面可能因部署策略或调用方档案收窄：门面索引的 surface 字段会说明被收窄的类别（默认不点名被隐藏的能力）。',
   '能力族：hana_system_*（系统信息，含规则库）、hana_metadata_* 与 hana_table_*（只读元数据与血缘）、hana_package_* / hana_repo_*（包与传输）、hana_data_preview*（数据预览/基表勘察）、hana_view_*（建模写操作）、hana_system_health / hana_system_activity / hana_system_trend / hana_table_storage（稳定性诊断）、hana_sql_analyze（SQL 分析）。',
   '',
   '写操作（hana_view_*）：先 validate 再 activate；改/删前先用 hana_metadata_where_used 查依赖。',

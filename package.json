@@ -1,6 +1,6 @@
 {
   "name": "saphana-modeler-mcp",
-  "version": "1.2.2",
+  "version": "1.3.0",
   "description": "SAP HANA Modeler MCP Server (TypeScript) - 经典 HANA 2.0 仓库建模能力（_SYS_REPO/_SYS_BI/_SYS_BIC）",
   "type": "module",
   "private": true,
@@ -14,6 +14,7 @@
   },
   "files": [
     "dist",
+    "CONFIG.md",
     "THIRD-PARTY-NOTICES.md"
   ],
   "engines": {
@@ -24,9 +25,10 @@
     "build": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json && node -e \"require('fs').chmodSync('dist/index.js',0o755)\"",
     "prepare": "npm run build",
     "typecheck": "tsc --noEmit -p tsconfig.json",
+    "check:tool-names": "node scripts/check-tool-names.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "check": "npm run typecheck && npm test",
+    "check": "npm run check:tool-names && npm run typecheck && npm test",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
     "pretest": "node -e \"if(require('fs').globSync('tests/unit/*.test.ts').length===0){console.error('未匹配到任何测试文件（tests/unit/*.test.ts）：tests/ 目录不入库（.gitignore），克隆后需自备本地测试。此处刻意以非零退出，避免「0 个测试」被当作通过。');process.exit(1)}\"",

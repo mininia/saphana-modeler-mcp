@@ -26,6 +26,7 @@ export const sqlAnalyzeCapabilities = {
       '三种取数方式（sql 与 planId 二选一）：① sql=只编译不执行，给估计计划；② planId=分析计划缓存里已执行过的语句（需 OPTIMIZER ADMIN）；③ sql + analyze=true=先真执行再分析（默认走 PlanViz 通道拿逐算子实测；通道不可用时降级为估计计划 + 语句级统计，source=sqlExecuted）。\n' +
       '返回：conclusion（一句话结论 + 逐条发现[risk/warn/info，带依据与建议] + 统计）；默认不返回原始执行计划，raw=true 才附算子明细（verbose=true 再加 OPERATOR_DETAILS/PROPERTIES）。\n' +
       `护栏：只允许单条 SELECT/WITH、不返回数据行、单次执行最多 ${ANALYZE_EXECUTION_TIMEOUT_MS / 60_000} 分钟、最多取 ${ANALYZE_MAX_ROWS} 行即关闭结果集；语句内 schema 须在服务端允许范围内（sql/analyze 模式未限定表名按当前用户默认 schema 判定，planId 模式按条目编译时的 schema 判定）。\n` +
+      '长分析可加 async=true：立即返回 taskId，用 hana_task_get 轮询（不受客户端单次调用超时限制）；执行中的 SQL 无法取消。\n' +
       '库侧写副作用：EXPLAIN 会向 SYS.EXPLAIN_PLAN_TABLE 写本次计划行（该表全库可读），回读后按唯一名删除；无 DELETE 权限时行残留，回执 planRowsCleaned=false + notes 给清理线索（PlanViz 通道不写该表）。\n' +
       '本工具归 write 组（只启用 read 的部署看不到它）。三态语义、PlanViz 六栏与降级口径见 rules=sql_analyze（hana_system_get_info）。',
     inputSchema: z.object({
@@ -46,6 +47,12 @@ export const sqlAnalyzeCapabilities = {
         .default(false)
         .describe(
           `仅 sql 模式：true=先真执行再分析（走 PlanViz 通道拿逐算子实测 + 六栏 panels；不可用时降级为估计计划 + 语句级统计）。护栏：只允许 SELECT、单次执行最多 ${ANALYZE_EXECUTION_TIMEOUT_MS / 60_000} 分钟、最多取 ${ANALYZE_MAX_ROWS} 行、不返回数据行；默认 false`,
+        ),
+      async: z
+        .boolean()
+        .default(false)
+        .describe(
+          'true=后台执行并通过 hana_task_get 轮询（长 analyze 用，避免客户端单次调用超时）；执行中的 SQL 无法取消',
         ),
       statementName: z
         .string()

@@ -11,6 +11,7 @@
 
 import type { McpServer } from '@modelcontextprotocol/server';
 import { mcpErrorText, withErrorEnvelope } from '../core/errors.js';
+import { attachResultInfo, resultInfoOf } from '../core/result-info.js';
 import { runHealth, normalizeChecks } from '../services/health.service.js';
 import { runActivity, normalizeSections } from '../services/activity.service.js';
 import { runTrend, normalizeTrendMetrics } from '../services/trend.service.js';
@@ -25,6 +26,10 @@ import { capabilityRegistrar, type ToolContext } from './index.js';
 import { CAP } from '../capabilities/manifest.js';
 import { toToolResult } from './common.js';
 import type { Envelope } from '../types/hana.js';
+
+/** 各工具条数上限的 schema 默认值（单一事实源 = 清单；区分调用方显式值与服务端默认） */
+const ACTIVITY_LIMIT_DEFAULT: number = CAP.hana_system_activity.inputSchema.shape.limit.parse(undefined);
+const STORAGE_TOPN_DEFAULT: number = CAP.hana_table_storage.inputSchema.shape.topN.parse(undefined);
 
 export function registerHealthTools(server: McpServer, ctx: ToolContext): void {
   const regCap = capabilityRegistrar(server, ctx);
@@ -44,9 +49,27 @@ export function registerHealthTools(server: McpServer, ctx: ToolContext): void {
   regCap(CAP.hana_system_activity, async ({ sections, minDurationSec, limit }) => {
     const norm = normalizeSections(sections);
     if (!norm.ok) return mcpErrorText(norm.message);
-    const envelope: Envelope = await withErrorEnvelope(() =>
-      runActivity(ctx.pool, { sections: norm.value, minDurationSec, limit }),
-    );
+    const envelope: Envelope = await withErrorEnvelope(async () => {
+      const report = await runActivity(ctx.pool, { sections: norm.value, minDurationSec, limit });
+      // 三段各自有 count（不限行的真实总数）与 items（前 limit 条）：聚合成一条 resultInfo。
+      type ActivityPart = NonNullable<typeof report.blocking>;
+      const parts = [report.blocking, report.transactions, report.statements].filter(
+        (p): p is ActivityPart => p !== undefined,
+      );
+      const returnedCount = parts.reduce((n, p) => n + p.items.length, 0);
+      const totalAvailable = parts.length > 0 ? parts.reduce((n, p) => n + p.count, 0) : undefined;
+      const truncated = parts.some((p) => p.count > p.items.length);
+      return attachResultInfo(
+        report,
+        resultInfoOf({
+          returnedCount,
+          ...(totalAvailable !== undefined ? { totalAvailable } : {}),
+          limit,
+          requestedLimit: limit !== ACTIVITY_LIMIT_DEFAULT,
+          truncated,
+        }),
+      );
+    });
     return toToolResult(envelope);
   });
 
@@ -64,8 +87,8 @@ export function registerHealthTools(server: McpServer, ctx: ToolContext): void {
       const tableCheck = validateTableName(table);
       if (!tableCheck.ok) return mcpErrorText(tableCheck.message);
     }
-    const envelope: Envelope = await withErrorEnvelope(() =>
-      runTableStorage(ctx.pool, {
+    const envelope: Envelope = await withErrorEnvelope(async () => {
+      const report = await runTableStorage(ctx.pool, {
         mode: modeResult.value,
         schema,
         table,
@@ -73,8 +96,22 @@ export function registerHealthTools(server: McpServer, ctx: ToolContext): void {
         minSizeMiB,
         // 未指定时透传 undefined（不要折叠成 'ACTIVE'）：服务层据此区分「未指定」与「显式指定」
         subtype: subtypeResult.explicit ? subtypeResult.value : undefined,
-      }),
-    );
+      });
+      // 下钻口径（column/index）的条目在 columns/indexes；表级口径在 rows。
+      const items: unknown[] = report.columns ?? report.indexes ?? report.rows;
+      // 不能用 report.tableCount 当 totalAvailable：它是**过滤前**的表数（fragmentation 的
+      // minSizeMiB、partition 的 subtype/BW 过滤都在取数后才生效），拿它会把"符合条件的就是这些"
+      // 误报成截断。统一按"取满 topN"判：取满才可能还有更多，未满就是全部。
+      return attachResultInfo(
+        report,
+        resultInfoOf({
+          returnedCount: items.length,
+          limit: topN,
+          requestedLimit: topN !== STORAGE_TOPN_DEFAULT,
+          truncated: items.length >= topN,
+        }),
+      );
+    });
     return toToolResult(envelope);
   });
 

@@ -338,7 +338,7 @@ const baseModelingCapabilities = {
     title: '校验计算视图一致性',
     description:
       '双模式校验：\n' +
-      'target=design（默认）：对可写包内设计时对象做激活前校验——临时副本 _CHKTMP 触发服务端激活检查（CheckResult 带编译明细）后删除，原对象激活状态不受影响；副本名带短哈希（总长 ≤29），与真实对象重名时本次拒绝执行（不删不改）；\n' +
+      'target=design（默认）：对可写包内设计时对象做激活前校验——临时副本 _CHKTMP 触发服务端激活检查（CheckResult 带编译明细）后删除，原对象激活状态不受影响；副本名带短哈希（总长 ≤29），与真实对象重名时本次拒绝执行（不删不改）；清理未完成时回执 tempResidue（对象名+原因），需人工清理，不静默。\n' +
       'target=runtime：对已激活的运行时计算视图做一致性校验（SYS.CHECK_CALCULATION_VIEW，需 schema+viewName，如 _SYS_BIC + "ZDEMO.ZDEMO_MKC/ZDEMO03_CV003"）。\n' +
       '激活前建议先 design 校验，激活后可用 runtime 复检；支持的动作清单用 hana_view_check_actions 查询。',
     inputSchema: z.object({
@@ -423,6 +423,7 @@ const baseModelingCapabilities = {
       'changeset_partial / changeset_conflict / changeset_invalid。\n' +
       '回执：新基线 etag 与 etagSource、breaking、migration、rowProbe（0 行附排查提示）、changeset 逐项 report' +
       '（etag/elapsedMs/状态）。\n' +
+      '原地覆盖、无自动回滚：改前用 hana_metadata_get_view(format=xml) 留档，恢复=用该 XML 重新 update。\n' +
       '方言与细节见 rules=write_receipt,sql_mode,bw_dialect,view_ops（hana_system_get_info）。',
     inputSchema: z
       .object({
@@ -518,7 +519,8 @@ const baseModelingCapabilities = {
     title: '删除 Calculation View（设计时对象）',
     description:
       '删除可写包下的 Calculation View 设计时对象（XS REST：DELETE + If-Match）：陈旧基线 412、对象已不存在 OBJECT_NOT_FOUND（均机读），回执带删除前 etag/version。\n' +
-      '有下游引用时属破坏性变更：须显式声明 migration.strategy=acknowledge_dependents 才放行，未声明即拒绝且不删除（回执带破坏项与下游计数）。删除会造成依赖方失效（删前建议用 hana_metadata_where_used 查引用）；写包范围由 HANA_WRITE_PACKAGES 限定。',
+      '有下游引用时属破坏性变更：须显式声明 migration.strategy=acknowledge_dependents 才放行，未声明即拒绝且不删除（回执带破坏项与下游计数）。删除会造成依赖方失效（删前建议用 hana_metadata_where_used 查引用）；写包范围由 HANA_WRITE_PACKAGES 限定。\n' +
+      '删除不可恢复：恢复方式 = 用事先导出的备份（hana_repo_export 或 hana_metadata_get_view(format=xml) 留档）经 hana_repo_import 重新导入。',
     inputSchema: z.object({
       packageId: zWritePackageId('目标包名；须在 HANA_WRITE_PACKAGES 可写范围内'),
       objectName: zObjectName('视图对象名（不含包名）'),
@@ -549,11 +551,11 @@ const baseModelingCapabilities = {
     effects: { destructive: false, idempotent: true },
     title: '查询异步任务状态与结果',
     description:
-      '轮询 hana_view_update(async=true) 提交的变更集任务：返回 status（working/completed/failed/cancelled）、进度与终态 result（与同步调用同形的回执信封）。\n' +
+      '轮询异步任务：`hana_view_update(async=true)` 的变更集、或 `hana_sql_analyze(async=true)` 的长分析。返回 kind、status（working/completed/failed/cancelled）、进度与终态 result（与同步调用同形的回执信封）。\n' +
       '只对本调用方可见（他人任务与不存在的任务回同一句「未知任务」）；任务状态在进程内，服务重启即失效——' +
       `终态任务约保留 ${TASK_TTL_MS_DEFAULT / 60_000} 分钟（注册表饱和时最旧的终态会被提前清理）。`,
     inputSchema: z.object({
-      taskId: z.string().min(1).max(128).describe('任务 id（hana_view_update(async=true) 的回执里给出）'),
+      taskId: z.string().min(1).max(128).describe('任务 id（async=true 调用的回执里给出）'),
     }),
     annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   }),
@@ -563,9 +565,9 @@ const baseModelingCapabilities = {
     category: 'modeling',
     kind: 'write',
     effects: { plan: planTaskCancel, destructive: false, idempotent: true },
-    title: '取消异步任务（协作式，动作边界生效）',
+    title: '取消异步任务（协作式）',
     description:
-      '请求取消一个运行中的变更集任务：当前动作不打断，在本动作结束后停止后续项，并触发与失败相同的逆序补偿（已执行项回到批前状态，终态 result 的 raw.code=changeset_cancelled 带完整报告）。已到终态的任务不可取消（如实回执、不报错）。只对本调用方可见。',
+      '请求取消一个运行中的异步任务。变更集（changeset）：当前动作不打断，结束后停止后续项并触发与失败相同的逆序补偿（终态 raw.code=changeset_cancelled 带完整报告）。SQL 分析：执行中的语句无法取消，分析会跑完并如实返回结果，终态会说明取消未生效。已到终态的任务不可取消（如实回执、不报错）。只对本调用方可见。',
     inputSchema: z.object({
       taskId: z.string().min(1).max(128).describe('要取消的任务 id'),
     }),

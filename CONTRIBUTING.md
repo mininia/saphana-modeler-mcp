@@ -7,8 +7,9 @@
 | 命令 | 作用 |
 | --- | --- |
 | `npm run typecheck` | 类型检查。**同时承担死代码检测**：`noUnusedLocals` / `noUnusedParameters` 会拦下未使用的导入与变量 |
-| `npm test` | 单元测试（900+ 项；测试文件在本地 `tests/`，不入库，见下） |
-| `npm run check` | 上面两个一起跑（提交前跑这个） |
+| `npm run check:tool-names` | 工具名一致性守卫：instructions / 规则库 / 描述里的 `hana_*` 必须是清单里登记的能力（改名的漂移在这里红） |
+| `npm test` | 单元测试（1000+ 项；测试文件在本地 `tests/`，不入库，见下） |
+| `npm run check` | 工具名守卫 + 类型检查 + 单测（提交前跑这个） |
 | `npm run format` | Prettier 格式化（`format:check` 只检查不写） |
 
 > 开发与检查要求 Node >= 24.18.1（与 package.json 的 engines 下限一致；启动期校验只比较 major.minor，即 >= 24.18 放行、patch 位不受校验，见 `core/node-version.ts`）。更低版本上 npm test 不可用：npm 在 Windows 固定用 cmd.exe 执行脚本，cmd 不展开 glob，而 Node 20 的 --test 也不展开（报 Could not find 或静默 0 用例）。
@@ -19,6 +20,19 @@
 
 - 产出发布件一律用 `npm run release:pack`：先 `npm run build`，再用 `npm pack --dry-run --json` 断言 `dist/index.js` 在打包清单中，最后才 `npm pack` 产出 tarball。
 - 禁止走 `--ignore-scripts` 类打包路径（npm pack / npm publish --ignore-scripts）：会跳过 `prepare`（= `npm run build`），静默产出只含 LICENSE/README/package.json 的无代码空壳包——装得上、跑不了。
+
+### 发布检查清单（每次发版逐项勾）
+
+- [ ] `CHANGELOG.md` 有本次条目——**提交前**补到当前版本段（不设 Unreleased），每条 1–3 行，只写对外可见变化；
+- [ ] `npm run check` 全绿（含 `check:tool-names`、类型检查、单测；测试文件在本地 `tests/`，CI 环境需自备）；
+- [ ] `npm run format:check` 通过；
+- [ ] 版本号 bump（`package.json`；`src/version.ts` 从它读取，不要另改）；
+- [ ] **工具面变化**：新增/删除/改名的工具写明 old → new 映射，并在 `scripts/check-tool-names.mjs` 的 `REMOVED_TOOL_NAMES` 留档（若删名后仍有旧引用）；
+- [ ] **schema 变化**：入参/回执字段的增删改在 CHANGELOG 标注「客户端需重连」；
+- [ ] **行为变化**：截断口径（`resultInfo`）、空集语义（`empty`）、审计终态（`denied/completed/failed`）的变化必须写；
+- [ ] 面预算通过（`tests/unit/surface-budget.test.ts`：能力数 / tools/list 字节 / 单条描述 / 规则库字节）；
+- [ ] `npm run release:pack` 产出 tarball，并确认打包清单含 `dist/index.js`；
+- [ ] 可选：npm `latest` / `next` 双 dist-tag（预发用 `next`，验收后提升到 `latest`）。
 
 ## 工具链
 
@@ -70,6 +84,28 @@ types ← core ← model ← services ← tools ← server ← index
 | 调用期授权闸门 | `config/authorize.ts`（**所有能力**过同一个闸门；资源维度由清单的 `effects.plan` 决定） |
 
 **注意"看起来一样但语义不同"的情况，不要合并**。例如 `core/num.ts` 的 `num`（空值→0）与 `sql-analyze.service` 的 `num`（非数→`undefined`，用于区分"没有值"和"值为 0"）语义不同，合并会引入静默的 `NaN`/`0` 变化。同理 `core/hana-errors.ts` 里几个错误码集**刻意不统一**：不同调用点的码集差异是策略差异，用参数化暴露出来，而不是合并成一个大集合悄悄改变行为。这类"不可合并"的地方都在代码里写了理由。
+
+| 做什么 | 唯一的家在 |
+| --- | --- |
+| 结果截断 / 空集语义（`resultInfo`、`empty`） | `core/result-info.ts`（服务层 `attach*`，信封在 `core/errors.ts` 提升） |
+| 写能力终态审计（`denied/completed/failed`） | `config/authorize.ts` 的 `dispatchAuthorized`（两条入口共用） |
+
+## 注册期 / 调用期分层（不要合并）
+
+- **注册期**（`tools/surface.ts` 的 `computeSurface`）只决定**呈现**：哪些工具进 `tools/list`、门面索引列什么、哪些可路由。它**不做授权结论**，也不产生"已授权"状态。
+- **调用期**（`config/authorize.ts` 的 `authorizeCall`）决定**调用成不成立**：能力级（分组/deny/档案）+ 资源级（写包/读 schema）+ 部署级。门面路由、提升后平铺直调、直接工具调用**三条入口必须都经过它**（由 `dispatchAuthorized` 统一执行）。
+- 典型反例：把"写包不在 `HANA_WRITE_PACKAGES`"塞进 `computeSurface`。那样能力会从工具面消失，模型只能看到"没有这个工具"，而拿不到资源边界的拦截报告；且 HTTP 每请求重建面后，同一配置下不同请求的"工具存不存在"会漂移。**资源判定永远在调用期**。
+- 防退化测试：`tests/unit/contract-layers.test.ts`（面内但越界仍被拒、三条入口同文案、deny 不出现在索引、注册面恒为六个门面）。
+
+## 文档的分层（单一事实源）
+
+| 层 | 写什么 | 不写什么 |
+| --- | --- | --- |
+| `SERVER_INSTRUCTIONS`（`src/server.ts`） | 骨架：服务是什么、引用约定、工具两层、写操作一句话、envelope、规则库指针 | 方言细节、参数语义、踩坑长文 |
+| 工具 `description`（`capabilities/defs/*.ts`） | 一句话定位 + 选择指引 + `rules=<id>` 指针 | 规则正文的复述 |
+| `src/rules/*.rules.ts` | **唯一详细正文**：方言、边界、通道、回执、为什么 | — |
+
+**新细节只能进规则库**；`description` / instructions 只留指针。理由：常驻文本的成本按会话计，而规则库按需查询。改完跑 `npm run check:tool-names` 与面预算测试（`tests/unit/instructions-budget.test.ts`、`surface-budget.test.ts`）。
 
 ## 日志
 

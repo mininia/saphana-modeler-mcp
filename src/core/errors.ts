@@ -1,5 +1,6 @@
 import { ProtocolError, SdkError, SdkErrorCode } from '@modelcontextprotocol/server';
 import type { Envelope, HanaMessage } from '../types/hana.js';
+import { isEmptyResultMarked, liftResultInfo } from './result-info.js';
 import { logger, redactSensitive } from './logger.js';
 import { currentAgentLabel, currentClientId } from './request-context.js';
 
@@ -125,7 +126,31 @@ export async function withErrorEnvelope<T>(fn: () => Promise<T>): Promise<Envelo
   });
   try {
     const data = await fn();
-    return withIdentity({ success: true, data, messages: [] });
+    // P0-1 / P0-2 的唯一提升点：服务层把 resultInfo 挂在 data 上（见 core/result-info.ts），
+    // 信封在这里把它搬到顶层并从 data 摘掉——所有工具共用同一段逻辑，handler 不各自拼字段。
+    const lifted = liftResultInfo(data);
+    // 空集：有 resultInfo 时以 returnedCount=0 且 **未被截断** 为准（0 条 + 扫描上限截断 = 没看完，
+    // 不是空集）；没有 limit 语义的列表用 Symbol 标记（不撞业务字段）。
+    const empty =
+      lifted.info !== undefined ? lifted.info.returnedCount === 0 && !lifted.info.truncated : isEmptyResultMarked(data);
+    // 固定安全上限（如计划回读硬顶）除 resultInfo.truncationReason 外再给一条稳定码，
+    // 让只读 messages 的调用方也能发现"结论基于不完整数据"。
+    const safetyCapHit = lifted.info?.truncationReason === 'safety-cap';
+    const messages: HanaMessage[] = [
+      ...(empty
+        ? [{ type: 'I' as const, id: 'EMPTY_RESULT', text: '未匹配到任何结果（空集是合法结果，不是错误）。' }]
+        : []),
+      ...(safetyCapHit
+        ? [{ type: 'W' as const, id: 'SAFETY_CAP_EXCEEDED', text: '结果触达固定安全上限，已截断（详见 resultInfo）。' }]
+        : []),
+    ];
+    return withIdentity({
+      success: true,
+      ...(lifted.info !== undefined ? { resultInfo: lifted.info } : {}),
+      ...(empty ? { empty: true as const } : {}),
+      data: lifted.data,
+      messages,
+    });
   } catch (e) {
     if (e instanceof HanaBusinessError) {
       const raw = e.code ? { code: e.code } : undefined;

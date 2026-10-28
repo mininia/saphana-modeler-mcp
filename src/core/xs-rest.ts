@@ -67,22 +67,22 @@ import { truncateWithNote } from './text.js';
 export const XS_BASE_PATH = '/sap/hana/xs/dt/base';
 
 /**
- * 解析 XS 端口（构造 XsRestClient 时调用）。**没有推导兜底**：2026-10-14 起 HANA_INSTANCE 已删除，
- * `80<instance>` 那条唯一推导规则随之取消——端口只能由部署方显式给出。
+ * 解析 XS 端口（构造 XsRestClient 时调用）。正式配置**默认 8010**（HANA_XS_PORT）；仍不做
+ * `80<instance>` 推导（HANA_INSTANCE 已删除，非默认实例/租户由部署方显式覆盖）。
  *
- * 未配置时**响亮失败并给出改法**，而不是退回某个猜出来的端口：猜错的表现是连到另一台/另一实例
- * 的 XS 端点（明文 HTTP 上把 HANA 账号与会话交出去），比"写不了"严重得多。
- * 文案面向调用方，故只说"服务端未启用该通道"，不写变量名（写明改哪项配置等于教它绕过；同
- * services/repo-transfer.service.ts 的拦截文案口径）。
+ * 手搭的残缺配置（脚本/单测）仍可能缺端口：此时响亮失败并给出改法，而不是退回某个猜出来的端口——
+ * 猜错的表现是连到另一台/另一实例的 XS 端点（明文 HTTP 上把 HANA 账号与会话交出去），
+ * 比"写不了"严重得多。文案面向调用方，故只说"服务端未启用该通道"，不写变量名。
  */
 function resolveXsPort(config: HanaConfig): number {
-  if (config.xsPort === undefined) {
+  const port = (config as { xsPort?: number }).xsPort;
+  if (port === undefined) {
     throw new Error(
       '服务端未启用 XS 通道：写入/激活/导入导出等能力依赖 XS 设计时 REST 端点，' +
-        '而该端点未配置（本版本不再按实例号推导端口，缺失时不做任何猜测）',
+        '而该配置缺失（正式配置默认 8010；残缺配置不做任何猜测）',
     );
   }
-  return config.xsPort;
+  return port;
 }
 
 /** SapBackPack 头 JSON 的字段（集中在常量表，便于按 SPS 调字段名/大小写） */
@@ -926,7 +926,9 @@ export class XsRestClient {
         `XS 导入 ${packageId}/${fileName} 未返回上传 Location（HTTP ${post.status}）：${post.body.slice(0, 200)}`,
       );
     }
-    const uploadUrl = /^https?:\/\//i.test(location) ? location : `${this.baseUrl}${location}`;
+    // Location 是**服务端给的**跳转目标；只允许同源——request() 会把会话 Cookie 带上去，
+    // 一个被篡改/配错的绝对地址会把凭据发到别的源（P1-5 的路径/URI 安全盘点项）。
+    const uploadUrl = resolveSameOriginLocation(this.baseUrl, location);
     // 实测：文本内容必须显式声明 charset=utf-8——缺省时 XS 层按 Latin-1 解码请求体，
     // 中文等非 ASCII 描述会被双重编码成乱码。
     // 后缀白名单覆盖**全部设计时文本对象**：.calculationview 之外还有 .attributeview/.analyticview
@@ -984,8 +986,9 @@ export function isDotOnlySegment(segment: string): boolean {
 /**
  * 路径片段 URL 编码（保留 '/'）。纯点段（'.'/'..'）一律拒绝——URL 归一会把它们折叠成上级路径，
  * 使请求落到同 base 下的另一个端点（见 isDotOnlySegment）；这是本仓对「点段归一」的唯一出口守卫。
+ * 导出仅为回归测试可直测（P1-5 的路径安全用例）；业务代码一律经本函数拼接 URL。
  */
-function encodePath(path: string): string {
+export function encodePath(path: string): string {
   return path
     .split('/')
     .map((s) => {
@@ -995,6 +998,24 @@ function encodePath(path: string): string {
       return encodeURIComponent(s);
     })
     .join('/');
+}
+
+/**
+ * 解析服务端返回的 Location（分片上传的下一跳）：相对地址拼到 baseUrl，绝对地址必须**同源**。
+ * 为什么要拦：`request()` 会给请求带上会话 Cookie；绝对地址若指向别的源，等于把凭据发给对方。
+ * 同源判定用 WHATWG URL 的 origin（scheme/host/port 三者一致），不做字符串前缀比较。
+ */
+export function resolveSameOriginLocation(baseUrl: string, location: string): string {
+  const base = new URL(baseUrl);
+  const target = new URL(location, base);
+  if (target.origin !== base.origin) {
+    throw new HanaBusinessError(
+      `XS 导入返回的 Location 指向了另一个源（${target.origin}），已拒绝跟随：` +
+        '会话凭据只允许发往当前 HANA 源。若经 TLS 终结/路径重写代理部署，请让代理回写为相对路径或同源 URL；' +
+        '否则请检查 XS 服务端配置或网关重写规则',
+    );
+  }
+  return target.toString();
 }
 
 /**

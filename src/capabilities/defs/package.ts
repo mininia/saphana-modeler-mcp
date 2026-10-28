@@ -91,7 +91,8 @@ export const packageCapabilities = {
       '把本地设计时文件（.calculationview XML 或导出的 zip）导入仓库（Transfer API：POST 目录目标 + PUT /base/xfer/import）。实测（SPS08）导入即激活，不存在 inactive 暂存；修改已有对象请走 hana_view_update。\n' +
       '来源二选一：filePath（本地路径，默认取文件名）或 content + fileName（内联内容）。\n' +
       '默认只用于新对象：目标文件已存在时拒绝，确需覆盖（备份恢复）显式传 overwrite=true。目标包须在 HANA_WRITE_PACKAGES 可写范围内。\n' +
-      '导入前解析 SQL 模式视图的 <definition> 脚本做读取范围校验（限定名按可读 schema 白名单、未限定名按当前默认 schema），命中即整次拒绝且零写入；无法解析的载荷（如 zip）在回执 contentScanNote 标注未扫描；含 <definition> 却提取不出正文的载荷整次拒绝。导入后回读元数据，回执带 ETag/etagSource 与并发迹象（跨进程并发导入无服务端前置，属已知例外）。',
+      'import 覆盖不可自动回滚：覆盖前先用 hana_repo_export 留档，恢复=重新导入该 zip。\n' +
+      '导入前的读取范围校验、contentScanNote 与导入后回读口径见 rules=write_receipt；跨进程并发导入无服务端前置，属已知例外。',
     inputSchema: z.object({
       targetPackageId: zWritePackageId('目标包名；须在 HANA_WRITE_PACKAGES 可写范围内'),
       filePath: z

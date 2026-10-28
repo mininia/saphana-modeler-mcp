@@ -11,10 +11,10 @@
  */
 
 import type { McpServer, ServerContext } from '@modelcontextprotocol/server';
-import { FACADE_CATEGORIES, type FacadeCategory } from '../capabilities/types.js';
+import { FACADE_CATEGORIES, registeredNameOf, type FacadeCategory } from '../capabilities/types.js';
 import { FACADE_SCHEMA, facadeIdOf } from '../capabilities/facades.js';
 import { CAPABILITY_LIST, FACADES, membersOfCategory } from '../capabilities/manifest.js';
-import { authorizeCall, blockedCallResult } from '../config/authorize.js';
+import { blockedCallResult, dispatchAuthorized } from '../config/authorize.js';
 import { policyFromConfig } from '../config/preflight.js';
 import type { CallerProfile } from '../config/profiles.js';
 import { mcpErrorText, withErrorEnvelope } from '../core/errors.js';
@@ -29,10 +29,11 @@ import {
   type CapabilityHandler,
   type ToolContext,
 } from './index.js';
-import { getRawHandler } from './handler-registry.js';
+import { getRawHandler, hasDynamicHandle } from './handler-registry.js';
 import {
   computeSurface,
   entitlementOf,
+  explainSurface,
   paramNamesOf,
   promoteCategories,
   resolveCapability,
@@ -57,6 +58,7 @@ function blockAuditPayload(
 ): Record<string, unknown> {
   return {
     capabilityId,
+    result: 'denied',
     verdict: 'block',
     ...(identity?.clientId ? { clientId: identity.clientId } : {}),
     ...(identity?.transport ? { transport: identity.transport } : {}),
@@ -65,6 +67,7 @@ function blockAuditPayload(
     via: facadeId,
     resources: { writePackages: [], readSchemas: [], readPackages: [] },
     codes,
+    denyReason: codes[0] ?? 'denied',
   };
 }
 
@@ -103,6 +106,8 @@ async function promoteOnFacadeCall(
     return {
       report: {
         promoted: false,
+        status: 'skipped',
+        notes: ['部署未配置 MCP_HTTP_TOKENS：提升整体关闭（单租户假设）；本类能力仍可经门面路由调用。'],
         hint: '本次未提升（部署未配置 Token）：直接用 { capability, args } 调用即可，不必等提升。',
       },
     };
@@ -128,9 +133,20 @@ async function promoteOnFacadeCall(
   // 活实例动作（stdio 长连接才有意义）：把出局工具从本进程注册面摘掉；HTTP 下恒为空数组
   const removed = unregisterCapabilities(server, evictedTools);
 
-  // 新增：stdio 是长连接单实例，必须在**活的实例**上注册，客户端才会看到（并收到 list_changed）
+  // 新增：stdio 是长连接单实例，必须在**活的实例**上注册，客户端才会看到（并收到 list_changed）。
+  // 重试口径：stdio 下把「面上但本实例仍无 handle」的都再试一次——上次瞬时失败的成员能在下一次
+  // 门面调用里补齐（HTTP 每请求重建 server，下一次请求自然带上，不需要这里重试）。
   const gained = CAPABILITY_LIST.filter((c) => after.surfaceIds.has(c.id) && !before.surfaceIds.has(c.id));
-  const registered = registerCapabilitiesDynamically(server, ctx, gained);
+  const toRegister =
+    identity === undefined
+      ? CAPABILITY_LIST.filter(
+          (c) =>
+            c.facadeOf === undefined && after.surfaceIds.has(c.id) && !hasDynamicHandle(server, registeredNameOf(c)),
+        )
+      : gained;
+  const registration = registerCapabilitiesDynamically(server, ctx, toRegister);
+  const registered = registration.registered;
+  const failures = registration.failures;
 
   if (added.length > 0 || evictedTools.length > 0) {
     logger.info(
@@ -142,31 +158,55 @@ async function promoteOnFacadeCall(
         promotedTools: registered,
         evictedTools,
         ...(removed.length > 0 ? { removedFromInstance: removed } : {}),
+        ...(failures.length > 0 ? { failures } : {}),
       },
       'capability-promotion',
     );
   }
 
   // 回执不撒谎：promoted 只认真正进面的新增；hint 按可触达成员与新增结果分支。
-  const baseHint = !anyEntitledMember
-    ? `本类在你这套权限下没有可用能力（索引为空），提升不会产生新工具。`
-    : promotableMembers.length === 0
-      ? `本类可触达的只有经门面路由的操作级别名（不注册为工具），提升不会产生新工具；` +
-        `直接用 { capability, args } 调用即可。`
-      : added.length > 0 && registered.length > 0
-        ? `本类能力已**提升进你的工具面**：下一次 tools/list 即可见（带完整参数 schema），可直接按工具名平铺调用，` +
-          `也可以继续用 { capability, args } 经本门面调用。提升在本连接内保持有效。`
-        : `本类能力此前已提升过，仍在你的工具面上（tools/list 里可直接调用）。`;
+  const baseHint =
+    failures.length > 0
+      ? `本类有 ${failures.length} 项能力本次加载失败（已成功 ${registered.length} 项）。可重试一次：再次调用本门面补齐；若仍失败请检查服务端日志，勿反复重试。`
+      : !anyEntitledMember
+        ? `本类在你这套权限下没有可用能力（索引为空），提升不会产生新工具。`
+        : promotableMembers.length === 0
+          ? `本类可触达的只有经门面路由的操作级别名（不注册为工具），提升不会产生新工具；` +
+            `直接用 { capability, args } 调用即可。`
+          : added.length > 0 && registered.length > 0
+            ? `本类能力已**提升进你的工具面**：下一次 tools/list 即可见（带完整参数 schema），可直接按工具名平铺调用，` +
+              `也可以继续用 { capability, args } 经本门面调用。提升在本连接内保持有效。`
+            : `本类能力此前已提升过，仍在你的工具面上（tools/list 里可直接调用）。`;
   const evictedHint =
     evictedTools.length > 0
       ? ` 已达面上限（MCP_CAPABILITY_SURFACE_MAX），以下工具被移出你的工具面：${evictedTools.join(', ')}` +
         `（仍可经门面路由调用）。`
       : '';
 
+  // P1-7：策略性省略只说到类别，不点名被隐藏的能力（names 调试开关才列 id）。
+  const explainNames = ctx.config.explainSurface === 'names';
+  const hiddenMembers = membersOfCategory(category).filter((m) => !before.entitlementIds.has(m.id));
+  const notes: string[] = [];
+  if (hiddenMembers.length > 0) {
+    notes.push(`本类有 ${hiddenMembers.length} 项能力因部署策略或调用方档案不可见，未提升。`);
+    if (explainNames) notes.push(`未提升的能力：${hiddenMembers.map((m) => m.id).join(', ')}`);
+  }
+  const warnings =
+    failures.length > 0
+      ? [
+          `本类有 ${failures.length} 项能力加载失败（可重试一次：再次调用本门面；仍失败请查服务端日志）。` +
+            (explainNames ? `失败能力：${failures.map((f) => f.capabilityId).join(', ')}` : ''),
+        ]
+      : [];
+  const status = failures.length > 0 ? 'partial' : registered.length > 0 ? 'loaded' : 'already-loaded';
+
   return {
     report: {
       promoted: registered.length > 0,
+      status,
       promotedTools: registered,
+      ...(warnings.length > 0 ? { warnings } : {}),
+      ...(notes.length > 0 ? { notes } : {}),
       ...(evictedTools.length > 0 ? { evictedTools } : {}),
       hint: baseHint + evictedHint,
     },
@@ -194,6 +234,9 @@ async function promoteOnFacadeCall(
       const members = surfaceCapabilities(new Set(ids)).filter(
         (c) => c.category === category && c.facadeOf === undefined,
       );
+      const surfaceExplanation = explainSurface(ctx, identity, {
+        names: ctx.config.explainSurface === 'names',
+      });
       const envelope: Envelope = await withErrorEnvelope(async () => ({
         facade: facadeId,
         category,
@@ -205,6 +248,8 @@ async function promoteOnFacadeCall(
           summary: summaryOf(c),
           params: paramNamesOf(c),
         })),
+        // P1-7：面被收窄时才说明（全量面不追加噪音）；默认只到类别，不点名被隐藏的能力。
+        ...(surfaceExplanation.status === 'restricted' ? { surface: surfaceExplanation } : {}),
         ...promotion.report,
       }));
       return toToolResult(envelope);
@@ -241,25 +286,32 @@ async function promoteOnFacadeCall(
       );
     }
 
-    // 按目标能力授权（与「目标本身在面上」的路径同一个 authorizeCall）
-    const auth = authorizeCall(target, parsed.data as Record<string, unknown>, {
-      policy: policyFromConfig(ctx.config, ctx.toolFilter),
-      // 复用 entitlementOf 解析出的同一次档案，不二次推导回退规则
-      profile,
-      agentLabel: ctx.config.agentLabel,
-    });
-    if (!auth.allowed) return blockedCallResult(auth);
-
-    // 派发到原始 handler（闸门已在上面按目标能力跑过；不走 SDK callTool 以免二次过闸）
-    const handler = getRawHandler(server, target.id) as CapabilityHandler<typeof target.inputSchema> | undefined;
-    if (!handler) {
-      // 可触达但本进程没有 handler：编程错误（清单登记与注册不同步）
-      logger.error(
-        { capabilityId: target.id, via: facadeId },
-        '门面路由：目标能力的 handler 未注册（清单与注册不同步）',
-      );
-      return mcpErrorText(UNKNOWN_CAPABILITY_TEXT);
-    }
-    return handler(parsed.data as never, serverCtx as ServerContext);
+    // 按目标能力授权 → 派发 → 写能力终态审计：与平铺直调**同一个执行壳**（dispatchAuthorized）。
+    // 归因 via=门面 id（审计里能区分「经门面路由」与「提升后平铺直调」）。
+    return dispatchAuthorized(
+      target,
+      parsed.data as Record<string, unknown>,
+      {
+        policy: policyFromConfig(ctx.config, ctx.toolFilter),
+        // 复用 entitlementOf 解析出的同一次档案，不二次推导回退规则
+        profile,
+        agentLabel: ctx.config.agentLabel,
+        via: facadeId,
+      },
+      () => {
+        // 派发到原始 handler（闸门已在执行壳里按目标能力跑过；不走 SDK callTool 以免二次过闸）
+        const handler = getRawHandler(server, target.id) as CapabilityHandler<typeof target.inputSchema> | undefined;
+        if (!handler) {
+          // 可触达但本进程没有 handler：编程错误（清单登记与注册不同步）
+          logger.error(
+            { capabilityId: target.id, via: facadeId },
+            '门面路由：目标能力的 handler 未注册（清单与注册不同步）',
+          );
+          return mcpErrorText(UNKNOWN_CAPABILITY_TEXT);
+        }
+        return handler(parsed.data as never, serverCtx as ServerContext);
+      },
+      (blocked) => blockedCallResult(blocked),
+    );
   };
 }

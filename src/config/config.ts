@@ -169,6 +169,11 @@ const envSchema = z.object({
    */
   HANA_TOOL_DENY: z.string().default('').transform(splitList),
   /**
+   * 工具面省略说明的调试开关（P1-7）：默认关闭，只说明"哪些类别被收窄/加载失败"，**不点名**被隐藏的能力。
+   * 置 `names` 才在说明里输出被隐藏/失败的能力名（排障用；会泄漏能力存在性，不要常开）。
+   */
+  HANA_EXPLAIN_SURFACE: z.preprocess(emptyAsUnset, z.enum(['names']).optional()),
+  /**
    * 调用方档案定义：`name=kinds[:glob|glob][;name2=…]`，kinds 用 + 连接。
    * 例：MCP_PROFILES="analyst=read;dev=read+write:hana_view_*|hana_metadata_*;default=read"
    * 档案**只能收紧**部署策略；配了档案就必须定义 default（HTTP 无档案参数的 Token 与 stdio 都落它）。
@@ -238,18 +243,18 @@ const envSchema = z.object({
     }),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
   /**
-   * XS Classic 设计时 REST 端口（直连 HTTP）。**写/导出等走 XS 通道的能力必需**：
-   * 2026-10-14 起不再按实例号推导 `80<instance>`（HANA_INSTANCE 已删除），未配置时 XS 出口
-   * 会在构造客户端处直接报「未配置」并说明改法，不静默退回某个猜出来的端口。
-   * 与 HANA_PORT 同口径：空串按未设置、纯数字校验在装载时做，越界（如 '0'/'99999'）在
-   * loadConfig 统一收口——不让坏值拖到首次 XS REST 调用才以驱动层错误暴露。
+   * XS Classic 设计时 REST 端口（直连 HTTP）。**写/导出等走 XS 通道的能力使用**。
+   * 默认 `8010`（适配多数单实例部署）；非默认实例/租户请显式覆盖——仍不按实例号推导
+   * `80<instance>`（HANA_INSTANCE 已删除，那条规则推不出非默认租户）。
+   * 与 HANA_PORT 同口径：空串按未设置（→ 默认 8010）、纯数字校验在装载时做，越界（如 '0'/'99999'）
+   * 在 loadConfig 统一收口——不让坏值拖到首次 XS REST 调用才以驱动层错误暴露。
    */
   HANA_XS_PORT: z.preprocess(
     trimmedOrUnset,
     z
       .string()
       .regex(/^[0-9]+$/, 'XS 端口必须是数字')
-      .optional(),
+      .default('8010'),
   ),
   /** XS 设计时 REST 基础路径（默认 /sap/hana/xs/dt/base） */
   HANA_XS_BASE_PATH: z.string().min(1).default(XS_BASE_PATH),
@@ -437,6 +442,8 @@ export interface HanaConfig {
   toolAllow: string[];
   /** 强制禁用的工具名 glob 列表（最高优先级；来自 HANA_TOOL_DENY） */
   toolDeny: string[];
+  /** 工具面省略说明的调试开关（来自 HANA_EXPLAIN_SURFACE=names）；未配置 = 不点名被隐藏的能力 */
+  explainSurface?: 'names';
   /**
    * 调用方档案表（来自 MCP_PROFILES；空表 = 只有隐式 default 档案，不额外收紧）。
    * 档案只作用于**调用期授权**（config/authorize.ts），不改变注册期可见性。
@@ -472,11 +479,10 @@ export interface HanaConfig {
    */
   connectionSourceMixed: boolean;
   /**
-   * XS Classic 设计时 REST 直连端口（来自 HANA_XS_PORT）。**不再有推导兜底**（2026-10-14 起
-   * 实例号已删除）：未配置即 undefined，由 XsRestClient 在构造处报「未配置 HANA_XS_PORT」，
-   * 可选类型保留给"不用 XS 通道的部署"与手搭的残缺配置。
+   * XS Classic 设计时 REST 直连端口（来自 HANA_XS_PORT，**默认 8010**）。
+   * 不再按实例号推导；非默认实例/租户由部署方显式覆盖。
    */
-  xsPort?: number;
+  xsPort: number;
   /** XS 设计时 REST 基础路径（默认 /sap/hana/xs/dt/base） */
   xsBasePath: string;
   /** HANA 连接池并发上限（来自 HANA_POOL_MAX，默认 4）；N 个代理进程 = N×该值条 HANA 连接 */
@@ -712,19 +718,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HanaConfig {
     throw new Error(`无效的 SQL 端口: ${parsed.HANA_PORT}`);
   }
 
-  // XS 端口：可留空（不用 XS 通道的部署无需配）。'0'/'99999' 这类越界值若放行，要到首次
-  // XS REST 调用才以驱动层错误暴露，故在装载时收口；未配置时不再推导（HANA_INSTANCE 已删除），
-  // 由 XsRestClient 在构造处报「未启用 XS 通道」
-  const explicitXsPort = parsed.HANA_XS_PORT;
-  const xsPort = explicitXsPort ? parseInt(explicitXsPort, 10) : undefined;
-  if (xsPort !== undefined && (xsPort < 1 || xsPort > 65535)) {
-    throw new Error(`无效的 XS 端口: ${explicitXsPort}`);
+  // XS 端口：默认 8010（envSchema 已给默认值）。'0'/'99999' 这类越界值若放行，要到首次
+  // XS REST 调用才以驱动层错误暴露，故在装载时收口；不按实例号推导（HANA_INSTANCE 已删除），
+  // 非默认实例/租户由部署方用 HANA_XS_PORT 覆盖。
+  const xsPort = parseInt(parsed.HANA_XS_PORT, 10);
+  if (xsPort < 1 || xsPort > 65535) {
+    throw new Error(`无效的 XS 端口: ${parsed.HANA_XS_PORT}`);
   }
-  if (xsPort === undefined) {
-    // 启动即告知（而不是等首次写/导出才暴露）：与「不让坏值拖到首次调用」同一口径。
-    // 措辞含"只读部署可忽略"，避免把不需要 XS 的部署吓一跳
+  if (!hasValue(env.HANA_XS_PORT)) {
+    // 默认值 8010 是便利不是猜测的许可证：非默认实例/租户必须显式覆盖。XS 通道是明文 HTTP，
+    // 端口指错会把 HANA 账号与会话发到另一个服务——每次启动留一条可见告警。
     logger.warn(
-      'HANA_XS_PORT 未配置：写入/激活/导入导出等走 XS 通道的能力将不可用（本版本不再按实例号推导端口；只读部署可忽略本条）',
+      'HANA_XS_PORT 未配置，使用默认 8010；非默认实例/租户请显式覆盖（XS 通道为明文 HTTP，端口错误会把凭据发到错误端点）',
     );
   }
 
@@ -765,6 +770,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HanaConfig {
     toolGroups: parsed.HANA_TOOL_GROUPS,
     toolAllow: parsed.HANA_TOOL_ALLOW,
     toolDeny: parsed.HANA_TOOL_DENY,
+    explainSurface: parsed.HANA_EXPLAIN_SURFACE,
     profiles,
     profileId: parsed.MCP_PROFILE,
     agentLabel: parsed.MCP_AGENT_LABEL,

@@ -29,6 +29,13 @@ import { TASK_MAX_RETAINED_DEFAULT, TASK_MAX_RUNNING_DEFAULT, TASK_TTL_MS_DEFAUL
 
 export type TaskStatus = 'working' | 'completed' | 'failed' | 'cancelled';
 
+/**
+ * 任务种类（只影响回执措辞与取消语义，不影响注册表容量/归属/TTL）：
+ * - `changeset`：hana_view_update 的多对象变更集（取消在动作边界生效并逆序补偿）；
+ * - `sql_analyze`：hana_sql_analyze(async=true) 的长 SQL 分析（执行中的语句无法中途打断）。
+ */
+export type TaskKind = 'changeset' | 'sql_analyze';
+
 /** 终态（不再变化、可被清理） */
 const TERMINAL: ReadonlySet<TaskStatus> = new Set(['completed', 'failed', 'cancelled']);
 
@@ -36,6 +43,8 @@ export interface TaskRecord {
   id: string;
   /** 归属键：HTTP 已认证 clientId / stdio 的 '(stdio)'（未配 Token 的 HTTP = 'anonymous'） */
   owner: string;
+  /** 任务种类（决定取消语义与回执措辞） */
+  kind: TaskKind;
   /** 一句话说明（如 `changeset PKG/CV_A +2`），给轮询方认领用 */
   label: string;
   status: TaskStatus;
@@ -83,14 +92,16 @@ function sweep(now: number): void {
 /**
  * 创建一个运行中的任务。**容量检查在这里**（超出运行上限抛中文业务错误——调用方立即知道
  * "现在提交不了"，而不是拿到一个永远排队中的假句柄）。
+ *
+ * @param kind 任务种类（默认 changeset；只影响回执措辞与取消语义）
  */
-export function createTask(owner: string, label: string, total: number): TaskRecord {
+export function createTask(owner: string, label: string, total: number, kind: TaskKind = 'changeset'): TaskRecord {
   const now = Date.now();
   sweep(now);
   const running = countRunningTasks();
   if (running >= TASK_MAX_RUNNING_DEFAULT) {
     throw new HanaBusinessError(
-      `异步任务已达运行上限（${TASK_MAX_RUNNING_DEFAULT} 个并发）：本次未提交任何写操作。` +
+      `异步任务已达运行上限（${TASK_MAX_RUNNING_DEFAULT} 个并发）：本次未提交任何任务。` +
         `请先等待运行中的任务结束（hana_task_get 轮询），或改用同步模式（去掉 async）`,
     );
   }
@@ -98,6 +109,7 @@ export function createTask(owner: string, label: string, total: number): TaskRec
   const record: TaskRecord = {
     id: randomUUID(),
     owner,
+    kind,
     label,
     status: 'working',
     createdAt: iso,

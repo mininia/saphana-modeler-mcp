@@ -6,6 +6,8 @@
  * - 硬错误（参数非法/对象不存在）：MCP isError + 恢复提示（见 core/errors.ts 的 mcpErrorText）
  */
 
+import type { ResultInfo } from '../core/result-info.js';
+
 /** HANA 业务消息（对齐 SAP 消息结构，类型映射自 HANA error/warning） */
 export interface HanaMessage {
   /** S=成功 I=信息 W=警告 E=错误 */
@@ -21,6 +23,16 @@ export interface Envelope {
   success: boolean;
   data?: unknown;
   messages: HanaMessage[];
+  /**
+   * 统一截断契约（P0-1）：只在**有 limit/cap 语义**时出现；无该字段 = 本次结果不存在"被截断"这回事。
+   * 构造与提升都在 core/result-info.ts 一处完成，工具 handler 不各自拼。
+   */
+  resultInfo?: ResultInfo;
+  /**
+   * 合法空集（P0-2）：`success:true` + `empty:true`，并附 `messages` 里一条 `EMPTY_RESULT` 说明。
+   * 权限不可见/上游失败仍然是 `success:false`——空集不伪装成错误，错误也不伪装成空集。
+   */
+  empty?: true;
   /** 透传原始返回（如 HANA 原生错误对象），供调试 */
   raw?: unknown;
   /**

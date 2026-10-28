@@ -5,7 +5,7 @@ import { logger } from '../core/logger.js';
 import { currentIdentity } from '../core/request-context.js';
 import { activeProfile } from '../config/profiles.js';
 import { policyFromConfig } from '../config/preflight.js';
-import { authorizeCall, blockedCallResult } from '../config/authorize.js';
+import { blockedCallResult, dispatchAuthorized } from '../config/authorize.js';
 import { registeredNameOf, type Capability } from '../capabilities/types.js';
 import { CAPABILITY_LIST, membersOfCategory } from '../capabilities/manifest.js';
 import { facadeDescription } from '../capabilities/facades.js';
@@ -147,30 +147,44 @@ function gatedHandler<S extends z.ZodType>(
 ): (args: Record<string, unknown>, extra: unknown) => unknown {
   return (args, extra) => {
     const identity = currentIdentity();
-    const auth = authorizeCall(cap, args, {
-      policy: policyFromConfig(ctx.config, ctx.toolFilter),
-      profile: activeProfile(ctx.config, identity),
-      agentLabel: ctx.config.agentLabel,
-    });
-    if (!auth.allowed) return blockedCallResult(auth);
-    // 放行：转发给真实 handler（类型由外层 cast 保证）
-    return (handler as (a: unknown, e: unknown) => unknown)(args, extra);
+    // 授权 → 执行 → 写能力终态审计：三个动作收在 dispatchAuthorized 一处，
+    // 门面路由与平铺直调共用同一个壳（P0-4）。
+    return dispatchAuthorized(
+      cap,
+      args,
+      {
+        policy: policyFromConfig(ctx.config, ctx.toolFilter),
+        profile: activeProfile(ctx.config, identity),
+        agentLabel: ctx.config.agentLabel,
+      },
+      () => (handler as (a: unknown, e: unknown) => unknown)(args, extra),
+      (auth) => blockedCallResult(auth) as never,
+    );
   };
+}
+
+/**
+ * 动态提升的注册结果（P1-6）：成功清单 + 可重试的失败清单。
+ * `failures` 是**瞬时/编程**失败（handler 未登记、注册器抛错），重试门面调用可能补齐；
+ * 策略性省略（deny/档案）在面计算阶段就被排除，不会走到这里。
+ */
+export interface DynamicRegistrationResult {
+  registered: string[];
+  failures: { capabilityId: string; reason: string }[];
 }
 
 /**
  * 把已提升的能力挂到当前已连接的实例上（stdio 路径）。
  * HTTP 无会话、每请求新建 server，下一个请求自然带上新能力，不需要它。
  * 闸门照旧包上——动态注册与静态注册走同一条判定。
- *
- * @returns 真正注册成功的工具名（handler 未登记的跳过）
  */
 export function registerCapabilitiesDynamically(
   server: McpServer,
   ctx: ToolContext,
   caps: readonly Capability[],
-): string[] {
+): DynamicRegistrationResult {
   const registered: string[] = [];
+  const failures: { capabilityId: string; reason: string }[] = [];
   for (const cap of caps) {
     const name = registeredNameOf(cap);
     if (hasDynamicHandle(server, name)) continue; // 幂等：重复提升同一分类不重复挂
@@ -178,17 +192,24 @@ export function registerCapabilitiesDynamically(
     if (!raw) {
       // 面内但本进程没有 handler：编程错误，响亮记录而非静默跳过
       logger.error({ capabilityId: cap.id }, '提升：目标能力的 handler 未注册（清单与注册不同步），本次跳过');
+      failures.push({ capabilityId: cap.id, reason: 'handler_missing' });
       continue;
     }
-    const handle = server.registerTool(
-      name,
-      registrationOf(cap, surfaceOf(ctx)),
-      gatedHandler(ctx, cap, raw as CapabilityHandler<typeof cap.inputSchema>) as never,
-    ) as unknown as { remove(): void };
-    recordDynamicHandle(server, name, handle);
-    registered.push(name);
+    try {
+      const handle = server.registerTool(
+        name,
+        registrationOf(cap, surfaceOf(ctx)),
+        gatedHandler(ctx, cap, raw as CapabilityHandler<typeof cap.inputSchema>) as never,
+      ) as unknown as { remove(): void };
+      recordDynamicHandle(server, name, handle);
+      registered.push(name);
+    } catch (e) {
+      // 单个注册失败不拖垮整类：记 warning，交由调用方回报 partial（可重试）
+      logger.error({ capabilityId: cap.id, err: e }, '提升：能力注册失败（本次跳过，重试门面调用可补齐）');
+      failures.push({ capabilityId: cap.id, reason: 'register_failed' });
+    }
   }
-  return registered;
+  return { registered, failures };
 }
 
 /**

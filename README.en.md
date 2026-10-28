@@ -86,7 +86,7 @@ Connection info is only allowed from environment variables / `mcp.json` `env` (*
 | `HANA_TIMEZONE` | optional | Process timezone (sets `TZ`, affecting log timestamps and local-time semantics); **not pushed down to the HANA session**. Default `Asia/Shanghai` | `Asia/Shanghai` |
 | `HANA_READ_SCHEMA` | optional | Extra queryable schemas (comma-separated, appended to built-in allowlist) | `SAPABAP1,OTHER_SCHEMA` |
 | `HANA_WRITE_PACKAGES` | optional | Writable repository package prefixes (comma-separated, incl. sub-packages). **Empty = write boundary not enabled**: requests that declare write packages are hard-blocked by the runtime gate with `boundary_off` (writing requires an explicit configuration; only the service layer is fail-open — see the write-boundary note below); when set, only configured packages and their sub-packages are writable | `ZDEMO1,ZDEMO2.ZDEMO_SD` |
-| `HANA_XS_PORT` | optional | XS Classic design-time REST port (**required** for XS-channel capabilities: writes, imports/exports); no longer derived as `80<instance>`, and XS-channel calls fail outright when unset (read-only deployments may omit it) | `8010` |
+| `HANA_XS_PORT` | optional | XS Classic design-time REST port; **defaults to `8010`** (override for non-default instances/tenants; it is still not derived from the instance number) | `8000` |
 | `HANA_XS_BASE_PATH` | optional | XS design-time REST base path, default `/sap/hana/xs/dt/base` | — |
 | `HANA_POOL_MAX` | optional | HANA connection pool size, default `4` (saturation behavior and deployment sizing: see "Transports → Timeouts & resource governance") | `8` |
 | `HANA_POOL_WAIT_MS` | optional | Queue wait timeout when the pool is saturated (ms), default `30000` | `60000` |
@@ -98,6 +98,7 @@ Connection info is only allowed from environment variables / `mcp.json` `env` (*
 | `HANA_TOOL_GROUPS` | optional | Enabled tool groups (comma-separated `read`/`write`/`admin`); **empty = no restriction (all enabled)** | `read` |
 | `HANA_TOOL_ALLOW` | optional | Force-enabled tool name globs (registered even if their group is disabled; comma-separated, supports `*`) | `hana_view_validate` |
 | `HANA_TOOL_DENY` | optional | Force-disabled tool name globs (highest priority, overrides allow & groups; comma-separated, supports `*`) | `hana_data_preview*` |
+| `HANA_EXPLAIN_SURFACE` | optional | Debug only: when set to `names`, the facade index `surface` explanation lists hidden/failed capability names (default reports categories only, never leaking capability existence) | `names` |
 | `MCP_PROFILES` | optional | **Caller profiles** (`name=kinds[:glob\|glob][;…]`, kinds joined by `+`). Profiles can only *tighten* the deployment policy; defining any profile requires a `default` one | `analyst=read;dev=read+write:hana_view_*;default=read` |
 | `MCP_PROFILE` | optional | Profile used by this process (stdio) and by callers without a profile in their token; must be defined in `MCP_PROFILES` | `default` |
 | `MCP_AGENT_LABEL` | optional | Process-level attribution label, written into the envelope and every `capability-audit` record; empty = the field is not emitted | `prod-cn-01` |
@@ -468,7 +469,11 @@ scripts/               General smoke script (smoke-stdio); real-machine verifica
 
 > `tests/` and `docs/` are not committed (they contain environment identifiers/probe records, kept locally for development); after cloning, prepare tests & docs as needed.
 
-Each tool returns a unified envelope `{ success, data?, messages[], raw? }` (in HTTP mode it also carries `clientId`, the caller identity resolved from `MCP_HTTP_TOKENS`): protocol-level hard errors (illegal params, etc.) come back via MCP `isError` with a recovery hint; HANA business failures (e.g. activation error details) go through `success:false`. **The write path's 412 conflicts and the delete 404 (object already gone) are business envelopes** (`success=false` + machine-readable code, see "Transports → Concurrency & locking") and do **not** go through `isError`.
+Each tool returns a unified envelope `{ success, data?, messages[], raw?, resultInfo?, empty? }` (in HTTP mode it also carries `clientId`, the caller identity resolved from `MCP_HTTP_TOKENS`): protocol-level hard errors (illegal params, etc.) come back via MCP `isError` with a recovery hint; HANA business failures (e.g. activation error details) go through `success:false`. **The write path's 412 conflicts and the delete 404 (object already gone) are business envelopes** (`success=false` + machine-readable code, see "Transports → Concurrency & locking") and do **not** go through `isError`.
+
+- `resultInfo`: the unified truncation contract (`returnedCount` / `totalAvailable?` / `truncated` / `truncationReason` ∈ `requested-limit | server-cap | safety-cap`). **No such field = nothing was truncated**; an empty result is never marked truncated.
+- `empty`: a legal empty result set (`success:true` + `empty:true` + an `EMPTY_RESULT` note in `messages`). Invisible-by-permission or upstream failure is still `success:false`.
+- Full text: `hana_system_get_info(rules=result_contract)`.
 
 ## HANA Authorization Requirements
 
@@ -571,9 +576,10 @@ Point to the local build artifact, stdio transport:
 > In HTTP mode, connection info and other env-var configuration lives on the **server side** (the shell / .env the server starts from); the client only fills in `url`.
 > When the server sets `MCP_HTTP_TOKENS` (or the backward-compatible `MCP_HTTP_TOKEN`), the client carries the bearer token via `headers` (header support varies per client — check its own docs).
 
-> **Raise the client's tool-call timeout (`hana_sql_analyze` with `analyze=true`)**: this mode **really executes** the statement, and the server allows it up to **5 minutes** (plus roughly 2.5 minutes of queueing and control calls in the worst case). Most clients cut a tool call off far earlier — Claude Code defaults to **60 seconds** — so a big calculation view gets killed client-side while the server-side statement keeps running, and you never see the result. Set the client's per-call timeout to **600000 ms (10 minutes)**:
+> **Raise the client's tool-call timeout (`hana_sql_analyze` with `analyze=true`)**: this mode **really executes** the statement, and the server allows it up to **5 minutes** (plus roughly 2.5 minutes of queueing and control calls in the worst case). Most clients cut a tool call off far earlier — Claude Code defaults to **60 seconds** — so a big calculation view gets killed client-side while the server-side statement keeps running, and you never see the result. For long analyses add **`async=true`**: the call returns a `taskId` immediately and you poll with `hana_task_get` (a running SQL statement cannot be cancelled). Or set the client's per-call timeout to **600000 ms (10 minutes)**:
 > - **Per server**: add `"timeout": 600000` to that server's entry in `mcp.json` (milliseconds; overrides `MCP_TOOL_TIMEOUT`; values below 1000 are ignored)
 > - **Globally**: set `MCP_TOOL_TIMEOUT=600000` in the environment that **starts the client**
+> - Long **changesets** use the same task API via `hana_view_update(async=true)`.
 
 ## License
 

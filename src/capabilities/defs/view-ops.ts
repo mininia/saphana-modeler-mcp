@@ -77,6 +77,9 @@ export function buildViewOpCapabilities(parent: Capability): Record<string, Capa
       title: decl.title,
       description:
         `op=${decl.id}：${decl.summary}。${decl.detail ?? ''}\n` +
+        (decl.effects.destructive
+          ? '此项为破坏性变更、不可自动回滚：改前用 hana_metadata_get_view(format=xml) 留档，恢复=用该 XML 重新 update。\n'
+          : '') +
         `经门面路由调用（本条目不注册为工具）：args = 父工具身份参数（packageId / objectName 必填；` +
         `ifMatch / dryRun / migration 可选）+ 本 op 参数。与 ` +
         `${parent.id}({ operations: [{ op: "${decl.id}", … }] }) 完全等价（同一 handler、同一闸门与破坏性判定）。`,

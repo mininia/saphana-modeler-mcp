@@ -74,6 +74,8 @@ export interface AuthorizationContext {
   caller?: CallerIdentity;
   /** 进程级归因标签（`MCP_AGENT_LABEL`），随审计事件落地 */
   agentLabel?: string;
+  /** 归因入口（门面路由时 = 门面 id；平铺直调缺省）——只进审计，不参与判定 */
+  via?: string;
 }
 
 /** 一次调用的授权结论 */
@@ -88,9 +90,31 @@ export interface AuthorizationResult {
   audit: CapabilityAuditEvent;
 }
 
+/**
+ * 审计终态（P0-4）：
+ * - 读能力：`allowed | denied`（授权判定即终态，无后续副作用）；
+ * - 写能力（含 destructive 的 admin）：`denied | completed | failed`——**每次尝试恰好一条终态记录**。
+ *   放行时闸门不单独记 `allowed`，由调用方在本次执行结束后记 `completed`/`failed`；
+ *   拦截仍由闸门记 `denied`（此时根本没有执行阶段）。
+ */
+export type AuditResult = 'allowed' | 'denied' | 'completed' | 'failed';
+
+/** 审计里的非敏感目标标识（包/对象/op；不放 SQL、不放请求体） */
+export interface AuditTarget {
+  packageId?: string;
+  objectName?: string;
+  op?: string;
+}
+
 /** `capability-audit` 事件载荷（字段固定：审计链路不随入口变化） */
 export interface CapabilityAuditEvent {
   capabilityId: string;
+  /** 终态（P0-4）：读 = allowed|denied；写 = denied|completed|failed */
+  result: AuditResult;
+  /**
+   * `allow|block` 投影（兼容旧日志读取方）。
+   * `completed`/`failed` 都投影为 `allow`：它们是在**已授权**之后发生的执行结局。
+   */
   verdict: 'allow' | 'block';
   clientId?: string;
   transport?: 'http' | 'stdio';
@@ -98,9 +122,40 @@ export interface CapabilityAuditEvent {
   profileId?: string;
   /** 进程级归因标签（MCP_AGENT_LABEL；未配置时不产生该字段） */
   agentLabel?: string;
+  /** 归因入口（门面路由时 = 门面 id） */
+  via?: string;
+  /** 非敏感目标（包/对象/op） */
+  target?: AuditTarget;
   resources: { writePackages: string[]; readSchemas: string[]; readPackages: string[] };
   /** 本次产生的全部规则码（放行时可能含 warn 级） */
   codes: string[];
+  /** 拒绝原因（稳定规则码；仅 denied） */
+  denyReason?: string;
+  /** 执行失败原因（稳定码；仅 failed；不放原始报文） */
+  failureDetail?: string;
+  /** true = 本次调用只是把工作交给异步任务（终态在执行侧另记一条，带 taskId） */
+  deferred?: boolean;
+}
+
+/**
+ * 写能力判定（P0-4 的「写」口径）：kind=write，或声明了 destructive 的 admin
+ * （如 hana_repo_import——它确实覆盖仓库文件，不能按只读记 allowed）。
+ * 门面是**入口**，不是执行单元：它自己的判定不落终态（真正的目标能力会落），
+ * 否则每次调门面都会多出一条 `hana_modeling completed` 的假写记录。
+ */
+export function isMutationCapability(capability: Capability): boolean {
+  if (capability.facadeOf !== undefined) return false;
+  return capability.kind === 'write' || capability.effects.destructive === true;
+}
+
+/** 从入参提取非敏感目标标识（只认 string；SQL/请求体一律不进审计） */
+export function auditTargetOf(args: Record<string, unknown>): AuditTarget | undefined {
+  const target: AuditTarget = {
+    ...(typeof args['packageId'] === 'string' ? { packageId: args['packageId'] } : {}),
+    ...(typeof args['objectName'] === 'string' ? { objectName: args['objectName'] } : {}),
+    ...(typeof args['op'] === 'string' ? { op: args['op'] } : {}),
+  };
+  return Object.keys(target).length > 0 ? target : undefined;
 }
 
 /**
@@ -147,15 +202,20 @@ export function authorizeCall(
       ...checkDeployment(policy),
     ];
     const verdict = assembleVerdict(policy, grants, ['本次调用：能力 (未登记)——拒绝']);
+    const unknownTarget = auditTargetOf(args);
     const audit: CapabilityAuditEvent = {
       capabilityId: '(未登记能力)',
+      result: 'denied',
       verdict: 'block',
       ...(identity.clientId ? { clientId: identity.clientId } : {}),
       ...(identity.transport ? { transport: identity.transport } : {}),
       ...(profile ? { profileId: profile.id } : {}),
       ...(agentLabel ? { agentLabel } : {}),
+      ...(ctx.via ? { via: ctx.via } : {}),
+      ...(unknownTarget ? { target: unknownTarget } : {}),
       resources: { writePackages: [], readSchemas: [], readPackages: [] },
       codes: ['unknown_capability'],
+      denyReason: 'unknown_capability',
     };
     logger.warn({ ...audit }, 'capability-audit');
     return { allowed: false, plan: planReadless('(未登记能力)'), verdict, audit };
@@ -175,23 +235,112 @@ export function authorizeCall(
     extraGrants: checkProfile(capability, plan, profile, (policy.profiles?.size ?? 0) > 0),
   });
 
+  const target = auditTargetOf(args);
   const audit: CapabilityAuditEvent = {
     capabilityId: capability.id,
+    result: verdict.allowed ? 'allowed' : 'denied',
     verdict: verdict.allowed ? 'allow' : 'block',
     ...(identity.clientId ? { clientId: identity.clientId } : {}),
     ...(identity.transport ? { transport: identity.transport } : {}),
     ...(profile ? { profileId: profile.id } : {}),
     ...(agentLabel ? { agentLabel } : {}),
+    ...(ctx.via ? { via: ctx.via } : {}),
+    ...(target ? { target } : {}),
     resources: {
       writePackages: plan.writePackages,
       readSchemas: plan.readSchemas,
       readPackages: plan.readPackages,
     },
     codes: verdict.blocking.length > 0 ? verdict.blocking.map((g) => g.code) : verdict.warnings.map((g) => g.code),
+    ...(verdict.allowed ? {} : { denyReason: verdict.blocking[0]?.code ?? 'blocked' }),
   };
-  logger[verdict.allowed ? 'info' : 'warn']({ ...audit }, 'capability-audit');
+  // P0-4：读能力的授权结论就是终态；写能力放行时**不记**（终态由执行侧记 completed/failed），
+  // 拦截则由闸门记 denied——每次写尝试在日志里恰好一条终态记录。
+  if (!verdict.allowed) logger.warn({ ...audit }, 'capability-audit');
+  else if (!isMutationCapability(capability)) logger.info({ ...audit }, 'capability-audit');
 
   return { allowed: verdict.allowed, plan, verdict, audit };
+}
+
+/**
+ * 执行侧终态审计（P0-4）：写能力在本次执行结束后记 `completed` 或 `failed`。
+ * 读能力不记（它们的终态在 authorizeCall 已记 allowed|denied）。
+ *
+ * @param auth authorizeCall 的返回值（沿用身份、资源计划与规则码，不另算一份）
+ * @param failureDetail 失败时的稳定码（枚举值/业务码），**不放异常原文或请求体**
+ */
+export function auditTerminal(
+  capability: Capability,
+  auth: AuthorizationResult,
+  outcome: 'completed' | 'failed',
+  failureDetail?: string,
+  deferred = false,
+): void {
+  if (!isMutationCapability(capability)) return;
+  // 沿用授权记录的身份/资源/规则码；只替换终态字段（denied 才会带 denyReason，这里必然没有）
+  const { denyReason: _denyReason, ...base } = auth.audit;
+  const event: CapabilityAuditEvent = {
+    ...base,
+    result: outcome,
+    verdict: 'allow',
+    ...(failureDetail !== undefined ? { failureDetail } : {}),
+    // 只有**确实创建了任务**（回执带 taskId）才标 deferred；异步提交被拒时不得留一条找不到任务的记录
+    ...(deferred ? { deferred: true } : {}),
+  };
+  logger[outcome === 'failed' ? 'warn' : 'info']({ ...event }, 'capability-audit');
+}
+
+/**
+ * 从工具返回值提取失败稳定码（不读散文：只看机读字段）。
+ * - MCP isError：`is_error`（硬错误在 core/errors 已给恢复提示，不进审计原文）
+ * - 业务失败信封：`raw.code`；没有机读码时用 `business_failure`（不读 messages 散文）
+ */
+function failureCodeOf(value: unknown): { failed: boolean; detail?: string; deferred?: boolean } {
+  if (value === null || typeof value !== 'object') return { failed: false };
+  const rec = value as Record<string, unknown>;
+  if (rec['isError'] === true) return { failed: true, detail: 'is_error' };
+  const envelope = rec['structuredContent'] as
+    { success?: unknown; raw?: unknown; data?: { taskId?: unknown } } | undefined;
+  if (envelope === undefined || typeof envelope !== 'object') return { failed: false };
+  if (envelope.success !== false) {
+    return { failed: false, deferred: typeof envelope.data?.taskId === 'string' };
+  }
+  const raw = envelope.raw as { code?: unknown } | undefined;
+  const code = raw !== null && typeof raw === 'object' && typeof raw.code === 'string' ? raw.code : undefined;
+  return { failed: true, detail: code ?? 'business_failure' };
+}
+
+/**
+ * 已授权调用的统一执行壳（P0-4）：授权 → 执行 → 写能力记终态。
+ * 门面路由与平铺直调共用它，保证两条入口的审计字段与终态口径一致。
+ *
+ * @param onBlocked 拦截回执的构造器（两处形状不同：直调回 blockedCallResult，路由回同样的硬错误）
+ */
+export async function dispatchAuthorized<T>(
+  capability: Capability,
+  args: Record<string, unknown>,
+  ctx: AuthorizationContext,
+  dispatch: () => T | Promise<T>,
+  onBlocked: (result: AuthorizationResult) => T,
+): Promise<T> {
+  const auth = authorizeCall(capability, args, ctx);
+  if (!auth.allowed) return onBlocked(auth);
+  try {
+    const value = await dispatch();
+    const outcome = failureCodeOf(value);
+    auditTerminal(capability, auth, outcome.failed ? 'failed' : 'completed', outcome.detail, outcome.deferred);
+    return value;
+  } catch (e) {
+    // 异常路径同样必须落一条终态（否则「每次写尝试恰好一条」在失败时失效）
+    const detail =
+      e !== null && typeof e === 'object' && typeof (e as { code?: unknown }).code === 'string'
+        ? (e as { code: string }).code
+        : e instanceof Error
+          ? e.name
+          : 'unknown_error';
+    auditTerminal(capability, auth, 'failed', detail);
+    throw e;
+  }
 }
 
 /**

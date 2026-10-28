@@ -221,7 +221,10 @@ export interface SqlAnalyzeResult {
   operators?: PlanOperator[];
   /** 原始执行计划（仅 raw=true 时返回）：按层级缩进的文本树 */
   planText?: string;
+  /** 本次实际参与分析的算子数（回读硬上限截断后的行数） */
   operatorCount: number;
+  /** 计划表里的算子总数（回读**前**的 COUNT；totalOperatorCount > operatorCount = 撞到回读硬上限） */
+  totalOperatorCount: number;
   /** 是否因 limit 截断（raw=true 时才有意义） */
   truncated: boolean;
   rootCount: number;
@@ -650,6 +653,8 @@ async function tryPlanVizExecution(conn: HanaConnection, args: BaseArgs & { sql:
         panels,
         ...(args.raw ? { planText: panels.planGraph.tree, operators: toPlanOperators(plan, args.limit) } : {}),
         operatorCount: plan.operators.length,
+        // PlanViz 通道拿的是全量计划（无回读硬上限），总数即算子数
+        totalOperatorCount: plan.operators.length,
         // limit 与 EXPLAIN 路径同口径：raw 时的算子行要截断，并如实标注
         truncated: plan.operators.length > args.limit,
         // 主计划的根才是"这条语句的根"；全部算子里的根包含各子计划片段的根（实测 1063 个算子里有 422 个）
@@ -824,6 +829,7 @@ async function finish(
     conclusion,
     ...(args.raw ? { operators: render.operators, planText: render.planText } : {}),
     operatorCount: render.operatorCount,
+    totalOperatorCount: totalRows,
     truncated: args.raw ? render.truncated : false,
     rootCount: render.rootCount,
     orphanCount: render.orphanCount,

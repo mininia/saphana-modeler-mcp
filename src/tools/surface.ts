@@ -15,11 +15,11 @@
  */
 
 import { CAPABILITY_LIST, findCapability, membersOfCategory } from '../capabilities/manifest.js';
-import { type Capability, type FacadeCategory } from '../capabilities/types.js';
+import { CAPABILITY_CATALOG, type Capability, type FacadeCategory } from '../capabilities/types.js';
 import { activeProfile, profileAllows, type CallerProfile } from '../config/profiles.js';
 import type { HanaConfig } from '../config/config.js';
 import { ANONYMOUS_CLIENT_ID, currentIdentity } from '../core/request-context.js';
-import { shouldRegisterTool, type ToolFilterConfig } from './groups.js';
+import { matchGlob, shouldRegisterTool, type ToolFilterConfig } from './groups.js';
 
 /**
  * 面的计算只需要「策略 + 配置」。刻意不 import ./index.js 的 ToolContext（会成环）；
@@ -203,4 +203,86 @@ export function paramNamesOf(cap: Capability): string[] {
 /** 按 id 解析能力（路由用）；未登记返回 undefined */
 export function resolveCapability(id: string): Capability | undefined {
   return findCapability(id);
+}
+
+/**
+ * 工具面省略说明（P1-7）：让模型知道「为什么有些能力不在」，同时**默认不泄漏**被隐藏的能力名。
+ *
+ * 三类口径（与清单/计划一致）：
+ * - 部署策略 / deny：说明句 + 涉及**类别**，默认不点名能力，不提示重试；
+ * - 分组 / allow 过滤：只列本次启用的类别；
+ * - 档案收紧：说明句 + 涉及类别（同样不点名）。
+ * 瞬时注册失败不在本函数（它发生在提升时，见 tools/capability.tools.ts 的 warnings）。
+ *
+ * 全量面返回 `{ status: 'full' }`——正常部署**不追加任何噪音**。
+ * `names=true` 是 `HANA_EXPLAIN_SURFACE=names` 的调试口径，才会输出被隐藏的能力 id。
+ */
+export interface SurfaceExplanation {
+  status: 'full' | 'restricted';
+  /** 本次部署启用的类别（有成员可见的类别） */
+  enabledCategories?: FacadeCategory[];
+  /** 一个可见成员都没有的类别 */
+  omittedCategories?: FacadeCategory[];
+  /** 可读说明（不含能力名，除非调试开关） */
+  notes?: string[];
+  /** 被隐藏的能力 id（仅调试开关 `HANA_EXPLAIN_SURFACE=names`） */
+  omittedNames?: string[];
+}
+
+export function explainSurface(
+  ctx: SurfaceContext,
+  identity: { clientId?: string; profileId?: string } | undefined,
+  opts: { names?: boolean } = {},
+): SurfaceExplanation {
+  const profile = activeProfile(ctx.config, identity);
+  const concrete = CAPABILITY_LIST.filter((c) => c.facadeOf === undefined);
+  const denied: Capability[] = [];
+  const groupHidden: Capability[] = [];
+  const profileHidden: Capability[] = [];
+
+  for (const cap of concrete) {
+    if (!shouldRegisterTool(cap.id, ctx.toolFilter)) {
+      // deny 与分组/allow 过滤分开归因：前者是部署策略，后者是"本次启用了哪些类别"
+      const deniedById =
+        matchGlob(cap.id, ctx.toolFilter.denyPatterns) ||
+        (cap.routeOnly === true && matchGlob(cap.module, ctx.toolFilter.denyPatterns));
+      (deniedById ? denied : groupHidden).push(cap);
+    } else if (!profileAllows(profile, cap.id, cap.kind).ok) {
+      profileHidden.push(cap);
+    }
+  }
+
+  const hidden = [...denied, ...groupHidden, ...profileHidden];
+  if (hidden.length === 0) return { status: 'full' };
+
+  const categoriesOf = (caps: readonly Capability[]): FacadeCategory[] => {
+    const set = new Set(caps.map((c) => c.category));
+    return CAPABILITY_CATALOG.map((e) => e.id).filter((id) => set.has(id));
+  };
+  const hiddenIds = new Set(hidden.map((c) => c.id));
+  const enabledCategories = CAPABILITY_CATALOG.map((e) => e.id).filter((cat) =>
+    concrete.some((c) => c.category === cat && !hiddenIds.has(c.id)),
+  );
+  const omittedCategories = CAPABILITY_CATALOG.map((e) => e.id)
+    .filter((cat) => concrete.some((c) => c.category === cat))
+    .filter((cat) => !enabledCategories.includes(cat));
+
+  const notes: string[] = [];
+  if (denied.length > 0) {
+    notes.push(`部分能力因部署策略不可见（涉及类别：${categoriesOf(denied).join('、')}）。`);
+  }
+  if (groupHidden.length > 0) {
+    notes.push(`本次部署启用的类别：${enabledCategories.join('、') || '(无)'}（未启用的能力不可见）。`);
+  }
+  if (profileHidden.length > 0) {
+    notes.push(`部分能力因调用方档案不可见（涉及类别：${categoriesOf(profileHidden).join('、')}）。`);
+  }
+
+  return {
+    status: 'restricted',
+    enabledCategories,
+    ...(omittedCategories.length > 0 ? { omittedCategories } : {}),
+    notes,
+    ...(opts.names ? { omittedNames: hidden.map((c) => c.id) } : {}),
+  };
 }
