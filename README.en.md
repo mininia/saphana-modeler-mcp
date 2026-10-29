@@ -45,7 +45,7 @@ operations actions are among the plans for the future.
 npx -y @mininia/saphana-modeler-mcp
 ```
 
-Pair this with the "MCP Client Setup" section below — set `command` to `npx` and `args` to `["-y", "@mininia/saphana-modeler-mcp"]`.
+The minimal `mcp.json` is under Configuration below.
 
 > Source install (builds locally, requires Node >= 22): `npx -y github:mininia/saphana-modeler-mcp`.
 
@@ -61,8 +61,6 @@ node scripts/smoke-stdio.mjs   # smoke test: handshake + tool registration (no r
 ```
 
 > Cloning builds from source: `prepare` compiles right after install, and the build toolchain (`typescript`, `@types/node`) lives in `optionalDependencies` — do **not** install with `--omit=optional` (`NODE_ENV=production` and `--omit=dev` are unaffected).
-
-MCP setup: copy `mcp.json.example` to `mcp.json` and fill in real connection details (both `mcp.json` and `.env` are gitignored — **do not commit**). See "MCP Client Setup" below.
 
 ## Configuration
 
@@ -113,6 +111,27 @@ Connection info is only allowed from environment variables / `mcp.json` `env` (*
 | `MCP_HTTP_ALLOWED_HOSTS` | optional | Allowed `Host` header hostnames (DNS rebinding protection; comma-separated, no ports, IPv6 in brackets), defaults to loopback names only | `localhost,myhost.corp` |
 | `MCP_HTTP_ALLOWED_ORIGINS` | optional | Allowed `Origin` hostnames (comma-separated, no scheme/port; requests without an Origin header pass). **Defaults to inheriting `MCP_HTTP_ALLOWED_HOSTS`**; explicitly empty = reject every request carrying an Origin | `localhost` |
 | `MCP_HTTP_ALLOW_ANONYMOUS` | optional | Explicitly accepts the risk of "listening externally with no Bearer token" (default `false`). **A non-loopback bind with no token is refused at startup** (in that posture the write boundary, tool groups and schema allowlist are all moot); set it to `true` only when something in front already authenticates (e.g. a reverse proxy) | `false` |
+
+Minimal `mcp.json` (npx startup):
+
+```jsonc
+{
+  "mcpServers": {
+    "saphana-modeler-mcp": {
+      "command": "npx",
+      "args": ["-y", "@mininia/saphana-modeler-mcp"],
+      "env": {
+        "HANA_HOST": "hana-host.example",
+        "HANA_PORT": "31015",
+        "HANA_USER": "YOUR_USERNAME",
+        "HANA_PASSWORD": "YOUR_PASSWORD"
+      }
+    }
+  }
+}
+```
+
+> Local clone: replace `command`/`args` with `"node"` / `["<absolute-repo-path>/dist/index.js"]`.
 
 ## Transports
 
@@ -512,55 +531,9 @@ When privileges are insufficient, troubleshoot with `hana_check_privileges` firs
 
 ## MCP Client Setup
 
-Copy `mcp.json.example` to `mcp.json`, fill in real connection details, then configure per your client:
-
 **Claude Desktop / Cursor / VS Code (MCP extension)**
 
-Point to the local build artifact, stdio transport:
-
-```jsonc
-{
-  "mcpServers": {
-    "saphana-modeler-mcp": {
-      "command": "node",
-      "args": ["<absolute-repo-path>/dist/index.js"],
-      "env": {
-        "HANA_HOST": "hana-host.example",
-        "HANA_PORT": "31015",
-        "HANA_USER": "YOUR_USERNAME",
-        "HANA_PASSWORD": "YOUR_PASSWORD",
-        "HANA_DB_NAME": "SYSTEMDB",
-        "HANA_TLS": "false",
-        "HANA_WRITE_PACKAGES": "ZDEMO1",
-        "HANA_XS_PORT": "8010"
-      }
-    }
-  }
-}
-```
-
-**Or one-shot via npx (npm package)**:
-
-```jsonc
-{
-  "mcpServers": {
-    "saphana-modeler-mcp": {
-      "command": "npx",
-      "args": ["-y", "@mininia/saphana-modeler-mcp"],
-      "env": {
-        "HANA_HOST": "hana-host.example",
-        "HANA_PORT": "31015",
-        "HANA_USER": "YOUR_USERNAME",
-        "HANA_PASSWORD": "YOUR_PASSWORD",
-        "HANA_DB_NAME": "SYSTEMDB",
-        "HANA_TLS": "false",
-        "HANA_WRITE_PACKAGES": "ZDEMO1",
-        "HANA_XS_PORT": "8010"
-      }
-    }
-  }
-}
-```
+See the minimal `mcp.json` under Configuration above (npx startup); for the local build, replace `command`/`args` with `node` / `["<absolute-repo-path>/dist/index.js"]`.
 
 **Streamable HTTP setup** (remote/shared deployment; start the server with `MCP_HTTP_PORT` set first — see "Transports"):
 

@@ -31,7 +31,7 @@ SAP HANA 经典 Modeler 能力的 MCP 服务器（TypeScript，Node >= 22.0.0）
 npx -y @mininia/saphana-modeler-mcp
 ```
 
-配合下方「MCP 客户端接入」，把 `command` 换成 `npx`、`args` 换成 `["-y", "@mininia/saphana-modeler-mcp"]`。
+最小 `mcp.json` 见下方「配置」。
 
 > 从源码安装（会本地构建，需 Node >= 22）：`npx -y github:mininia/saphana-modeler-mcp`。
 
@@ -45,8 +45,6 @@ cp .env.example .env # 填写真实 HANA 连接
 npm run build
 node scripts/smoke-stdio.mjs   # 冒烟：握手 + 工具注册（无需真实 HANA）
 ```
-
-> `mcp.json` 与 `.env` 均已 gitignore，**请勿提交**。
 
 ## 配置
 
@@ -63,14 +61,14 @@ MDC 环境还需 `HANA_DB_NAME`。缺失必填项时服务启动即失败。
 
 **完整参数、配置来源、工具分组与可见性、调用方档案、传输方式、安全边界、HANA 授权要求：见 [CONFIG.md](CONFIG.md)。**
 
-最小 `mcp.json`：
+最小 `mcp.json`（npx 启动）：
 
 ```jsonc
 {
   "mcpServers": {
     "saphana-modeler-mcp": {
-      "command": "node",
-      "args": ["<仓库绝对路径>/dist/index.js"],
+      "command": "npx",
+      "args": ["-y", "@mininia/saphana-modeler-mcp"],
       "env": {
         "HANA_HOST": "hana-host.example",
         "HANA_PORT": "31015",
@@ -81,6 +79,8 @@ MDC 环境还需 `HANA_DB_NAME`。缺失必填项时服务启动即失败。
   }
 }
 ```
+
+> 本地 clone 运行：把 `command`/`args` 换成 `"node"` / `["<仓库绝对路径>/dist/index.js"]`。
 
 ## 运行方式
 
@@ -171,8 +171,8 @@ src/
 
 ## MCP 客户端接入
 
-**stdio（Claude Desktop / Cursor / VS Code）**：见上方最小 `mcp.json`；`npx` 方式把 `command`/`args` 换成
-`npx` / `["-y", "@mininia/saphana-modeler-mcp"]`。
+**stdio（Claude Desktop / Cursor / VS Code）**：见上方「配置」的最小 `mcp.json`（npx 启动）；
+本地构建产物把 `command`/`args` 换成 `node` / `["<仓库绝对路径>/dist/index.js"]`。
 
 **Streamable HTTP**（服务端先设置 `MCP_HTTP_PORT` 启动）：
 
