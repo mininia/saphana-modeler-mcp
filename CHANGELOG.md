@@ -4,6 +4,12 @@
 >
 > 约定：每次提交前把变化补到对应版本条目下；每条 1–3 行，只写对外可见变化。
 
+## 1.3.1 - 2026-10-29
+
+- Node 下限从 `>=24.18.1` 降至 `>=22.0.0`（22.23.4 上 typecheck/build/1070 单测/两条 smoke 全绿；Node 20 已 EOL，运行时在 20.12.2 上实测可跑）。
+- 修复 stdio/HTTP 冒烟脚本的 dummy 配置：`HANA_PORT` 为空导致 `npm run smoke` 启动即失败；同时移除已废弃的 `HANA_INSTANCE`。
+- 发布到 npm：`npx -y @mininia/saphana-modeler-mcp`（预构建 dist，无需本地编译）。
+
 ## 1.3.0 - 2026-10-27
 
 - 结果契约：新增 `resultInfo`（截断原因）与 `empty`（合法空集）；旧字段 `data.truncated/count/limit` 兼容保留。

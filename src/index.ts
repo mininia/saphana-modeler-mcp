@@ -21,7 +21,7 @@ const SHUTDOWN_TIMEOUT_MS = 5_000;
 
 /** 入口：Node 版本校验 → 加载配置 → 构建连接池（懒连接，不阻塞启动）→ stdio / Streamable HTTP transport 启动 */
 async function main(): Promise<void> {
-  // 启动前置：Node 版本兼容校验（与 package.json 的 engines 一致，见 core/node-version.ts；实测全绿下限 >=24.18，过旧的版本可能在依赖 import 期先崩）
+  // 启动前置：Node 版本兼容校验（与 package.json 的 engines 一致，见 core/node-version.ts；下限 >=22.0，过旧的版本可能在依赖 import 期先崩）
   const nodeVersion = checkNodeVersion();
   if (!nodeVersion.ok) {
     console.error(

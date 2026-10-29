@@ -2,7 +2,7 @@
 
 > 🌐 [中文](README.md) | English
 
-An MCP server for SAP HANA classic Modeler capabilities (TypeScript, Node >= 24.18.1; older versions may crash while loading dependencies, so please upgrade). Targeting on-premise HANA 2.0
+An MCP server for SAP HANA classic Modeler capabilities (TypeScript, Node >= 22.0.0; older versions may crash while loading dependencies, so please upgrade). Targeting on-premise HANA 2.0
 (classic `_SYS_REPO` repository modeling), it provides **metadata browsing, data preview, lineage query, and
 modeling write operations** for information views (calculation views / attribute views / analytic views) and
 repository objects.
@@ -39,13 +39,15 @@ operations actions are among the plans for the future.
 
 ## Quick Start
 
-**Option 1: one-shot via npx (no clone required — recommended for trial)**
+**Option 1: one-shot via npx (npm prebuilt package — no clone/build required)**
 
 ```bash
-npx github:mininia/saphana-modeler-mcp   # auto clone + build + launch
+npx -y @mininia/saphana-modeler-mcp
 ```
 
-Pair this with the "MCP Client Setup" section below — set `command` to `npx` and `args` to `["github:mininia/saphana-modeler-mcp"]`.
+Pair this with the "MCP Client Setup" section below — set `command` to `npx` and `args` to `["-y", "@mininia/saphana-modeler-mcp"]`.
+
+> Source install (builds locally, requires Node >= 22): `npx -y github:mininia/saphana-modeler-mcp`.
 
 **Option 2: clone & run locally (development / customization)**
 
@@ -537,14 +539,14 @@ Point to the local build artifact, stdio transport:
 }
 ```
 
-**Or one-shot via npx (no clone required)**:
+**Or one-shot via npx (npm package)**:
 
 ```jsonc
 {
   "mcpServers": {
     "saphana-modeler-mcp": {
       "command": "npx",
-      "args": ["github:mininia/saphana-modeler-mcp"],
+      "args": ["-y", "@mininia/saphana-modeler-mcp"],
       "env": {
         "HANA_HOST": "hana-host.example",
         "HANA_PORT": "31015",

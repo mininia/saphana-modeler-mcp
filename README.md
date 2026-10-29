@@ -2,7 +2,7 @@
 
 > 🌐 中文 | [English](README.en.md)
 
-SAP HANA 经典 Modeler 能力的 MCP 服务器（TypeScript，Node >= 24.18.1）。面向本地部署 HANA 2.0
+SAP HANA 经典 Modeler 能力的 MCP 服务器（TypeScript，Node >= 22.0.0）。面向本地部署 HANA 2.0
 （经典 `_SYS_REPO` 仓库建模），提供视图与仓库对象的**元数据浏览、数据预览、血缘查询与建模写操作**。
 通过 MCP 协议接入 Claude / IDE 等客户端（**stdio / Streamable HTTP 双传输**），无需打开 HANA Studio。
 
@@ -25,13 +25,15 @@ SAP HANA 经典 Modeler 能力的 MCP 服务器（TypeScript，Node >= 24.18.1�
 
 ## 快速开始
 
-**npx 一键试用（无需克隆）：**
+**npx 一键启动（npm 预构建包，无需克隆/编译）：**
 
 ```bash
-npx github:mininia/saphana-modeler-mcp
+npx -y @mininia/saphana-modeler-mcp
 ```
 
-配合下方「MCP 客户端接入」，把 `command` 换成 `npx`、`args` 换成 `["github:mininia/saphana-modeler-mcp"]`。
+配合下方「MCP 客户端接入」，把 `command` 换成 `npx`、`args` 换成 `["-y", "@mininia/saphana-modeler-mcp"]`。
+
+> 从源码安装（会本地构建，需 Node >= 22）：`npx -y github:mininia/saphana-modeler-mcp`。
 
 **克隆本地运行：**
 
@@ -170,7 +172,7 @@ src/
 ## MCP 客户端接入
 
 **stdio（Claude Desktop / Cursor / VS Code）**：见上方最小 `mcp.json`；`npx` 方式把 `command`/`args` 换成
-`npx` / `["github:mininia/saphana-modeler-mcp"]`。
+`npx` / `["-y", "@mininia/saphana-modeler-mcp"]`。
 
 **Streamable HTTP**（服务端先设置 `MCP_HTTP_PORT` 启动）：
 

@@ -1,13 +1,16 @@
 {
-  "name": "saphana-modeler-mcp",
-  "version": "1.3.0",
+  "name": "@mininia/saphana-modeler-mcp",
+  "version": "1.3.1",
   "description": "SAP HANA Modeler MCP Server (TypeScript) - 经典 HANA 2.0 仓库建模能力（_SYS_REPO/_SYS_BI/_SYS_BIC）",
   "type": "module",
-  "private": true,
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/mininia/saphana-modeler-mcp.git"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
   },
   "bin": {
     "saphana-modeler-mcp": "dist/index.js"
@@ -18,12 +21,13 @@
     "THIRD-PARTY-NOTICES.md"
   ],
   "engines": {
-    "node": ">=24.18.1"
+    "node": ">=22.0.0"
   },
   "scripts": {
     "prebuild": "node -e \"const p=require('./package.json');const bad=['typescript','@types/node'].filter((n)=>p.devDependencies&&p.devDependencies[n]);if(bad.length){console.error('构建工具链不得声明在 devDependencies（命中：'+bad.join('、')+'）：NODE_ENV=production 与 --omit=dev 会省略 devDependencies，而 prepare 仍会在安装后执行构建，克隆/npx 安装将失败；请改为声明在 optionalDependencies。');process.exit(1)};const r=(s)=>{try{require.resolve(s);return true}catch{return false}};if(!(r('typescript')&&r('@types/node/package.json'))){console.error('构建工具链缺失：typescript 或 @types/node 当前不可加载（--omit=optional 的省略式安装不装它们，optional 依赖安装失败同样缺失）。请用完整安装（npm ci / npm install）后重试。');process.exit(1)}\"",
     "build": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json && node -e \"require('fs').chmodSync('dist/index.js',0o755)\"",
     "prepare": "npm run build",
+    "prepublishOnly": "npm run check:tool-names && npm run typecheck",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "check:tool-names": "node scripts/check-tool-names.mjs",
     "format": "prettier --write .",

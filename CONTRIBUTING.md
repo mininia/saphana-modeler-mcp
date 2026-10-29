@@ -12,7 +12,7 @@
 | `npm run check` | 工具名守卫 + 类型检查 + 单测（提交前跑这个） |
 | `npm run format` | Prettier 格式化（`format:check` 只检查不写） |
 
-> 开发与检查要求 Node >= 24.18.1（与 package.json 的 engines 下限一致；启动期校验只比较 major.minor，即 >= 24.18 放行、patch 位不受校验，见 `core/node-version.ts`）。更低版本上 npm test 不可用：npm 在 Windows 固定用 cmd.exe 执行脚本，cmd 不展开 glob，而 Node 20 的 --test 也不展开（报 Could not find 或静默 0 用例）。
+> 开发与检查要求 Node >= 22.0.0（与 package.json 的 engines 下限一致；启动期校验只比较 major.minor，即 >= 22.0 放行、patch 位不受校验，见 `core/node-version.ts`）。不要用 Node 20：它已 EOL，而且 npm 在 Windows 固定用 cmd.exe 执行脚本、cmd 不展开 glob，Node 20 的 --test 也不展开（报 Could not find 或静默 0 用例）；`pretest` 用到的 `fs.globSync` 也要 22+。
 
 `tests/` 与 `test-verification/` 均不入库（列在 `.gitignore`）：克隆后本地没有测试文件，`npm test` 需自备 `tests/` 才能跑；`verify:*` / `probe:*` 仅在保留本地实机脚本的环境可用，且需要真实 HANA 连接，不在常规检查范围内。
 

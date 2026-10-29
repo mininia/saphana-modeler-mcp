@@ -20,11 +20,10 @@ export const FACADE_ORDER = [
   'hana_diagnostics',
 ];
 
-/** dummy HANA 配置：两个脚本都不调用触库工具，仅用于让 config 校验通过 */
+/** dummy HANA 配置：两个脚本都不调用触库工具，仅用于让 config 校验通过（HANA_PORT 必填） */
 export const DUMMY_HANA_ENV = {
   HANA_HOST: 'dummy.local',
-  HANA_INSTANCE: '00',
-  HANA_PORT: '',
+  HANA_PORT: '30015',
   HANA_USER: 'dummy',
   HANA_PASSWORD: 'dummy',
   HANA_LOCALE: 'zh_CN',
