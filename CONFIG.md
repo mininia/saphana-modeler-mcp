@@ -46,10 +46,13 @@
 | `HANA_POOL_WAIT_MS` | 可选 | 池满后的排队等待超时（ms），默认 `30000` | `60000` |
 | `HANA_POOL_MAX_WAITERS` | 可选 | 排队上限（个），默认 `64` | `128` |
 | `HANA_SQL_TIMEOUT_MS` | 可选 | 写路径五条 SQL 语句的语句超时，默认 `60000` | `120000` |
+| `HANA_SQL_ALLOW_MULTI_STATEMENT` | 可选 | `hana_sql_execute`：同时解锁“多物理行”与“多语句”，默认 `false`；有写时服务端自动事务（全部成功才 commit） | `true` |
+| `HANA_SQL_MAX_RESULT_BYTES` | 可选 | `hana_sql_execute`：单次结果累计字节上限，默认 `1000000`（最小 `1024`，最大 `52428800`） | `2000000` |
+| `HANA_SQL_MAX_STATEMENTS` | 可选 | `hana_sql_execute`：单次调用语句条数上限，默认 `20`（最大 `100`） | `50` |
 | `HANA_XS_TIMEOUT_MS` | 可选 | XS REST 请求默认超时（ms），默认 `30000` | `60000` |
 | `HANA_XS_XFER_TIMEOUT_MS` | 可选 | XS Transfer（xfer）导入/导出超时（ms），默认 `300000` | `600000` |
 | `HANA_ACTIVATION_CONCURRENCY` | 可选 | 服务端激活的并发上限（进程内信号量），默认 `2` | `4` |
-| `HANA_TOOL_GROUPS` | 可选 | 启用的工具功能分组（逗号分隔 `read`/`write`/`admin`）；**空=不限制** | `read` |
+| `HANA_TOOL_GROUPS` | 可选 | 启用的工具功能分组（逗号分隔 `read`/`write`/`admin`/`sql`）；**空 = read/write/admin 启用，sql 默认关闭** | `read` / `read,sql` |
 | `HANA_TOOL_ALLOW` | 可选 | 强制启用的工具名/组名 glob（逗号分隔，支持 `*`） | `hana_view_validate` / `write` |
 | `HANA_TOOL_DENY` | 可选 | 强制禁用的工具名/组名 glob（优先级最高） | `hana_data_preview*` |
 | `HANA_EXPLAIN_SURFACE` | 可选 | 仅调试：置 `names` 时门面索引的 `surface` 说明列出被隐藏/加载失败的能力名 | `names` |
@@ -68,13 +71,14 @@
 
 ## 工具分组与可见性控制
 
-30 个业务能力（28 + 异步任务查询/取消）按功能划分为三组。**注册面上只有六个分类门面**——具体能力经门面索引 + 路由调用（见 README「工具面」）。可见性配置管的是**可触达上限**（哪些能力存在且有权用），不等于注册面。
+业务能力按功能划分为四个业务组；另有独立的 `sql` 组。**注册面上恒有六个分类门面**——具体能力经门面索引 + 路由调用（见 README「工具面」）。`hana_sql_execute` 是**独立的第七个根工具**：显式启用 `sql` 组后与门面同级常驻 `tools/list`，不属于任何业务分类、不进任何门面索引/描述；关闭时对模型完全不可见。可见性配置管的是**可触达上限**（哪些能力存在且有权用），不等于注册面。
 
 | 分组 | 说明 | 能力 |
 | --- | --- | --- |
 | **read** 数据读取 | 访问 HANA 数据/元数据/系统信息与异步任务状态，不改动仓库 | `hana_system_get_info`、`hana_check_privileges`、`hana_package_list`、`hana_package_list_objects`、`hana_metadata_get_view`、`hana_metadata_search_objects`、`hana_metadata_list_fields`、`hana_metadata_get_field_logic`、`hana_metadata_where_used`、`hana_table_list`、`hana_table_columns`、`hana_data_preview`、`hana_data_preview_diagnose`、`hana_task_get` |
 | **write** 写操作 | 改动仓库设计时对象/包、接受任意 SQL 的分析、取消异步任务 | `hana_package_create`、`hana_view_create`、`hana_view_activate`、`hana_view_update`、`hana_view_delete`、`hana_view_validate`、`hana_view_check_actions`、`hana_sql_analyze`、`hana_task_cancel` |
 | **admin** 管理操作 | Transfer / Change-Tracking API 与系统监视面 | `hana_repo_export`、`hana_repo_import`、`hana_repo_changelist`、`hana_system_health`、`hana_system_activity`、`hana_table_storage`、`hana_system_trend` |
+| **sql** 直接执行（**默认关闭**） | 独立第七根工具：在 HANA 上直接执行任意 SQL（读/写/管理类）。**空 `HANA_TOOL_GROUPS` 不会启用它**；须显式 `HANA_TOOL_GROUPS=sql` 或 `HANA_TOOL_ALLOW=hana_sql_execute`。未启用时它不进 `tools/list`、不进任何门面描述/索引，提示里也不提及 | `hana_sql_execute` |
 
 > 分组（kind）是**权限层级**而非"行为画像"：稳定性诊断四件套、`hana_repo_changelist` 行为只读但归 admin；`hana_sql_analyze` 接受任意 SQL 但归 write。客户端注解（`readOnlyHint`）描述行为，两者不互相推导。
 >
@@ -84,18 +88,40 @@
 
 配置变量优先级：`HANA_TOOL_DENY` > `HANA_TOOL_ALLOW` > `HANA_TOOL_GROUPS`。
 
-- `HANA_TOOL_GROUPS`：启用的分组（逗号分隔）；空=不限制。
+- `HANA_TOOL_GROUPS`：启用的分组（逗号分隔）；空 = read/write/admin 启用（**sql 默认关闭**，须显式写 `sql`）。
 - `HANA_TOOL_ALLOW`：强制启用（即便分组未启用），支持组名与工具名 glob。
 - `HANA_TOOL_DENY`：强制禁用（优先级最高），支持组名与 glob。
 
 > **没有别名层**：`MCP_TOOL_*` 不再识别；未识别的 `HANA_*` / `MCP_*` / `LOG_*` 变量会在启动日志告警（防拼写错误静默失效）。
 >
-> 组名可直接用于 allow/deny（`read` / `write` / `admin`），展开为该组全部工具名。例：`HANA_TOOL_GROUPS=read,write` + `HANA_TOOL_DENY=write` ⇒ 等价只读部署。
+> 组名可直接用于 allow/deny（`read` / `write` / `admin` / `sql`），展开为该组全部工具名。例：`HANA_TOOL_GROUPS=read,write` + `HANA_TOOL_DENY=write` ⇒ 等价只读部署。
+
+### 直接执行 HANA SQL（hana_sql_execute）
+
+`sql` 组默认关闭：未显式启用时该能力对模型**完全不可见**（不注册、不进任何门面描述/索引、提示不提及）。
+启用方式：`HANA_TOOL_GROUPS` 里加 `sql`（如 `read,write,admin,sql`），或 `HANA_TOOL_ALLOW=hana_sql_execute`；`HANA_TOOL_DENY` 仍最高。
+它是**独立的第七个根工具**（`category=sql`，不属于任何业务门面），启用后直接出现在 `tools/list`，不需要先调门面提升。
+
+安全默认（规则层 + 服务层双重校验）：
+
+- **调用时机**：仅在用户明确要求执行 SQL 时调用；不用于探测、验证或替代专用工具。该约束写在工具说明里，服务端无法读取用户原始消息，属模型侧软约束；需要硬拦截请在客户端把该工具设为需人工确认。
+- **默认单条 + 单物理行**：多语句或换行符（`\n`/`\r`/U+2028/U+2029）被拒绝；`HANA_SQL_ALLOW_MULTI_STATEMENT=true` 同时解锁两者。
+  多语句在同一池连接上顺序执行，**有写**时服务端自动开事务（全部成功才 commit，失败 rollback，finally 恢复 `autoCommit=true`）。
+- **显式事务控制一律拒绝**：`BEGIN` / `COMMIT` / `ROLLBACK` / `SAVEPOINT` / `RELEASE` / `SET TRANSACTION`。
+- **修改会话状态的 `SET` 一律拒绝**（连接归还池后会污染后续调用，例如 `SET SCHEMA` 改变 `CURRENT_SCHEMA`）。
+- **管理类默认允许**：`CALL` / `GRANT` / `REVOKE` / `ALTER SYSTEM` / `RECONFIGURE` / `IMPORT` / `EXPORT` / `EXECUTE` 等不再有单独开关，直接受数据库账号权限约束；`EXPLAIN` 始终拒绝并提示改用 `hana_sql_analyze`；`DO` 匿名块明确不支持（请改用 `CALL` 或拆成多条语句）。
+- **`maxRows` / `timeoutMs` 是工具参数**：默认 500 行 / 60000ms，上限 10000 行 / 3600000ms；不是环境变量。
+- **部署级结果上限**：`HANA_SQL_MAX_RESULT_BYTES` / `HANA_SQL_MAX_STATEMENTS`（见上表）。SELECT 流式取行、到上限即关闭结果集；二进制值 base64 包装并限制单格大小；超限标记 `truncated` 并挂 `resultInfo`。
+- **`async=true`**：立即返回 `taskId`，用 `hana_task_get` 轮询终态（需 `read` 组可见；取消还需 `write` 组的 `hana_task_cancel`）；执行中的 SQL 无法中途取消。只启用 `sql` 组的部署不要使用 `async`。
+- **服务端不做 schema 级拦截**：不扫描 FROM/JOIN、不查 CURRENT_SCHEMA、不参与 `HANA_READ_SCHEMA` / 写 schema 白名单判定；能访问哪些对象由 HANA 账号权限决定。启用前请按最小权限原则使用专用数据库账号。
+- **审计不落 SQL 原文**：`capability-audit` 的 target 只记 `op: "sql"` + SQL 的 sha256 前 12 位 + 字符数。
+- **DDL 的固有风险**：HANA 可能隐式提交，多语句事务回滚不保证撤销已执行的 DDL；回执会如实提示。
 
 **典型部署形态：**
 
-- **只读分析师**：`HANA_TOOL_GROUPS=read` —— 可触达上限收窄到 14 个 read 档能力；`hana_diagnostics` 索引为空，`hana_modeling` 只剩 `hana_task_get`。
+- **只读分析师**：`HANA_TOOL_GROUPS=read` —— 可触达上限收窄到 read 档能力；`hana_diagnostics` 索引为空，`hana_modeling` 只剩 `hana_task_get`。
 - **建模开发者**：`HANA_TOOL_GROUPS=read,write` —— admin 档不可达。
+- **需要直接执行 SQL**：`HANA_TOOL_GROUPS=read,write,admin,sql`（或 `HANA_TOOL_ALLOW=hana_sql_execute`）；再按需打开 `HANA_SQL_ALLOW_MULTI_STATEMENT`；`maxRows`/`timeoutMs` 在工具调用时传。
 - **关闭特定能力**：`HANA_TOOL_DENY=hana_view_delete` —— 索引、路由、提升都够不着。
 
 未知分组名（如 `HANA_TOOL_GROUPS=read,bogus`）启动即失败（fail-closed）。
@@ -111,6 +137,7 @@ MCP_PROFILE=default                                            # stdio 进程用
 MCP_HTTP_TOKENS="alice:<token>:dev,bob:<token>:analyst"        # 第三段 = 该身份的档案
 ```
 
+- 档案的 kinds 合法值为 `read`/`write`/`admin`/`sql`；部署的 `HANA_TOOL_GROUPS` 是天花板，档案要使用 `hana_sql_execute` 时还必须把 `sql` 写进该档案的 kinds（否则能力仍不可触达）。
 - **只能收紧、不能放宽**：档案不能把部署级 deny 掉的能力变回来，也不能扩大可写包/可读 schema 范围。越界组合（只读部署里写 `dev=read+write`）**启动即拒绝**。
 - **配了 `MCP_PROFILES` 就必须定义 `default`**：HTTP 不带第三段的 Token 与 stdio 进程都落它。
 - 判定发生在**调用期**（`authorizeCall`），拦截回执与其它策略拦截同形（不含补救路径）。
@@ -176,6 +203,7 @@ MCP_HTTP_PORT=3000 MCP_HTTP_TOKENS='shared:your-long-random-token' node dist/ind
 - **本地文件边界**：`hana_repo_export` 的 `saveTo` 与 `hana_repo_import` 的 `filePath` 直通服务器本地文件系统。只允许**服务器工作目录内的相对路径**（绝对路径与含 `..` 的路径一律拒绝）；需要更强隔离时让服务进程以专用目录为工作目录启动。
 - **XS 写通道为明文 HTTP**：XS REST 默认 `http://`，HANA 账号密码、会话 Cookie 与 CSRF token 全部明文传输；`HANA_TLS`/`HANA_SSL_VALIDATE` 只作用于 SQL 通道。必须由网络侧隔离；XS 端点支持 TLS 时置 `HANA_XS_TLS=true` 并把 `HANA_XS_PORT` 指向 HTTPS 端口。
 - **权限策略层**：`src/config/preflight.ts` 是唯一判定入口，能力级（`HANA_TOOL_GROUPS/ALLOW/DENY`）+ 资源级（`HANA_WRITE_PACKAGES` / `HANA_READ_SCHEMA`）+ 部署级（`HANA_TLS` / `MCP_HTTP_*`）。三个调用方共用同一层：服务启动自检、工具层运行期闸门（`runPreflight`）、CLI/实机脚本（`npm run preflight`）。
+- **直接执行 SQL 的边界**：`hana_sql_execute`（sql 组，默认关闭）执行的是**调用方提交的任意 SQL**——`HANA_WRITE_PACKAGES` / `HANA_READ_SCHEMA` / 写 schema 白名单都不适用于它（那是仓库包与读取面边界）；服务端不扫描、不拦截 schema，能访问哪些对象由 HANA 账号权限决定。启用前请按最小权限原则使用专用数据库账号。
 - **拦截消息不含补救路径**：返回给模型的拦截消息只陈述事实（维度/规则码/请求内容/生效策略），不写"改哪项配置可放行"；补救指引只在运维向位置（启动自检与本文档）。
 - **部署级不变量（启动即拒绝）**：① HTTP 非回环监听且无 Bearer Token → 拒绝启动（除非 `MCP_HTTP_ALLOW_ANONYMOUS=true`）；② `HANA_TLS=false`、③ 加密但 `HANA_SSL_VALIDATE=false`、④ XS 写通道明文（未置 `HANA_XS_TLS=true`）→ 告警放行，但每次启动可见。
 - **读范围边界**：受约束的是「按名指定 schema 去读」（`schema` 不在 `HANA_READ_SCHEMA` 即被拦）；不约束已激活视图自身定义的读取、`hana_data_preview` 视图预览、仓库包维度与 `hana_table_storage` 省略 schema 时的全库统计。

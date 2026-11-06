@@ -176,8 +176,8 @@ export function submitBackgroundTask(owner: string, spec: BackgroundTaskSpec): T
   return submissionOf(
     record,
     '任务已在后台执行（本响应不代表执行结果）。用 hana_task_get({taskId}) 轮询状态与终态 result。' +
-      (spec.kind === 'sql_analyze'
-        ? '取消对**已开始执行的 SQL 无法生效**：分析会跑完并如实返回结果，终态会说明取消未生效。'
+      (spec.kind === 'sql_analyze' || spec.kind === 'sql_execute'
+        ? '取消对**已开始执行的 SQL 无法生效**：语句会跑完并如实返回结果，终态会说明取消未生效。'
         : '要停止用 hana_task_cancel({taskId})。') +
       `任务状态在进程内：服务重启即失效；终态任务约保留 ${TERMINAL_TTL_MINUTES} 分钟。`,
   );
@@ -358,6 +358,8 @@ export function taskViewFor(id: string, owner: string): TaskView | undefined {
 
 function viewOf(t: TaskRecord): TaskView {
   const terminal = isTerminal(t.status);
+  // SQL 类任务（analyze / execute）的执行中语句都无法中途取消，回执措辞共用一套。
+  const sqlLike = t.kind === 'sql_analyze' || t.kind === 'sql_execute';
   // 取消请求到达太晚、未生效的终态：completed（批次已走完）或 failed（批次先按失败停止）——
   // 两者都如实说明取消未生效（终态是批次自身的结局，不是这次取消的结果）
   const lateCancel = t.cancelRequested && (t.status === 'completed' || t.status === 'failed');
@@ -366,9 +368,13 @@ function viewOf(t: TaskRecord): TaskView {
       ? t.status === 'completed'
         ? '注意：取消请求到达时分析已执行完毕（未生效）——终态为 completed。'
         : '注意：取消请求到达时分析已按失败结束（未生效）——终态为 failed，失败原因见 result。'
-      : t.status === 'completed'
-        ? '注意：取消请求到达时批次已执行完毕（未生效）——终态为 completed。'
-        : '注意：取消请求到达时批次已按失败停止（未生效）——终态为 failed，失败原因见 result。';
+      : t.kind === 'sql_execute'
+        ? t.status === 'completed'
+          ? '注意：取消请求到达时 SQL 已执行完毕（未生效）——终态为 completed。'
+          : '注意：取消请求到达时 SQL 已按失败结束（未生效）——终态为 failed，失败原因见 result。'
+        : t.status === 'completed'
+          ? '注意：取消请求到达时批次已执行完毕（未生效）——终态为 completed。'
+          : '注意：取消请求到达时批次已按失败停止（未生效）——终态为 failed，失败原因见 result。';
   return {
     taskId: t.id,
     kind: t.kind,
@@ -383,12 +389,12 @@ function viewOf(t: TaskRecord): TaskView {
     ...(t.errorText !== undefined ? { errorText: t.errorText } : {}),
     hint: !terminal
       ? t.cancelRequested
-        ? t.kind === 'sql_analyze'
+        ? sqlLike
           ? '取消已受理：正在执行的 SQL 不会被中途打断，执行结束后终态会说明取消未生效；继续轮询即可（无需重复取消）。'
           : // 取消已受理（协作式：动作边界生效）——不能再劝一次「要停止用 hana_task_cancel」，
             // 那会让调用方重复刚做过的动作
             '取消已受理：当前动作结束后停止并执行逆序补偿，继续 hana_task_get 轮询即可（无需重复取消）。'
-        : t.kind === 'sql_analyze'
+        : sqlLike
           ? '任务仍在执行：稍后再次 hana_task_get 轮询（执行中的 SQL 无法取消）。'
           : '任务仍在执行：稍后再次 hana_task_get 轮询；要停止用 hana_task_cancel。'
       : lateCancel

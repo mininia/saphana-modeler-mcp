@@ -301,16 +301,19 @@ export function hasUnqualifiedTableRef(sql: string): boolean {
 }
 
 /**
- * 按**顶层 `;`** 切分语句（引号标识符按 token 整体跳过——`FROM "A;B"` 里的分号不是语句边界；
- * 括号内不切）。服务于 CTE 的**语句级作用域**：WITH 定义只在本语句内可见，
- * 逐语句收集 CTE 名才不会让前一条语句的 CTE 名抑制后续语句里的同名真实表。
+ * 按**顶层 `;`** 切分语句（引号标识符/字符串字面量/注释按 token 整体跳过——`FROM "A;B"`、
+ * `SELECT 'a;b'`、`-- x;` 里的分号都不是语句边界；括号内不切）。
+ * 服务于 CTE 的**语句级作用域**（hasUnqualifiedTableRef）与 SQL 直接执行（hana_sql_execute）：
+ * 后者需要**原文切片**送去执行，所以本函数必须能直接吃原始 SQL（不能只吃剥离后的文本）。
  *
  * 只切 `;`、**不切**语句起始关键字：关键字（如 CASE…END 的 END）会出现在单条语句内部，
  * 按它切会把同一条语句里的 CTE 名拆到两个片段、`FROM <CTE>` 被当成未限定表误报，
  * 合法脚本被默认 schema 白名单误拦；`;` 才是 SQL 语句的真正分隔符（CTE 作用域与之一致）。
- * 未闭合引号时剩余部分整段收进当前语句（与 tableNameRegion 的未闭合处理同一口径）。
+ * 未闭合引号/注释时剩余部分整段收进当前语句（与 tableNameRegion 的未闭合处理同一口径）。
+ *
+ * 对 `stripSqlLiteralsAndComments` 的产物调用时结果不变（字面量已变成空 `''`、注释已变成空格）。
  */
-function splitSqlStatements(text: string): string[] {
+export function splitSqlStatements(text: string): string[] {
   const out: string[] = [];
   let start = 0;
   let depth = 0;
@@ -320,6 +323,29 @@ function splitSqlStatements(text: string): string[] {
       const end = skipQuotedIdentifier(text, i);
       if (end < 0) break; // 未闭合引号：剩余部分原样收进当前语句
       i = end - 1; // -1 抵消循环自增
+      continue;
+    }
+    if (ch === "'") {
+      const end = skipQuotedLiteral(text, i);
+      if (end < 0) break;
+      i = end - 1;
+      continue;
+    }
+    if (ch === '-' && text[i + 1] === '-') {
+      while (i < text.length && text[i] !== '\n' && text[i] !== '\r') i++;
+      i--; // 让循环自增落在换行（或结尾）之后
+      continue;
+    }
+    if (ch === '/' && text[i + 1] === '*') {
+      i += 2;
+      while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++;
+      i++; // 跳过 `*`，循环自增跳过 `/`
+      continue;
+    }
+    if (ch === '$' && text[i + 1] === '$') {
+      i += 2;
+      while (i < text.length && !(text[i] === '$' && text[i + 1] === '$')) i++;
+      i++;
       continue;
     }
     if (ch === '(') depth++;
@@ -448,6 +474,18 @@ function skipQuotedIdentifier(text: string, open: number): number {
     if (text[i] === '"' && text[i + 1] === '"')
       i += 2; // "" 转义
     else if (text[i] === '"') return i + 1;
+    else i++;
+  }
+  return -1;
+}
+
+/** 跳过一段字符串字面量（含 `''` 转义），返回收尾引号之后的偏移；未闭合返回 -1 */
+function skipQuotedLiteral(text: string, open: number): number {
+  let i = open + 1;
+  while (i < text.length) {
+    if (text[i] === "'" && text[i + 1] === "'")
+      i += 2; // '' 转义
+    else if (text[i] === "'") return i + 1;
     else i++;
   }
   return -1;

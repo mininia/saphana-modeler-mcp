@@ -114,3 +114,34 @@ export const ANALYZE_EXECUTION_TIMEOUT_MS = 300_000;
  * 放宽它等于把"一次卡死拖垮全部工具调用"的时间窗放大 10 倍。
  */
 export const ANALYZE_CONTROL_TIMEOUT_MS = 30_000;
+
+/*
+ * hana_sql_execute（直接执行 HANA SQL）的默认值与硬上限：
+ * - maxRows / timeoutMs 是**工具参数**（schema 的默认值与合法上限），不放环境变量；
+ * - maxResultBytes / maxStatements 是**部署级环境变量**（HANA_SQL_MAX_RESULT_BYTES / HANA_SQL_MAX_STATEMENTS）；
+ * - 单格二进制上限是内部常量。
+ * 文案用模板插值生成，改这里会一起变。
+ */
+
+/** 单条 SELECT 最多回读的行数（默认 500；取满即关闭结果集） */
+export const SQL_MAX_ROWS_DEFAULT = 500;
+export const SQL_MAX_ROWS_LIMIT = 10_000;
+
+/** 单条语句的执行超时 ms（默认 60s；上限 1h） */
+export const SQL_EXEC_TIMEOUT_MS_DEFAULT = 60_000;
+export const SQL_EXEC_TIMEOUT_MS_LIMIT = 3_600_000;
+
+/** 单次结果累计字节上限（默认 1MB；最小 1KB，上限 50MB） */
+export const SQL_MAX_RESULT_BYTES_DEFAULT = 1_000_000;
+export const SQL_MAX_RESULT_BYTES_MIN = 1_024;
+export const SQL_MAX_RESULT_BYTES_LIMIT = 50 * 1024 * 1024;
+
+/** 单次调用允许的语句条数（默认 20；上限 100） */
+export const SQL_MAX_STATEMENTS_DEFAULT = 20;
+export const SQL_MAX_STATEMENTS_LIMIT = 100;
+
+/**
+ * 单个二进制单元格进入结果前的最大字节数（不暴露为 env）：Base64 会膨胀约 4/3，
+ * 不设单格上限时一个 BLOB 就能吃掉整个结果预算，其它列全被挤掉。
+ */
+export const SQL_MAX_CELL_BYTES_DEFAULT = 64 * 1024;

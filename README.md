@@ -22,6 +22,7 @@ SAP HANA 经典 Modeler 能力的 MCP 服务器（TypeScript，Node >= 22.0.0）
 | 建模写操作 | 新建/激活/更新/删除计算视图、设计时+运行时校验 | `hana_view_create`、`hana_view_activate`、`hana_view_update`、`hana_view_delete`、`hana_view_validate`、`hana_view_check_actions` |
 | 仓库传输 | 包导出备份、设计时文件导入、变更列表 | `hana_repo_export`、`hana_repo_import`、`hana_repo_changelist` |
 | SQL 分析 | 可读分析结论；`analyze=true` 走 PlanViz 逐算子实测；`async=true` 后台执行并轮询；`raw=true` 给原始计划 | `hana_sql_analyze` |
+| SQL 直接执行 | 独立第七根工具：在 HANA 上直接执行 SQL（读/写/管理类），返回列名+行或受影响行数；`maxRows`/`timeoutMs` 为调用参数，`async=true` 返回 taskId。**sql 组默认关闭**，需显式启用 | `hana_sql_execute` |
 
 ## 快速开始
 
@@ -92,6 +93,9 @@ MDC 环境还需 `HANA_DB_NAME`。缺失必填项时服务启动即失败。
 ## 工具面：六个分类门面 + 按需提升
 
 `tools/list` 常驻的只有六个分类门面；具体能力默认隐藏，经门面索引 + 路由调用，调门面时按分类提升进工具面。
+**另有一个独立根工具**：显式启用 `sql` 组后，`hana_sql_execute` 与门面同级常驻 `tools/list`（默认关闭时完全不可见；它不属于任何门面，也不进任何门面索引/描述）。启用方式：`HANA_TOOL_GROUPS=read,write,admin,sql` 或 `HANA_TOOL_ALLOW=hana_sql_execute`。
+
+`hana_sql_execute` **仅在用户明确要求执行 SQL 时调用**，不用于探测、验证或替代专用工具。安全默认：单条语句 + 单物理行（`HANA_SQL_ALLOW_MULTI_STATEMENT=true` 解锁多行/多语句，有写时服务端自动事务）；显式事务控制与修改会话状态的 `SET` 一律拒绝；管理类语句默认允许（受数据库账号权限约束；`EXPLAIN` 仍请用 `hana_sql_analyze`，`DO` 块/过程体不支持）；`maxRows`/`timeoutMs` 是工具调用参数（默认 500 行 / 60000ms）；`async=true` 返回 `taskId`，用 `hana_task_get` 轮询（需 read 组可见）；服务端**不做 schema 级拦截**，访问范围由数据库账号权限决定；审计只记 SQL 的 sha256 指纹与字符数，**不落原文**。详见 [CONFIG.md](CONFIG.md) 的「直接执行 HANA SQL」。
 
 | 门面 | 方向 | 成员数 |
 | --- | --- | --- |

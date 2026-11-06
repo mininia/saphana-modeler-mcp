@@ -567,10 +567,11 @@ function assemble(policy: Policy, grants: Grant[], requestLines: string[]): Verd
 
 function formatCapability(c: ToolFilterConfig): string {
   const none = c.enabledGroups.size === 0 && c.allowPatterns.length === 0 && c.denyPatterns.length === 0;
-  if (none) return '未过滤（全部工具注册）';
+  // 空配置不再等于「全部」：sql 组默认关闭（hana_sql_execute 必须显式启用）
+  if (none) return '未过滤（read/write/admin 启用；sql 组默认关闭）';
   const parts: string[] = [];
   if (c.enabledGroups.size > 0) parts.push(`启用分组 ${[...c.enabledGroups].join('/')}`);
-  else parts.push('启用分组 全部');
+  else parts.push('启用分组 read/write/admin（sql 默认关闭）');
   if (c.allowPatterns.length > 0) parts.push(`allow ${c.allowPatterns.join(', ')}`);
   if (c.denyPatterns.length > 0) parts.push(`deny ${c.denyPatterns.join(', ')}`);
   return parts.join('；');

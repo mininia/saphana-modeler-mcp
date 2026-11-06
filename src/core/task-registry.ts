@@ -32,9 +32,10 @@ export type TaskStatus = 'working' | 'completed' | 'failed' | 'cancelled';
 /**
  * 任务种类（只影响回执措辞与取消语义，不影响注册表容量/归属/TTL）：
  * - `changeset`：hana_view_update 的多对象变更集（取消在动作边界生效并逆序补偿）；
- * - `sql_analyze`：hana_sql_analyze(async=true) 的长 SQL 分析（执行中的语句无法中途打断）。
+ * - `sql_analyze`：hana_sql_analyze(async=true) 的长 SQL 分析（执行中的语句无法中途打断）；
+ * - `sql_execute`：hana_sql_execute(async=true) 的直接 SQL 执行（执行中的语句无法中途打断）。
  */
-export type TaskKind = 'changeset' | 'sql_analyze';
+export type TaskKind = 'changeset' | 'sql_analyze' | 'sql_execute';
 
 /** 终态（不再变化、可被清理） */
 const TERMINAL: ReadonlySet<TaskStatus> = new Set(['completed', 'failed', 'cancelled']);

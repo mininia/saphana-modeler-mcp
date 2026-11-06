@@ -21,6 +21,7 @@ import { metadataCapabilities } from './defs/metadata.js';
 import { previewCapabilities } from './defs/preview.js';
 import { modelingCapabilities } from './defs/modeling.js';
 import { sqlAnalyzeCapabilities } from './defs/sql-analyze.js';
+import { sqlExecuteCapabilities } from './defs/sql-execute.js';
 import { healthCapabilities } from './defs/health.js';
 
 /**
@@ -35,6 +36,8 @@ const BASE_CAPABILITIES = {
   ...previewCapabilities,
   ...modelingCapabilities,
   ...sqlAnalyzeCapabilities,
+  // SQL 直接执行（kind=sql，默认关闭的独立分组；rootTool 常驻但受 entitlement 约束）
+  ...sqlExecuteCapabilities,
   ...healthCapabilities,
 } satisfies Record<string, Capability<z.ZodType>>;
 

@@ -1,6 +1,6 @@
 import type { McpServer, ServerContext, CallToolResult, InputRequiredResult } from '@modelcontextprotocol/server';
 import { z } from 'zod';
-import { parseToolFilter, shouldRegisterTool, type ToolFilterConfig, ALL_TOOL_GROUPS } from './groups.js';
+import { parseToolFilter, shouldRegisterTool, matchGlob, type ToolFilterConfig, ALL_TOOL_GROUPS } from './groups.js';
 import { logger } from '../core/logger.js';
 import { currentIdentity } from '../core/request-context.js';
 import { activeProfile } from '../config/profiles.js';
@@ -25,6 +25,7 @@ import { registerPreviewTools } from './preview.tools.js';
 import { registerModelingTools } from './modeling.tools.js';
 import { registerTaskTools } from './task.tools.js';
 import { registerSqlAnalyzeTools } from './sql-analyze.tools.js';
+import { registerSqlExecuteTools } from './sql-execute.tools.js';
 import { registerHealthTools } from './health.tools.js';
 import type { HanaPool } from '../core/hana-client.js';
 import type { HanaConfig } from '../config/config.js';
@@ -188,6 +189,9 @@ export function registerCapabilitiesDynamically(
   for (const cap of caps) {
     const name = registeredNameOf(cap);
     if (hasDynamicHandle(server, name)) continue; // 幂等：重复提升同一分类不重复挂
+    // 根工具（hana_sql_execute）在 entitled 时已由注册器**静态**注册；提升时再挂一次会撞名。
+    // 它本来就是常驻的（rootTool 语义），不需要也不应该经“分类提升”进入工具面。
+    if (cap.rootTool === true) continue;
     const raw = getRawHandler(server, cap.id);
     if (!raw) {
       // 面内但本进程没有 handler：编程错误，响亮记录而非静默跳过
@@ -231,15 +235,26 @@ export function unregisterCapabilities(server: McpServer, toolNames: readonly st
  * 操作级别名不是工具，不列入。
  */
 export function logToolFilterSummary(filter: ToolFilterConfig): void {
-  if (filter.enabledGroups.size === 0 && filter.allowPatterns.length === 0 && filter.denyPatterns.length === 0) {
-    return; // 全空 = 不过滤（向后兼容默认），不打扰日志
+  // sql 组是**默认关闭**的独立分组：空配置不等于“全部启用”。只在既未启用、也未被显式 deny 时
+  // 提示一次（启动期唯一一次；指数级 HTTP 每请求构建不会再刷）。
+  const sqlEnabled = filter.enabledGroups.has('sql') || matchGlob('hana_sql_execute', filter.allowPatterns);
+  const sqlDenied = matchGlob('hana_sql_execute', filter.denyPatterns);
+  if (!sqlEnabled && !sqlDenied) {
+    logger.info(
+      'sql 组默认关闭：hana_sql_execute 不注册、不出现在 tools/list 与门面索引；' +
+        '需显式 HANA_TOOL_GROUPS=sql 或 HANA_TOOL_ALLOW=hana_sql_execute 才启用',
+    );
   }
-  const groupSummary =
-    filter.enabledGroups.size === 0
-      ? '全部分组启用'
-      : Array.from(ALL_TOOL_GROUPS)
-          .map((g) => `${g}${filter.enabledGroups.has(g) ? '✓' : '✗'}`)
-          .join(' ');
+  if (filter.enabledGroups.size === 0 && filter.allowPatterns.length === 0 && filter.denyPatterns.length === 0) {
+    return; // 全空 = 不过滤 read/write/admin（sql 除外），不打扰日志
+  }
+  // 空配置下 read/write/admin 默认启用，sql 默认关闭——摘要如实反映，不写成“全部启用”
+  const groupSummary = Array.from(ALL_TOOL_GROUPS)
+    .map(
+      (g) =>
+        `${g}${filter.enabledGroups.size === 0 ? (g === 'sql' ? '✗' : '✓') : filter.enabledGroups.has(g) ? '✓' : '✗'}`,
+    )
+    .join(' ');
   logger.info(
     { enabledGroups: groupSummary, allow: filter.allowPatterns, deny: filter.denyPatterns },
     '工具可见性过滤已启用（HANA_TOOL_GROUPS/HANA_TOOL_ALLOW/HANA_TOOL_DENY）',
@@ -273,6 +288,8 @@ export function registerAllTools(server: McpServer, ctx: ToolContext): void {
   // 异步任务工具紧随建模模块：注册顺序必须与清单顺序一致（顺序断言会核对）。
   registerTaskTools(server, ctx);
   registerSqlAnalyzeTools(server, ctx);
+  // SQL 直接执行紧随 SQL 分析（清单顺序：sqlAnalyzeCapabilities → sqlExecuteCapabilities → health）
+  registerSqlExecuteTools(server, ctx);
   registerHealthTools(server, ctx);
 
   // 零工具只可能来自显式 deny 掉全部能力（误配）：SDK 不声明 tools，客户端表现为协议层 -32601。
@@ -281,7 +298,7 @@ export function registerAllTools(server: McpServer, ctx: ToolContext): void {
   if (!anyVisible) {
     logger.warn(
       '当前配置未启用任何工具：SDK 不会声明 tools 能力，客户端调 tools/list 将得到 -32601。' +
-        '请检查 HANA_TOOL_GROUPS/HANA_TOOL_ALLOW/HANA_TOOL_DENY（空=全部启用）。',
+        '请检查 HANA_TOOL_GROUPS/HANA_TOOL_ALLOW/HANA_TOOL_DENY（空=read/write/admin 启用，sql 默认关闭）。',
     );
   }
 }

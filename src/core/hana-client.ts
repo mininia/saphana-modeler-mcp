@@ -7,6 +7,7 @@ import {
   POOL_ACQUIRE_TIMEOUT_MS_DEFAULT,
   POOL_MAX_DEFAULT,
   POOL_MAX_WAITERS_DEFAULT,
+  SQL_MAX_CELL_BYTES_DEFAULT,
   SQL_TIMEOUT_MS_DEFAULT,
 } from './limits.js';
 
@@ -595,4 +596,326 @@ export async function execPreparedOn<T = Record<string, unknown>>(
       /* 释放语句失败无关结果 */
     }
   }
+}
+
+// ── hana_sql_execute 的执行原语 ─────────────────────────────────
+//
+// 与 execStreamingOn 的分工：那一条路只计数、不返回数据行（SQL 分析只需要统计）；
+// 这里要把**列名 + 行**带回给调用方，因此额外承担：取行上限、累计字节上限、二进制单元格
+// base64 包装（含单格上限）、bigint 转字符串。超时/清理契约与 execStreamingOn 完全一致：
+// prepare 同步抛错归一化、finally 里 rs.close() + stmt.drop()。
+
+/** `execLimitedOn` 的护栏参数（全部必填：任意 SQL 的执行必须有时间/行数/字节上限） */
+export interface ExecLimitedOptions {
+  /** 语句超时 ms（驱动 Statement.setTimeout） */
+  timeoutMs: number;
+  /** 最多返回多少行（取满后再探测一次是否还有下一行，据此如实标记 truncated） */
+  maxRows: number;
+  /** 返回结果的累计字节上限（估算：字符串按 UTF-8 字节、二进制按 base64 长度） */
+  maxResultBytes: number;
+  /** 单个二进制单元格最多带出多少原始字节（默认 SQL_MAX_CELL_BYTES_DEFAULT） */
+  maxCellBytes?: number;
+}
+
+/** 二进制列的包装形态（JSON 无法直接表达 Buffer） */
+export interface BinaryCellValue {
+  type: 'binary';
+  base64: string;
+  /** 原始字节数（即使被单格上限截断也如实给原长） */
+  bytes: number;
+  /** true = 原始值超过单格上限，只带出了前 maxCellBytes 字节 */
+  truncated: boolean;
+}
+
+export interface ExecLimitedResult {
+  columns: string[];
+  /** 行数组，与 columns 对齐（不用对象键：重复列名会互相覆盖） */
+  rows: unknown[][];
+  /** 实际返回的行数 */
+  rowsFetched: number;
+  truncated: boolean;
+  truncationReason?: 'max-rows' | 'max-bytes';
+  /** 累计估算字节数 */
+  bytes: number;
+  wallClockMs: number;
+  maxRows: number;
+  maxResultBytes: number;
+  timeoutMs: number;
+}
+
+/** 回调式 ResultSet.next 的 Promise 包装 */
+function nextAsync(rs: HanaResultSet): Promise<boolean> {
+  return new Promise((resolve, reject) => {
+    rs.next((err: Error | null, more?: boolean) => (err ? reject(normalizeHanaError(err)) : resolve(more === true)));
+  });
+}
+
+/**
+ * 回调式 ResultSet.getValues 的 Promise 包装。
+ * 含 LOB 列时同步 `getValues()` 会阻塞事件循环（驱动自身的 `getValuesCanBlock()` 正是为此提供），
+ * 单进程 HTTP 下会把所有并发客户端一起卡住；此时改用异步重载逐行取值。
+ */
+function getValuesAsync(rs: HanaResultSet): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    rs.getValues((err: Error | null, values?: unknown) => (err ? reject(normalizeHanaError(err)) : resolve(values)));
+  });
+}
+
+/** 单个值 → 可 JSON 序列化的值 + 估算字节数 */
+function normalizeCell(value: unknown, maxCellBytes: number): { value: unknown; bytes: number } {
+  if (Buffer.isBuffer(value)) {
+    const cut = value.length > maxCellBytes ? value.subarray(0, maxCellBytes) : value;
+    const cell: BinaryCellValue = {
+      type: 'binary',
+      base64: cut.toString('base64'),
+      bytes: value.length,
+      truncated: value.length > maxCellBytes,
+    };
+    return { value: cell, bytes: cell.base64.length + 48 };
+  }
+  // 驱动对大整数可能给 bigint；JSON.stringify 对 bigint 直接抛错
+  if (typeof value === 'bigint') return { value: value.toString(), bytes: 24 };
+  if (value instanceof Date) return { value: value.toISOString(), bytes: 28 };
+  if (typeof value === 'string') return { value, bytes: Buffer.byteLength(value, 'utf8') + 2 };
+  if (typeof value === 'number' || typeof value === 'boolean' || value === null) {
+    return { value, bytes: 8 };
+  }
+  try {
+    const json = JSON.stringify(value);
+    return { value, bytes: json === undefined ? 8 : Buffer.byteLength(json, 'utf8') };
+  } catch {
+    // 循环引用等病态值：退化为字符串，保证结果可序列化
+    return { value: String(value), bytes: 32 };
+  }
+}
+
+/**
+ * 在**已持有的连接**上流式执行一条 SELECT：返回列名 + 限量行。
+ *
+ * - 行数上限：取满 `maxRows` 后**再探测一次 next**（不读值）——据此区分“恰好 N 行”与“还有更多”；
+ *   有更多则标记 truncated=true 并立刻关闭结果集；
+ * - 字节上限：累计估算字节超过 `maxResultBytes` 时丢弃当前行并停止，标记 truncated（reason=max-bytes）；
+ * - 二进制：Buffer → `{ type:'binary', base64, bytes, truncated }`，单格超过 maxCellBytes 只带前缀；
+ * - LOB：`getValuesCanBlock()` 为 true 时走异步取值，避免同步读取 LOB 阻塞事件循环；
+ * - bigint → 字符串；Date → ISO 字符串；
+ * - 清理：无论成功/失败/超时，finally 里 rs.close() + stmt.drop()。
+ */
+export async function execLimitedOn(
+  conn: Connection,
+  sql: string,
+  opts: ExecLimitedOptions,
+): Promise<ExecLimitedResult> {
+  const startedAt = Date.now();
+  const maxCellBytes = opts.maxCellBytes ?? SQL_MAX_CELL_BYTES_DEFAULT;
+  let stmt: HanaStatement | undefined;
+  let rs: HanaResultSet | undefined;
+  try {
+    // prepare 的同步抛错必须收进归一化范围（语法/对象不存在/无权限都在这一阶段）
+    stmt = conn.prepare(sql);
+    stmt.setTimeout(opts.timeoutMs);
+    const statement = stmt;
+    rs = await new Promise<HanaResultSet>((resolve, reject) => {
+      const onResult = (err: Error | null, resultSet?: HanaResultSet): void => {
+        if (err) reject(normalizeHanaError(err));
+        else if (!resultSet) reject(new HanaBusinessError('执行语句未返回结果集'));
+        else resolve(resultSet);
+      };
+      statement.execQuery(onResult);
+    });
+    const resultSet = rs;
+    const columns = resultSet.getColumnInfo().map((c) => c.columnName);
+    // 统一按列顺序取值（对象形态在重复列名下会覆盖；数组与 columns 一一对应）
+    resultSet.setAsArrayDefault(true);
+
+    const rows: unknown[][] = [];
+    let bytes = 0;
+    let truncated = false;
+    let truncationReason: 'max-rows' | 'max-bytes' | undefined;
+    while (rows.length < opts.maxRows) {
+      const hasNext = await nextAsync(resultSet);
+      if (!hasNext) break;
+      // 测试替身可能没有该方法（真实驱动一定有）；缺失时按同步取值处理，保持旧行为。
+      const canBlock = typeof resultSet.getValuesCanBlock === 'function' && resultSet.getValuesCanBlock() === true;
+      const raw = canBlock ? await getValuesAsync(resultSet) : resultSet.getValues<unknown>();
+      const values = Array.isArray(raw) ? raw : columns.map((name) => (raw as Record<string, unknown> | null)?.[name]);
+      const cells = values.map((v) => normalizeCell(v, maxCellBytes));
+      const rowBytes = cells.reduce((sum, c) => sum + c.bytes, 0);
+      if (bytes + rowBytes > opts.maxResultBytes) {
+        truncated = true;
+        truncationReason = 'max-bytes';
+        break; // 当前行不放进去（宁可少一行，也不让结果超预算）
+      }
+      rows.push(cells.map((c) => c.value));
+      bytes += rowBytes;
+    }
+    // 行数上限：再探一行（只判存在、不读值）才能如实说“恰好 N 行”还是“还有更多”
+    if (!truncated && rows.length >= opts.maxRows) {
+      const hasMore = await nextAsync(resultSet);
+      if (hasMore) {
+        truncated = true;
+        truncationReason = 'max-rows';
+      }
+    }
+    return {
+      columns,
+      rows,
+      rowsFetched: rows.length,
+      truncated,
+      ...(truncationReason !== undefined ? { truncationReason } : {}),
+      bytes,
+      wallClockMs: Date.now() - startedAt,
+      maxRows: opts.maxRows,
+      maxResultBytes: opts.maxResultBytes,
+      timeoutMs: opts.timeoutMs,
+    };
+  } catch (e) {
+    throw normalizeHanaError(e);
+  } finally {
+    try {
+      rs?.close();
+    } catch {
+      /* 结果集关闭失败不掩盖原始错误 */
+    }
+    try {
+      stmt?.drop();
+    } catch {
+      /* 同上 */
+    }
+  }
+}
+
+export interface ExecUpdateOptions {
+  /** 语句超时 ms */
+  timeoutMs: number;
+}
+
+export interface ExecUpdateResult {
+  /** DML 返回影响行数（驱动 exec 给数字）；DDL 通常没有该字段 */
+  affectedRows?: number;
+  wallClockMs: number;
+  timeoutMs: number;
+}
+
+/**
+ * 在**已持有的连接**上执行一条 DML/DDL：prepare → setTimeout → stmt.exec。
+ * 驱动对 DML 的 exec 回调返回数字（影响行数）；DDL 可能返回 undefined/对象，此时不编造 0。
+ * 失败也 drop 语句；错误归一化（prepare 同步抛错同样归一）。
+ */
+export async function execUpdateOn(conn: Connection, sql: string, opts: ExecUpdateOptions): Promise<ExecUpdateResult> {
+  const startedAt = Date.now();
+  let stmt: HanaStatement | undefined;
+  try {
+    stmt = conn.prepare(sql);
+    const statement = stmt;
+    const result = await new Promise<unknown>((resolve, reject) => {
+      const onDone = (err: Error | null, res?: unknown): void => {
+        if (err) reject(normalizeHanaError(err));
+        else resolve(res);
+      };
+      try {
+        statement.setTimeout(opts.timeoutMs);
+        statement.exec(onDone);
+      } catch (e) {
+        // 同步抛错也要归一化后 reject（不能让它穿透 Promise 执行器变成未捕获异常）
+        reject(normalizeHanaError(e));
+      }
+    });
+    const affectedRows =
+      typeof result === 'number'
+        ? result
+        : result !== null &&
+            typeof result === 'object' &&
+            typeof (result as { affectedRows?: unknown }).affectedRows === 'number'
+          ? (result as { affectedRows: number }).affectedRows
+          : undefined;
+    return {
+      ...(affectedRows !== undefined ? { affectedRows } : {}),
+      wallClockMs: Date.now() - startedAt,
+      timeoutMs: opts.timeoutMs,
+    };
+  } catch (e) {
+    throw normalizeHanaError(e);
+  } finally {
+    try {
+      stmt?.drop();
+    } catch {
+      /* 释放语句失败无关结果 */
+    }
+  }
+}
+
+/** 事务包装的结局（**不抛错**：失败与回滚状态一并带回，服务层据此如实回报再决定是否上抛） */
+export type TransactionOutcome<T> =
+  | { ok: true; value: T; rolledBack: false; autoCommitRestored: boolean }
+  | { ok: false; error: HanaBusinessError; rolledBack: boolean; autoCommitRestored: boolean };
+
+/** 回调式 commit/rollback/setAutoCommit 的 Promise 包装 */
+function commitAsync(conn: Connection): Promise<void> {
+  return new Promise((resolve, reject) => {
+    conn.commit((err: Error | null) => (err ? reject(normalizeHanaError(err)) : resolve()));
+  });
+}
+
+function rollbackAsync(conn: Connection): Promise<void> {
+  return new Promise((resolve, reject) => {
+    conn.rollback((err: Error | null) => (err ? reject(normalizeHanaError(err)) : resolve()));
+  });
+}
+
+function setAutoCommitAsync(conn: Connection, flag: boolean): Promise<void> {
+  return new Promise((resolve, reject) => {
+    try {
+      conn.setAutoCommit(flag);
+      resolve();
+    } catch (e) {
+      reject(normalizeHanaError(e));
+    }
+  });
+}
+
+/**
+ * 在**同一条池连接**上执行一段事务：setAutoCommit(false) → fn → commit；
+ * fn/commit 失败 → rollback；**finally 一定恢复 setAutoCommit(true)**——
+ * 绝不能把 autoCommit=false 的连接还给池（下一个借用者会在不知情的情况下把写入挂在未提交事务里）。
+ *
+ * 返回值带 `rolledBack` / `autoCommitRestored`：调用方必须如实回报（DDL 在 HANA 可能隐式提交，
+ * 回滚不保证撤销其效果——这由服务层的回执文案说明，不在这里假装成功）。
+ */
+export async function withTransactionOn<T>(conn: Connection, fn: () => Promise<T>): Promise<TransactionOutcome<T>> {
+  try {
+    await setAutoCommitAsync(conn, false);
+  } catch (e) {
+    // autoCommit 状态未知：这条连接不能再还给池（否则下一个借用者可能在不知情的事务里写入）
+    await disconnectAsync(conn);
+    throw e;
+  }
+  type Body = { ok: true; value: T; rolledBack: false } | { ok: false; error: HanaBusinessError; rolledBack: boolean };
+  let outcome: Body;
+  try {
+    const value = await fn();
+    await commitAsync(conn);
+    outcome = { ok: true, value, rolledBack: false };
+  } catch (e) {
+    let rolledBack = false;
+    try {
+      await rollbackAsync(conn);
+      rolledBack = true;
+    } catch {
+      /* 回滚失败：rolledBack=false 如实带回，不掩盖原始错误 */
+    }
+    outcome = { ok: false, error: normalizeHanaError(e), rolledBack };
+  }
+  let autoCommitRestored = true;
+  try {
+    await setAutoCommitAsync(conn, true);
+  } catch {
+    // 连接可能已不可用：标记后由池的存活检查决定丢弃；服务层据此给 warning
+    autoCommitRestored = false;
+  }
+  if (!autoCommitRestored) {
+    // 不能把 autoCommit=false 的连接还给池：主动断开，release 的 isValid 检查会丢弃它
+    // （而不是仅靠“可能不可用”的假设——isValid=true 并不代表事务状态已恢复）。
+    await disconnectAsync(conn);
+  }
+  return { ...outcome, autoCommitRestored };
 }

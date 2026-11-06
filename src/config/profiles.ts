@@ -17,7 +17,7 @@
  *
  * ```
  * MCP_PROFILES = "name=kinds[:glob|glob][;name2=…]"
- *              kinds = read|write|admin 用 + 连接
+ *              kinds = read|write|admin|sql 用 + 连接
  *              glob  = 能力 id 的 * 通配（| 分隔），复用 matchGlob
  * ```
  * 例：`analyst=read;dev=read+write:hana_view_*|hana_metadata_*;ci=read`
@@ -105,7 +105,7 @@ export function parseProfiles(raw: string): Map<string, CallerProfile> {
       .map((k) => k.trim().toLowerCase())
       .filter((k) => k !== '');
     if (kinds.length === 0) {
-      throw new Error(`MCP_PROFILES 档案 "${id}" 未声明任何 kind：应为 read/write/admin 用 + 连接`);
+      throw new Error(`MCP_PROFILES 档案 "${id}" 未声明任何 kind：应为 ${ALL_KINDS.join('/')} 用 + 连接`);
     }
     const invalid = kinds.filter((k) => !ALL_KINDS.includes(k as ToolKind));
     if (invalid.length > 0) {

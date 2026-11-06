@@ -67,8 +67,10 @@ const NAMED_PARAM_RE = /(?<!:):[A-Za-z_][A-Za-z0-9_]*/;
  * 于是 `"a;b"` / `"A?B"` / `"X:ID"` / `"FOR UPDATE"` 这类合法标识符的内容会被守卫当成语句文本，
  * 把一条完全合法的单条 SELECT 硬拒（实测：报"语句含多个分号分隔的语句"/"语句含绑定占位符"/
  * "不接受加锁读"，理由与事实相反）。`""` 是引号标识符内的转义写法，按对处理。
+ *
+ * 导出给 SQL 直接执行（services/sql-execute.rules）复用——占位符/分号守卫口径只有这一份实现。
  */
-function maskQuotedIdentifiers(text: string): string {
+export function maskQuotedIdentifiers(text: string): string {
   return text.replace(/"(?:[^"]|"")*"/g, (m) => ' '.repeat(m.length));
 }
 

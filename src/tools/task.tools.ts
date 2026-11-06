@@ -1,6 +1,7 @@
 /**
  * 异步任务工具（工具化任务 API）：hana_task_get（read）/ hana_task_cancel（write）。
- * 任务由 `hana_view_update(async=true)` 的变更集、或 `hana_sql_analyze(async=true)` 的长分析提交；
+ * 任务由 `hana_view_update(async=true)` 的变更集、`hana_sql_analyze(async=true)` 的长分析、
+ * 或 `hana_sql_execute(async=true)` 的直接 SQL 执行提交；
  * 归属判定在服务层（owner 不匹配与不存在同形）。归属键只有一处派生
  * （surface.currentSurfaceKey），提交侧与查询/取消侧共用。
  */

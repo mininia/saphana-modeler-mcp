@@ -614,6 +614,35 @@ export function planSqlAnalyze(args: Record<string, unknown>): WritePlan {
 }
 
 /**
+ * hana_sql_execute：**直接执行任意 SQL**（读/写/管理类）。
+ *
+ * 产品决策（2026-11）：SQL 专用 schema 闸门已移除——不扫描 readSchemas/writeSchemas，
+ * 不参与 HANA_READ_SCHEMA / 写 schema 白名单判定；能访问什么由 HANA 账号权限决定。
+ * 本函数只做叙述计划（`effects.plan` 是清单对非 read 档的硬性要求），不声明任何资源。
+ */
+export function planSqlExecute(args: Record<string, unknown>): WritePlan {
+  const p = emptyPlan('hana_sql_execute');
+  const sql = asStr(args.sql);
+  if (!sql) {
+    p.steps.push('未提供 SQL：本次不会执行任何语句（handler 会先返回参数错误）');
+    return p;
+  }
+  const maxRows = typeof args.maxRows === 'number' ? args.maxRows : undefined;
+  const timeoutMs = typeof args.timeoutMs === 'number' ? args.timeoutMs : undefined;
+  p.steps.push(
+    `通过 SQL 连接${args.async === true ? '在后台任务中' : ''}直接执行调用方提交的 SQL；` +
+      '不扫描 schema、不做服务端 schema 级拦截，访问范围由数据库账号权限约束',
+  );
+  if (maxRows !== undefined || timeoutMs !== undefined) {
+    p.steps.push(`本次参数：maxRows=${maxRows ?? '(默认)'}，timeoutMs=${timeoutMs ?? '(默认)'}`);
+  }
+  p.uncertain.push('SQL 可能访问任意 schema/对象：服务端不扫描、不拦截，真正的边界是数据库账号权限');
+  p.uncertain.push('管理类语句默认允许；EXPLAIN/DO 与显式事务控制仍拒绝');
+  p.uncertain.push('HANA 的 DDL 可能隐式提交：多语句事务回滚不保证撤销已执行的 DDL 效果');
+  return p;
+}
+
+/**
  * 兜底规划器（能力清单里未声明 `effects.plan` 时使用）。
  *
  * **只对"可能写仓库包"的能力启用**（见 manifest.planFor 的 kind 分支）：它按入参表面提取

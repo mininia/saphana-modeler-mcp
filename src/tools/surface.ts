@@ -172,7 +172,10 @@ export function computeSurface(
     if (!entitlementIds.has(c.id)) continue;
     // 门面：常驻（它们是入口，提升不改变这一点）
     if (c.facadeOf !== undefined) surfaceIds.add(c.id);
-    // 具体能力：只有其分类被提升过才进面
+    // 根工具（hana_sql_execute）：entitled 时常驻，与门面同级；不需要先调门面提升。
+    // 它的可见性仍由 shouldRegisterTool（sql 组默认关闭）与档案决定，见 entitlementOf。
+    else if (c.rootTool === true) surfaceIds.add(c.id);
+    // 其它具体能力：只有其分类被提升过才进面
     else if (promotedMembers.has(c.id)) surfaceIds.add(c.id);
   }
   return { key, canPromote: allowed, entitlementIds, surfaceIds, promoted };
@@ -235,7 +238,12 @@ export function explainSurface(
   opts: { names?: boolean } = {},
 ): SurfaceExplanation {
   const profile = activeProfile(ctx.config, identity);
-  const concrete = CAPABILITY_LIST.filter((c) => c.facadeOf === undefined);
+  // `sql` 组是**默认关闭**的敏感能力：未显式启用时对 AI 完全不可见——不参与 hidden 统计、
+  // 也不参与类别可用性推导（否则每次全量部署都会多出一条「有类别被收窄」的假说明）。
+  // 显式启用（shouldRegisterTool=true）后才进入正常的能力面说明；被 deny 时同样完全不提。
+  const concrete = CAPABILITY_LIST.filter(
+    (c) => c.facadeOf === undefined && (c.kind !== 'sql' || shouldRegisterTool(c.id, ctx.toolFilter)),
+  );
   const denied: Capability[] = [];
   const groupHidden: Capability[] = [];
   const profileHidden: Capability[] = [];
@@ -255,9 +263,11 @@ export function explainSurface(
   const hidden = [...denied, ...groupHidden, ...profileHidden];
   if (hidden.length === 0) return { status: 'full' };
 
-  const categoriesOf = (caps: readonly Capability[]): FacadeCategory[] => {
+  const categoriesOf = (caps: readonly Capability[]): string[] => {
     const set = new Set(caps.map((c) => c.category));
-    return CAPABILITY_CATALOG.map((e) => e.id).filter((id) => set.has(id));
+    // 业务类别走门面目录；sql 是独立分类（无门面），单独给一个人可读标签。
+    const facades: string[] = CAPABILITY_CATALOG.map((e) => e.id).filter((id) => set.has(id));
+    return [...facades, ...(set.has('sql') ? ['SQL 执行'] : [])];
   };
   const hiddenIds = new Set(hidden.map((c) => c.id));
   const enabledCategories = CAPABILITY_CATALOG.map((e) => e.id).filter((cat) =>

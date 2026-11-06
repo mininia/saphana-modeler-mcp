@@ -43,8 +43,8 @@ export const FACADE_SCHEMA = z.object({
 });
 /** 六个门面（键 = 门面 id，字面量联合） */
 export type FacadeCapabilities = { [K in FacadeCategory as `hana_${K}`]: Capability<typeof FACADE_SCHEMA> };
-/** 档位严格度（read < write < admin）：门面的 kind 取成员里最大的那个 */
-const KIND_SEVERITY: Record<ToolKind, number> = { read: 0, write: 1, admin: 2 };
+/** 档位严格度（read < write < admin < sql）：门面的 kind 取**非 rootTool**成员里最大的那个 */
+const KIND_SEVERITY: Record<ToolKind, number> = { read: 0, write: 1, admin: 2, sql: 3 };
 function strictestKind(members: readonly Capability[]): ToolKind {
   return members.reduce<ToolKind>((acc, c) => (KIND_SEVERITY[c.kind] > KIND_SEVERITY[acc] ? c.kind : acc), 'read');
 }
@@ -103,7 +103,10 @@ export function buildFacades(base: readonly Capability[]): FacadeCapabilities {
     if (!entry) {
       throw new Error(`分类 "${category}" 不在 CAPABILITY_CATALOG 里：门面的标题与方向句无从生成`);
     }
-    const kind = strictestKind(members);
+    // rootTool（如 sql 组的 hana_sql_execute）是独立入口，不参与门面的 kind 推导：
+    // 否则 hana_diagnostics 的 kind 会变成 sql，`HANA_TOOL_DENY=sql` 会顺带把门面藏掉。
+    // effects 仍按全部成员计算——门面确实能路由到 rootTool，破坏性提示不能漏。
+    const kind = strictestKind(members.filter((m) => m.rootTool !== true));
     // 成员的函数，不是手写常量：门面能路由到什么，就声明成什么
     const destructive = members.some((c) => c.effects.destructive);
     const idempotent = members.every((c) => c.effects.idempotent);

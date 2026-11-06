@@ -32,17 +32,18 @@ import type { z } from 'zod';
 import type { WritePlan } from '../write-plan.js';
 
 /** 能力的可见性归属（= 原 TOOL_GROUPS 的分组语义；由 HANA_TOOL_GROUPS 过滤） */
-export type ToolKind = 'read' | 'write' | 'admin';
+export type ToolKind = 'read' | 'write' | 'admin' | 'sql';
 
 /**
  * 能力分类（**AI 能力视角**，2026-10-09 重构；参照 SAP HANA MCP Server 的 six areas）：
  * 分类轴 = "AI 想干什么"，而不是"代码长在哪"——门面、索引、提升都按它分组。
  *
- * **六个域，与门面一一对应**：`FACADE_CATEGORIES` 就是这六个（见下方它的说明）。
- * 曾有第七个 `capability` 域（放"发现/路由/占位"这类元能力），随 P10-f 的两条元入口与占位工具
- * 全部删除而消失——**没有成员的分类是个空概念**，留着只会让"分类 ⊂ 门面"这条对应关系不再成立。
+ * **六个业务域，与门面一一对应**：`FACADE_CATEGORIES` 就是这六个（见下方它的说明）。
+ * 2026-11 新增的 `sql` 是**独立分类**，只承载与门面同级的根工具（`hana_sql_execute`）：
+ * 它没有门面、不进入任何门面的索引/描述，也不参与分类提升。六个业务域与六个门面的
+ * 一一对应关系保持不变。
  */
-export type CapabilityCategory = 'system' | 'discovery' | 'data' | 'insights' | 'modeling' | 'diagnostics';
+export type CapabilityCategory = 'system' | 'discovery' | 'data' | 'insights' | 'modeling' | 'diagnostics' | 'sql';
 
 /**
  * 分类目录（**单一事实源**）：id + 名称 + 一句话说明。门面工具（`hana_<分类>`）的
@@ -65,7 +66,7 @@ export const CAPABILITY_CATALOG = [
  * 仍然分成两个类型是刻意的：前者是"能力归属哪一类"（声明用），本类型是"哪几类需要常驻入口"
  * （注册/判定用）。二者混成一个会让"新增一个分类"隐式多出一个门面，而门面的入参 schema、
  * kind 推导、可见性规则都得跟着成立——那不该是加一行目录就能带来的后果。
- * （历史上两者确实不同：曾有第七个 `capability` 域，只放占位能力、不做门面。）
+ * 2026-11 的 `sql` 分类正是这条规则的实例：它有成员、但没有门面，只承载根工具。
  */
 export const FACADE_CATEGORIES = [
   'system',
@@ -146,6 +147,18 @@ export interface Capability<S extends z.ZodType = z.ZodType> {
    * 所以本字段表达的是「门面入口」，**不**表达"具体能力不进面"：具体能力是否在面上由提升决定。
    */
   facadeOf?: FacadeCategory;
+  /**
+   * **根工具**：与门面同级、常驻 `tools/list` 的具体能力（2026-11 新增 `hana_sql_execute`）。
+   *
+   * - 仍属于其 `category`（会出现在该分类索引里、可经门面路由调用）；
+   * - 受 entitlement 约束：`shouldRegisterTool` / 档案判定与其它具体能力**完全同一条**——
+   *   区别只在 `computeSurface`：entitled 时直接进面，不必先调用门面提升；
+   * - **不参与动态提升的重复注册**：它已由注册器静态注册，提升时跳过（否则同名注册两次）。
+   *
+   * 用途是「默认关闭的敏感能力」：`kind: 'sql'` 组默认不启用（见 tools/groups.ts），
+   * 但部署方显式启用后它必须能直接被看到，不能要求模型先调门面才发现。
+   */
+  rootTool?: boolean;
   /**
    * **只经路由**的能力（操作级条目 `<工具>#<op>`，2026-10-10）：有清单声明、可路由、可授权、
    * 可出现在门面索引里，但**永不注册为工具**（注册名 = module = 父工具名，注册即撞名）。

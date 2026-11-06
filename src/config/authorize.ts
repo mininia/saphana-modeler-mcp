@@ -49,6 +49,7 @@ import { BLOCKED_PREFIX, mcpErrorText } from '../core/errors.js';
 import { currentAgentLabel, currentIdentity } from '../core/request-context.js';
 import { logger } from '../core/logger.js';
 import { formatWritePlan, planToRequest, type WritePlan } from '../write-plan.js';
+import { sqlFingerprint } from '../services/sql-execute.rules.js';
 
 /** 调用方身份（HTTP = 认证后的 clientId；stdio = 进程内单客户端，无身份上下文） */
 export interface CallerIdentity {
@@ -104,6 +105,10 @@ export interface AuditTarget {
   packageId?: string;
   objectName?: string;
   op?: string;
+  /** SQL 的 sha256 前 12 位（`args.sql` 为字符串时；**不落原文**） */
+  sqlHash?: string;
+  /** SQL 字符数（规模画像；**不落原文**） */
+  sqlChars?: number;
 }
 
 /** `capability-audit` 事件载荷（字段固定：审计链路不随入口变化） */
@@ -150,10 +155,15 @@ export function isMutationCapability(capability: Capability): boolean {
 
 /** 从入参提取非敏感目标标识（只认 string；SQL/请求体一律不进审计） */
 export function auditTargetOf(args: Record<string, unknown>): AuditTarget | undefined {
+  const sql = args['sql'];
+  // 与规则层 parseSqlScript 同口径（trim 后求指纹）：否则仅首尾空格就会让审计与回执对不上。
+  const sqlText = typeof sql === 'string' ? sql.trim() : undefined;
   const target: AuditTarget = {
     ...(typeof args['packageId'] === 'string' ? { packageId: args['packageId'] } : {}),
     ...(typeof args['objectName'] === 'string' ? { objectName: args['objectName'] } : {}),
     ...(typeof args['op'] === 'string' ? { op: args['op'] } : {}),
+    // SQL 原文**绝不进审计**：只记稳定指纹与长度（同一条 SQL 可对照，但无法从日志还原语句）
+    ...(sqlText !== undefined ? { op: 'sql', sqlHash: sqlFingerprint(sqlText), sqlChars: sqlText.length } : {}),
   };
   return Object.keys(target).length > 0 ? target : undefined;
 }

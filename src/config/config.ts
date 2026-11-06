@@ -7,6 +7,11 @@ import {
   POOL_ACQUIRE_TIMEOUT_MS_DEFAULT,
   POOL_MAX_DEFAULT,
   POOL_MAX_WAITERS_DEFAULT,
+  SQL_MAX_RESULT_BYTES_DEFAULT,
+  SQL_MAX_RESULT_BYTES_LIMIT,
+  SQL_MAX_RESULT_BYTES_MIN,
+  SQL_MAX_STATEMENTS_DEFAULT,
+  SQL_MAX_STATEMENTS_LIMIT,
   SQL_TIMEOUT_MS_DEFAULT,
   XS_TIMEOUT_MS_DEFAULT,
   XS_XFER_TIMEOUT_MS_DEFAULT,
@@ -270,6 +275,20 @@ const envSchema = z.object({
   HANA_POOL_MAX_WAITERS: intEnvSchema(POOL_MAX_WAITERS_DEFAULT, 1, 100_000),
   /** 写路径语句超时 ms HANA_SQL_TIMEOUT_MS：防一条挂死的写语句占住池位直到进程重启（只给写路径，不加全局默认，理由见 core/limits.js） */
   HANA_SQL_TIMEOUT_MS: intEnvSchema(SQL_TIMEOUT_MS_DEFAULT, 1, 3_600_000),
+  /* ── hana_sql_execute（直接执行 HANA SQL）：默认关闭分组的多语句开关与结果硬上限 ──
+   * 工具本身还须 HANA_TOOL_GROUPS=sql 或 HANA_TOOL_ALLOW=hana_sql_execute 才会暴露
+   * （sql 组默认关闭，见 tools/groups.ts）。maxRows / timeoutMs 是**工具参数**，不在这里配置；
+   * 这里只保留“多语句解锁”与两个服务端结果上限（默认值取自 core/limits.js）。 */
+  /** 同时解锁“多物理行”与“多语句”；默认 false（单条 + 单行） */
+  HANA_SQL_ALLOW_MULTI_STATEMENT: boolSchema(false),
+  /** 单次结果累计字节上限（默认 1000000，最小 1024，最大 50MB） */
+  HANA_SQL_MAX_RESULT_BYTES: intEnvSchema(
+    SQL_MAX_RESULT_BYTES_DEFAULT,
+    SQL_MAX_RESULT_BYTES_MIN,
+    SQL_MAX_RESULT_BYTES_LIMIT,
+  ),
+  /** 单次调用允许的语句条数（默认 20，最大 100） */
+  HANA_SQL_MAX_STATEMENTS: intEnvSchema(SQL_MAX_STATEMENTS_DEFAULT, 1, SQL_MAX_STATEMENTS_LIMIT),
   /** XS REST 请求超时 ms HANA_XS_TIMEOUT_MS：覆盖走 request() 出口的全部调用，防一条挂死的 XS 请求占住池位直到进程重启 */
   HANA_XS_TIMEOUT_MS: intEnvSchema(XS_TIMEOUT_MS_DEFAULT, 1, 3_600_000),
   /** XS 传输（xfer 导入/导出）超时 ms HANA_XS_XFER_TIMEOUT_MS：整包上传/下载天然慢，单独放宽上限，同样防挂死 */
@@ -493,6 +512,12 @@ export interface HanaConfig {
   poolMaxWaiters: number;
   /** 写路径语句超时 ms（来自 HANA_SQL_TIMEOUT_MS，默认 60000）：写路径五条语句的超时来源，不做全局默认 */
   sqlTimeoutMs: number;
+  /** hana_sql_execute：是否解锁多行/多语句（HANA_SQL_ALLOW_MULTI_STATEMENT，默认 false） */
+  sqlAllowMultiStatement: boolean;
+  /** hana_sql_execute：单次结果累计字节上限（HANA_SQL_MAX_RESULT_BYTES） */
+  sqlMaxResultBytes: number;
+  /** hana_sql_execute：单次调用允许的语句条数（HANA_SQL_MAX_STATEMENTS） */
+  sqlMaxStatements: number;
   /** XS REST 请求超时 ms（来自 HANA_XS_TIMEOUT_MS，默认 30000） */
   xsTimeoutMs: number;
   /** XS 传输（xfer 导入/导出）超时 ms（来自 HANA_XS_XFER_TIMEOUT_MS，默认 300000） */
@@ -783,6 +808,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HanaConfig {
     poolWaitMs: parsed.HANA_POOL_WAIT_MS,
     poolMaxWaiters: parsed.HANA_POOL_MAX_WAITERS,
     sqlTimeoutMs: parsed.HANA_SQL_TIMEOUT_MS,
+    // hana_sql_execute 的多语句开关与结果上限（maxRows/timeoutMs 是工具参数，不在这里）
+    sqlAllowMultiStatement: parsed.HANA_SQL_ALLOW_MULTI_STATEMENT,
+    sqlMaxResultBytes: parsed.HANA_SQL_MAX_RESULT_BYTES,
+    sqlMaxStatements: parsed.HANA_SQL_MAX_STATEMENTS,
     xsTimeoutMs: parsed.HANA_XS_TIMEOUT_MS,
     xsXferTimeoutMs: parsed.HANA_XS_XFER_TIMEOUT_MS,
     activationConcurrency: parsed.HANA_ACTIVATION_CONCURRENCY,

@@ -14,17 +14,24 @@
 import { splitList } from '../core/text.js';
 import { CAPABILITY_LIST, findCapability, membersOfCategory } from '../capabilities/manifest.js';
 
-/** 工具功能分组 */
-export type ToolGroup = 'read' | 'write' | 'admin';
+/**
+ * 工具功能分组。
+ *
+ * `sql` 是 2026-11 新增的**默认关闭**分组（直接执行 HANA SQL）：空配置下只启用 read/write/admin，
+ * 绝不因为「空=全部」顺带开启它；须显式 `HANA_TOOL_GROUPS=sql` 或
+ * `HANA_TOOL_ALLOW=hana_sql_execute` 才启用，`HANA_TOOL_DENY` 仍最高。
+ */
+export type ToolGroup = 'read' | 'write' | 'admin' | 'sql';
 
-/** 全部分组（用于配置校验与日志） */
-export const ALL_TOOL_GROUPS: readonly ToolGroup[] = ['read', 'write', 'admin'];
+/** 全部分组（用于配置校验与日志；顺序 = 日志里的展示顺序） */
+export const ALL_TOOL_GROUPS: readonly ToolGroup[] = ['read', 'write', 'admin', 'sql'];
 
 /** 分组中文标签（日志/文档用） */
 export const GROUP_LABELS: Record<ToolGroup, string> = {
   read: '数据读取',
   write: '写操作',
   admin: '管理操作',
+  sql: 'SQL 直接执行（默认关闭）',
 };
 
 /**
@@ -102,6 +109,10 @@ export function parseToolFilter(rawGroups: string, rawAllow: string, rawDeny: st
 /**
  * 非门面能力的可见性判定（deny 已先行扣除）：allow 优先，其次分组开关。
  * 门面不走这里。
+ *
+ * **空配置的例外**：`enabledGroups.size === 0` 表示「默认启用 read/write/admin」，
+ * 但 `sql` 组**默认关闭**——它接受任意 SQL（含写/管理类），不能靠「空=全部」顺带放开。
+ * 显式 `HANA_TOOL_GROUPS=sql` 或 allow 命中才启用；deny 已在调用方先行扣除。
  */
 function registerableByName(name: string, filter: ToolFilterConfig): boolean {
   // 按自有属性查表：TOOL_GROUPS 继承 Object.prototype，'toString' 一类名字会取到继承成员。
@@ -109,7 +120,7 @@ function registerableByName(name: string, filter: ToolFilterConfig): boolean {
   const group = TOOL_GROUPS[name];
   if (group === undefined) return false; // 未登记 = 不暴露（fail-closed）
   if (matchGlob(name, filter.allowPatterns)) return true;
-  if (filter.enabledGroups.size === 0) return true;
+  if (filter.enabledGroups.size === 0) return group !== 'sql';
   return filter.enabledGroups.has(group);
 }
 
