@@ -39,6 +39,10 @@ export interface SqlExecutePolicy {
   allowMultiStatement: boolean;
   /** 单次调用允许的语句条数（默认 HANA_SQL_MAX_STATEMENTS 默认值） */
   maxStatements?: number;
+  /** 只读环境（ACCESS=readonly + HANA_READONLY_SQL=select-only）：只允许 read 类语句 */
+  readOnly?: boolean;
+  /** 只读环境 + HANA_READONLY_SQL=deny：整体拒绝 hana_sql_execute */
+  readonlySqlDeny?: boolean;
 }
 
 /** 单条已分类语句 */
@@ -272,6 +276,16 @@ export function parseSqlScript(raw: string, opts: SqlExecutePolicy): ParsedSqlSc
     problems.push(problem('sql_nul', 'SQL 含 NUL 字符', '请去掉文本中的不可见 NUL 字节后重试'));
     return result;
   }
+  if (opts.readonlySqlDeny === true) {
+    problems.push(
+      problem(
+        'sql_readonly_denied',
+        '当前环境为只读，且 HANA_READONLY_SQL=deny：hana_sql_execute 整体不可用',
+        '如需只读查询，请由部署方设置 HANA_READONLY_SQL=select-only；写操作请切换到 ACCESS=readwrite 的环境',
+      ),
+    );
+    return result;
+  }
   const strippedAll = stripSqlLiteralsAndComments(sql);
   const maskedAll = maskQuotedIdentifiers(strippedAll);
   if (maskedAll.includes('?') || NAMED_PARAM_RE.test(maskedAll)) {
@@ -326,6 +340,33 @@ export function parseSqlScript(raw: string, opts: SqlExecutePolicy): ParsedSqlSc
     const stripped = stripSqlLiteralsAndComments(statement);
     const kind = classifySqlStatement(statement);
     statements.push({ index, sql: statement, kind });
+
+    // 只读环境：只允许 read 类；再额外拒绝 read 类里会加锁/改序列状态的构造。
+    // 这是运行期护栏，真正的边界仍是只读数据库账号。
+    if (opts.readOnly === true) {
+      if (kind !== 'read') {
+        problems.push(
+          problem(
+            'sql_readonly_violation',
+            `只读环境只允许 SELECT 类语句（第 ${index + 1} 条被判定为 ${kind}）`,
+            '当前环境 ACCESS=readonly；写操作请切换到可写环境，或由部署方设置 HANA_READONLY_SQL=deny 完全关闭',
+          ),
+        );
+        return;
+      }
+      // 引号标识符可能是合法列名（"NEXTVAL"），必须与占位符检查同口径先遮蔽再匹配。
+      const upper = maskQuotedIdentifiers(stripped).toUpperCase();
+      if (/\bFOR\s+(UPDATE|SHARE)\b/.test(upper) || /\bNEXTVAL\b/.test(upper)) {
+        problems.push(
+          problem(
+            'sql_readonly_mutation',
+            `只读环境不允许加锁或序列自增（第 ${index + 1} 条含 FOR UPDATE/FOR SHARE 或 NEXTVAL）`,
+            '请去掉 FOR UPDATE/FOR SHARE/NEXTVAL 后重试；只读环境不应改变行锁或序列状态',
+          ),
+        );
+        return;
+      }
+    }
 
     if (kind === 'transaction') {
       problems.push(

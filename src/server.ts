@@ -36,6 +36,16 @@ export const SERVER_INSTRUCTIONS = [
 ].join('\n');
 
 /**
+ * 多环境补充说明（仅多环境部署注入；单环境保持 SERVER_INSTRUCTIONS 逐字不变）。
+ * 环境身份以每次回执的 environment 字段为准；切换是显式管理操作，不隐含在业务工具参数里。
+ */
+export const MULTI_ENV_INSTRUCTIONS = [
+  '多环境：每次回执带 environment（执行环境 LABEL）与 calledFromEnvironment；以回执为准，不要假设“上次切到哪”。',
+  '查看/切换：先调 hana_env_list（拿当前 LABEL、from、epoch、一次性 switchToken），再经 hana_system 调 hana_env_switch（confirm 必须逐字等于目标 LABEL）；切换只影响之后的调用，任务按提交时环境执行。',
+  '变更类调用必须带 expectedEnvironment=<当前 LABEL>；只读环境（access=readonly）会拒绝变更类能力，hana_sql_execute 默认只允许 SELECT 类语句。',
+].join('\n');
+
+/**
  * 创建 MCP Server（协议层）：McpServer（含 instructions）+ 工具注册（v2 config-object 范式）。
  * pool 为懒连接；真实工具经 pool 访问 HANA。
  * 注意：Streamable HTTP 模式下本函数作为按请求工厂被 createMcpHandler 反复调用（无状态服务），
@@ -44,11 +54,21 @@ export const SERVER_INSTRUCTIONS = [
 export function createServer(ctx: ToolContext): McpServer {
   // 调用方面：**每次构建钉住一份**——HTTP 按请求构建，于是每个身份看到自己的面（门面 ∩ 授权）；
   // stdio 单实例。纯函数，不含跨调用状态。见 tools/surface.ts。
+  const instructions = ctx.manager?.multiEnv
+    ? `${SERVER_INSTRUCTIONS}\n\n${MULTI_ENV_INSTRUCTIONS}`
+    : SERVER_INSTRUCTIONS;
   const server = new McpServer(
     // 版本号取自 package.json（src/version.ts），不在此硬编码：发版时不会漏改而报旧版本
     { name: SERVER_NAME, version: SERVER_VERSION },
-    { instructions: SERVER_INSTRUCTIONS },
+    { instructions },
   );
-  registerAllTools(server, ctx.surface ? ctx : { ...ctx, surface: computeSurface(ctx, currentIdentity()) });
+  // 不要把 ctx 展开成字面量：`{ ...ctx }` 会**求值一次** pool/config getter，把多环境的
+  // 动态绑定固化成启动时的 base 环境。用原型继承保留 getter，只额外挂本次构建的 surface。
+  const effectiveCtx: ToolContext = ctx.surface
+    ? ctx
+    : (Object.assign(Object.create(ctx) as ToolContext, {
+        surface: computeSurface(ctx, currentIdentity()),
+      }) as ToolContext);
+  registerAllTools(server, effectiveCtx);
   return server;
 }

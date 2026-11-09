@@ -415,11 +415,22 @@ export class HanaPool {
     }
   }
 
-  /** 关闭全部空闲连接（进程退出时调用）并清空内存中的密码副本 */
+  /**
+   * 关闭全部空闲连接（进程退出时调用）并清空内存中的密码副本。
+   * **环境切换不要用它**：它会擦除 pwd，池对象不可复用；切换用 closeIdle。
+   */
   async closeAll(): Promise<void> {
-    await Promise.all(this.idle.splice(0).map((c) => disconnectAsync(c)));
+    await this.closeIdle();
     // 凭据生命周期：连接池关闭后清除密码，避免常驻内存
     (this.options as ConnectionOptions & { pwd?: string }).pwd = '';
+  }
+
+  /**
+   * 只关闭空闲连接，不清密码、不改变池对象可用性。
+   * 用于环境切换/空闲回收：之后仍可 acquire 新建连接（密码还在 options 里）。
+   */
+  async closeIdle(): Promise<void> {
+    await Promise.all(this.idle.splice(0).map((c) => disconnectAsync(c)));
   }
 
   /** 池状态（调试/测试用） */

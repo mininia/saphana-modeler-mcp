@@ -28,6 +28,7 @@ import type { HanaPool } from '../core/hana-client.js';
 import type { XsRestClient } from '../core/xs-rest.js';
 import type { Envelope } from '../types/hana.js';
 import { HanaBusinessError, withErrorEnvelope } from '../core/errors.js';
+import { currentEnvironmentLabel, currentEnvironmentRuntime, runWithEnvironment } from '../core/environment-context.js';
 import { logger } from '../core/logger.js';
 import { truncateWithNote } from '../core/text.js';
 import {
@@ -61,12 +62,22 @@ function auditTaskTerminal(
   writePackages: readonly string[] = [],
 ): void {
   const owner = getTask(taskId)?.owner ?? '(unknown)';
+  const record = getTask(taskId);
   const event = {
     capabilityId,
     result,
     verdict: 'allow' as const,
     ...(owner !== '(stdio)' && owner !== '(unknown)' ? { clientId: owner } : {}),
     ...(owner === '(stdio)' ? { transport: 'stdio' as const } : {}),
+    ...(record?.multiEnv
+      ? {
+          environment: record.environment,
+          epoch: record.envEpoch,
+          access: record.envAccess,
+          configKey: record.envConfigKey,
+          calledFromEnvironment: currentEnvironmentLabel(),
+        }
+      : {}),
     via: 'async-task',
     taskId,
     ...(detail !== undefined ? { failureDetail: detail } : {}),
@@ -88,6 +99,8 @@ export interface TaskView extends Omit<TaskRecord, 'id' | 'owner' | 'result'> {
   taskId: string;
   terminal: boolean;
   result?: unknown;
+  /** 轮询方当前所在环境（与任务自身 environment 区分，便于还原跨环境轮询） */
+  calledFromEnvironment: string;
   hint: string;
 }
 
@@ -97,6 +110,9 @@ export interface TaskSubmission {
   status: TaskStatus;
   kind: TaskKind;
   label: string;
+  /** 任务提交时绑定的环境（LABEL）；轮询时据此还原 */
+  environment: string;
+  envEpoch: number;
   submittedAt: string;
   /** 进度形状取自 TaskRecord（current 在提交时还没有，Pick 掉） */
   progress: Pick<TaskRecord['progress'], 'total' | 'done'>;
@@ -116,6 +132,8 @@ function submissionOf(record: TaskRecord, hint: string): TaskSubmission {
     status: record.status,
     kind: record.kind,
     label: record.label,
+    environment: record.environment,
+    envEpoch: record.envEpoch,
     submittedAt: record.createdAt,
     progress: { total: record.progress.total, done: 0 },
     hint,
@@ -139,10 +157,10 @@ export function submitChangesetTask(
   client?: XsRestClient,
 ): TaskSubmission {
   const record = createTask(owner, labelOf(actions), actions.length, 'changeset'); // 容量超限时在此抛中文硬错误（未提交任何写）
-  // 双保险（评审 #1106/#1107/#1110）：任务体自身已保证「不 throw」（见下方 failTask），这里再兜一层——
-  // 任何逃逸的拒约在此落 failed 终态，而不是变成未处理的 Promise 拒约（Node ≥20 默认会终止整个进程，
-  // 且任务记录会永久停在 working、占满运行槽位）。
-  void runChangesetTask(config, pool, record.id, actions, client).catch((e) => failTask(record.id, e));
+  // 提交时捕获 runtime：任务体（含 catch/failTask）都在该环境下执行，切换 active 不影响它。
+  const runtime = currentEnvironmentRuntime();
+  const run = () => runChangesetTask(config, pool, record.id, actions, client).catch((e) => failTask(record.id, e));
+  void (runtime ? runWithEnvironment(runtime, run) : run());
   return submissionOf(
     record,
     '任务已在后台执行（本响应不代表任何写入结果）。用 hana_task_get({taskId}) 轮询状态；' +
@@ -172,7 +190,11 @@ export interface BackgroundTaskSpec {
  */
 export function submitBackgroundTask(owner: string, spec: BackgroundTaskSpec): TaskSubmission {
   const record = createTask(owner, spec.label, spec.total ?? 1, spec.kind);
-  void runBackgroundTask(record.id, spec).catch((e) => failTask(record.id, e, spec.capabilityId));
+  // 提交时捕获 runtime：run() 里的 ctx.pool / ctx.config getter 会读绑定值，
+  // 而不是任务真正开始时的 active（切换环境后旧任务不会跑到新环境）。
+  const runtime = currentEnvironmentRuntime();
+  const run = () => runBackgroundTask(record.id, spec).catch((e) => failTask(record.id, e, spec.capabilityId));
+  void (runtime ? runWithEnvironment(runtime, run) : run());
   return submissionOf(
     record,
     '任务已在后台执行（本响应不代表执行结果）。用 hana_task_get({taskId}) 轮询状态与终态 result。' +
@@ -379,6 +401,12 @@ function viewOf(t: TaskRecord): TaskView {
     taskId: t.id,
     kind: t.kind,
     label: t.label,
+    environment: t.environment,
+    envEpoch: t.envEpoch,
+    envAccess: t.envAccess,
+    envConfigKey: t.envConfigKey,
+    multiEnv: t.multiEnv,
+    calledFromEnvironment: currentEnvironmentLabel(),
     status: t.status,
     terminal,
     createdAt: t.createdAt,

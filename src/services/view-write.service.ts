@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import type { HanaPool } from '../core/hana-client.js';
 import { HanaBusinessError } from '../core/errors.js';
+import { currentDatabaseScopeKey } from '../core/environment-context.js';
 import { withKeyedLock } from '../core/keyed-mutex.js';
 import { ACTIVATION_CONCURRENCY_DEFAULT, ACTIVATION_SEMAPHORE } from '../core/limits.js';
 import { logger, redactSensitive } from '../core/logger.js';
@@ -2014,7 +2015,9 @@ export async function checkCalculationViewDesignTime(
   const { rest, file } = designTimeTarget(config, objectName, client);
   const tempObject = tempCheckName(objectName);
   const tempFile = designTimeFile(tempObject);
-  const registryKey = `${packageId}/${tempFile}`;
+  // 登记键按**物理库**分域：两个 LABEL 指向同一租户时，临时副本必须共享归属与互斥
+  // （锁键 writeLockKey 已按同一口径分域）。
+  const registryKey = `${currentDatabaseScopeKey()}:${packageId}/${tempFile}`;
   // 临界区（keyed lock，key=包/归一后的对象名）：同一对象的并发校验会推导出同一个临时名，
   // 并行会让一方删到另一方正在用的副本——把「探测 → 预清理 → 写入校验 → 收尾清理」整段按对象串行化。
   // 锁不可重入：本临界区内不再取同一把锁（fileContent/fileMeta/checkFile/deleteFile 都不取锁）。

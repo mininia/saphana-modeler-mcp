@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
-import { loadConfig } from './config/config.js';
-import { HanaPool } from './core/hana-client.js';
+import { loadEnvironments } from './config/config.js';
+import { EnvironmentManager } from './config/environment-runtime.js';
+import { currentEnvironmentRuntime } from './core/environment-context.js';
 import { applyLoggerConfig, logger } from './core/logger.js';
 import { checkNodeVersion } from './core/node-version.js';
 import { setProcessAgentLabel } from './core/request-context.js';
@@ -30,7 +31,8 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const config = loadConfig();
+  const loaded = loadEnvironments();
+  const config = loaded.base.config;
   // 日志配置换成**已校验**的取值：logger 必须早于 config 可用（应用配置前它只会读 env），
   // 所以这里显式把级别与时区与其余模块同源对齐，避免 logger 直读 process.env 造成判定值 ≠ 运行值。
   applyLoggerConfig({ level: config.logLevel, timezone: config.timezone });
@@ -81,15 +83,41 @@ async function main(): Promise<void> {
   }
 
   // 池与超时参数（HANA_POOL_*/HANA_SQL_TIMEOUT_MS，默认值见 core/limits.ts 单一事实源）。
-  // 部署含义：max 是**每代理池大小**——N 个代理进程 = N×poolMax 条到 HANA 的连接，
-  // 多进程部署时 HANA 侧连接数按进程数线性放大，调大前先核对 DB 侧连接预算。
-  const pool = new HanaPool(config, {
+  // 部署含义：max 是**每环境池大小**——N 个环境 × poolMax 是理论上限；连接仍懒建立，
+  // 稳态通常只有 active 环境建连。多进程部署时 HANA 侧连接数按进程数线性放大，调大前先核对 DB 侧连接预算。
+  const manager = new EnvironmentManager(loaded, {
     max: config.poolMax,
     maxWaiters: config.poolMaxWaiters,
     acquireTimeoutMs: config.poolWaitMs,
     statementTimeoutMs: config.sqlTimeoutMs,
   });
-  const ctx: ToolContext = { pool, config, toolFilter };
+  // 调用期 pool/config 取“本次调用绑定的 runtime”；未进入上下文（启动期/测试直调）回退 active。
+  const ctx: ToolContext = {
+    get pool() {
+      return (currentEnvironmentRuntime() ?? manager.current()).pool;
+    },
+    get config() {
+      return (currentEnvironmentRuntime() ?? manager.current()).config;
+    },
+    toolFilter,
+    manager,
+  };
+  logger.info(
+    {
+      environments: manager.list().map((rt) => ({
+        label: rt.label,
+        configKey: rt.configKey,
+        access: rt.access,
+        state: rt.state,
+      })),
+      start: manager.current().label,
+      switchable: [...manager.switchable],
+      multiEnv: manager.multiEnv,
+    },
+    manager.multiEnv
+      ? '多环境已加载（单 active；切换能力由 HANA_ENV_SWITCHABLE 决定）'
+      : '单环境模式（未配置 _ENV_ 覆盖）',
+  );
   let httpClose: (() => Promise<void>) | undefined;
 
   if (config.httpPort != null) {
@@ -123,7 +151,7 @@ async function main(): Promise<void> {
   // ② 'exit'（stdin EOF / 显式 process.exit / 崩溃兜底）：回调不可 await，只有各清理函数的**同步前缀**
   //    会生效（如 httpClose 的 server.close/closeIdleConnections 立即停止接受新连接）；异步尾部依赖路径 ①。
   const closeResources = async (): Promise<void> => {
-    const tasks: Promise<unknown>[] = [pool.closeAll()];
+    const tasks: Promise<unknown>[] = [manager.closeAll()];
     if (httpClose) tasks.push(httpClose());
     for (const r of await Promise.allSettled(tasks)) {
       if (r.status === 'rejected') logger.warn({ err: r.reason }, '进程收尾步骤失败（不阻塞退出）');
@@ -146,7 +174,7 @@ async function main(): Promise<void> {
   process.on('SIGINT', onSignal);
   // 'exit' 钩子仅同步前缀生效（见上方注释②）：从池中摘除空闲连接并启动断开、停止 HTTP 接受新连接
   process.on('exit', () => {
-    void pool.closeAll();
+    void manager.closeAll();
     void httpClose?.();
   });
 }

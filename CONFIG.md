@@ -34,6 +34,11 @@
 | `HANA_PASSWORD` | ✅ | 密码 | — |
 | `HANA_LOCALE` | 可选 | 连接语言，默认 `zh` | `zh` |
 | `HANA_DB_NAME` | 可选 | 租户数据库名（MDC 必填） | `SYSTEMDB` / 业务租户名 |
+| `HANA_ACCESS` | 可选 | 环境只读/可写策略：`readwrite`（默认）/ `readonly`（拒绝变更类能力；行为只读的 admin 不受影响；单环境同样生效） | `readonly` |
+| `HANA_LABEL` | 可选 | 基础环境的系统标识（多环境）；默认 `default`。命名环境用 `HANA_LABEL_ENV_<XXXX>` 覆盖 | `PRD_CN` |
+| `HANA_ENV_START` | 可选 | 启动环境 LABEL；默认基础环境的 `LABEL`（未设 `HANA_LABEL` 时为 `default`） | `PRD_CN` |
+| `HANA_ENV_SWITCHABLE` | 可选 | 可切环境 LABEL（逗号分隔）；空 = 不可切。**用 LABEL，不是 `_ENV_` 配置键** | `PRD_CN,PRD_EU` |
+| `HANA_READONLY_SQL` | 可选 | 只读环境的 SQL 策略：`select-only`（默认）/ `deny`；仍受 `sql` 工具组控制 | `deny` |
 | `HANA_TLS` | 可选 | TLS 加密，默认 `true`（fail-closed；仅可信链路显式 `false`） | `true` |
 | `HANA_SSL_VALIDATE` | 可选 | TLS 下校验证书，默认 `true`；自签证书环境显式 `false` | `true` |
 | `HANA_TIMEZONE` | 可选 | 进程时区（设置 `TZ`，影响日志时间戳与本地时间语义）；**不下发 HANA 会话**。默认 `Asia/Shanghai` | `Asia/Shanghai` |
@@ -65,9 +70,60 @@
 | `MCP_HTTP_HOST` | 可选 | HTTP 监听地址，默认 `127.0.0.1`（fail-closed） | `0.0.0.0` |
 | `MCP_HTTP_TOKEN` | **已废弃** | 等价于 `MCP_HTTP_TOKENS=shared:<token>`；计划在下一个大版本删除 | — |
 | `MCP_HTTP_TOKENS` | 可选 | 多客户端 Token → 身份映射（`name:token[:profile]`）；`token` ≥16 字符且不得含冒号 | `alice:<token>:dev,bob:<token>` |
+| `MCP_HTTP_CLIENT_ENVS` | 可选 | HTTP 身份 → 环境 LABEL 绑定（`clientId:LABEL`，逗号分隔）；**多环境 HTTP 必填，且每个 Token 都要绑定**；仅 HTTP 模式 | `alice:PRD_CN,bob:PRD_EU` |
 | `MCP_HTTP_ALLOWED_HOSTS` | 可选 | 允许的 Host 头主机名（逗号分隔，默认仅本机名） | `localhost,myhost.corp` |
 | `MCP_HTTP_ALLOWED_ORIGINS` | 可选 | 允许的 Origin 主机名；未设置时继承 `MCP_HTTP_ALLOWED_HOSTS` | `localhost` |
 | `MCP_HTTP_ALLOW_ANONYMOUS` | 可选 | 显式承认「对外监听且不配置 Token」的风险，默认 `false`（非回环 + 无 Token 时拒绝启动） | `false` |
+
+## 多 HANA 环境（单进程、单 active）
+
+默认是单环境，**不需要任何 `_ENV_` 变量**。只有至少出现一个 `HANA_<PARAM>_ENV_<XXXX>` 才进入多环境模式；只设置 `HANA_LABEL` / `HANA_ENV_START` / `HANA_ENV_SWITCHABLE` 不会触发多环境。
+
+### 规则
+
+- 共用参数保持原名（`HANA_HOST` / `HANA_PORT` / `HANA_USER` / `HANA_PASSWORD` / `HANA_DB_NAME` / `HANA_TLS` / `HANA_SSL_VALIDATE` / `HANA_LOCALE` / `HANA_XS_PORT` / `HANA_XS_TLS` / `HANA_XS_BASE_PATH` / `HANA_ACCESS` / `HANA_LABEL`）；它们也是基础环境。
+- 命名环境用 `HANA_<PARAM>_ENV_<XXXX>` 覆盖；`XXXX` 匹配 `^[A-Z][A-Z0-9_]{0,31}$`。未写的字段继承共用值（包括 `ACCESS`）。
+- `LABEL` 是 MCP 识别的系统标识：基础环境用 `HANA_LABEL`（默认 `default`），命名环境用 `HANA_LABEL_ENV_<XXXX>`（默认 `XXXX`）。`LABEL` 必须唯一；`HANA_ENV_START` / `HANA_ENV_SWITCHABLE` / `hana_env_switch` / 回执 / 审计都用它。
+- 只读环境（`ACCESS=readonly`）：拒绝变更类能力；行为只读的 admin（健康诊断/导出/变更列表）不受影响；`hana_sql_execute` 由 `HANA_READONLY_SQL` 控制（`select-only` 下只允许 SELECT，并拒绝 `FOR UPDATE` / `FOR SHARE` / `NEXTVAL`）。**单环境同样生效**。
+- 多环境变更类调用必须带 `expectedEnvironment=<当前 LABEL>`（门面索引的 `params` 已包含该字段）。
+- `hana_env_list` 发放一次性 `switchToken`（仅 stdio 且 switch 可达时）；`hana_env_switch` 是 route-only，HTTP 拒绝且不进索引；目标有运行中任务时需 `acknowledgeRunningTasks=true`。
+- 切换只影响之后的调用；旧环境有运行中任务时进入 `task-draining`，任务/调用结束后回 `idle`；切换前会预检目标连接。
+- 同一物理库（`host:port/dbName`）的多个 `LABEL` 共享对象锁、临时校验登记与预览占用。
+- **旧前缀 `HANA_ENV_<NAME>_*`、JSON/YAML 配置文件不支持**，出现即启动失败；避免两套真源。
+- 密码：加载后 `HANA_PASSWORD` 与所有 `HANA_PASSWORD_ENV_*` 从 `process.env` 删除。
+
+### 示例（两个生产环境）
+
+```dotenv
+# 共用参数（也是基础环境；LABEL=PRD_CN）
+HANA_HOST=hana-prd-cn.example
+HANA_PORT=30015
+HANA_USER=PRD_CN_READER
+HANA_PASSWORD=...
+HANA_DB_NAME=PRDDB_CN
+HANA_ACCESS=readonly
+HANA_LABEL=PRD_CN
+
+# 命名环境 PRD_EU：只写差异；port/tls/locale/access 继承共用值
+HANA_HOST_ENV_PRD_EU=hana-prd-eu.example
+HANA_USER_ENV_PRD_EU=PRD_EU_READER
+HANA_PASSWORD_ENV_PRD_EU=...
+HANA_DB_NAME_ENV_PRD_EU=PRDDB_EU
+HANA_XS_PORT_ENV_PRD_EU=8000
+
+# 启动/可切列表都用 LABEL
+HANA_ENV_START=PRD_CN
+HANA_ENV_SWITCHABLE=PRD_CN,PRD_EU
+
+# 只读环境的 SQL 策略（默认 select-only；deny = 完全关闭）
+HANA_READONLY_SQL=select-only
+```
+
+如果两个环境共用同一密码/账号，只写需要覆盖的字段即可；未覆盖的 `USER`/`PASSWORD` 会继承共用值（启动日志会提示只覆盖了其中一个）。
+
+### `.env` 加载陷阱
+
+扁平主机+用户+密码三件套齐备时，服务**完全不读 `.env`**。如果 `_ENV_` 变量只写在 `.env`、扁平凭据来自 `mcp.json`，它们会静默消失：请把 `_ENV_` 与扁平凭据放在同一来源（例如都放 `mcp.json` 的 `env`）。
 
 ## 工具分组与可见性控制
 
@@ -75,9 +131,9 @@
 
 | 分组 | 说明 | 能力 |
 | --- | --- | --- |
-| **read** 数据读取 | 访问 HANA 数据/元数据/系统信息与异步任务状态，不改动仓库 | `hana_system_get_info`、`hana_check_privileges`、`hana_package_list`、`hana_package_list_objects`、`hana_metadata_get_view`、`hana_metadata_search_objects`、`hana_metadata_list_fields`、`hana_metadata_get_field_logic`、`hana_metadata_where_used`、`hana_table_list`、`hana_table_columns`、`hana_data_preview`、`hana_data_preview_diagnose`、`hana_task_get` |
+| **read** 数据读取 | 访问 HANA 数据/元数据/系统信息与异步任务状态，不改动仓库 | `hana_system_get_info`、`hana_check_privileges`、`hana_package_list`、`hana_package_list_objects`、`hana_metadata_get_view`、`hana_metadata_search_objects`、`hana_metadata_list_fields`、`hana_metadata_get_field_logic`、`hana_metadata_where_used`、`hana_table_list`、`hana_table_columns`、`hana_data_preview`、`hana_data_preview_diagnose`、`hana_task_get`（多环境另含 `hana_env_list`） |
 | **write** 写操作 | 改动仓库设计时对象/包、接受任意 SQL 的分析、取消异步任务 | `hana_package_create`、`hana_view_create`、`hana_view_activate`、`hana_view_update`、`hana_view_delete`、`hana_view_validate`、`hana_view_check_actions`、`hana_sql_analyze`、`hana_task_cancel` |
-| **admin** 管理操作 | Transfer / Change-Tracking API 与系统监视面 | `hana_repo_export`、`hana_repo_import`、`hana_repo_changelist`、`hana_system_health`、`hana_system_activity`、`hana_table_storage`、`hana_system_trend` |
+| **admin** 管理操作 | Transfer / Change-Tracking API 与系统监视面 | `hana_repo_export`、`hana_repo_import`、`hana_repo_changelist`、`hana_system_health`、`hana_system_activity`、`hana_table_storage`、`hana_system_trend`（多环境另含 route-only `hana_env_switch`） |
 | **sql** 直接执行（**默认关闭**） | 独立第七根工具：在 HANA 上直接执行任意 SQL（读/写/管理类）。**空 `HANA_TOOL_GROUPS` 不会启用它**；须显式 `HANA_TOOL_GROUPS=sql` 或 `HANA_TOOL_ALLOW=hana_sql_execute`。未启用时它不进 `tools/list`、不进任何门面描述/索引，提示里也不提及 | `hana_sql_execute` |
 
 > 分组（kind）是**权限层级**而非"行为画像"：稳定性诊断四件套、`hana_repo_changelist` 行为只读但归 admin；`hana_sql_analyze` 接受任意 SQL 但归 write。客户端注解（`readOnlyHint`）描述行为，两者不互相推导。
@@ -161,6 +217,7 @@ HTTP 模式要点：
 - **无会话**：每个请求新建协议实例、无 `Mcp-Session-Id`、无会话级状态，因此不存在跨会话串扰与会话劫持面；隔离粒度 = 单个服务进程：所有客户端共享同一连接池、同一工具可见性配置、同一可写包白名单。
 - **安全默认（fail-closed）**：仅绑定 `127.0.0.1`，Host/Origin 白名单默认仅本机名。对外暴露需同时：`MCP_HTTP_HOST=0.0.0.0` + `MCP_HTTP_ALLOWED_HOSTS` 放行对外主机名（浏览器类客户端再放行 `MCP_HTTP_ALLOWED_ORIGINS`）。
 - **认证**：设置 `MCP_HTTP_TOKENS`（或向后兼容的 `MCP_HTTP_TOKEN`）后所有请求强制 Bearer Token 校验（缺失/不匹配 → 401）；未设置时回环监听即为访问边界。**对外监听且无 Token 时默认拒绝启动**，确需如此须显式 `MCP_HTTP_ALLOW_ANONYMOUS=true`。
+- **多环境 + HTTP**：无会话 HTTP 不能用进程级 active；必须 `MCP_HTTP_TOKENS` + `MCP_HTTP_CLIENT_ENVS`（每个 Token 绑定一个环境 LABEL）。请求入口把该 Token 的 runtime 钉进 ALS，工具/审计/任务都按它执行；`hana_env_switch` 在 HTTP 下拒绝，且不会出现在门面索引/描述中。多环境 HTTP 缺少绑定或存在未绑定 Token → 启动失败。单环境 HTTP 不需要该项。
 - 请求体上限 10MB（按字节计）：声明的 `Content-Length` 超限直接 413；流式上传同样按字节计数、本地拦截。
 - **客户端身份归因**：`MCP_HTTP_TOKENS` 把每个 Token 映射为独立 `clientId`，随请求上下文贯穿到工具层；每次工具调用返回的 envelope 带 `clientId`（stdio 无此字段）；每个写操作在服务端日志留一条审计记录（`clientId` + 包 + 对象）。
 - **并发与锁**（进程内 keyed lock，按「包/对象」串行化）：

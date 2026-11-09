@@ -168,6 +168,12 @@ export interface Capability<S extends z.ZodType = z.ZodType> {
    *   · 门面描述只列非 routeOnly 成员（索引两者都列）。
    */
   routeOnly?: boolean;
+  /**
+   * 控制面能力（如 hana_env_switch）：只经门面路由、不注册为工具；与 routeOnly 的区别是
+   * **不参与门面的 kind / destructive / idempotent 推导**——否则把 env switch 放进 system
+   * 分类会把只读的 `hana_system` 门面误标成 admin/destructive。
+   */
+  control?: boolean;
   title: string;
   description: string;
   inputSchema: S;

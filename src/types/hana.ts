@@ -46,4 +46,17 @@ export interface Envelope {
    * 与调用方身份（clientId）正交。未配置时该字段缺省——不产生恒为空的噪音字段。
    */
   agentLabel?: string;
+  /**
+   * 执行环境（LABEL）。仅多环境部署产生；单环境保持旧输出。
+   * 与 `calledFromEnvironment` 配对：前者是真正执行的环境，后者是调用入口绑定的环境。
+   */
+  environment?: string;
+  /** 执行时的环境 epoch（多环境） */
+  epoch?: number;
+  /** 执行环境的只读/可写策略（多环境） */
+  access?: 'readwrite' | 'readonly';
+  /** 配置键命名空间（default / XXXX，多环境，排障用） */
+  configKey?: string;
+  /** 调用发起时的环境（LABEL）；多环境 */
+  calledFromEnvironment?: string;
 }

@@ -14,6 +14,7 @@ SAP HANA 经典 Modeler 能力的 MCP 服务器（TypeScript，Node >= 22.0.0）
 | 分类 | 能力 | 工具 |
 | --- | --- | --- |
 | 系统 | 版本信息、用户权限与建模能力自检 | `hana_system_get_info`、`hana_check_privileges` |
+| 环境管理（多环境） | 环境列表、只读/可写标识、一次性 token 切换 | `hana_env_list`、`hana_env_switch` |
 | 稳定性诊断 | 实例体检（读数 + 12 项结论、三态）、会话与阻塞深潜、表存储画像、历史趋势 | `hana_system_health`、`hana_system_activity`、`hana_table_storage`、`hana_system_trend` |
 | 包 | 包清单/包树、包内对象、新建包 | `hana_package_list`、`hana_package_list_objects`、`hana_package_create` |
 | 元数据 | 完整定义、对象搜索、字段清单、单字段逻辑、血缘 | `hana_metadata_get_view`、`hana_metadata_search_objects`、`hana_metadata_list_fields`、`hana_metadata_get_field_logic`、`hana_metadata_where_used` |
@@ -83,6 +84,8 @@ MDC 环境还需 `HANA_DB_NAME`。缺失必填项时服务启动即失败。
 
 > 本地 clone 运行：把 `command`/`args` 换成 `"node"` / `["<仓库绝对路径>/dist/index.js"]`。
 
+**多 HANA 环境（可选）**：单环境不需要任何 `_ENV_` 变量。多环境用 `HANA_<PARAM>_ENV_<XXXX>` 只覆盖差异，`LABEL` 作为系统标识，切换用 `hana_env_list` + `hana_env_switch`；HTTP 用 `MCP_HTTP_CLIENT_ENVS` 做 Token→环境绑定。完整规则见 [CONFIG.md 的「多 HANA 环境」](CONFIG.md#多-hana-环境单进程单-active)。
+
 ## 运行方式
 
 - **stdio（默认）**：不设置 `MCP_HTTP_PORT`，由 MCP 客户端拉起进程。
@@ -93,13 +96,11 @@ MDC 环境还需 `HANA_DB_NAME`。缺失必填项时服务启动即失败。
 ## 工具面：六个分类门面 + 按需提升
 
 `tools/list` 常驻的只有六个分类门面；具体能力默认隐藏，经门面索引 + 路由调用，调门面时按分类提升进工具面。
-**另有一个独立根工具**：显式启用 `sql` 组后，`hana_sql_execute` 与门面同级常驻 `tools/list`（默认关闭时完全不可见；它不属于任何门面，也不进任何门面索引/描述）。启用方式：`HANA_TOOL_GROUPS=read,write,admin,sql` 或 `HANA_TOOL_ALLOW=hana_sql_execute`。
-
-`hana_sql_execute` **仅在用户明确要求执行 SQL 时调用**，不用于探测、验证或替代专用工具。安全默认：单条语句 + 单物理行（`HANA_SQL_ALLOW_MULTI_STATEMENT=true` 解锁多行/多语句，有写时服务端自动事务）；显式事务控制与修改会话状态的 `SET` 一律拒绝；管理类语句默认允许（受数据库账号权限约束；`EXPLAIN` 仍请用 `hana_sql_analyze`，`DO` 块/过程体不支持）；`maxRows`/`timeoutMs` 是工具调用参数（默认 500 行 / 60000ms）；`async=true` 返回 `taskId`，用 `hana_task_get` 轮询（需 read 组可见）；服务端**不做 schema 级拦截**，访问范围由数据库账号权限决定；审计只记 SQL 的 sha256 指纹与字符数，**不落原文**。详见 [CONFIG.md](CONFIG.md) 的「直接执行 HANA SQL」。
+另有一个独立根工具：显式启用 `sql` 组后，`hana_sql_execute` 与门面同级常驻（默认不可见，不属于任何门面）。它仅在用户明确要求执行 SQL 时调用；语句/事务/管理类规则与 `maxRows`、`timeoutMs`、`async` 见 [CONFIG.md](CONFIG.md)。
 
 | 门面 | 方向 | 成员数 |
 | --- | --- | --- |
-| `hana_system` | 连接与环境：当前连接是谁、连到哪 | 2 |
+| `hana_system` | 连接与环境：当前连接是谁、连到哪；多环境时含环境列表与切换 | 2（多环境 3） |
 | `hana_discovery` | 浏览与查找：找包/对象/表，读定义与字段结构 | 7 |
 | `hana_data` | 取数预览：看已激活视图/基表的数据 | 2 |
 | `hana_insights` | 结构与血缘分析：影响面、字段级计算逻辑 | 2 |
@@ -116,6 +117,7 @@ hana_view_update({ … })
 ```
 
 - 权限只有**一层（能力层）**：门面是入口，常驻；索引/路由/提升/调用一律按**目标能力**判。
+- 多环境部署时 `hana_system` 额外包含 `hana_env_list` / `hana_env_switch`；单环境不出现。
 - 拒绝不泄漏存在性：未知能力、无权能力、跨类路由**逐字同形**。
 - 操作级别名 `hana_view_update#<op>`（8 条）只经门面路由，不注册为工具。
 - 工具分组、档案与动态面细节见 [CONFIG.md](CONFIG.md)。

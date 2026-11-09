@@ -66,9 +66,10 @@ export function facadeDescription(
   if (!entry) {
     throw new Error(`分类 "${category}" 不在 CAPABILITY_CATALOG 里：门面的方向句无从生成`);
   }
-  // 描述常驻：只列主干能力；routeOnly 别名只报数量，全量由调门面取索引给出。
+  // 描述常驻：只列主干能力；routeOnly 别名/控制面能力只报数量，全量由调门面取索引给出。
   const primary = members.filter((m) => m.routeOnly !== true && isVisible(m));
-  const aliases = members.filter((m) => m.routeOnly === true && isVisible(m));
+  const aliases = members.filter((m) => m.routeOnly === true && m.id.includes('#') && isVisible(m));
+  const controls = members.filter((m) => m.routeOnly === true && !m.id.includes('#') && isVisible(m));
   return [
     `${entry.name}：${entry.description}。`,
     `本类共 ${primary.length} 项能力：`,
@@ -78,6 +79,12 @@ export function facadeDescription(
       ? [
           `另有 ${aliases.length} 项**操作级别名**（\`<工具>#<操作>\`，如 \`hana_view_update#add_join\`）：` +
             `不常驻、不注册为工具，只经本门面路由调用——调本门面取索引可看全量（含别名）。`,
+        ]
+      : []),
+    ...(controls.length > 0
+      ? [
+          `另有 ${controls.length} 项**控制面能力**（${controls.map((m) => m.id).join('、')}）：` +
+            `不注册为工具，只经本门面路由调用；受调用期闸门与运行期状态校验约束。`,
         ]
       : []),
     `调用：\`{ capability: "<上表 id>", args: { … } }\`；不带参数只返回索引。调本门面会把本类能力提升进工具面（此后可按工具名平铺调用）。`,
@@ -105,11 +112,12 @@ export function buildFacades(base: readonly Capability[]): FacadeCapabilities {
     }
     // rootTool（如 sql 组的 hana_sql_execute）是独立入口，不参与门面的 kind 推导：
     // 否则 hana_diagnostics 的 kind 会变成 sql，`HANA_TOOL_DENY=sql` 会顺带把门面藏掉。
-    // effects 仍按全部成员计算——门面确实能路由到 rootTool，破坏性提示不能漏。
-    const kind = strictestKind(members.filter((m) => m.rootTool !== true));
-    // 成员的函数，不是手写常量：门面能路由到什么，就声明成什么
-    const destructive = members.some((c) => c.effects.destructive);
-    const idempotent = members.every((c) => c.effects.idempotent);
+    // 控制面能力（hana_env_switch）同理：它属于治理入口，不应把只读的 hana_system 标成 admin/destructive。
+    const derived = members.filter((m) => m.rootTool !== true && m.control !== true);
+    const kind = strictestKind(derived);
+    // 成员的函数，不是手写常量：门面能路由到什么，就声明成什么（控制面除外，见上）
+    const destructive = derived.some((c) => c.effects.destructive);
+    const idempotent = derived.every((c) => c.effects.idempotent);
     out[id] = {
       id,
       module: id,

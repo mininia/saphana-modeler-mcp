@@ -6,6 +6,7 @@ import { currentIdentity } from '../core/request-context.js';
 import { activeProfile } from '../config/profiles.js';
 import { policyFromConfig } from '../config/preflight.js';
 import { blockedCallResult, dispatchAuthorized } from '../config/authorize.js';
+import { capabilityInputSchema } from '../config/environment-policy.js';
 import { registeredNameOf, type Capability } from '../capabilities/types.js';
 import { CAPABILITY_LIST, membersOfCategory } from '../capabilities/manifest.js';
 import { facadeDescription } from '../capabilities/facades.js';
@@ -19,6 +20,7 @@ import {
 } from './handler-registry.js';
 import { registerCapabilityTools } from './capability.tools.js';
 import { registerSystemTools } from './system.tools.js';
+import { registerEnvironmentTools } from './env.tools.js';
 import { registerPackageTools } from './package.tools.js';
 import { registerMetadataTools } from './metadata.tools.js';
 import { registerPreviewTools } from './preview.tools.js';
@@ -29,6 +31,12 @@ import { registerSqlExecuteTools } from './sql-execute.tools.js';
 import { registerHealthTools } from './health.tools.js';
 import type { HanaPool } from '../core/hana-client.js';
 import type { HanaConfig } from '../config/config.js';
+import type { EnvironmentManager } from '../config/environment-runtime.js';
+import {
+  currentEnvironmentRuntime,
+  reclaimDrainingEnvironment,
+  runWithEnvironment,
+} from '../core/environment-context.js';
 
 export interface ToolContext {
   /** HANA 连接池（懒连接，工具经池访问 HANA） */
@@ -40,6 +48,12 @@ export interface ToolContext {
    * 未进面的能力不出现在 tools/list，但仍可经门面路由调用（判定走同一套闸门）。
    */
   toolFilter: ToolFilterConfig;
+  /**
+   * 多环境管理器。存在时，每次工具调用入口绑定一次 runtime：
+   * `ctx.pool` / `ctx.config` 的 getter 优先读绑定值，handler 内不再看全局 active。
+   * 省略 = 单环境测试/脚本直调，行为与旧版一致。
+   */
+  manager?: EnvironmentManager;
   /**
    * 本次 server 构建使用的**面**：`(门面 ∪ 已提升分类的成员) ∩ 部署策略 ∩ 档案`。
    * HTTP 按请求构建（于是每个身份看到自己的面）；stdio 单实例。省略 = 由 `surfaceOf` 现算。
@@ -77,7 +91,7 @@ function registerVisibleTool(server: McpServer, ctx: ToolContext): McpServer['re
  * 能力清单条目 → SDK 的 registerTool 配置：title / inputSchema / annotations 全部取自清单。
  * 门面描述按 surface 重建，文本随 deny / 分组 / 档案的收窄而收窄。
  */
-function registrationOf<S extends z.ZodType>(cap: Capability<S>, surface: CallerSurface) {
+function registrationOf<S extends z.ZodType>(cap: Capability<S>, surface: CallerSurface, multiEnv: boolean) {
   const description =
     cap.facadeOf !== undefined
       ? facadeDescription(cap.facadeOf, membersOfCategory(cap.facadeOf), (m) => surface.entitlementIds.has(m.id))
@@ -85,7 +99,8 @@ function registrationOf<S extends z.ZodType>(cap: Capability<S>, surface: Caller
   return {
     title: cap.title,
     description,
-    inputSchema: cap.inputSchema,
+    // 多环境下变更类能力要求 expectedEnvironment；读能力/单环境原样返回
+    inputSchema: capabilityInputSchema(cap, multiEnv),
     annotations: cap.annotations,
   };
 }
@@ -123,7 +138,7 @@ export function capabilityRegistrar(server: McpServer, ctx: ToolContext): Capabi
     // ② 可见则注册（配置来自清单）
     (register as (n: string, c: unknown, f: unknown) => unknown)(
       registeredNameOf(cap),
-      registrationOf(cap, surface),
+      registrationOf(cap, surface, ctx.manager?.multiEnv === true),
       gatedHandler(ctx, cap, handler),
     );
   } as CapabilityRegistrar;
@@ -150,17 +165,36 @@ function gatedHandler<S extends z.ZodType>(
     const identity = currentIdentity();
     // 授权 → 执行 → 写能力终态审计：三个动作收在 dispatchAuthorized 一处，
     // 门面路由与平铺直调共用同一个壳（P0-4）。
-    return dispatchAuthorized(
-      cap,
-      args,
-      {
-        policy: policyFromConfig(ctx.config, ctx.toolFilter),
-        profile: activeProfile(ctx.config, identity),
-        agentLabel: ctx.config.agentLabel,
-      },
-      () => (handler as (a: unknown, e: unknown) => unknown)(args, extra),
-      (auth) => blockedCallResult(auth) as never,
-    );
+    const run = (): unknown =>
+      dispatchAuthorized(
+        cap,
+        args,
+        {
+          policy: policyFromConfig(ctx.config, ctx.toolFilter),
+          profile: activeProfile(ctx.config, identity),
+          agentLabel: ctx.config.agentLabel,
+        },
+        () => (handler as (a: unknown, e: unknown) => unknown)(args, extra),
+        (auth) => blockedCallResult(auth) as never,
+      );
+    // 多环境：入口取一次 runtime 并绑定到本次调用（含异步续体）。捕获发生在任何 await 之前，
+    // 因此之后切换 active 不会影响这次调用；policyFromConfig(ctx.config) 也读绑定值。
+    const manager = ctx.manager;
+    if (!manager) return run();
+    // HTTP 请求入口可能已按 Token 绑定 runtime；有绑定就用它，stdio/未绑定才用进程 active。
+    const runtime = currentEnvironmentRuntime() ?? manager.current();
+    runtime.callRefs += 1;
+    manager.beginCall();
+    return runWithEnvironment(runtime, async () => {
+      try {
+        return await run();
+      } finally {
+        runtime.callRefs = Math.max(0, runtime.callRefs - 1);
+        manager.endCall();
+        // 切走后进入 task-draining 的环境：最后一个在途调用结束（且无任务）时回 idle/关空闲池。
+        reclaimDrainingEnvironment(runtime);
+      }
+    });
   };
 }
 
@@ -202,7 +236,7 @@ export function registerCapabilitiesDynamically(
     try {
       const handle = server.registerTool(
         name,
-        registrationOf(cap, surfaceOf(ctx)),
+        registrationOf(cap, surfaceOf(ctx), ctx.manager?.multiEnv === true),
         gatedHandler(ctx, cap, raw as CapabilityHandler<typeof cap.inputSchema>) as never,
       ) as unknown as { remove(): void };
       recordDynamicHandle(server, name, handle);
@@ -281,6 +315,8 @@ export function registerAllTools(server: McpServer, ctx: ToolContext): void {
   // 门面最先注册（入口排最前）；stdio 的动态注册也是 append 到末尾，两种传输顺序一致。
   registerCapabilityTools(server, ctx);
   registerSystemTools(server, ctx);
+  // 环境管理紧随 system：多环境才注册 hana_env_list / hana_env_switch（route-only）
+  registerEnvironmentTools(server, ctx);
   registerPackageTools(server, ctx);
   registerMetadataTools(server, ctx);
   registerPreviewTools(server, ctx);

@@ -18,6 +18,7 @@ import { CAPABILITY_LIST, findCapability, membersOfCategory } from '../capabilit
 import { CAPABILITY_CATALOG, type Capability, type FacadeCategory } from '../capabilities/types.js';
 import { activeProfile, profileAllows, type CallerProfile } from '../config/profiles.js';
 import type { HanaConfig } from '../config/config.js';
+import { capabilityInputSchema } from '../config/environment-policy.js';
 import { ANONYMOUS_CLIENT_ID, currentIdentity } from '../core/request-context.js';
 import { matchGlob, shouldRegisterTool, type ToolFilterConfig } from './groups.js';
 
@@ -28,6 +29,11 @@ import { matchGlob, shouldRegisterTool, type ToolFilterConfig } from './groups.j
 export interface SurfaceContext {
   config: HanaConfig;
   toolFilter: ToolFilterConfig;
+  /** 多环境管理器（可选；测试/单环境可省略）：环境管理能力按 multiEnv/switchable 条件可见 */
+  manager?: {
+    multiEnv: boolean;
+    switchable: readonly string[];
+  };
 }
 
 /** stdio 进程（单客户端）的提升键 */
@@ -118,8 +124,25 @@ export function entitlementOf(
   profile: CallerProfile | undefined;
 } {
   const profile = activeProfile(ctx.config, identity);
+  // 切换必须能拿到 hana_env_list 发放的一次性 token：list 自身不可达（read 组关闭/档案拒绝）时
+  // switch 也必然不可用，不能把它列进索引。HTTP 下进程级切换不受支持，同样不列。
+  const envListCapability = findCapability('hana_env_list');
+  const envListVisible =
+    ctx.manager?.multiEnv === true &&
+    envListCapability !== undefined &&
+    shouldRegisterTool(envListCapability.id, ctx.toolFilter) &&
+    profileAllows(profile, envListCapability.id, envListCapability.kind).ok;
+  /** 环境管理能力只在多环境注册；switch 还要求 list 可达、switchable 非空且非 HTTP */
+  const envCapabilityVisible = (c: Capability): boolean => {
+    if (c.id === 'hana_env_list') return ctx.manager?.multiEnv === true;
+    if (c.id === 'hana_env_switch') {
+      return envListVisible && (ctx.manager?.switchable?.length ?? 0) > 0 && ctx.config.httpPort == null;
+    }
+    return true;
+  };
   /** 单个能力的可触达判定：可见性配置 + 档案（门面只过 deny 那一关，见上） */
   const entitled = (c: Capability): boolean => {
+    if (!envCapabilityVisible(c)) return false;
     if (!shouldRegisterTool(c.id, ctx.toolFilter)) return false;
     if (c.facadeOf !== undefined) return true; // 门面：入口不参与能力层判定（分组/档案都不拦它）
     // 档案维度与调用期闸门共用 profileAllows（单点实现）：undefined 档案 → profile_unknown → false
@@ -197,9 +220,12 @@ export function summaryOf(cap: Capability): string {
 /**
  * 能力的参数名清单（门面索引用；只给名字不给 schema）。
  * 完整 schema 由提升给出（提升后它是 tools/list 的一等工具）。
+ * 多环境下变更类能力会被追加必填 expectedEnvironment——索引必须与路由校验同源，
+ * 否则按索引参数调用会直接 input_schema_invalid。
  */
-export function paramNamesOf(cap: Capability): string[] {
-  const shape = (cap.inputSchema as unknown as { shape?: Record<string, unknown> }).shape;
+export function paramNamesOf(cap: Capability, multiEnv = false): string[] {
+  const schema = capabilityInputSchema(cap, multiEnv);
+  const shape = (schema as unknown as { shape?: Record<string, unknown> }).shape;
   return shape ? Object.keys(shape) : [];
 }
 

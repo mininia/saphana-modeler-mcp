@@ -8,6 +8,7 @@ import {
 } from '../core/hana-errors.js';
 import { withKeyedLock } from '../core/keyed-mutex.js';
 import { logger } from '../core/logger.js';
+import { currentDatabaseScopeKey } from '../core/environment-context.js';
 import { clampLimit } from '../core/num.js';
 import { assertSafeRuntimeName, assertSchemaAllowed, quoteIdentifier, quoteLiteral, qualifyName } from '../core/sql.js';
 import { truncateWithNote } from '../core/text.js';
@@ -201,9 +202,14 @@ function intermediateViewName(viewRef: string, node: string): string {
   return name;
 }
 
+/** 中间视图占用/归属状态的 key：物理库 + 视图名（同库多 LABEL 共享同一份 dp 视图与占用计数） */
+function intermediateScopeKey(viewName: string): string {
+  return `${currentDatabaseScopeKey()}:${viewName}`;
+}
+
 /** 中间视图占用/归属状态的操作锁 key（与写路径的 "包/对象" key 命名空间隔离） */
 function intermediateLockKey(viewName: string): string {
-  return `dp:${viewName}`;
+  return `dp:${intermediateScopeKey(viewName)}`;
 }
 
 /**
@@ -370,6 +376,7 @@ async function previewNodeViaIntermediate(
   let reused = false;
   /** 仅复用路径回报新鲜度；新鲜度查询在锁内做——此刻视图必然还在（锁外读会撞上并发 DROP 的窗口） */
   let freshness: IntermediateFreshness | undefined;
+  const scopeKey = intermediateScopeKey(viewName);
   await withKeyedLock(intermediateLockKey(viewName), async () => {
     // 存在性三态（评审 #1111/#1121）：'unknown'（SYS.VIEWS 读失败/不可见）不得冒充「不存在」——
     // 它照走 CREATE，但容忍「对象已存在」并回退到复用；只有 'missing' 是确定的「不存在」。
@@ -384,7 +391,7 @@ async function previewNodeViaIntermediate(
           [INTERMEDIATE_SCHEMA, viewRef, node, viewName, INTERMEDIATE_VERSION],
           { timeoutMs: INTERMEDIATE_CONTROL_TIMEOUT_MS },
         );
-        intermediateOwned.add(viewName); // 本服务创建的才可清理（预存在的他人对象不在此列）
+        intermediateOwned.add(scopeKey); // 本服务创建的才可清理（预存在的他人对象不在此列）
       } catch (e) {
         // 存在性不可判定（读失败）或跨进程竞态（两进程同判「不存在」，一方先 CREATE）下，
         // 对象其实在场 ⇒ CREATE 撞「对象已存在」：按复用继续（重读新鲜度），不让只读预览打成假失败
@@ -398,7 +405,7 @@ async function previewNodeViaIntermediate(
         }
       }
     }
-    intermediateInUse.set(viewName, (intermediateInUse.get(viewName) ?? 0) + 1);
+    intermediateInUse.set(scopeKey, (intermediateInUse.get(scopeKey) ?? 0) + 1);
   });
 
   let rows: Record<string, unknown>[];
@@ -455,9 +462,10 @@ async function previewNodeViaIntermediate(
  * ≤0 时移除条目；返回剩余计数。
  */
 function decrementIntermediateInUse(viewName: string): number {
-  const remaining = (intermediateInUse.get(viewName) ?? 1) - 1;
-  if (remaining > 0) intermediateInUse.set(viewName, remaining);
-  else intermediateInUse.delete(viewName);
+  const key = intermediateScopeKey(viewName);
+  const remaining = (intermediateInUse.get(key) ?? 1) - 1;
+  if (remaining > 0) intermediateInUse.set(key, remaining);
+  else intermediateInUse.delete(key);
   return remaining;
 }
 
@@ -476,12 +484,13 @@ async function releaseIntermediateView(
   pool: HanaPool,
   viewName: string,
 ): Promise<{ dropped: boolean; reason?: string }> {
+  const scopeKey = intermediateScopeKey(viewName);
   return withKeyedLock(intermediateLockKey(viewName), async () => {
     const remaining = decrementIntermediateInUse(viewName);
     if (remaining > 0) {
       return { dropped: false, reason: `仍有 ${remaining} 个预览调用在使用该视图` };
     }
-    if (!intermediateOwned.has(viewName)) {
+    if (!intermediateOwned.has(scopeKey)) {
       return { dropped: false, reason: '视图非本服务创建（他人或历史残留），不主动删除' };
     }
     try {
@@ -490,7 +499,7 @@ async function releaseIntermediateView(
         [INTERMEDIATE_SCHEMA, viewName, INTERMEDIATE_VERSION],
         { timeoutMs: INTERMEDIATE_CONTROL_TIMEOUT_MS },
       );
-      intermediateOwned.delete(viewName);
+      intermediateOwned.delete(scopeKey);
       return { dropped: true };
     } catch (e) {
       // 占用中（其他会话正在读）或权限不足：保留视图供下次复用（清理失败不得掩盖原始错误）

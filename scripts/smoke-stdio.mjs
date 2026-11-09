@@ -267,7 +267,12 @@ async function caseFacadeBehaviour() {
     return parent !== undefined && matchGlob(parent, denyPatterns);
   };
   /** 单个具体能力是否可见（deny > allow > 分组；空分组 = 不限制） */
+  /** 环境控制能力只在多环境（至少一个 _ENV_ 覆盖）进面；单环境索引不列它们 */
+  const ENV_CONTROL_IDS = new Set(['hana_env_list', 'hana_env_switch']);
+  const hasEnvOverrides = Object.keys(env).some((k) => /^HANA_[A-Z0-9_]+_ENV_[A-Z0-9_]+$/.test(k));
+  const envControlVisible = (id) => hasEnvOverrides || !ENV_CONTROL_IDS.has(id);
   const capVisible = (id) => {
+    if (!envControlVisible(id)) return false;
     if (capDenied(id)) return false;
     if (matchGlob(id, allowPatterns)) return true;
     if (enabledGroups.length === 0) return true;
@@ -277,7 +282,8 @@ async function caseFacadeBehaviour() {
     return enabledGroups.includes(group);
   };
   /** 门面是否注册：**门面层不做限制**——恒在；只有显式 deny（命中门面 id，或全部成员被 deny）才消失 */
-  const facadeVisible = (facade) => !capDenied(facade) && FACADE_MEMBERS[facade].some((id) => !capDenied(id));
+  const facadeVisible = (facade) =>
+    !capDenied(facade) && FACADE_MEMBERS[facade].some((id) => !capDenied(id) && envControlVisible(id));
 
   await withServer(env, async ({ request, initialize, call }) => {
     await initialize('smoke-stdio-facade');

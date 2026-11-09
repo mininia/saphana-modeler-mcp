@@ -34,11 +34,15 @@ import { parseSqlScript, type SqlExecutePolicy, type SqlStatementKind } from './
 
 /** 从已加载配置取执行策略（默认值取自 core/limits；测试的残缺 config 也不会崩） */
 export function sqlExecutePolicyOf(
-  config: Pick<HanaConfig, 'sqlAllowMultiStatement' | 'sqlMaxStatements'>,
+  config: Pick<HanaConfig, 'sqlAllowMultiStatement' | 'sqlMaxStatements' | 'access' | 'readonlySql'>,
 ): SqlExecutePolicy {
+  const readonly = config.access === 'readonly';
+  const policy = config.readonlySql ?? 'select-only';
   return {
     allowMultiStatement: config.sqlAllowMultiStatement === true,
     maxStatements: config.sqlMaxStatements ?? SQL_MAX_STATEMENTS_DEFAULT,
+    readOnly: readonly && policy === 'select-only',
+    readonlySqlDeny: readonly && policy === 'deny',
   };
 }
 

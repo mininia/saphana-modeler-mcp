@@ -16,9 +16,11 @@ import { FACADE_SCHEMA, facadeIdOf } from '../capabilities/facades.js';
 import { CAPABILITY_LIST, FACADES, membersOfCategory } from '../capabilities/manifest.js';
 import { blockedCallResult, dispatchAuthorized } from '../config/authorize.js';
 import { policyFromConfig } from '../config/preflight.js';
+import { capabilityInputSchema } from '../config/environment-policy.js';
 import type { CallerProfile } from '../config/profiles.js';
 import { mcpErrorText, withErrorEnvelope } from '../core/errors.js';
 import { logger } from '../core/logger.js';
+import { currentEnvironmentRuntime } from '../core/environment-context.js';
 import { currentIdentity } from '../core/request-context.js';
 import type { Envelope } from '../types/hana.js';
 import { toToolResult } from './common.js';
@@ -56,6 +58,7 @@ function blockAuditPayload(
   capabilityId: string,
   codes: string[],
 ): Record<string, unknown> {
+  const runtime = currentEnvironmentRuntime();
   return {
     capabilityId,
     result: 'denied',
@@ -64,6 +67,15 @@ function blockAuditPayload(
     ...(identity?.transport ? { transport: identity.transport } : {}),
     ...(profile ? { profileId: profile.id } : {}),
     ...(ctx.config.agentLabel ? { agentLabel: ctx.config.agentLabel } : {}),
+    ...(runtime?.multiEnv
+      ? {
+          environment: runtime.label,
+          epoch: runtime.epoch,
+          access: runtime.access,
+          configKey: runtime.configKey,
+          calledFromEnvironment: runtime.label,
+        }
+      : {}),
     via: facadeId,
     resources: { writePackages: [], readSchemas: [], readPackages: [] },
     codes,
@@ -246,7 +258,7 @@ async function promoteOnFacadeCall(
           title: c.title,
           kind: c.kind,
           summary: summaryOf(c),
-          params: paramNamesOf(c),
+          params: paramNamesOf(c, ctx.manager?.multiEnv === true),
         })),
         // P1-7：面被收窄时才说明（全量面不追加噪音）；默认只到类别，不点名被隐藏的能力。
         ...(surfaceExplanation.status === 'restricted' ? { surface: surfaceExplanation } : {}),
@@ -268,8 +280,9 @@ async function promoteOnFacadeCall(
       return mcpErrorText(UNKNOWN_CAPABILITY_TEXT);
     }
 
-    // 服务端按目标能力的 schema 校验（客户端 schema 只是便利，不是校验层）
-    const parsed = target.inputSchema.safeParse(args ?? {});
+    // 服务端按目标能力的 schema 校验（客户端 schema 只是便利，不是校验层）。
+    // 多环境下变更类目标会多一个必填 expectedEnvironment（与注册面同源）。
+    const parsed = capabilityInputSchema(target, ctx.manager?.multiEnv === true).safeParse(args ?? {});
     if (!parsed.success) {
       // 审计不能缺席：schema 失败也是按目标能力的拒绝，否则与纯索引调用在审计里不可区分。
       logger.warn(

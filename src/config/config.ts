@@ -19,6 +19,7 @@ import {
 import { IDENTITY_NAME_HINT, IDENTITY_NAME_RE, splitList } from '../core/text.js';
 import { XS_BASE_PATH } from '../core/xs-rest.js';
 import { findInvalidWritePackages } from './write-boundary.js';
+import { buildEnvironments, isEnvironmentConfigKey, type LoadedEnvironments } from './environment-config.js';
 import { IMPLICIT_DEFAULT_PROFILE_ID, parseProfiles, type CallerProfile } from './profiles.js';
 import { DEFAULT_HTTP_HOST, DEFAULT_SSL_VALIDATE, DEFAULT_TLS } from './deployment.js';
 
@@ -137,6 +138,20 @@ const envSchema = z.object({
   HANA_LOCALE: z.string().min(1).default(DEFAULT_LOCALE),
   /** 租户数据库名（MDC 环境必填，如 SYSTEMDB / 业务租户名） */
   HANA_DB_NAME: z.string().min(1).optional(),
+  /**
+   * 环境的只读/可写策略（多环境）。基础环境用 HANA_ACCESS；命名环境用
+   * HANA_ACCESS_ENV_<XXXX> 覆盖。只读闸门只看它，不按环境名推断。
+   */
+  HANA_ACCESS: z.enum(['readwrite', 'readonly']).default('readwrite'),
+  /**
+   * 基础环境的系统标识（LABEL）。命名环境用 HANA_LABEL_ENV_<XXXX>；
+   * 不写时基础环境为 default、命名环境为 <XXXX>。LABEL 是 MCP 识别的标识，
+   * HANA_ENV_START / HANA_ENV_SWITCHABLE / 工具 / 审计都用它。
+   */
+  HANA_LABEL: z
+    .string()
+    .default('')
+    .transform((s) => s.trim()),
   /**
    * 是否启用 TLS 加密连接。默认 true（fail-closed：未显式配置时不允许明文传输凭据/数据）。
    * 仅当确认网络链路可信（如 localhost）且需兼容自签证书时才显式置 false。
@@ -263,6 +278,21 @@ const envSchema = z.object({
   ),
   /** XS 设计时 REST 基础路径（默认 /sap/hana/xs/dt/base） */
   HANA_XS_BASE_PATH: z.string().min(1).default(XS_BASE_PATH),
+  /**
+   * XS 写通道是否走 HTTPS。默认 false（XS 端点缺省明文）；命名环境用
+   * HANA_XS_TLS_ENV_<XXXX> 覆盖。XsRestClient 优先用 runtime config.xsTls，
+   * 未给时回退进程级 HANA_XS_TLS。
+   */
+  HANA_XS_TLS: boolSchema(false),
+  /** 启动即激活的环境 LABEL；默认基础环境的 LABEL（未设 HANA_LABEL 时为 default） */
+  HANA_ENV_START: z
+    .string()
+    .default('')
+    .transform((s) => s.trim()),
+  /** 可切换环境 LABEL 列表（逗号分隔）；默认空 = 不可切 */
+  HANA_ENV_SWITCHABLE: z.string().default('').transform(splitList),
+  /** 只读环境的 SQL 策略：select-only（默认）/ deny；仍受 sql 工具组控制 */
+  HANA_READONLY_SQL: z.enum(['select-only', 'deny']).default('select-only'),
   /* ── 并发与超时旋钮：池、SQL/XS 超时、激活并发 ──
    * 全部为 intEnvSchema（数字型、可留空、留空 = 默认值；非法值启动即失败）；
    * 前缀 HANA_ 的理由：这些都是与 HANA 连接侧资源相关的运行参数（与 HANA_XS_PORT/HANA_READ_SCHEMA 同类），
@@ -330,6 +360,14 @@ const envSchema = z.object({
    * 可与 MCP_HTTP_TOKEN（deprecated 别名，映射为身份 shared）并存。格式：alice:<token>,bob:<token>
    */
   MCP_HTTP_TOKENS: z
+    .string()
+    .default('')
+    .transform((s) => s.trim()),
+  /**
+   * HTTP 多客户端 Token → 环境 LABEL 绑定（`clientId:LABEL`，逗号分隔）。
+   * 仅 HTTP 模式有效；多环境 HTTP 必须为每个 Token 绑定环境（否则启动失败）。
+   */
+  MCP_HTTP_CLIENT_ENVS: z
     .string()
     .default('')
     .transform((s) => s.trim()),
@@ -426,6 +464,71 @@ export function parseHttpClients(raw: string, singleToken?: string): HttpClientI
   return clients;
 }
 
+/**
+ * 解析 HTTP Token → 环境绑定（`MCP_HTTP_CLIENT_ENVS`）。
+ *
+ * fail-closed：
+ * - 仅 HTTP 模式有效；stdio 配了即启动失败（避免“以为生效、其实没有”）。
+ * - 多环境 HTTP 必须为每个 Token 绑定环境；缺少绑定或配置为空都拒绝启动——进程级 active
+ *   在无会话 HTTP 下会跨客户端串环境。
+ * - clientId 必须在 MCP_HTTP_TOKENS 中；LABEL 必须在已配置环境表中；重复绑定失败。
+ */
+export function parseHttpClientEnvironments(
+  raw: string,
+  clients: readonly HttpClientIdentity[],
+  labels: ReadonlySet<string>,
+  httpMode: boolean,
+  multiEnv: boolean,
+): Map<string, string> {
+  const entries = splitList(raw);
+  if (!httpMode) {
+    if (entries.length > 0) {
+      throw new Error('MCP_HTTP_CLIENT_ENVS 仅在 HTTP 模式（设置 MCP_HTTP_PORT）下有效');
+    }
+    return new Map();
+  }
+  if (multiEnv && clients.length === 0) {
+    throw new Error(
+      '多环境 HTTP 必须配置 MCP_HTTP_TOKENS，并用 MCP_HTTP_CLIENT_ENVS 为每个 Token 绑定环境 LABEL；' +
+        '或改用一进程一环境',
+    );
+  }
+
+  const byClient = new Map<string, string>();
+  for (const entry of entries) {
+    const parts = entry.split(':');
+    if (parts.length !== 2 || parts[0].trim() === '' || parts[1].trim() === '') {
+      throw new Error(`MCP_HTTP_CLIENT_ENVS 条目格式非法：${entry}（应为 clientId:LABEL）`);
+    }
+    const clientId = parts[0].trim();
+    const label = parts[1].trim();
+    if (!clients.some((c) => c.clientId === clientId)) {
+      throw new Error(
+        `MCP_HTTP_CLIENT_ENVS 引用了未配置的客户端身份：${clientId}；` +
+          `已配置身份：${clients.map((c) => c.clientId).join(', ') || '(无)'}`,
+      );
+    }
+    if (!labels.has(label)) {
+      throw new Error(`MCP_HTTP_CLIENT_ENVS 引用了未知环境 LABEL：${label}；可用 LABEL：${[...labels].join(', ')}`);
+    }
+    if (byClient.has(clientId)) {
+      throw new Error(`MCP_HTTP_CLIENT_ENVS 客户端身份重复：${clientId}`);
+    }
+    byClient.set(clientId, label);
+  }
+
+  if (multiEnv) {
+    const missing = clients.map((c) => c.clientId).filter((id) => !byClient.has(id));
+    if (missing.length > 0) {
+      throw new Error(
+        `多环境 HTTP 下每个 Token 都必须绑定环境；缺少：${missing.join(', ')}。` +
+          '请补 MCP_HTTP_CLIENT_ENVS（clientId:LABEL），或改用一进程一环境',
+      );
+    }
+  }
+  return byClient;
+}
+
 export interface HanaConfig {
   /** HANA 主机名/IP（真实值仅存在于本地 mcp.json/.env） */
   host: string;
@@ -483,10 +586,22 @@ export interface HanaConfig {
   httpTokens: HttpClientIdentity[];
   /** 允许的 Host 头主机名（DNS rebinding 防护，来自 MCP_HTTP_ALLOWED_HOSTS） */
   httpAllowedHosts: string[];
+  /** HTTP 客户端身份 → 环境 LABEL 绑定（MCP_HTTP_CLIENT_ENVS；仅 HTTP 模式） */
+  httpClientEnvs?: Map<string, string>;
   /** 允许的 Origin 主机名（无 Origin 头放行，来自 MCP_HTTP_ALLOWED_ORIGINS） */
   httpAllowedOrigins: string[];
   /** 显式承认「对外监听且不认证」的风险（来自 MCP_HTTP_ALLOW_ANONYMOUS，默认 false） */
   httpAllowAnonymous: boolean;
+  /** 当前环境的系统标识（LABEL）；单环境默认 `default` */
+  environment?: string;
+  /** 配置键命名空间：`default` 或 `<XXXX>`（用于排障/审计，不参与授权） */
+  configKey?: string;
+  /** 只读/可写策略（HANA_ACCESS / HANA_ACCESS_ENV_<XXXX>） */
+  access?: 'readwrite' | 'readonly';
+  /** 只读环境 SQL 策略（HANA_READONLY_SQL） */
+  readonlySql?: 'select-only' | 'deny';
+  /** XS 写通道是否走 HTTPS；undefined = 回退进程级 HANA_XS_TLS */
+  xsTls?: boolean;
   /**
    * 连接目标/凭据各变量的实际来源标签（仅已设置项，不含值；来自 tryLoadDotEnv）。
    * 例：{ HANA_USER: '进程环境变量', HANA_HOST: '.env（工作目录）' }
@@ -638,7 +753,9 @@ const RUNTIME_DIRECT_ENV_KEYS = ['HANA_XS_TLS'] as const;
  */
 function warnUnknownEnvKeys(env: Record<string, unknown>): void {
   const known = new Set<string>([...Object.keys(envSchema.shape), ...RUNTIME_DIRECT_ENV_KEYS]);
-  const suspicious = Object.keys(env).filter((k) => /^(HANA_|MCP_|LOG_)/.test(k) && !known.has(k));
+  const suspicious = Object.keys(env).filter(
+    (k) => /^(HANA_|MCP_|LOG_)/.test(k) && !known.has(k) && !isEnvironmentConfigKey(k),
+  );
   if (suspicious.length > 0) {
     logger.warn(
       { keys: suspicious },
@@ -727,8 +844,11 @@ function parseSurfaceMax(raw: string): number {
 /**
  * 加载并校验配置。HANA_HOST/HANA_PORT/HANA_USER/HANA_PASSWORD 必填（无默认值），
  * 缺失或非法抛 zod 校验错误（服务启动即失败，不给半配置运行的机会）。
+ *
+ * 内部实现返回基础环境 + 命名环境表；对外保留 loadConfig（只要基础 config）与
+ * loadEnvironments（要完整环境表）两个入口，避免脚本/测试一次性全改。
  */
-export function loadConfig(env: NodeJS.ProcessEnv = process.env): HanaConfig {
+function loadInternal(env: NodeJS.ProcessEnv): LoadedEnvironments {
   const dotenv = tryLoadDotEnv(env);
   // 无别名层（2026-10-14）：envSchema 是唯一真值源，旧名/已删名一律不认，
   // 由 warnUnknownEnvKeys 以「未识别环境变量」告警兜住（不再做旧名归一）
@@ -761,8 +881,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HanaConfig {
   // 将解析后的时区应用到整个进程（影响 new Date() 等本地时间语义）
   process.env.TZ = parsed.HANA_TIMEZONE;
 
-  // 凭据生命周期：取出密码后即从进程环境移除，避免常驻 process.env 被同机进程/子进程/调试器读取
-  delete process.env.HANA_PASSWORD;
+  // 凭据生命周期：先不删密码——命名环境的 `HANA_PASSWORD_ENV_*` 还要用；
+  // 构建完环境表后由 deletePasswordKeys 统一从 env/process.env 移除。
   // HTTP Bearer Token 与密码同属"能触发全部工具（含写）的凭据"，同一威胁模型下一并移除：
   // 值已进 config.httpTokens 内存副本，后续判定不再读 env（服务进程内禁止重新解析 env，
   // 见 index.ts 与 preflight.policyFromConfig 的说明）
@@ -780,7 +900,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HanaConfig {
     );
   }
 
-  return {
+  const baseConfig: HanaConfig = {
     host: parsed.HANA_HOST,
     port,
     user: parsed.HANA_USER,
@@ -825,5 +945,54 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HanaConfig {
     httpAllowAnonymous: parsed.MCP_HTTP_ALLOW_ANONYMOUS,
     connectionSources: dotenv.sources,
     connectionSourceMixed,
+    // 环境维度：基础环境是 default；命名环境在 buildEnvironments 里派生
+    environment: parsed.HANA_LABEL || 'default',
+    configKey: 'default',
+    access: parsed.HANA_ACCESS,
+    readonlySql: parsed.HANA_READONLY_SQL,
+    xsTls: parsed.HANA_XS_TLS,
   };
+
+  const loaded = buildEnvironments(env, baseConfig, {
+    start: parsed.HANA_ENV_START,
+    switchable: parsed.HANA_ENV_SWITCHABLE,
+  });
+
+  // HTTP Token → 环境绑定（多环境 HTTP 必须为每个 Token 绑定；stdio 配了即失败）
+  const httpClientEnvs = parseHttpClientEnvironments(
+    parsed.MCP_HTTP_CLIENT_ENVS,
+    baseConfig.httpTokens,
+    new Set(loaded.entries.map((e) => e.label)),
+    parsed.MCP_HTTP_PORT != null,
+    loaded.multiEnv,
+  );
+  baseConfig.httpClientEnvs = httpClientEnvs;
+  for (const entry of loaded.entries) entry.config.httpClientEnvs = httpClientEnvs;
+
+  // 环境表已构建（命名环境密码已拷进各自 config），再统一擦除进程环境里的密码副本
+  deletePasswordKeys(env);
+  return loaded;
+}
+
+/**
+ * 擦除基础密码与所有命名环境密码（`HANA_PASSWORD_ENV_*`）。
+ * 同时处理传入的 env 对象与 process.env：测试/脚本用自定义 env 时也不留下副本。
+ */
+function deletePasswordKeys(env: NodeJS.ProcessEnv): void {
+  const keys = Object.keys(env).filter((k) => k === 'HANA_PASSWORD' || k.startsWith('HANA_PASSWORD_ENV_'));
+  for (const key of keys) {
+    delete env[key];
+    delete process.env[key];
+  }
+  delete process.env.HANA_PASSWORD;
+}
+
+/** 只要基础环境配置（既有脚本/测试入口，行为保持）。 */
+export function loadConfig(env: NodeJS.ProcessEnv = process.env): HanaConfig {
+  return loadInternal(env).base.config;
+}
+
+/** 完整环境表：基础环境 + 命名环境 + start/switchable；多环境启动使用。 */
+export function loadEnvironments(env: NodeJS.ProcessEnv = process.env): LoadedEnvironments {
+  return loadInternal(env);
 }

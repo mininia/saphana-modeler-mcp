@@ -3,6 +3,7 @@ import { HanaBusinessError } from '../core/errors.js';
 import { logger } from '../core/logger.js';
 import { splitList } from '../core/text.js';
 import { getEnvironmentProfile, type EnvironmentProfile } from '../config/profile.js';
+import { currentEnvironmentRuntime } from '../core/environment-context.js';
 import { RULES, RULE_IDS, getRules, type RuleId, type RuleObject } from '../rules/index.js';
 
 /** 规则目录条目（省 token 的索引：只给 id + title；要看全文再传 rules=<id>） */
@@ -46,6 +47,14 @@ export interface SystemInfo {
   currentSchema: string;
   /** 环境档案：首次调用时探测一次并进程内缓存；探测失败 fail-open（detected:false + note），不影响其余信息 */
   profile: EnvironmentProfile;
+  /** 多环境身份（单环境不产生）：当前 LABEL / access / epoch / state */
+  environment?: {
+    name: string;
+    configKey: string;
+    access: 'readwrite' | 'readonly';
+    epoch: number;
+    state: string;
+  };
   /** 规则库：省略 rules = 目录（id+title）；传 all 或规则 id = 命中规则全文 */
   rules: RuleQueryResult;
 }
@@ -131,6 +140,7 @@ export async function getSystemInfo(pool: HanaPool, opts?: SystemInfoOptions): P
 
   // 环境档案：进程内缓存；刷新只影响档案本身，主体信息每次现查
   const profile = await getEnvironmentProfile(pool, { refresh: opts?.refreshProfile });
+  const rt = currentEnvironmentRuntime();
 
   return {
     sid: row.SYSTEM_ID,
@@ -143,6 +153,17 @@ export async function getSystemInfo(pool: HanaPool, opts?: SystemInfoOptions): P
     currentUser: sess[0]?.CURRENT_USER ?? '',
     currentSchema: sess[0]?.CURRENT_SCHEMA ?? '',
     profile,
+    ...(rt?.multiEnv
+      ? {
+          environment: {
+            name: rt.label,
+            configKey: rt.configKey,
+            access: rt.access,
+            epoch: rt.epoch,
+            state: rt.state,
+          },
+        }
+      : {}),
     rules,
   };
 }

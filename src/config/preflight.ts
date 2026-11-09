@@ -125,7 +125,7 @@ export interface PolicyRequest {
 }
 
 /** 判定维度 */
-export type Dimension = 'capability' | 'resource' | 'deployment' | 'profile';
+export type Dimension = 'capability' | 'resource' | 'deployment' | 'profile' | 'environment';
 
 /** 单条判定结论 */
 export interface Grant {
@@ -331,9 +331,9 @@ export function policyFromConfig(config: HanaConfig, capability: ToolFilterConfi
       allowAnonymous: config.httpAllowAnonymous,
       tls: config.tls,
       sslValidate: config.sslValidate,
-      // HANA_XS_TLS 不经 HanaConfig 传递（core/xs-rest.ts 运行期直读进程环境变量）：
-      // 这里读同一来源，保证判定值与 XS 通道实际 scheme 同源
-      xsPlaintext: !isEnvTrue(process.env.HANA_XS_TLS),
+      // XS scheme：优先 runtime config.xsTls（多环境每环境可不同）；未给时回退进程级
+      // HANA_XS_TLS。判定值与 core/xs-rest.ts 的实际 scheme 同源。
+      xsPlaintext: !(config.xsTls ?? isEnvTrue(process.env.HANA_XS_TLS)),
     },
     source: '服务已加载配置',
   };

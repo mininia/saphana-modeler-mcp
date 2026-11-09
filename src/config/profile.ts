@@ -23,6 +23,7 @@
  */
 
 import type { HanaPool } from '../core/hana-client.js';
+import { currentEnvironmentLabel } from '../core/environment-context.js';
 import { logger, redactSensitive } from '../core/logger.js';
 
 /** 环境档案（经 hana_system_get_info 的 profile 字段暴露） */
@@ -148,10 +149,10 @@ async function probe(pool: HanaPool): Promise<EnvironmentProfile> {
   };
 }
 
-/** 进程内缓存（探测成功才写；一个进程只服务一个 HANA 目标，故不按池分键） */
-let cached: EnvironmentProfile | undefined;
-/** 并发去重：首次探测被多个请求同时触发时只探一次（HTTP 多客户端下这是常态路径） */
-let inflight: Promise<EnvironmentProfile> | undefined;
+/** 进程内缓存（按环境 LABEL 分键；DEV 与 PRD 的版本/SPS 档案互不串用） */
+const cachedByEnv = new Map<string, EnvironmentProfile>();
+/** 并发去重：同一环境首次探测被多个请求同时触发时只探一次（HTTP 多客户端下这是常态路径） */
+const inflightByEnv = new Map<string, Promise<EnvironmentProfile>>();
 
 /**
  * 取环境档案（进程内缓存，`opts.refresh` 强制重探）。**绝不抛错**：探测失败返回
@@ -159,27 +160,30 @@ let inflight: Promise<EnvironmentProfile> | undefined;
  */
 export async function getEnvironmentProfile(pool: HanaPool, opts?: { refresh?: boolean }): Promise<EnvironmentProfile> {
   const refresh = opts?.refresh === true;
+  const env = currentEnvironmentLabel();
+  const cached = cachedByEnv.get(env);
   if (!refresh && cached !== undefined) return cached;
+  const inflight = inflightByEnv.get(env);
   if (!refresh && inflight !== undefined) return inflight;
 
   const started = probe(pool)
     .then((profile) => {
-      cached = profile; // 成功（含部分字段缺失）才缓存；失败不缓存，留给下一次重试
+      cachedByEnv.set(env, profile); // 成功（含部分字段缺失）才缓存；失败不缓存，留给下一次重试
       return profile;
     })
     .catch((e: unknown): EnvironmentProfile => {
-      logger.warn({ err: e }, '环境档案探测失败（fail-open，不阻塞调用）');
+      logger.warn({ err: e, environment: env }, '环境档案探测失败（fail-open，不阻塞调用）');
       return { detected: false, note: `未探测到：${reasonOf(e)}` };
     })
     .finally(() => {
-      if (inflight === started) inflight = undefined;
+      if (inflightByEnv.get(env) === started) inflightByEnv.delete(env);
     });
-  inflight = started;
+  inflightByEnv.set(env, started);
   return started;
 }
 
 /** 清空档案缓存（仅测试用，与 resetKeyedLocks / resetTempCheckRegistry 等 reset* 入口对称） */
 export function resetEnvironmentProfileCache(): void {
-  cached = undefined;
-  inflight = undefined;
+  cachedByEnv.clear();
+  inflightByEnv.clear();
 }

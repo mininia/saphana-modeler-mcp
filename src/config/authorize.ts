@@ -39,6 +39,7 @@
  */
 
 import { assembleVerdict, checkDeployment, runPreflight, type Grant, type Policy, type Verdict } from './preflight.js';
+import { environmentGrants } from './environment-policy.js';
 import { profileAllows, type CallerProfile } from './profiles.js';
 import { isPackageAllowed } from './write-boundary.js';
 import { planFor } from '../capabilities/manifest.js';
@@ -47,6 +48,7 @@ import type { Capability } from '../capabilities/types.js';
 import { isSchemaAllowedWith } from '../core/sql.js';
 import { BLOCKED_PREFIX, mcpErrorText } from '../core/errors.js';
 import { currentAgentLabel, currentIdentity } from '../core/request-context.js';
+import { currentEnvironmentRuntime } from '../core/environment-context.js';
 import { logger } from '../core/logger.js';
 import { formatWritePlan, planToRequest, type WritePlan } from '../write-plan.js';
 import { sqlFingerprint } from '../services/sql-execute.rules.js';
@@ -125,6 +127,16 @@ export interface CapabilityAuditEvent {
   transport?: 'http' | 'stdio';
   /** 调用方档案名（未配档案时为隐式 default） */
   profileId?: string;
+  /** 执行环境（LABEL）；仅多环境部署产生 */
+  environment?: string;
+  /** 执行时的环境 epoch；仅多环境部署产生 */
+  epoch?: number;
+  /** 执行环境的只读/可写策略；仅多环境部署产生 */
+  access?: 'readwrite' | 'readonly';
+  /** 配置键命名空间（排障用）；仅多环境部署产生 */
+  configKey?: string;
+  /** 调用发起时的环境（LABEL）；仅多环境部署产生 */
+  calledFromEnvironment?: string;
   /** 进程级归因标签（MCP_AGENT_LABEL；未配置时不产生该字段） */
   agentLabel?: string;
   /** 归因入口（门面路由时 = 门面 id） */
@@ -196,6 +208,17 @@ export function authorizeCall(
   const { policy, profile } = ctx;
   const identity = ctx.caller ?? currentCaller();
   const agentLabel = ctx.agentLabel ?? currentAgentLabel();
+  const runtime = currentEnvironmentRuntime();
+  // 单环境不产生环境字段，保持旧输出逐字兼容。
+  const envAudit = runtime?.multiEnv
+    ? {
+        environment: runtime.label,
+        epoch: runtime.epoch,
+        access: runtime.access,
+        configKey: runtime.configKey,
+        calledFromEnvironment: runtime.label,
+      }
+    : {};
 
   // 未登记能力：**在规划之前就拒绝**——拒绝依据不得依赖入参：
   // 一旦让 args 参与，回执里的规则码就会随入参变化——那本身就是一条存在性/形状探针。
@@ -221,6 +244,7 @@ export function authorizeCall(
       ...(identity.transport ? { transport: identity.transport } : {}),
       ...(profile ? { profileId: profile.id } : {}),
       ...(agentLabel ? { agentLabel } : {}),
+      ...envAudit,
       ...(ctx.via ? { via: ctx.via } : {}),
       ...(unknownTarget ? { target: unknownTarget } : {}),
       resources: { writePackages: [], readSchemas: [], readPackages: [] },
@@ -242,7 +266,10 @@ export function authorizeCall(
         `；读 schema ${plan.readSchemas.length ? plan.readSchemas.join(', ') : '(无)'}` +
         `；跨包只读引用 ${plan.readPackages.length ? plan.readPackages.join(', ') : '(无)'}`,
     ],
-    extraGrants: checkProfile(capability, plan, profile, (policy.profiles?.size ?? 0) > 0),
+    extraGrants: [
+      ...checkProfile(capability, plan, profile, (policy.profiles?.size ?? 0) > 0),
+      ...environmentGrants(capability, args, runtime),
+    ],
   });
 
   const target = auditTargetOf(args);
@@ -254,6 +281,7 @@ export function authorizeCall(
     ...(identity.transport ? { transport: identity.transport } : {}),
     ...(profile ? { profileId: profile.id } : {}),
     ...(agentLabel ? { agentLabel } : {}),
+    ...envAudit,
     ...(ctx.via ? { via: ctx.via } : {}),
     ...(target ? { target } : {}),
     resources: {

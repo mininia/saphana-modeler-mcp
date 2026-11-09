@@ -3,6 +3,7 @@ import type { Envelope, HanaMessage } from '../types/hana.js';
 import { isEmptyResultMarked, liftResultInfo } from './result-info.js';
 import { logger, redactSensitive } from './logger.js';
 import { currentAgentLabel, currentClientId } from './request-context.js';
+import { currentEnvironmentRuntime } from './environment-context.js';
 
 /**
  * 乐观锁冲突（412）/ 目标缺失（404）的机读载荷，经 withErrorEnvelope 进 envelope.raw.conflict。
@@ -119,8 +120,20 @@ export async function withErrorEnvelope<T>(fn: () => Promise<T>): Promise<Envelo
   // agentLabel 是进程级的，stdio 下同样有值）
   const clientId = currentClientId();
   const agentLabel = currentAgentLabel();
+  const runtime = currentEnvironmentRuntime();
+  // 单环境不产生环境字段，保持旧输出逐字兼容；多环境附执行环境与入口环境。
+  const envFields = runtime?.multiEnv
+    ? {
+        environment: runtime.label,
+        epoch: runtime.epoch,
+        access: runtime.access,
+        configKey: runtime.configKey,
+        calledFromEnvironment: runtime.label,
+      }
+    : {};
   const withIdentity = (e: Envelope): Envelope => ({
     ...e,
+    ...envFields,
     ...(clientId ? { clientId } : {}),
     ...(agentLabel ? { agentLabel } : {}),
   });

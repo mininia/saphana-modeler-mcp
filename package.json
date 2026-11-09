@@ -58,6 +58,8 @@
     "verify:changeset": "npm run build && node test-verification/verify-changeset.mjs",
     "verify:ops": "npm run build && node test-verification/verify-ops.mjs",
     "verify:tasks": "npm run build && node test-verification/verify-tasks.mjs",
+    "verify:multi-env": "npm run build && node test-verification/verify-multi-env.mjs",
+    "verify:multi-env-http": "npm run build && node test-verification/verify-http-multi-env.mjs",
     "release:pack": "npm run build && node -e \"const{execSync}=require('child_process');const[info]=JSON.parse(execSync('npm pack --dry-run --json --ignore-scripts',{encoding:'utf8'}));const files=info.files.map((f)=>f.path);if(!files.includes('dist/index.js')){console.error('release:pack 中止：打包清单缺少 dist/index.js，会出现无代码空壳包');process.exit(1);}console.log('release:pack 产物校验通过：dist/index.js 已在打包清单中（共 '+files.length+' 个文件）');\" && npm pack"
   },
   "dependencies": {

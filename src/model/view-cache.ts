@@ -1,5 +1,6 @@
 import type { HanaPool } from '../core/hana-client.js';
 import { quoteIdentifier } from '../core/sql.js';
+import { currentEnvironmentLabel } from '../core/environment-context.js';
 import { getViewDefinition, suffixInClause, suffixesOf } from '../services/metadata.service.js';
 import type { ViewDefinitionResult } from '../services/metadata.service.js';
 import type { ViewDefinition, ViewKind } from './view-types.js';
@@ -49,7 +50,8 @@ export class ViewDefinitionCache {
     // 与 getViewDefinition 是同一条对象表查询口径，过滤语义演进时不会分叉。
     const suffixes = suffixesOf(opts.kind);
     const version = opts.version ?? 'active';
-    const key = `${packageId}/${objectName}/${suffixes.join(',')}/${version}`;
+    // 环境维度：DEV 与 PRD 同名对象可能 VERSION_ID 相同，key 不带环境会串定义。
+    const key = `${currentEnvironmentLabel()}/${packageId}/${objectName}/${suffixes.join(',')}/${version}`;
     const entry = this.entries.get(key);
 
     if (entry && Date.now() - entry.cachedAt < this.ttlMs) {
@@ -94,7 +96,7 @@ export class ViewDefinitionCache {
    * 退回 TTL/版本自愈，不会误删别的对象。
    */
   invalidate(packageId: string, objectName: string): number {
-    const prefix = `${packageId}/${objectName}/`;
+    const prefix = `${currentEnvironmentLabel()}/${packageId}/${objectName}/`;
     let removed = 0;
     for (const key of this.entries.keys()) {
       if (key.startsWith(prefix)) {

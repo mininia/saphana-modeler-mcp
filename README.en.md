@@ -26,6 +26,7 @@ operations actions are among the plans for the future.
 | Category | Capability | Tools |
 | --- | --- | --- |
 | System | Version info, user privileges & modeling capability self-check | `hana_system_get_info`, `hana_check_privileges` |
+| Environment (multi-env) | Environment list with read-only/readwrite flags, one-time token switching | `hana_env_list`, `hana_env_switch` |
 | Package | Package list/tree, objects in a package (with activation status), create package | `hana_package_list`, `hana_package_list_objects`, `hana_package_create` |
 | Metadata | Full definition read, object search, field list, single-field logic tracing, lineage | `hana_metadata_get_view`, `hana_metadata_search_objects`, `hana_metadata_list_fields`, `hana_metadata_get_field_logic`, `hana_metadata_where_used` |
 | Table catalog | Accessible table list, table column structure | `hana_table_list`, `hana_table_columns` |
@@ -73,6 +74,8 @@ Connection info is only allowed from environment variables / `mcp.json` `env` (*
 | **Streamable HTTP** (you run `npm start` / a container) | Nothing spawns the process on your behalf, so **`mcp.json` plays no part**; the source is the shell/container environment → `.env` as fallback |
 
 `.env` is looked up in the **working directory first, then the project root** (`dist/` two levels up), and it applies **per variable** — `process.loadEnvFile` never overwrites variables that already exist. So if only part of the credential triple comes from the external environment, the two sources get mixed (the classic case: a leftover `HANA_USER` in your shell silently wins over the one in `.env` while everything else comes from `.env`), which can connect you to a different environment. When the server detects connection targets/credentials coming from more than one source it logs a startup **warning** naming each variable's source — use it to clean up the stray variables.
+
+**Multiple HANA environments (optional):** a single environment needs no `_ENV_` variables. Override only per-environment differences with `HANA_<PARAM>_ENV_<XXXX>`, use `LABEL` as the system identifier, and switch with `hana_env_list` + `hana_env_switch`; over HTTP use `MCP_HTTP_CLIENT_ENVS` for Token→environment binding. Full rules and examples: [CONFIG.md](CONFIG.md).
 
 | Option | Required | Description | Example |
 | --- | --- | --- | --- |
@@ -197,9 +200,9 @@ Every concrete capability stays (nothing was removed — all of them are still r
 the six category facades** — concrete capabilities are indexed and promoted on demand
 (mirrors SAP hana-cli's `discover_by_category` + `hana_execute`). There is one standalone seventh root tool: `hana_sql_execute` — after the
 `sql` group is explicitly enabled it is resident alongside the facades (when the group is off it is
-completely invisible — not in `tools/list`, not in any facade description/index, and never mentioned in hints). It is not a member of any facade. Enable it with `HANA_TOOL_GROUPS=read,write,admin,sql` (or `HANA_TOOL_ALLOW=hana_sql_execute`).
+completely invisible — not in `tools/list`, not in any facade description/index, and never mentioned in hints). It is not a member of any facade.
 
-`hana_sql_execute` is **called only when the user explicitly asks to execute SQL** — not for probing, verification, or replacing dedicated tools. Safe defaults: single statement + single physical line (`HANA_SQL_ALLOW_MULTI_STATEMENT=true` unlocks multi-line/multi-statement; with writes the server opens a transaction on one pooled connection and commits only if all statements succeed); explicit transaction control and session-state-changing `SET` are always rejected; admin statements are allowed by default (constrained by database privileges; `EXPLAIN` is still redirected to `hana_sql_analyze`, and anonymous `DO` blocks / procedure bodies are unsupported); `maxRows`/`timeoutMs` are tool parameters (defaults `500` / `60000`); `async=true` returns a `taskId` polled via `hana_task_get` (requires the `read` group); the server performs **no schema-level interception** — what you can touch is decided by the HANA account's privileges; the audit record keeps only the SQL sha256 fingerprint and character count — **never the SQL text**. See CONFIG.md's "Direct HANA SQL execution" section.
+`hana_sql_execute` is **called only when the user explicitly asks to execute SQL** — not for probing, verification, or replacing dedicated tools. Statement/transaction/admin rules plus `maxRows`, `timeoutMs` and `async` are documented in CONFIG.md.
 
 ```
 registered surface = (six facades ∪ entitled root tools ∪ members of promoted categories) ∩ deployment policy ∩ caller profile
@@ -247,9 +250,9 @@ Live verification: `npm run verify:authz` (covers all of the above).
 
 | Group | Description | Capabilities |
 | --- | --- | --- |
-| **read** (data read) | Access to HANA data/metadata/system info — no repository changes | `hana_system_get_info`, `hana_check_privileges`, `hana_package_list`, `hana_package_list_objects`, `hana_metadata_get_view`, `hana_metadata_search_objects`, `hana_metadata_list_fields`, `hana_metadata_get_field_logic`, `hana_metadata_where_used`, `hana_table_list`, `hana_table_columns`, `hana_data_preview`, `hana_data_preview_diagnose`, `hana_task_get` |
+| **read** (data read) | Access to HANA data/metadata/system info — no repository changes | `hana_system_get_info`, `hana_check_privileges`, `hana_package_list`, `hana_package_list_objects`, `hana_metadata_get_view`, `hana_metadata_search_objects`, `hana_metadata_list_fields`, `hana_metadata_get_field_logic`, `hana_metadata_where_used`, `hana_table_list`, `hana_table_columns`, `hana_data_preview`, `hana_data_preview_diagnose`, `hana_task_get` (multi-env also `hana_env_list`) |
 | **write** (write ops) | Modifies design-time repository objects/packages (create/activate/update/delete/design-time validate) plus arbitrary-SQL analysis and cancelling async tasks | `hana_package_create`, `hana_view_create`, `hana_view_activate`, `hana_view_update`, `hana_view_delete`, `hana_view_validate`, `hana_view_check_actions`, `hana_sql_analyze`, `hana_task_cancel` |
-| **admin** (admin ops) | Transfer / Change-Tracking APIs and the system-monitoring surface (the tightened exposure tier) | `hana_repo_export`, `hana_repo_import`, `hana_repo_changelist`, `hana_system_health`, `hana_system_activity`, `hana_table_storage`, `hana_system_trend` |
+| **admin** (admin ops) | Transfer / Change-Tracking APIs and the system-monitoring surface (the tightened exposure tier) | `hana_repo_export`, `hana_repo_import`, `hana_repo_changelist`, `hana_system_health`, `hana_system_activity`, `hana_table_storage`, `hana_system_trend` (multi-env also route-only `hana_env_switch`) |
 | **sql** (direct SQL execution, **off by default**) | Standalone seventh root tool: execute SQL directly on HANA (read/write/admin statements). An empty `HANA_TOOL_GROUPS` does **not** enable it; use `HANA_TOOL_GROUPS=sql` or `HANA_TOOL_ALLOW=hana_sql_execute`. When off it is completely invisible (not in `tools/list`, not in any facade description/index, never mentioned in hints) | `hana_sql_execute` |
 
 > **The facade layer is unrestricted.** There is exactly **one permission layer — the capability layer**: the six facades are *entrances* and stay resident in `tools/list` under any group configuration (they disappear only via an explicit `HANA_TOOL_DENY` on the facade id, or on all of its members). The group switch only decides the **capability layer** — index / routing / promotion / calls are all judged by the **target** capability's kind. A read-only deployment therefore still sees `hana_modeling` / `hana_diagnostics`, but their indexes list only what you are entitled to — `hana_modeling` keeps its read-tier `hana_task_get` (async-task polling), `hana_diagnostics` is empty (the entrance is there, only what you may use appears inside).
@@ -333,7 +336,7 @@ Beyond the basic facts, `hana_system_get_info` returns two **on-demand** items (
 
 ## Tool Reference
 
-31 business capabilities + 8 `hana_view_update#<op>` operation aliases (route-only; never registered as tools) + 6 facades derived from them, all carrying annotations (`readOnlyHint` / `destructiveHint` / `idempotentHint`) so hosts can auto-approve and confirm dangerous operations.
+31 business capabilities + 8 `hana_view_update#<op>` operation aliases (route-only; never registered as tools) + 6 facades derived from them, all carrying annotations (`readOnlyHint` / `destructiveHint` / `idempotentHint`) so hosts can auto-approve and confirm dangerous operations. Multi-environment deployments additionally expose two control capabilities (`hana_env_list`, `hana_env_switch`), which are not part of the 31 and disappear entirely in single-environment mode.
 
 > **These capabilities are not on the registered surface**: `tools/list` holds only the six category facades, and every row below is reached via "call a facade with no arguments → take the category index → call the facade with `capability` + `args`". The id in this table is both the capability id and the value for the router's `capability` field.
 
@@ -341,6 +344,8 @@ Beyond the basic facts, `hana_system_get_info` returns two **on-demand** items (
 | --- | --- | --- |
 | `hana_system_get_info` | `hana_system` | read-only | Version/SID/host/instance/current user & schema; plus environment `profile` and the rules catalog (`rules`: omitted = catalog, `all`/rule ids = full text) |
 | `hana_check_privileges` | `hana_system` | read-only | Current user's privilege matrix & modeling capability summary (troubleshooting entry point) |
+| `hana_env_list` | `hana_system` | read-only (multi-env) | List environments and issue a one-time switch token (stdio only; requires `hana_env_switch` to be reachable) |
+| `hana_env_switch` | `hana_system` | admin (multi-env, route-only) | Switch the process's active environment; HTTP refuses |
 | `hana_metadata_get_view` | `hana_discovery` | read-only | Full view definition: json=structured definition (nodes/data sources/output fields/variables), xml=raw design-time XML; `version` defaults to `active`; `inactive` reads the unactivated/pending version |
 | `hana_package_list` | `hana_discovery` | read-only | Repository package list (with hierarchy depth, owner; supports fragment filter/truncation) |
 | `hana_package_list_objects` | `hana_discovery` | read-only | Objects in a package (name/type/version/activation status; supports filter/truncation) |
@@ -375,7 +380,7 @@ Beyond the basic facts, `hana_system_get_info` returns two **on-demand** items (
 
 | Facade | Category | Direction | Members |
 | --- | --- | --- | --- |
-| `hana_system` | system | Connection & environment: who you are and what you are connected to (version, privilege tier, rules catalog) | 2 |
+| `hana_system` | system | Connection & environment: who you are and what you are connected to (version, privilege tier, rules catalog); in multi-env mode also environment list & switching | 2 (3 in multi-env) |
 | `hana_discovery` | discovery | Browse & find: packages/objects/tables, their definitions and field structure | 7 |
 | `hana_data` | data | Data preview: read rows from activated views and base tables (plus preview diagnosis) | 2 |
 | `hana_insights` | insights | Structure & lineage analysis: what depends on it, field-level calculation logic | 2 |

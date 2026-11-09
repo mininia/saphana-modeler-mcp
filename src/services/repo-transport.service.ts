@@ -3,6 +3,7 @@ import { toHanaDateTime } from '../core/datetime.js';
 import { BLOCKED_PREFIX, HanaBusinessError } from '../core/errors.js';
 import { withKeyedLock } from '../core/keyed-mutex.js';
 import { logger } from '../core/logger.js';
+import { currentDatabaseScopeKey } from '../core/environment-context.js';
 import { currentAgentLabel, currentClientId } from '../core/request-context.js';
 import { PACKAGE_ID_RE } from '../core/sql.js';
 import { isPackageAllowed } from '../config/write-boundary.js';
@@ -98,7 +99,9 @@ export function assertWritePackageAllowed(packageId: string, objectName?: string
  * 现有各路径均满足「各自只取一次、不嵌套」（详见各调用点注释）。
  */
 export function writeLockKey(packageId: string, objectName: string): string {
-  return `${packageId}/${objectName}`;
+  // **物理库**维度（host:port/dbName）：同一租户下的同名包/对象必须互斥——两个 LABEL 指向
+  // 同一库时仍是同一份仓库状态；不同库的同名对象则互不阻塞。未进入环境上下文时回退 default。
+  return `${currentDatabaseScopeKey()}:${packageId}/${objectName}`;
 }
 
 const u32le = (n: number): Buffer => {

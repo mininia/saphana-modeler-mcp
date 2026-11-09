@@ -4,6 +4,7 @@
  */
 
 import { z } from 'zod';
+import { planReadless } from '../planners.js';
 import { cap, type Capability } from '../types.js';
 
 export const systemCapabilities = {
@@ -38,5 +39,44 @@ export const systemCapabilities = {
       '返回当前 HANA 用户的有效权限矩阵：角色、系统权限、有 SELECT 的 schema 列表、REPO.* 仓库权限，以及建模能力摘要（读仓库/写仓库/激活/读元数据/读数据）。用于排查连接用户是否具备仓库读写与视图激活权限',
     inputSchema: z.object({}),
     annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  }),
+  hana_env_list: cap({
+    id: 'hana_env_list',
+    category: 'system',
+    kind: 'read',
+    rootTool: true,
+    effects: { destructive: false, idempotent: true },
+    title: '列出 HANA 环境',
+    description:
+      '列出本进程配置的 HANA 环境：当前 active 环境（LABEL）、每个环境的 access/state/运行任务数，' +
+      '以及可切列表与一次性 switchToken。多环境部署才注册；不连 HANA，当前环境不可用时也能查看。' +
+      '切换用 hana_system({capability:"hana_env_switch"})，token 由本工具发放。',
+    inputSchema: z.object({}),
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  }),
+  hana_env_switch: cap({
+    id: 'hana_env_switch',
+    category: 'system',
+    kind: 'admin',
+    routeOnly: true,
+    control: true,
+    effects: { destructive: true, idempotent: false, plan: () => planReadless('hana_env_switch') },
+    title: '切换 HANA 环境',
+    description:
+      '切换当前 active 环境（多环境、stdio）。必须先用 hana_env_list 获取 from/epoch/switchToken，' +
+      'confirm 逐字等于目标 LABEL；目标有运行中任务时需 acknowledgeRunningTasks=true。' +
+      'HTTP 模式拒绝（多客户端共享进程）。只经 hana_system 门面路由，不注册为平铺工具。',
+    inputSchema: z.object({
+      to: z.string().min(1).max(32).describe('目标环境 LABEL（见 hana_env_list 返回的 name）'),
+      from: z.string().min(1).max(32).describe('当前环境 LABEL；必须与 hana_env_list 的 current 一致'),
+      epoch: z.number().int().min(1).describe('hana_env_list 返回的 epoch；过期则拒绝'),
+      switchToken: z.string().min(8).max(128).describe('hana_env_list 发放的一次性 token'),
+      confirm: z.string().min(1).max(32).describe('必须逐字等于 to'),
+      acknowledgeRunningTasks: z
+        .boolean()
+        .optional()
+        .describe('目标环境有运行中任务时必须显式 true，表示接受新调用与任务共享池'),
+    }),
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
   }),
 } satisfies Record<string, Capability<z.ZodType>>;

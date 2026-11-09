@@ -25,6 +25,11 @@
 
 import { randomUUID } from 'node:crypto';
 import { HanaBusinessError } from './errors.js';
+import {
+  currentEnvironmentLabel,
+  currentEnvironmentRuntime,
+  reclaimDrainingEnvironment,
+} from './environment-context.js';
 import { TASK_MAX_RETAINED_DEFAULT, TASK_MAX_RUNNING_DEFAULT, TASK_TTL_MS_DEFAULT } from './limits.js';
 
 export type TaskStatus = 'working' | 'completed' | 'failed' | 'cancelled';
@@ -46,6 +51,16 @@ export interface TaskRecord {
   owner: string;
   /** 任务种类（决定取消语义与回执措辞） */
   kind: TaskKind;
+  /** 提交时的环境系统标识（LABEL）；任务体在提交时捕获的 runtime 下执行 */
+  environment: string;
+  /** 提交时的环境 epoch（用于回执/审计还原；P1/P2 恒为当前值） */
+  envEpoch: number;
+  /** 提交时环境的只读/可写策略（审计回执用） */
+  envAccess: 'readwrite' | 'readonly';
+  /** 提交时环境的配置键（排障用） */
+  envConfigKey: string;
+  /** 是否为多环境部署（单环境不产生环境字段，保持旧输出） */
+  multiEnv: boolean;
   /** 一句话说明（如 `changeset PKG/CV_A +2`），给轮询方认领用 */
   label: string;
   status: TaskStatus;
@@ -71,6 +86,15 @@ export function resetTaskRegistry(): void {
 export function countRunningTasks(): number {
   let n = 0;
   for (const t of tasks.values()) if (!TERMINAL.has(t.status)) n++;
+  return n;
+}
+
+/** 某环境（LABEL）当前运行中的任务数；切换前据此判断是否需要 acknowledgeRunningTasks */
+export function countRunningTasksForEnvironment(environment: string): number {
+  let n = 0;
+  for (const t of tasks.values()) {
+    if (!TERMINAL.has(t.status) && t.environment === environment) n++;
+  }
   return n;
 }
 
@@ -107,10 +131,19 @@ export function createTask(owner: string, label: string, total: number, kind: Ta
     );
   }
   const iso = new Date(now).toISOString();
+  const runtime = currentEnvironmentRuntime();
+  // 任务租约：提交时 +1；终态 patch 时 -1（任务体在捕获的 runtime 下执行）
+  if (runtime) runtime.taskRefs += 1;
   const record: TaskRecord = {
     id: randomUUID(),
     owner,
     kind,
+    // 提交时捕获环境：任务体之后即使切换 active，也不会跑到新环境上
+    environment: runtime?.label ?? currentEnvironmentLabel(),
+    envEpoch: runtime?.epoch ?? 1,
+    envAccess: runtime?.access ?? 'readwrite',
+    envConfigKey: runtime?.configKey ?? 'default',
+    multiEnv: runtime?.multiEnv ?? false,
     label,
     status: 'working',
     createdAt: iso,
@@ -141,11 +174,20 @@ export function patchTask(
   const t = tasks.get(id);
   if (!t) return undefined;
   if (TERMINAL.has(t.status) && patch.status !== undefined && patch.status !== t.status) return t;
+  const wasTerminal = TERMINAL.has(t.status);
   if (patch.done !== undefined) t.progress.done = patch.done;
   if (patch.current !== undefined) t.progress = { ...t.progress, current: patch.current };
   if (patch.status !== undefined) t.status = patch.status;
   if (patch.result !== undefined) t.result = patch.result;
   if (patch.errorText !== undefined) t.errorText = patch.errorText;
+  if (!wasTerminal && TERMINAL.has(t.status)) {
+    const runtime = currentEnvironmentRuntime();
+    if (runtime && runtime.label === t.environment) {
+      runtime.taskRefs = Math.max(0, runtime.taskRefs - 1);
+      // 切走后进入 task-draining 的环境：最后一个任务结束且没有在途调用时回收池。
+      reclaimDrainingEnvironment(runtime);
+    }
+  }
   t.updatedAt = new Date().toISOString();
   return t;
 }

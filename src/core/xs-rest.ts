@@ -330,8 +330,10 @@ export class XsRestClient {
   constructor(config: HanaConfig) {
     const host = config.host;
     const port = resolveXsPort(config);
-    // scheme：默认明文 http（XS 端点未开 TLS 时唯一可用）；HANA_XS_TLS=true 显式切 https
-    this.baseUrl = `${xsSchemeFromEnv()}://${host}:${port}`;
+    // scheme：优先 runtime config.xsTls（多环境每环境可不同）；未给时回退进程级
+    // HANA_XS_TLS（默认明文 http，仅显式真值切 https）。
+    const scheme = config.xsTls === undefined ? xsSchemeFromEnv() : config.xsTls ? 'https' : 'http';
+    this.baseUrl = `${scheme}://${host}:${port}`;
     // 默认值单点在 XS_BASE_PATH（本文件），config 的 HANA_XS_BASE_PATH zod default 引用同一常量；
     // 这里保留兜底是因为 XsRestClient 要对"字段缺失的配置"也能给出可用行为，而不是 TypeError
     this.basePath = (config.xsBasePath ?? XS_BASE_PATH).replace(/\/+$/, '');
