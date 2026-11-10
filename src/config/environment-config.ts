@@ -38,8 +38,8 @@ export interface LoadedEnvironments {
 
 /** 环境名（`_ENV_` 后面的配置键命名空间） */
 const ENV_KEY_RE = /^[A-Z][A-Z0-9_]{0,31}$/;
-/** 系统标识（LABEL）；`default` 是基础环境保留值 */
-const LABEL_RE = /^[A-Z][A-Z0-9_]{0,31}$/;
+/** 系统标识（LABEL）；大小写、数字、`_`、`-`，最长 32 字符；`default` 是基础环境保留值 */
+const LABEL_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/;
 /** 不允许作为配置键/环境名的保留字 */
 const RESERVED_KEYS = new Set(['DEFAULT', 'START', 'SWITCHABLE', 'CONFIG']);
 
@@ -128,7 +128,7 @@ function parseLabel(key: string, raw: unknown): string | undefined {
   const s = nonEmpty(raw);
   if (s === undefined) return undefined;
   if (!LABEL_RE.test(s)) {
-    throw new Error(`${key} 非法：LABEL 必须匹配 ${LABEL_RE}（如 PRD_CN；default 保留给基础环境）`);
+    throw new Error(`${key} 非法：LABEL 必须匹配 ${LABEL_RE}（如 bwd / PRD_CN；default 保留给基础环境）`);
   }
   return s;
 }
@@ -145,7 +145,7 @@ function validateLabel(label: string, configKey: string, allowDefault: boolean):
   if (allowDefault && label === 'default') return;
   if (!LABEL_RE.test(label)) {
     throw new Error(
-      `环境 ${configKey} 的 LABEL "${label}" 非法：必须匹配 ${LABEL_RE}（如 PRD_CN）；` + '只允许基础环境使用 default',
+      `环境 ${configKey} 的 LABEL "${label}" 非法：必须匹配 ${LABEL_RE}（如 bwd / PRD_CN）；` + '只允许基础环境使用 default',
     );
   }
 }

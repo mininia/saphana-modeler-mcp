@@ -83,7 +83,7 @@
 
 - 共用参数保持原名（`HANA_HOST` / `HANA_PORT` / `HANA_USER` / `HANA_PASSWORD` / `HANA_DB_NAME` / `HANA_TLS` / `HANA_SSL_VALIDATE` / `HANA_LOCALE` / `HANA_XS_PORT` / `HANA_XS_TLS` / `HANA_XS_BASE_PATH` / `HANA_ACCESS` / `HANA_LABEL`）；它们也是基础环境。
 - 命名环境用 `HANA_<PARAM>_ENV_<XXXX>` 覆盖；`XXXX` 匹配 `^[A-Z][A-Z0-9_]{0,31}$`。未写的字段继承共用值（包括 `ACCESS`）。
-- `LABEL` 是 MCP 识别的系统标识：基础环境用 `HANA_LABEL`（默认 `default`），命名环境用 `HANA_LABEL_ENV_<XXXX>`（默认 `XXXX`）。`LABEL` 必须唯一；`HANA_ENV_START` / `HANA_ENV_SWITCHABLE` / `hana_env_switch` / 回执 / 审计都用它。
+- `LABEL` 是 MCP 识别的系统标识：基础环境用 `HANA_LABEL`（默认 `default`），命名环境用 `HANA_LABEL_ENV_<XXXX>`（默认 `XXXX`）。大小写字母/数字/`_`/`-`，最长 32 字符；必须唯一；`HANA_ENV_START` / `HANA_ENV_SWITCHABLE` / `hana_env_switch` / 回执 / 审计都用它。
 - 只读环境（`ACCESS=readonly`）：拒绝变更类能力；行为只读的 admin（健康诊断/导出/变更列表）不受影响；`hana_sql_execute` 由 `HANA_READONLY_SQL` 控制（`select-only` 下只允许 SELECT，并拒绝 `FOR UPDATE` / `FOR SHARE` / `NEXTVAL`）。**单环境同样生效**。
 - 多环境变更类调用必须带 `expectedEnvironment=<当前 LABEL>`（门面索引的 `params` 已包含该字段）。
 - `hana_env_list` 发放一次性 `switchToken`（仅 stdio 且 switch 可达时）；`hana_env_switch` 是 route-only，HTTP 拒绝且不进索引；目标有运行中任务时需 `acknowledgeRunningTasks=true`。
