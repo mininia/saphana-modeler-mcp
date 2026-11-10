@@ -57,7 +57,7 @@ node scripts/smoke-stdio.mjs   # 冒烟：握手 + 工具注册（无需真实 H
 | `HANA_HOST` / `HANA_PORT` | HANA 主机与 SQL 端口（端口必填，纯数字） |
 | `HANA_USER` / `HANA_PASSWORD` | 数据库用户名与密码 |
 
-MDC 环境还需 `HANA_DB_NAME`。缺失必填项时服务启动即失败。
+MDC 指定租户时需 `HANA_DB_NAME`；非 MDC 可省略。缺失必填项时服务启动即失败。
 
 `HANA_XS_PORT`（XS 设计时 REST 端口）**非必填，默认 8010**；非默认实例/租户请显式覆盖。
 

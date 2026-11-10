@@ -33,7 +33,7 @@
 | `HANA_USER` | ✅ | 数据库用户名 | — |
 | `HANA_PASSWORD` | ✅ | 密码 | — |
 | `HANA_LOCALE` | 可选 | 连接语言，默认 `zh` | `zh` |
-| `HANA_DB_NAME` | 可选 | 租户数据库名（MDC 必填） | `SYSTEMDB` / 业务租户名 |
+| `HANA_DB_NAME` | 可选 | 租户数据库名（MDC 指定租户时填写；非 MDC 可省略） | `SYSTEMDB` / 业务租户名 |
 | `HANA_ACCESS` | 可选 | 环境只读/可写策略：`readwrite`（默认）/ `readonly`（拒绝变更类能力；行为只读的 admin 不受影响；单环境同样生效） | `readonly` |
 | `HANA_LABEL` | 可选 | 基础环境的系统标识（多环境）；默认 `default`。命名环境用 `HANA_LABEL_ENV_<XXXX>` 覆盖 | `PRD_CN` |
 | `HANA_ENV_START` | 可选 | 启动环境 LABEL；默认基础环境的 `LABEL`（未设 `HANA_LABEL` 时为 `default`） | `PRD_CN` |

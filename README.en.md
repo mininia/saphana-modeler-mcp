@@ -84,7 +84,7 @@ Connection info is only allowed from environment variables / `mcp.json` `env` (*
 | `HANA_USER` | ✅ | Database username | — |
 | `HANA_PASSWORD` | ✅ | Password | — |
 | `HANA_LOCALE` | optional | Connection locale, default `zh` | `zh` |
-| `HANA_DB_NAME` | optional | Tenant database name (required for MDC) | `SYSTEMDB` / tenant name |
+| `HANA_DB_NAME` | optional | Tenant database name (set when targeting a tenant in MDC; omit otherwise) | `SYSTEMDB` / tenant name |
 | `HANA_TLS` | optional | TLS encryption, default `true` (fail-closed; set `false` only on trusted links) | `true` |
 | `HANA_SSL_VALIDATE` | optional | Validate certificate under TLS, default `true`; set `false` for self-signed certs | `true` |
 | `HANA_TIMEZONE` | optional | Process timezone (sets `TZ`, affecting log timestamps and local-time semantics); **not pushed down to the HANA session**. Default `Asia/Shanghai` | `Asia/Shanghai` |

@@ -136,7 +136,7 @@ const envSchema = z.object({
   HANA_PASSWORD: z.string().min(1),
   /** 连接 Locale（默认 zh），影响服务器端语言/错误消息 */
   HANA_LOCALE: z.string().min(1).default(DEFAULT_LOCALE),
-  /** 租户数据库名（MDC 环境必填，如 SYSTEMDB / 业务租户名） */
+  /** 租户数据库名（MDC 指定租户时填写，如 SYSTEMDB / 业务租户名；非 MDC 可省略） */
   HANA_DB_NAME: z.string().min(1).optional(),
   /**
    * 环境的只读/可写策略（多环境）。基础环境用 HANA_ACCESS；命名环境用
