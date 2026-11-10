@@ -5,6 +5,7 @@ import { splitList } from '../core/text.js';
 import { getEnvironmentProfile, type EnvironmentProfile } from '../config/profile.js';
 import { currentEnvironmentRuntime } from '../core/environment-context.js';
 import { RULES, RULE_IDS, getRules, type RuleId, type RuleObject } from '../rules/index.js';
+import { SERVER_NAME, SERVER_VERSION } from '../version.js';
 
 /** 规则目录条目（省 token 的索引：只给 id + title；要看全文再传 rules=<id>） */
 export interface RuleCatalogEntry {
@@ -38,6 +39,7 @@ export interface SystemInfo {
   sid: string;
   database: string;
   host: string;
+  /** HANA 数据库版本（不是 MCP 服务版本；后者见 mcpServer.version） */
   version: string;
   usage: string;
   startedAt: string;
@@ -45,6 +47,17 @@ export interface SystemInfo {
   hostInfo: Record<string, string>;
   currentUser: string;
   currentSchema: string;
+  /**
+   * 本 MCP 服务自身身份（与 HANA 数据库的 version 区分）：
+   * name/version 来自 package.json（src/version.ts 单一来源），node 为进程运行时版本。
+   * 同一信息在协议层也可见：legacy 见 initialize 的 serverInfo，modern 见每条结果的
+   * `_meta["io.modelcontextprotocol/serverInfo"]`。
+   */
+  mcpServer: {
+    name: string;
+    version: string;
+    node: string;
+  };
   /** 环境档案：首次调用时探测一次并进程内缓存；探测失败 fail-open（detected:false + note），不影响其余信息 */
   profile: EnvironmentProfile;
   /** 多环境身份（单环境不产生）：当前 LABEL / access / epoch / state */
@@ -152,6 +165,7 @@ export async function getSystemInfo(pool: HanaPool, opts?: SystemInfoOptions): P
     hostInfo,
     currentUser: sess[0]?.CURRENT_USER ?? '',
     currentSchema: sess[0]?.CURRENT_SCHEMA ?? '',
+    mcpServer: { name: SERVER_NAME, version: SERVER_VERSION, node: process.version },
     profile,
     ...(rt?.multiEnv
       ? {

@@ -13,7 +13,7 @@ SAP HANA 经典 Modeler 能力的 MCP 服务器（TypeScript，Node >= 22.0.0）
 
 | 分类 | 能力 | 工具 |
 | --- | --- | --- |
-| 系统 | 版本信息、用户权限与建模能力自检 | `hana_system_get_info`、`hana_check_privileges` |
+| 系统 | 版本信息（HANA 与本 MCP 服务自身版本）、用户权限与建模能力自检 | `hana_system_get_info`、`hana_check_privileges` |
 | 环境管理（多环境） | 环境列表、只读/可写标识、一次性 token 切换 | `hana_env_list`、`hana_env_switch` |
 | 稳定性诊断 | 实例体检（读数 + 12 项结论、三态）、会话与阻塞深潜、表存储画像、历史趋势 | `hana_system_health`、`hana_system_activity`、`hana_table_storage`、`hana_system_trend` |
 | 包 | 包清单/包树、包内对象、新建包 | `hana_package_list`、`hana_package_list_objects`、`hana_package_create` |

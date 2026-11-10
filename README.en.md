@@ -25,7 +25,7 @@ operations actions are among the plans for the future.
 
 | Category | Capability | Tools |
 | --- | --- | --- |
-| System | Version info, user privileges & modeling capability self-check | `hana_system_get_info`, `hana_check_privileges` |
+| System | Version info (HANA and the MCP server itself), user privileges & modeling capability self-check | `hana_system_get_info`, `hana_check_privileges` |
 | Environment (multi-env) | Environment list with read-only/readwrite flags, one-time token switching | `hana_env_list`, `hana_env_switch` |
 | Package | Package list/tree, objects in a package (with activation status), create package | `hana_package_list`, `hana_package_list_objects`, `hana_package_create` |
 | Metadata | Full definition read, object search, field list, single-field logic tracing, lineage | `hana_metadata_get_view`, `hana_metadata_search_objects`, `hana_metadata_list_fields`, `hana_metadata_get_field_logic`, `hana_metadata_where_used` |
@@ -342,7 +342,7 @@ Beyond the basic facts, `hana_system_get_info` returns two **on-demand** items (
 
 | Capability id | Facade | Type | Description |
 | --- | --- | --- |
-| `hana_system_get_info` | `hana_system` | read-only | Version/SID/host/instance/current user & schema; plus environment `profile` and the rules catalog (`rules`: omitted = catalog, `all`/rule ids = full text) |
+| `hana_system_get_info` | `hana_system` | read-only | Version/SID/host/instance/current user & schema; plus `mcpServer` (this MCP server's own name/version/Node runtime), environment `profile` and the rules catalog (`rules`: omitted = catalog, `all`/rule ids = full text) |
 | `hana_check_privileges` | `hana_system` | read-only | Current user's privilege matrix & modeling capability summary (troubleshooting entry point) |
 | `hana_env_list` | `hana_system` | read-only (multi-env) | List environments and issue a one-time switch token (stdio only; requires `hana_env_switch` to be reachable) |
 | `hana_env_switch` | `hana_system` | admin (multi-env, route-only) | Switch the process's active environment; HTTP refuses |

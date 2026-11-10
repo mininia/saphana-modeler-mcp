@@ -16,7 +16,8 @@ export const systemCapabilities = {
     title: '获取 HANA 系统信息',
     description:
       '获取 HANA 数据库基础信息：SID/数据库名/主机、版本、用途/状态、启动时间、主机信息、当前用户与 schema（来源：SYS.M_DATABASE / M_HOST_INFORMATION）。\n' +
-      '另附 profile（环境档案：版本/SPS、权限档位、激活器行为；探测失败标「未探测到」）与 rules（省略=目录 id+title，传 all 或规则 id=全文）。',
+      '另附 mcpServer（**本 MCP 服务自身**的名字/版本/Node 运行时版本，与数据库 version 区分开）、' +
+      'profile（环境档案：版本/SPS、权限档位、激活器行为；探测失败标「未探测到」）与 rules（省略=目录 id+title，传 all 或规则 id=全文）。',
     inputSchema: z.object({
       rules: z
         .string()
