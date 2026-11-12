@@ -46,6 +46,7 @@ export const sqlAnalyzeRules: readonly RuleObject[] = [
       '不写业务数据、不碰仓库，唯一的库侧写入是执行 EXPLAIN 时向 SYS.EXPLAIN_PLAN_TABLE 写本次算子行',
       '（该表全库可读、不随连接销毁），回读后按唯一 STATEMENT_NAME 删除——无 DELETE 权限时行残留，',
       '回执 planRowsCleaned=false 并在 notes 给清理线索（PlanViz 通道不写该表，故不回报该字段）。',
+      '环境口径：清单声明 mutates=persistent（analyze=true 会真执行 SELECT、EXPLAIN 写计划行），只读环境仍整体拒绝。',
     ].join('\n'),
     tools: ['hana_sql_analyze'],
   },

@@ -35,6 +35,16 @@ import type { WritePlan } from '../write-plan.js';
 export type ToolKind = 'read' | 'write' | 'admin' | 'sql';
 
 /**
+ * HANA 侧副作用口径（环境只读闸门 / expectedEnvironment / 审计终态的唯一事实源）。
+ * 只描述 HANA 侧：本地文件写入与进程内控制面算 none。
+ * - none：纯读；
+ * - transient：只建可回收临时对象（_SYS_BIC 中间视图、_CHKTMP）；
+ * - persistent：改仓库设计时对象或数据。
+ * 静态声明取最重路径，不从 kind / destructive / annotations 推导。
+ */
+export type MutationScope = 'none' | 'transient' | 'persistent';
+
+/**
  * 能力分类（**AI 能力视角**，2026-10-09 重构；参照 SAP HANA MCP Server 的 six areas）：
  * 分类轴 = "AI 想干什么"，而不是"代码长在哪"——门面、索引、提升都按它分组。
  *
@@ -112,6 +122,8 @@ export interface CapabilityEffects {
   destructive: boolean;
   /** 同参数重复调用是否等价（客户端重试安全性的依据） */
   idempotent: boolean;
+  /** HANA 侧副作用口径（见 MutationScope）；必填，防止再按 kind 猜行为 */
+  mutates: MutationScope;
 }
 
 /**
@@ -134,6 +146,7 @@ export interface Capability<S extends z.ZodType = z.ZodType> {
    *
    * 门面是**入口**，不参与能力层（kind / 档案）判定——权限只有一层，谁的能力可用一律按**目标能力**
    * 判（`tools/groups.ts` 的 `shouldRegisterTool`、`config/authorize.ts` 的 `authorizeCall`）。
+   * 环境副作用是正交的另一维，按目标能力的 `effects.mutates` 判（见 `MutationScope`）。
    * 所以部署收窄时入口照旧常在：只读部署也看得到 `hana_modeling`/`hana_diagnostics`，只是索引里
    * 只剩 read 档成员（`hana_modeling` 剩 `hana_task_get`，`hana_diagnostics` 为空）。只有显式 deny
    * 才会让门面消失：命中门面 id，或把它**全部**成员 deny 掉。

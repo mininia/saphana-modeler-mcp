@@ -99,7 +99,7 @@ function registrationOf<S extends z.ZodType>(cap: Capability<S>, surface: Caller
   return {
     title: cap.title,
     description,
-    // 多环境下变更类能力要求 expectedEnvironment；读能力/单环境原样返回
+    // 多环境下非纯读能力（mutates != none，含临时对象）要求 expectedEnvironment；纯读/单环境原样返回
     inputSchema: capabilityInputSchema(cap, multiEnv),
     annotations: cap.annotations,
   };

@@ -73,6 +73,8 @@ export function buildViewOpCapabilities(parent: Capability): Record<string, Capa
         plan: (args) => planViewOpAlias(decl.id, args),
         destructive: decl.effects.destructive,
         idempotent: parent.effects.idempotent,
+        // 别名是父工具的一次 operations 调用：副作用口径与父能力同源
+        mutates: parent.effects.mutates,
       },
       title: decl.title,
       description:

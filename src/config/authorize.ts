@@ -39,7 +39,7 @@
  */
 
 import { assembleVerdict, checkDeployment, runPreflight, type Grant, type Policy, type Verdict } from './preflight.js';
-import { environmentGrants } from './environment-policy.js';
+import { environmentGrants, environmentMutationScope } from './environment-policy.js';
 import { profileAllows, type CallerProfile } from './profiles.js';
 import { isPackageAllowed } from './write-boundary.js';
 import { planFor } from '../capabilities/manifest.js';
@@ -95,10 +95,8 @@ export interface AuthorizationResult {
 
 /**
  * 审计终态（P0-4）：
- * - 读能力：`allowed | denied`（授权判定即终态，无后续副作用）；
- * - 写能力（含 destructive 的 admin）：`denied | completed | failed`——**每次尝试恰好一条终态记录**。
- *   放行时闸门不单独记 `allowed`，由调用方在本次执行结束后记 `completed`/`failed`；
- *   拦截仍由闸门记 `denied`（此时根本没有执行阶段）。
+ * - none/transient：`allowed | denied`（授权即终态，无持久副作用）；
+ * - persistent：`denied | completed | failed`——每次尝试恰好一条终态记录。
  */
 export type AuditResult = 'allowed' | 'denied' | 'completed' | 'failed';
 
@@ -155,14 +153,11 @@ export interface CapabilityAuditEvent {
 }
 
 /**
- * 写能力判定（P0-4 的「写」口径）：kind=write，或声明了 destructive 的 admin
- * （如 hana_repo_import——它确实覆盖仓库文件，不能按只读记 allowed）。
- * 门面是**入口**，不是执行单元：它自己的判定不落终态（真正的目标能力会落），
- * 否则每次调门面都会多出一条 `hana_modeling completed` 的假写记录。
+ * 审计终态口径：只有 persistent 记 completed/failed；none/transient 同读能力记 allowed。
+ * 与 HANA_ACCESS 闸门同源（environmentMutationScope），不按 kind 推断。
  */
-export function isMutationCapability(capability: Capability): boolean {
-  if (capability.facadeOf !== undefined) return false;
-  return capability.kind === 'write' || capability.effects.destructive === true;
+export function isPersistentMutation(capability: Capability): boolean {
+  return environmentMutationScope(capability) === 'persistent';
 }
 
 /** 从入参提取非敏感目标标识（只认 string；SQL/请求体一律不进审计） */
@@ -292,10 +287,9 @@ export function authorizeCall(
     codes: verdict.blocking.length > 0 ? verdict.blocking.map((g) => g.code) : verdict.warnings.map((g) => g.code),
     ...(verdict.allowed ? {} : { denyReason: verdict.blocking[0]?.code ?? 'blocked' }),
   };
-  // P0-4：读能力的授权结论就是终态；写能力放行时**不记**（终态由执行侧记 completed/failed），
-  // 拦截则由闸门记 denied——每次写尝试在日志里恰好一条终态记录。
+  // P0-4：非持久写入授权即终态；persistent 放行时不记，由执行侧记 completed/failed。
   if (!verdict.allowed) logger.warn({ ...audit }, 'capability-audit');
-  else if (!isMutationCapability(capability)) logger.info({ ...audit }, 'capability-audit');
+  else if (!isPersistentMutation(capability)) logger.info({ ...audit }, 'capability-audit');
 
   return { allowed: verdict.allowed, plan, verdict, audit };
 }
@@ -314,7 +308,7 @@ export function auditTerminal(
   failureDetail?: string,
   deferred = false,
 ): void {
-  if (!isMutationCapability(capability)) return;
+  if (!isPersistentMutation(capability)) return;
   // 沿用授权记录的身份/资源/规则码；只替换终态字段（denied 才会带 denyReason，这里必然没有）
   const { denyReason: _denyReason, ...base } = auth.audit;
   const event: CapabilityAuditEvent = {

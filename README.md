@@ -116,7 +116,7 @@ hana_modeling({ "capability": "hana_view_update", "args": { … } })
 hana_view_update({ … })
 ```
 
-- 权限只有**一层（能力层）**：门面是入口，常驻；索引/路由/提升/调用一律按**目标能力**判。
+- 权限只有**一层（能力层）**：门面是入口，常驻；索引/路由/提升/调用一律按**目标能力**判。环境副作用是另一条正交维度：`HANA_ACCESS=readonly` 按清单 `effects.mutates` 只拦持久写入，临时对象（节点预览中间视图、`_CHKTMP`）与纯读放行，且不改变工具可见性。
 - 多环境部署时 `hana_system` 额外包含 `hana_env_list` / `hana_env_switch`；单环境不出现。
 - 拒绝不泄漏存在性：未知能力、无权能力、跨类路由**逐字同形**。
 - 操作级别名 `hana_view_update#<op>`（8 条）只经门面路由，不注册为工具。

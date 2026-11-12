@@ -285,7 +285,7 @@ const baseModelingCapabilities = {
     id: 'hana_view_create',
     category: 'modeling',
     kind: 'write',
-    effects: { plan: planViewCreate, destructive: false, idempotent: false },
+    effects: { plan: planViewCreate, destructive: false, idempotent: false, mutates: 'persistent' },
     title: '新建 Calculation View（计算视图）',
     // SQL 方言、实测边界与并发解释见规则 sql_mode / activation_measure / write_transport / write_receipt。
     description:
@@ -334,7 +334,7 @@ const baseModelingCapabilities = {
     id: 'hana_view_validate',
     category: 'modeling',
     kind: 'write',
-    effects: { plan: planViewValidate, destructive: false, idempotent: true },
+    effects: { plan: planViewValidate, destructive: false, idempotent: true, mutates: 'transient' },
     title: '校验计算视图一致性',
     description:
       '双模式校验：\n' +
@@ -369,7 +369,7 @@ const baseModelingCapabilities = {
     id: 'hana_view_check_actions',
     category: 'modeling',
     kind: 'write',
-    effects: { plan: planViewCheckActions, destructive: false, idempotent: true },
+    effects: { plan: planViewCheckActions, destructive: false, idempotent: true, mutates: 'none' },
     title: '查询校验过程支持的动作清单',
     description:
       '查询 SYS.GET_CHECK_ACTIONS：某 CHECK 过程支持的 ACTION 全集及说明。用于调用 hana_view_validate 前确认动作名，或了解 HANA 的表/目录一致性检查能力。默认列出计算视图相关（CHECK_CALCULATION_VIEW）。',
@@ -387,7 +387,7 @@ const baseModelingCapabilities = {
     id: 'hana_view_activate',
     category: 'modeling',
     kind: 'write',
-    effects: { plan: planViewActivate, destructive: false, idempotent: false },
+    effects: { plan: planViewActivate, destructive: false, idempotent: false, mutates: 'persistent' },
     title: '激活 Calculation View（设计时对象）',
     description:
       '将可写包下的 Calculation View 设计时对象激活为运行时视图（XS REST：PUT + SapBackPack {"Activate":true}）。并发改动以 412 机读回执暴露，不静默回退。失败透传编译错误明细，不误报成功。\n' +
@@ -403,7 +403,7 @@ const baseModelingCapabilities = {
     id: 'hana_view_update',
     category: 'modeling',
     kind: 'write',
-    effects: { plan: planViewUpdate, destructive: true, idempotent: false },
+    effects: { plan: planViewUpdate, destructive: true, idempotent: false, mutates: 'persistent' },
     title: '更新 Calculation View（声明式 operations / 全量 XML / 变更集）',
     // 硬保留（验收脚本断言）：三方式互斥、关键参数名、migration 合法值、机读码全集、回执字段名、零写入语义。
     description:
@@ -515,7 +515,7 @@ const baseModelingCapabilities = {
     id: 'hana_view_delete',
     category: 'modeling',
     kind: 'write',
-    effects: { plan: planViewDelete, destructive: true, idempotent: false },
+    effects: { plan: planViewDelete, destructive: true, idempotent: false, mutates: 'persistent' },
     title: '删除 Calculation View（设计时对象）',
     description:
       '删除可写包下的 Calculation View 设计时对象（XS REST：DELETE + If-Match）：陈旧基线 412、对象已不存在 OBJECT_NOT_FOUND（均机读），回执带删除前 etag/version。\n' +
@@ -548,7 +548,7 @@ const baseModelingCapabilities = {
     id: 'hana_task_get',
     category: 'modeling',
     kind: 'read',
-    effects: { destructive: false, idempotent: true },
+    effects: { destructive: false, idempotent: true, mutates: 'none' },
     title: '查询异步任务状态与结果',
     description:
       '轮询异步任务：`hana_view_update(async=true)` 的变更集、或 `hana_sql_analyze(async=true)` 的长分析。返回 kind、status（working/completed/failed/cancelled）、进度与终态 result（与同步调用同形的回执信封）。\n' +
@@ -564,7 +564,7 @@ const baseModelingCapabilities = {
     id: 'hana_task_cancel',
     category: 'modeling',
     kind: 'write',
-    effects: { plan: planTaskCancel, destructive: false, idempotent: true },
+    effects: { plan: planTaskCancel, destructive: false, idempotent: true, mutates: 'none' },
     title: '取消异步任务（协作式）',
     description:
       '请求取消一个运行中的异步任务。变更集（changeset）：当前动作不打断，结束后停止后续项并触发与失败相同的逆序补偿（终态 raw.code=changeset_cancelled 带完整报告）。SQL 分析：执行中的语句无法取消，分析会跑完并如实返回结果，终态会说明取消未生效。已到终态的任务不可取消（如实回执、不报错）。只对本调用方可见。',

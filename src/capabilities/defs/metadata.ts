@@ -14,7 +14,7 @@ export const metadataCapabilities = {
     id: 'hana_metadata_get_view',
     category: 'discovery',
     kind: 'read',
-    effects: { destructive: false, idempotent: true },
+    effects: { destructive: false, idempotent: true, mutates: 'none' },
     title: '读取视图完整定义',
     description:
       '读取指定视图的完整定义：format=json 返回结构化定义（数据源/节点/输出字段/变量/计算逻辑），format=xml 返回仓库原始设计时 XML（备份/人工编辑回传用）。\n' +
@@ -37,7 +37,7 @@ export const metadataCapabilities = {
     id: 'hana_metadata_search_objects',
     category: 'discovery',
     kind: 'read',
-    effects: { destructive: false, idempotent: true },
+    effects: { destructive: false, idempotent: true, mutates: 'none' },
     title: '搜索仓库视图（按名称 / 按字段）',
     description:
       '两种模式（by）：\n' +
@@ -76,7 +76,7 @@ export const metadataCapabilities = {
     id: 'hana_metadata_list_fields',
     category: 'discovery',
     kind: 'read',
-    effects: { destructive: false, idempotent: true },
+    effects: { destructive: false, idempotent: true, mutates: 'none' },
     title: '列出视图字段清单',
     description:
       '列出视图字段清单：字段 ID、中文描述、类型（属性/度量）、聚合方式、来源（节点.列）、是否带计算逻辑。默认只列输出字段；pattern 按字段 ID 片段过滤，exact=true 精确匹配。version 默认 active，可传 inactive。\n' +
@@ -99,7 +99,7 @@ export const metadataCapabilities = {
     id: 'hana_metadata_get_field_logic',
     category: 'insights',
     kind: 'read',
-    effects: { destructive: false, idempotent: true },
+    effects: { destructive: false, idempotent: true, mutates: 'none' },
     title: '获取单字段计算逻辑',
     description:
       '获取单个字段的计算逻辑：公式原文（SQL/COLUMN_ENGINE）、引用的源字段、沿节点映射的溯源、字段元数据（描述/类型/长度）。SqlScriptView 节点返回脚本源码。version 默认 active，可传 inactive（字段逻辑与血缘同视角）。\n' +
@@ -137,7 +137,7 @@ export const metadataCapabilities = {
     id: 'hana_metadata_where_used',
     category: 'insights',
     kind: 'read',
-    effects: { destructive: false, idempotent: true },
+    effects: { destructive: false, idempotent: true, mutates: 'none' },
     title: '血缘/依赖关系搜索',
     description:
       '查询视图的依赖关系：upstream=该视图引用了哪些对象（数据源/上游视图），downstream=哪些对象引用了该视图。\n' +
@@ -167,7 +167,7 @@ export const metadataCapabilities = {
     id: 'hana_table_list',
     category: 'discovery',
     kind: 'read',
-    effects: { plan: planTableList, destructive: false, idempotent: true },
+    effects: { plan: planTableList, destructive: false, idempotent: true, mutates: 'none' },
     title: '列出 schema 下的表',
     description:
       '列出指定 schema（默认当前用户 schema）下当前用户可访问的表（SYS.TABLES 按权限过滤），支持名称模糊匹配与条数限制。建模选数据源时用 hana_table_columns 查看列结构',
@@ -186,7 +186,7 @@ export const metadataCapabilities = {
     id: 'hana_table_columns',
     category: 'discovery',
     kind: 'read',
-    effects: { plan: planTableColumns, destructive: false, idempotent: true },
+    effects: { plan: planTableColumns, destructive: false, idempotent: true, mutates: 'none' },
     title: '获取表列结构',
     description:
       '返回指定表的列结构：列名/位置/数据类型/长度/精度/可空/默认值/注释（来源：SYS.TABLE_COLUMNS）。表不存在或当前用户无权限时返回 isError，可先用 hana_table_list 确认可访问的表',

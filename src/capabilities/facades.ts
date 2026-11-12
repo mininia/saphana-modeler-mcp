@@ -16,7 +16,14 @@
  */
 import { z } from 'zod';
 import { planFacade } from './planners.js';
-import { CAPABILITY_CATALOG, FACADE_CATEGORIES, type Capability, type FacadeCategory, type ToolKind } from './types.js';
+import {
+  CAPABILITY_CATALOG,
+  FACADE_CATEGORIES,
+  type Capability,
+  type FacadeCategory,
+  type MutationScope,
+  type ToolKind,
+} from './types.js';
 /** 门面 id：`hana_<分类名>`——id 即分类，模型读工具名就知道该往哪走 */
 export function facadeIdOf(category: FacadeCategory): FacadeId {
   return `hana_${category}`;
@@ -47,6 +54,14 @@ export type FacadeCapabilities = { [K in FacadeCategory as `hana_${K}`]: Capabil
 const KIND_SEVERITY: Record<ToolKind, number> = { read: 0, write: 1, admin: 2, sql: 3 };
 function strictestKind(members: readonly Capability[]): ToolKind {
   return members.reduce<ToolKind>((acc, c) => (KIND_SEVERITY[c.kind] > KIND_SEVERITY[acc] ? c.kind : acc), 'read');
+}
+/** 副作用严格度（none < transient < persistent）：门面的 mutates 同样取成员最严 */
+const MUTATION_SEVERITY: Record<MutationScope, number> = { none: 0, transient: 1, persistent: 2 };
+function strictestMutationScope(members: readonly Capability[]): MutationScope {
+  return members.reduce<MutationScope>(
+    (acc, c) => (MUTATION_SEVERITY[c.effects.mutates] > MUTATION_SEVERITY[acc] ? c.effects.mutates : acc),
+    'none',
+  );
 }
 /**
  * 门面描述（唯一生成器，两个调用点）：
@@ -118,20 +133,21 @@ export function buildFacades(base: readonly Capability[]): FacadeCapabilities {
     // 成员的函数，不是手写常量：门面能路由到什么，就声明成什么（控制面除外，见上）
     const destructive = derived.some((c) => c.effects.destructive);
     const idempotent = derived.every((c) => c.effects.idempotent);
+    const mutates = strictestMutationScope(derived);
     out[id] = {
       id,
       module: id,
       category,
       kind,
       facadeOf: category,
-      effects: { plan: planFacade(id), destructive, idempotent },
+      effects: { plan: planFacade(id), destructive, idempotent, mutates },
       title: entry.name,
       // 常量描述保存**全集**（全可见）；投给客户端的文本由 tools/index.ts 在注册时按连接重建
       description: facadeDescription(category, members, () => true),
       inputSchema: FACADE_SCHEMA,
       annotations: {
-        // 与 kind / effects 一致（测试会断言三个字段不许互相矛盾）
-        readOnlyHint: kind === 'read',
+        // 门面是入口；可能路由到 transient/persistent 成员就不标只读（hana_data 因节点预览为 false）
+        readOnlyHint: mutates === 'none',
         idempotentHint: idempotent,
         destructiveHint: destructive,
         openWorldHint: false,

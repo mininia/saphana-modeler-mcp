@@ -18,7 +18,7 @@ export const sqlAnalyzeCapabilities = {
     id: 'hana_sql_analyze',
     category: 'diagnostics',
     kind: 'write',
-    effects: { plan: planSqlAnalyze, destructive: false, idempotent: false },
+    effects: { plan: planSqlAnalyze, destructive: false, idempotent: false, mutates: 'persistent' },
     title: 'SQL 分析（执行计划）',
     // 三态命名、PlanViz 六栏与降级口径见 rules=sql_analyze；这里保留取数方式、默认输出与护栏。
     description:

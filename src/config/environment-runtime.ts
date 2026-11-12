@@ -306,7 +306,7 @@ export class EnvironmentManager {
       pools: { kept: [...new Set(kept)], closed },
       notice:
         '切换只影响本次响应之后的调用；已开始的调用仍绑定原环境。' +
-        '写操作请携带 expectedEnvironment=<当前 LABEL>；需要切回时重新调用 hana_env_list 获取新 token。',
+        '非纯读调用（含临时对象）请携带 expectedEnvironment=<当前 LABEL>；需要切回时重新调用 hana_env_list 获取新 token。',
     };
   }
 

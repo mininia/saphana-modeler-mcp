@@ -29,7 +29,7 @@ export const previewCapabilities = {
     id: 'hana_data_preview',
     category: 'data',
     kind: 'read',
-    effects: { plan: planDataPreview, destructive: false, idempotent: true },
+    effects: { plan: planDataPreview, destructive: false, idempotent: true, mutates: 'transient' },
     title: '数据预览 / 基表勘察',
     // 细则（勘察画像、节点预览机制、权限诊断）见 rules=preview；此处只留目标形态与参数面。
     description:
@@ -96,7 +96,7 @@ export const previewCapabilities = {
     id: 'hana_data_preview_diagnose',
     category: 'data',
     kind: 'read',
-    effects: { destructive: false, idempotent: true },
+    effects: { destructive: false, idempotent: true, mutates: 'none' },
     title: '诊断数据预览权限',
     // 通道语义与 brief 字段解释见 rules=preview。
     description:

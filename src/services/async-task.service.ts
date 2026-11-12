@@ -50,9 +50,9 @@ import type { ChangesetAction } from './changeset.plan.js';
 export const UNKNOWN_TASK_TEXT = '未知任务：该任务不存在，或不属于当前调用方。';
 
 /**
- * 异步任务执行侧终态审计（P0-4）：提交调用只记 `deferred:true` 的 completed（= 已受理），
- * **真正的写入结局**在这里按任务终态记一条 completed/failed（带 taskId）。
- * 取消按 failed + failureDetail=changeset_cancelled 记——它确实没有完成，且已触发补偿。
+ * 异步任务执行侧终态审计（P0-4）：提交记 deferred:true 的 completed；真正的写入结局在这里记
+ * completed/failed。取消按 failed + failureDetail=changeset_cancelled 记。
+ * 前提：当前 async 能力都是 persistent；新增 transient/none 的 async 能力需重新判定。
  */
 function auditTaskTerminal(
   taskId: string,

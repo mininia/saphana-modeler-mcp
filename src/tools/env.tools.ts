@@ -91,7 +91,7 @@ export function registerEnvironmentTools(server: McpServer, ctx: ToolContext): v
           confirm,
           acknowledgeRunningTasks,
         });
-        // 独立的环境切换审计事件（能力审计另有 completed/failed 一条）
+        // 独立的环境切换审计事件（能力审计按 mutates=none 记 allowed，不落写终态）
         logger.info(
           {
             previous: outcome.previous,

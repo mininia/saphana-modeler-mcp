@@ -42,7 +42,7 @@ export const SERVER_INSTRUCTIONS = [
 export const MULTI_ENV_INSTRUCTIONS = [
   '多环境：每次回执带 environment（执行环境 LABEL）与 calledFromEnvironment；以回执为准，不要假设“上次切到哪”。',
   '查看/切换：先调 hana_env_list（拿当前 LABEL、from、epoch、一次性 switchToken），再经 hana_system 调 hana_env_switch（confirm 必须逐字等于目标 LABEL）；切换只影响之后的调用，任务按提交时环境执行。',
-  '变更类调用必须带 expectedEnvironment=<当前 LABEL>；只读环境（access=readonly）会拒绝变更类能力，hana_sql_execute 默认只允许 SELECT 类语句。',
+  '非纯读调用（含临时对象）必须带 expectedEnvironment=<当前 LABEL>；只读环境（access=readonly）只拒绝持久写入能力，临时对象与纯读放行，hana_sql_execute 默认只允许 SELECT 类语句。',
 ].join('\n');
 
 /**

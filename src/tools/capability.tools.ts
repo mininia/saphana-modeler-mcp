@@ -281,7 +281,7 @@ async function promoteOnFacadeCall(
     }
 
     // 服务端按目标能力的 schema 校验（客户端 schema 只是便利，不是校验层）。
-    // 多环境下变更类目标会多一个必填 expectedEnvironment（与注册面同源）。
+    // 多环境下非纯读目标（mutates != none）会多一个必填 expectedEnvironment（与注册面同源）。
     const parsed = capabilityInputSchema(target, ctx.manager?.multiEnv === true).safeParse(args ?? {});
     if (!parsed.success) {
       // 审计不能缺席：schema 失败也是按目标能力的拒绝，否则与纯索引调用在审计里不可区分。

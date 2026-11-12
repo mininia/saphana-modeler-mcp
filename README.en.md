@@ -158,7 +158,7 @@ HTTP mode notes:
   - Request body capped at 10MB (byte-counted): a declared `Content-Length` over the cap gets a direct 413; chunked uploads are byte-counted locally against the same cap too (the server refuses and closes the connection) — no reverse-proxy limit needed
 - **Client identity attribution**: `MCP_HTTP_TOKENS` maps each token to its own `clientId`, carried through the request context into the tool layer —
   - every tool result envelope carries `clientId` (absent in stdio mode, so the envelope shape is unchanged there)
-  - every write leaves one audit line in the server log (`clientId` + package + object); stdio logs carry no `clientId`
+  - every persistent write leaves one terminal audit line in the server log (`clientId` + package + object); transient objects and pure reads record `allowed` only; stdio logs carry no `clientId`
   - why it matters: the database identity is a single process-level technical account (`HANA_USER`), so `_SYS_REPO`'s `OWNER`/`ACTIVATED_BY` can only ever name that account — with multiple clients the repository side cannot tell callers apart
   - with no token configured (loopback default) every request is attributed to `anonymous`
 - **Concurrency & locking** (the real limits when one instance serves multiple clients; every known exception is spelled out):
@@ -256,6 +256,8 @@ Live verification: `npm run verify:authz` (covers all of the above).
 | **sql** (direct SQL execution, **off by default**) | Standalone seventh root tool: execute SQL directly on HANA (read/write/admin statements). An empty `HANA_TOOL_GROUPS` does **not** enable it; use `HANA_TOOL_GROUPS=sql` or `HANA_TOOL_ALLOW=hana_sql_execute`. When off it is completely invisible (not in `tools/list`, not in any facade description/index, never mentioned in hints) | `hana_sql_execute` |
 
 > **The facade layer is unrestricted.** There is exactly **one permission layer — the capability layer**: the six facades are *entrances* and stay resident in `tools/list` under any group configuration (they disappear only via an explicit `HANA_TOOL_DENY` on the facade id, or on all of its members). The group switch only decides the **capability layer** — index / routing / promotion / calls are all judged by the **target** capability's kind. A read-only deployment therefore still sees `hana_modeling` / `hana_diagnostics`, but their indexes list only what you are entitled to — `hana_modeling` keeps its read-tier `hana_task_get` (async-task polling), `hana_diagnostics` is empty (the entrance is there, only what you may use appears inside).
+>
+> **Environment side effects are a separate axis**: `HANA_ACCESS=readonly` judges the manifest's `effects.mutates` (`none` / `transient` / `persistent`) and blocks only persistent writes. It never hides tools — tool visibility stays with the group/profile layer. Transient objects (node-preview `_SYS_BIC` views, `_CHKTMP`) and pure reads are allowed in a read-only environment.
 
 > The `design` mode of `hana_view_validate` briefly writes a temporary validation object `_CHKTMP`, so the whole tool is classified as `write`; there is no mixed split by design/runtime mode — a read-only deployment (`HANA_TOOL_GROUPS=read`) does not expose this tool.
 >
@@ -355,7 +357,7 @@ Beyond the basic facts, `hana_system_get_info` returns two **on-demand** items (
 | `hana_metadata_where_used` | `hana_insights` | read-only | Lineage/dependency: upstream (who it depends on) / downstream (who depends on it, incl. runtime refs); `depth` multi-hop closure (default 1; `all` is capped by maxNodes, carrying `depthReached`/`truncated`/`asOf`); `version=inactive` reads the unactivated lineage (`INACTIVE_OBJECTCROSSREF`) |
 | `hana_table_list` | `hana_discovery` | read-only | Accessible tables under a given schema |
 | `hana_table_columns` | `hana_discovery` | read-only | Table column structure (name/type/length/precision/nullable/comment) |
-| `hana_data_preview` | `hana_data` | read-only | Activated-view data preview: overall direct / node intermediate-view / XML-derived — three channels, supports filtering & input parameters; permission-class failures auto-attach a diagnostic report |
+| `hana_data_preview` | `hana_data` | read-only (node preview creates a transient `_SYS_BIC` view) | Activated-view data preview: overall direct / node intermediate-view / XML-derived — three channels, supports filtering & input parameters; permission-class failures auto-attach a diagnostic report |
 | `hana_data_preview_diagnose` | `hana_data` | read-only | Data-preview privilege diagnosis: focuses on analytic-privilege protection and upstream data-source reachability, gives blocking points & grant suggestions |
 | `hana_view_create` | `hana_modeling` | write | Create a calculation view within a writable package — two forms: the graphical minimal form (single Projection + single source table full-column passthrough) and **SQL mode** (`mode=sql` + `script`/`scriptColumns`; see `npm run verify:sql-mode`); XS REST write path |
 | `hana_view_activate` | `hana_modeling` | write | Activate a design-time calculation view into a runtime column view (XS REST: PUT (with If-Match baseline) + SapBackPack Activate; error details transparent) |

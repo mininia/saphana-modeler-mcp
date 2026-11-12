@@ -34,7 +34,7 @@
 | `HANA_PASSWORD` | ✅ | 密码 | — |
 | `HANA_LOCALE` | 可选 | 连接语言，默认 `zh` | `zh` |
 | `HANA_DB_NAME` | 可选 | 租户数据库名（MDC 指定租户时填写；非 MDC 可省略） | `SYSTEMDB` / 业务租户名 |
-| `HANA_ACCESS` | 可选 | 环境只读/可写策略：`readwrite`（默认）/ `readonly`（拒绝变更类能力；行为只读的 admin 不受影响；单环境同样生效） | `readonly` |
+| `HANA_ACCESS` | 可选 | 环境只读/可写策略：`readwrite`（默认）/ `readonly`（只拒绝**持久写入**：仓库设计时对象与数据；临时对象与纯读放行；单环境同样生效） | `readonly` |
 | `HANA_LABEL` | 可选 | 基础环境的系统标识（多环境）；默认 `default`。命名环境用 `HANA_LABEL_ENV_<XXXX>` 覆盖 | `PRD_CN` |
 | `HANA_ENV_START` | 可选 | 启动环境 LABEL；默认基础环境的 `LABEL`（未设 `HANA_LABEL` 时为 `default`） | `PRD_CN` |
 | `HANA_ENV_SWITCHABLE` | 可选 | 可切环境 LABEL（逗号分隔）；空 = 不可切。**用 LABEL，不是 `_ENV_` 配置键** | `PRD_CN,PRD_EU` |
@@ -84,8 +84,8 @@
 - 共用参数保持原名（`HANA_HOST` / `HANA_PORT` / `HANA_USER` / `HANA_PASSWORD` / `HANA_DB_NAME` / `HANA_TLS` / `HANA_SSL_VALIDATE` / `HANA_LOCALE` / `HANA_XS_PORT` / `HANA_XS_TLS` / `HANA_XS_BASE_PATH` / `HANA_ACCESS` / `HANA_LABEL`）；它们也是基础环境。
 - 命名环境用 `HANA_<PARAM>_ENV_<XXXX>` 覆盖；`XXXX` 匹配 `^[A-Z][A-Z0-9_]{0,31}$`。未写的字段继承共用值（包括 `ACCESS`）。
 - `LABEL` 是 MCP 识别的系统标识：基础环境用 `HANA_LABEL`（默认 `default`），命名环境用 `HANA_LABEL_ENV_<XXXX>`（默认 `XXXX`）。大小写字母/数字/`_`/`-`，最长 32 字符；必须唯一；`HANA_ENV_START` / `HANA_ENV_SWITCHABLE` / `hana_env_switch` / 回执 / 审计都用它。
-- 只读环境（`ACCESS=readonly`）：拒绝变更类能力；行为只读的 admin（健康诊断/导出/变更列表）不受影响；`hana_sql_execute` 由 `HANA_READONLY_SQL` 控制（`select-only` 下只允许 SELECT，并拒绝 `FOR UPDATE` / `FOR SHARE` / `NEXTVAL`）。**单环境同样生效**。
-- 多环境变更类调用必须带 `expectedEnvironment=<当前 LABEL>`（门面索引的 `params` 已包含该字段）。
+- 只读环境（`ACCESS=readonly`）：只拒绝**持久写入能力**（清单 `effects.mutates='persistent'`：改仓库设计时对象或数据）；临时对象（`hana_data_preview` 的节点预览中间视图、`hana_view_validate` 的 `_CHKTMP`）与纯读放行；`hana_sql_execute` 由 `HANA_READONLY_SQL` 控制（`select-only` 下只允许 SELECT，并拒绝 `FOR UPDATE` / `FOR SHARE` / `NEXTVAL`）。**单环境同样生效**。
+- 多环境下所有非纯读调用（`effects.mutates != none`，**含临时对象**）必须带 `expectedEnvironment=<当前 LABEL>`（门面索引的 `params` 已包含该字段）。
 - `hana_env_list` 发放一次性 `switchToken`（仅 stdio 且 switch 可达时）；`hana_env_switch` 是 route-only，HTTP 拒绝且不进索引；目标有运行中任务时需 `acknowledgeRunningTasks=true`。
 - 切换只影响之后的调用；旧环境有运行中任务时进入 `task-draining`，任务/调用结束后回 `idle`；切换前会预检目标连接。
 - 同一物理库（`host:port/dbName`）的多个 `LABEL` 共享对象锁、临时校验登记与预览占用。
@@ -136,11 +136,21 @@ HANA_READONLY_SQL=select-only
 | **admin** 管理操作 | Transfer / Change-Tracking API 与系统监视面 | `hana_repo_export`、`hana_repo_import`、`hana_repo_changelist`、`hana_system_health`、`hana_system_activity`、`hana_table_storage`、`hana_system_trend`（多环境另含 route-only `hana_env_switch`） |
 | **sql** 直接执行（**默认关闭**） | 独立第七根工具：在 HANA 上直接执行任意 SQL（读/写/管理类）。**空 `HANA_TOOL_GROUPS` 不会启用它**；须显式 `HANA_TOOL_GROUPS=sql` 或 `HANA_TOOL_ALLOW=hana_sql_execute`。未启用时它不进 `tools/list`、不进任何门面描述/索引，提示里也不提及 | `hana_sql_execute` |
 
-> 分组（kind）是**权限层级**而非"行为画像"：稳定性诊断四件套、`hana_repo_changelist` 行为只读但归 admin；`hana_sql_analyze` 接受任意 SQL 但归 write。客户端注解（`readOnlyHint`）描述行为，两者不互相推导。
+> 分组（kind）是**权限层级**而非"行为画像"：稳定性诊断四件套、`hana_repo_changelist` 行为只读但归 admin；`hana_sql_analyze` 接受任意 SQL 但归 write。客户端注解（`readOnlyHint`）描述行为，两者不互相推导。**环境副作用另由清单的 `effects.mutates` 表达**（`none` / `transient` / `persistent`），不按 kind 推断。
 >
-> `hana_view_validate` design 模式会短暂写入 `_CHKTMP` 临时对象，故整工具归 write。
+> `hana_view_validate` design 模式会短暂写入 `_CHKTMP` 临时对象，故整工具归 write；其环境口径是 `transient`（只读环境放行）。
 >
 > **门面层不做限制**：六个门面在任何分组配置下都常驻 `tools/list`（只有显式 `HANA_TOOL_DENY` 命中门面 id、或 deny 掉它全部成员才会消失）。分组开关只决定**能力层**；索引/路由/提升/调用一律按**目标能力**的 kind 判。
+
+### 权限维度分工（三层正交）
+
+| 维度 | 配置 | 管什么 | 作用域 |
+| --- | --- | --- | --- |
+| **能力面** | `HANA_TOOL_GROUPS` / `HANA_TOOL_ALLOW` / `HANA_TOOL_DENY` + `MCP_PROFILES` | 哪些能力可见、可被调用（存在性/暴露面） | 进程 |
+| **环境副作用** | `HANA_ACCESS`（+ `HANA_READONLY_SQL`） | 当前环境允许哪些**持久写入**；只读环境只拦 `persistent` | 环境（多环境按 LABEL） |
+| **资源范围** | `HANA_WRITE_PACKAGES` / `HANA_READ_SCHEMA` | 能写哪些仓库包、能按名读哪些 schema | 进程 |
+
+三层互不推导：分组收窄不会改变环境副作用判定，`ACCESS=readonly` 也不会隐藏工具。选型：**全局只读部署**用 `HANA_TOOL_GROUPS=read`（写工具不可见）；**同一进程里按环境只读**用 `HANA_ACCESS_ENV_<XXXX>=readonly`（写工具仍可见，调用时被 `env_readonly` 拒绝）。
 
 配置变量优先级：`HANA_TOOL_DENY` > `HANA_TOOL_ALLOW` > `HANA_TOOL_GROUPS`。
 
@@ -264,7 +274,7 @@ MCP_HTTP_PORT=3000 MCP_HTTP_TOKENS='shared:your-long-random-token' node dist/ind
 - **拦截消息不含补救路径**：返回给模型的拦截消息只陈述事实（维度/规则码/请求内容/生效策略），不写"改哪项配置可放行"；补救指引只在运维向位置（启动自检与本文档）。
 - **部署级不变量（启动即拒绝）**：① HTTP 非回环监听且无 Bearer Token → 拒绝启动（除非 `MCP_HTTP_ALLOW_ANONYMOUS=true`）；② `HANA_TLS=false`、③ 加密但 `HANA_SSL_VALIDATE=false`、④ XS 写通道明文（未置 `HANA_XS_TLS=true`）→ 告警放行，但每次启动可见。
 - **读范围边界**：受约束的是「按名指定 schema 去读」（`schema` 不在 `HANA_READ_SCHEMA` 即被拦）；不约束已激活视图自身定义的读取、`hana_data_preview` 视图预览、仓库包维度与 `hana_table_storage` 省略 schema 时的全库统计。
-- **审计**：每次调用落地一条 `capability-audit`；写能力每次尝试一条终态 `denied | completed | failed`。持久化由部署方负责。
+- **审计**：每次调用落地一条 `capability-audit`；`effects.mutates='persistent'` 的能力每次尝试一条终态 `denied | completed | failed`（临时对象/纯读只记 `allowed`）。持久化由部署方负责。
 
 ## HANA 授权要求
 

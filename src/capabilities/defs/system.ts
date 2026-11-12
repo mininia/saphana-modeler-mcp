@@ -12,7 +12,7 @@ export const systemCapabilities = {
     id: 'hana_system_get_info',
     category: 'system',
     kind: 'read',
-    effects: { destructive: false, idempotent: true },
+    effects: { destructive: false, idempotent: true, mutates: 'none' },
     title: '获取 HANA 系统信息',
     description:
       '获取 HANA 数据库基础信息：SID/数据库名/主机、版本、用途/状态、启动时间、主机信息、当前用户与 schema（来源：SYS.M_DATABASE / M_HOST_INFORMATION）。\n' +
@@ -34,7 +34,7 @@ export const systemCapabilities = {
     id: 'hana_check_privileges',
     category: 'system',
     kind: 'read',
-    effects: { destructive: false, idempotent: true },
+    effects: { destructive: false, idempotent: true, mutates: 'none' },
     title: '检查当前用户权限与建模能力',
     description:
       '返回当前 HANA 用户的有效权限矩阵：角色、系统权限、有 SELECT 的 schema 列表、REPO.* 仓库权限，以及建模能力摘要（读仓库/写仓库/激活/读元数据/读数据）。用于排查连接用户是否具备仓库读写与视图激活权限',
@@ -46,7 +46,7 @@ export const systemCapabilities = {
     category: 'system',
     kind: 'read',
     rootTool: true,
-    effects: { destructive: false, idempotent: true },
+    effects: { destructive: false, idempotent: true, mutates: 'none' },
     title: '列出 HANA 环境',
     description:
       '列出本进程配置的 HANA 环境：当前 active 环境（LABEL）、每个环境的 access/state/运行任务数，' +
@@ -61,7 +61,7 @@ export const systemCapabilities = {
     kind: 'admin',
     routeOnly: true,
     control: true,
-    effects: { destructive: true, idempotent: false, plan: () => planReadless('hana_env_switch') },
+    effects: { destructive: true, idempotent: false, mutates: 'none', plan: () => planReadless('hana_env_switch') },
     title: '切换 HANA 环境',
     description:
       '切换当前 active 环境（多环境、stdio）。必须先用 hana_env_list 获取 from/epoch/switchToken，' +

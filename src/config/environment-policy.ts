@@ -1,39 +1,25 @@
 /**
  * 环境维度判定（多环境）。
  *
- * 两条规则：
- * 1. **只读闸门**：当前环境 ACCESS=readonly 时，阻断变更类能力；
- *    hana_sql_execute 例外——select-only 下交给 SQL 规则层逐条判定 read/dml，deny 下整体拒绝。
- * 2. **expectedEnvironment**：多环境下所有变更类调用必须显式自报当前 LABEL，防止“忘了切回”的整串漂移。
- *    它不是授权凭证；真正的写权限仍由全局策略与数据库账号决定。
+ * 判据唯一：清单的 `effects.mutates`，不按 kind/组名推断。
+ * - 只读闸门：ACCESS=readonly 只拦 persistent；transient/none 放行。
+ *   hana_sql_execute 在 select-only 下交给 SQL 规则层，deny 下整体拒绝。
+ * - expectedEnvironment：多环境下所有 mutates != none 的调用必须自报当前 LABEL
+ *   （防环境漂移，不是授权凭证）。
  *
  * 本模块只产出 Grant（与 profile/资源维度同一条判定链），不改写任何配置。
  */
 
 import { z } from 'zod';
-import type { Capability } from '../capabilities/types.js';
+import type { Capability, MutationScope } from '../capabilities/types.js';
 import { BLOCKED_PREFIX } from '../core/errors.js';
 import type { Grant } from './preflight.js';
 import type { EnvironmentRuntime } from './environment-runtime.js';
 
-/** 环境控制面能力：不是数据变更，不参与只读闸门与 expectedEnvironment */
-const ENV_CONTROL_IDS = new Set(['hana_env_list', 'hana_env_switch', 'hana_task_get', 'hana_task_cancel']);
-
-/**
- * 是否属于“会改变目标环境状态”的能力（只读闸门 + expectedEnvironment 用）。
- * 口径 = 写层（write/sql）或声明 destructive 的能力；**行为只读的 admin**（稳定性诊断、
- * 仓库导出、变更列表）不参与，否则只读环境会连监控/备份都不可用（与 CONFIG.md 的
- * “变更类能力”一致）。hana_data_preview 会创建中间视图，单独计入。
- */
-export function isEnvironmentMutation(capability: Capability): boolean {
-  if (capability.facadeOf !== undefined) return false;
-  if (ENV_CONTROL_IDS.has(capability.id)) return false;
-  return (
-    capability.kind === 'write' ||
-    capability.kind === 'sql' ||
-    capability.effects.destructive === true ||
-    capability.id === 'hana_data_preview'
-  );
+/** 环境副作用口径：门面/control 不碰 HANA 记 none，其余取 effects.mutates */
+export function environmentMutationScope(capability: Capability): MutationScope {
+  if (capability.facadeOf !== undefined || capability.control === true) return 'none';
+  return capability.effects.mutates;
 }
 
 function block(subject: string, code: string, message: string): Grant {
@@ -51,7 +37,8 @@ export function environmentGrants(
   runtime: EnvironmentRuntime | undefined,
 ): Grant[] {
   if (!runtime) return [];
-  if (!isEnvironmentMutation(capability)) return [];
+  const scope = environmentMutationScope(capability);
+  if (scope === 'none') return [];
 
   const grants: Grant[] = [];
   if (runtime.multiEnv) {
@@ -61,7 +48,7 @@ export function environmentGrants(
         block(
           capability.id,
           'env_assertion_missing',
-          `多环境变更类调用必须显式携带 expectedEnvironment（当前 LABEL=${runtime.label}），本次未执行`,
+          `多环境非纯读调用必须显式携带 expectedEnvironment（当前 LABEL=${runtime.label}），本次未执行`,
         ),
       );
     } else if (expected.trim() !== runtime.label) {
@@ -76,7 +63,7 @@ export function environmentGrants(
     }
   }
 
-  if (runtime.access === 'readonly') {
+  if (runtime.access === 'readonly' && scope === 'persistent') {
     const sqlPolicy = runtime.config.readonlySql ?? 'select-only';
     if (capability.id === 'hana_sql_execute' && sqlPolicy === 'select-only') {
       // 交给 SQL 规则层逐条判定；这里只保证 expectedEnvironment 已通过。
@@ -85,7 +72,8 @@ export function environmentGrants(
         block(
           capability.id,
           'env_readonly',
-          `当前环境 ${runtime.label} 为只读（ACCESS=readonly），变更类能力不可用；本次未执行`,
+          `当前环境 ${runtime.label} 为只读（ACCESS=readonly），持久写入能力不可用；` +
+            '临时对象与纯读不受影响，本次未执行',
         ),
       );
     }
@@ -93,12 +81,9 @@ export function environmentGrants(
   return grants;
 }
 
-/**
- * 多环境下给变更类能力 schema 增加必填 expectedEnvironment。
- * 读能力不加字段；单环境原样返回（零回归）。
- */
+/** 多环境下给非纯读能力（mutates != none，含临时对象）加必填 expectedEnvironment；单环境/纯读原样返回 */
 export function capabilityInputSchema(capability: Capability, multiEnv: boolean): z.ZodType {
-  if (!multiEnv || !isEnvironmentMutation(capability)) return capability.inputSchema;
+  if (!multiEnv || environmentMutationScope(capability) === 'none') return capability.inputSchema;
   const schema = capability.inputSchema;
   if (schema instanceof z.ZodObject) {
     return schema.extend({
@@ -106,7 +91,7 @@ export function capabilityInputSchema(capability: Capability, multiEnv: boolean)
         .string()
         .min(1)
         .max(32)
-        .describe('当前环境 LABEL，必须与 hana_env_list 返回的 current 逐字一致（多环境变更类调用必填）'),
+        .describe('当前环境 LABEL，必须与 hana_env_list 返回的 current 逐字一致（多环境非纯读调用必填）'),
     });
   }
   return schema;

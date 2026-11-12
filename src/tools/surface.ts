@@ -220,7 +220,7 @@ export function summaryOf(cap: Capability): string {
 /**
  * 能力的参数名清单（门面索引用；只给名字不给 schema）。
  * 完整 schema 由提升给出（提升后它是 tools/list 的一等工具）。
- * 多环境下变更类能力会被追加必填 expectedEnvironment——索引必须与路由校验同源，
+ * 多环境下非纯读能力（mutates != none，含临时对象）会被追加必填 expectedEnvironment——索引必须与路由校验同源，
  * 否则按索引参数调用会直接 input_schema_invalid。
  */
 export function paramNamesOf(cap: Capability, multiEnv = false): string[] {

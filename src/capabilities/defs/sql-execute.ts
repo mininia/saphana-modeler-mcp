@@ -25,7 +25,7 @@ export const sqlExecuteCapabilities = {
     category: 'sql',
     kind: 'sql',
     rootTool: true,
-    effects: { plan: planSqlExecute, destructive: true, idempotent: false },
+    effects: { plan: planSqlExecute, destructive: true, idempotent: false, mutates: 'persistent' },
     title: '直接执行 HANA SQL',
     description:
       '在 HANA 上直接执行 SQL（读/写/管理类）；SELECT 返回列名+行，DML/DDL 返回 affectedRows。\n' +

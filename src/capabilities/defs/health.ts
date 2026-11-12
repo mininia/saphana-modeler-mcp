@@ -157,6 +157,7 @@ export const healthCapabilities = {
       plan: planSystemViewRead('hana_system_health', '实例稳定性体检（内存/CPU/挂载点/备份/阻塞/告警）'),
       destructive: false,
       idempotent: true,
+      mutates: 'none',
     },
     title: 'HANA 稳定性体检',
     // 口径解释与实测说明在 rules=health_check（按需经 hana_system_get_info 查询）——描述只留骨架与查询指针。
@@ -192,6 +193,7 @@ export const healthCapabilities = {
       plan: planSystemViewRead('hana_system_activity', '阻塞事务/长事务/长语句深潜'),
       destructive: false,
       idempotent: true,
+      mutates: 'none',
     },
     title: 'HANA 会话与阻塞深潜',
     // 描述只留骨架与高频踩坑的一句（M_LOCKS 不存在）；逐项口径见 rules=activity_locks。
@@ -220,7 +222,7 @@ export const healthCapabilities = {
     id: 'hana_table_storage',
     category: 'diagnostics',
     kind: 'admin',
-    effects: { plan: planTableStorage, destructive: false, idempotent: true },
+    effects: { plan: planTableStorage, destructive: false, idempotent: true, mutates: 'none' },
     title: 'HANA 表存储与碎片画像',
     // 实测坑、成本量级与逐列口径在 rules=storage_profile；这里只留口径名、返回结构与单位。
     description:
@@ -281,6 +283,7 @@ export const healthCapabilities = {
       plan: planSystemViewRead('hana_system_trend', '历史趋势（_SYS_STATISTICS 时间轴聚合）'),
       destructive: false,
       idempotent: true,
+      mutates: 'none',
     },
     title: 'HANA 历史趋势',
     // 实测结构（采样粒度、TIME vs SERVER_TIMESTAMP）与保留期口径见 rules=trend_timeline。

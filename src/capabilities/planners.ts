@@ -733,15 +733,15 @@ export function planViewOpAlias(op: string, args: Record<string, unknown>): Writ
 }
 
 /**
- * 异步任务取消（hana_task_cancel）的计划：**不声明任何资源**——它只置位进程内取消标志，
- * 不触碰 HANA（批次的实际写入/补偿都发生在任务体里，走的是既有 changeset 路径与各自的闸门）。
- * kind 是 write（暴露面控制：只读档案不该拿到取消写流程的入口），故必须声明 planner 而不是走读兜底。
+ * 异步任务取消计划：不声明资源——只置进程内取消标志，不触碰 HANA。
+ * 补偿写入属任务提交时已授权的执行范围（补偿侧绕开调用期闸门），不在本次声明范围。
+ * kind=write 是暴露面控制，故必须声明 planner。
  */
 export function planTaskCancel(args: Record<string, unknown>): WritePlan {
   const taskId = asStr(args.taskId);
   return narrativePlan('hana_task_cancel', [
     `置位进程内任务 ${taskId ?? '?'} 的取消标志（无仓库写入）；` +
-      '批次已执行项的逆序补偿由任务体按既有 changeset 路径完成（那些写入走各自的闸门，不在本次声明范围）',
+      '批次已执行项的逆序补偿由任务体按既有 changeset 低层路径完成（补偿绕开调用期闸门，不在本次声明范围）',
   ]);
 }
 
