@@ -4,6 +4,12 @@
 >
 > 约定：每次提交前把变化补到对应版本条目下；每条 1–3 行，只写对外可见变化。
 
+## 1.4.2 - 2026-11-12
+
+- 元数据查询功能优化：`hana_metadata_search_objects` 支持按描述/注释搜索（`by=description|both`）——模型读仓库 caption 文本表（不解析 XML），表/列视图读 `COMMENTS`；表函数目录无描述列。
+- 同一工具新增对象类别 `category=model|table|columnView|tableFunction|all`（对齐 HANA Studio Find 页签）与 `packageId`/`schema`/`lang` 过滤；`category=all` 按类别分组返回 `groups`+`counts`。
+- `hana_table_list` 支持 `by=name|comment|both` 与 `tableType`（ROW/COLUMN/VIRTUAL）过滤。
+
 ## 1.4.1 - 2026-11-12
 
 - 修复新增权限维度与工具权限控制的冲突：环境只读闸门改按清单 `effects.mutates` 判定，只拦持久写入；`hana_data_preview` 等临时对象能力在 `HANA_ACCESS=readonly` 下恢复可用。

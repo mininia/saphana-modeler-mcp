@@ -5,9 +5,9 @@ import { viewDefinitionCache } from '../model/view-cache.js';
 import { parseResourceUri } from './preview.derive.js';
 import { HanaBusinessError } from '../core/errors.js';
 import { clampLimit } from '../core/num.js';
-import { assertSafeRuntimeName, assertSchemaAllowed, quoteIdentifier } from '../core/sql.js';
+import { assertSafeRuntimeName, assertSchemaAllowed, listAllowedSchemas, quoteIdentifier } from '../core/sql.js';
 import { suffixInClause, suffixesOf, VIEW_SUFFIXES } from '../model/view-suffixes.js';
-import { CROSSREF_TABLE, OBJECT_TABLE, type VersionScope } from '../model/view-scope.js';
+import { CROSSREF_TABLE, OBJECT_TABLE, OBJECT_TEXT_CONTENT_TABLE, type VersionScope } from '../model/view-scope.js';
 import { parseViewDefinition } from '../model/view-xml.js';
 import type {
   ViewCalculatedAttribute,
@@ -183,10 +183,16 @@ export interface TableInfo {
 
 export type TableListResult = PagedResult<TableInfo, 'tables'>;
 
-/** 表列表（SYS.TABLES 按当前用户权限过滤；schema 默认当前 schema）；回执带 count/limit/truncated，超 limit 不静默截断 */
+/** 表清单的匹配维度：name=表名（默认，大小写敏感）；comment=表注释（大小写不敏感）；both=两者 */
+export type TableListMatch = 'name' | 'comment' | 'both';
+
+/**
+ * 表列表（SYS.TABLES 按当前用户权限过滤；schema 默认当前 schema）；回执带 count/limit/truncated，超 limit 不静默截断。
+ * `by` 决定 pattern 匹配表名还是注释：注释空值为 `''`（不是 NULL），description 匹配时显式排除。
+ */
 export async function listTables(
   pool: HanaPool,
-  opts: { schema?: string; pattern?: string; limit?: number } = {},
+  opts: { schema?: string; pattern?: string; by?: TableListMatch; tableType?: string; limit?: number } = {},
 ): Promise<TableListResult> {
   const limit = clampLimit(opts.limit, 50, 1, 200);
   const schema = opts.schema ?? (await currentSchema(pool));
@@ -195,9 +201,23 @@ export async function listTables(
   if (opts.schema) assertSchemaAllowed(opts.schema);
   const where = ['SCHEMA_NAME = ?'];
   const params: Array<string | number> = [schema];
+  if (opts.tableType) {
+    where.push('TABLE_TYPE = ?');
+    params.push(opts.tableType);
+  }
   if (opts.pattern) {
-    where.push('TABLE_NAME LIKE ?');
-    params.push(`%${opts.pattern}%`);
+    const by = opts.by ?? 'name';
+    const like = `%${opts.pattern}%`;
+    if (by === 'name') {
+      where.push('TABLE_NAME LIKE ?');
+      params.push(like);
+    } else if (by === 'comment') {
+      where.push("COMMENTS IS NOT NULL AND COMMENTS <> '' AND UPPER(COMMENTS) LIKE UPPER(?)");
+      params.push(like);
+    } else {
+      where.push("(TABLE_NAME LIKE ? OR (COMMENTS IS NOT NULL AND COMMENTS <> '' AND UPPER(COMMENTS) LIKE UPPER(?)))");
+      params.push(like, like);
+    }
   }
   const whereSql = where.join(' AND ');
   return runPaged('tables', limit, {
@@ -879,6 +899,8 @@ export interface ObjectSearchItem {
   versionId: number;
   /** 命中行所属版本视角：active=已激活；inactive=未激活/挂起 */
   status: VersionScope;
+  /** 模型 caption（ACTIVE/INACTIVE_OBJECT_TEXT_CONTENT，TEXT_ID='caption'）；无文本时为 undefined */
+  description?: string;
   /** status=active：激活时间/人 */
   activatedAt?: string;
   activatedBy?: string;
@@ -890,33 +912,178 @@ export interface ObjectSearchItem {
 
 export type ObjectSearchResult = PagedResult<ObjectSearchItem, 'objects'>;
 
+/** 元数据搜索的对象类别（对齐 HANA Studio Modeler Find：Models/Tables/Column Views/Table Functions） */
+export type MetadataCategory = 'model' | 'table' | 'columnView' | 'tableFunction' | 'all';
+
+/** 名称/描述搜索维度（字段反查 by=field 是独立通道，不在此枚举） */
+export type MetadataSearchMode = 'name' | 'description' | 'both';
+
+/** 目录类别（表/列视图/表函数） */
+export type CatalogCategory = 'table' | 'columnView' | 'tableFunction';
+
+/** 目录对象（表/列视图/表函数）搜索条目 */
+export interface CatalogSearchItem {
+  category: CatalogCategory;
+  schemaName: string;
+  objectName: string;
+  /** TABLE_TYPE / VIEW_TYPE / FUNCTION_TYPE */
+  objectType: string;
+  /** 表/列视图的注释（SYS.TABLES.COMMENTS / SYS.VIEWS.COMMENTS）；表函数目录无描述列，恒为 undefined */
+  description?: string;
+  /** 表函数 OWNER_NAME */
+  owner?: string;
+  /** 目录对象的创建时间 */
+  createdAt?: string;
+}
+
+export type CatalogSearchResult = PagedResult<CatalogSearchItem, 'items'> & {
+  category: CatalogCategory;
+  /** 口径说明（如表函数无描述列） */
+  notes?: string[];
+};
+
+/** category=all 的分组命中总数 */
+export interface MetadataSearchCounts {
+  models: number;
+  tables: number;
+  columnViews: number;
+  tableFunctions: number;
+}
+
 /**
- * 按名称片段搜索仓库对象（视图定位用）：
+ * 元数据搜索结果：
+ * - category=model：`objects`（既有兼容字段，模型 caption 会作为 description 附带）；
+ * - category=table/columnView/tableFunction：`items`；
+ * - category=all：`groups` + `counts`（按类别分组，对齐 Find 对话框的结果页签）。
+ * `limit` 是**每个类别**的上限；`count` 在 all 时为各类别命中数之和。
+ */
+export interface MetadataSearchResult {
+  category: MetadataCategory;
+  by: MetadataSearchMode;
+  count: number;
+  limit: number;
+  truncated: boolean;
+  objects?: ObjectSearchItem[];
+  items?: CatalogSearchItem[];
+  groups?: {
+    models: ObjectSearchItem[];
+    tables: CatalogSearchItem[];
+    columnViews: CatalogSearchItem[];
+    tableFunctions: CatalogSearchItem[];
+  };
+  counts?: MetadataSearchCounts;
+  /** 口径说明（如：表函数无描述列、version=inactive 只作用于模型） */
+  notes?: string[];
+}
+
+/** 模型 caption 的默认语言：空串（HANA 默认文本；实测覆盖 2679/2680 个仓库视图） */
+const DEFAULT_CAPTION_LANG = '';
+
+const descriptionKey = (pkg: string, name: string, suffix: string): string => `${pkg}\u0000${name}\u0000${suffix}`;
+
+/**
+ * 批量取模型 caption（只查当前页的对象，避免逐对象 N+1）。
+ * 与对象表同版本视角：active 读 ACTIVE_OBJECT_TEXT_CONTENT，inactive 读 INACTIVE_OBJECT_TEXT_CONTENT。
+ */
+async function fetchModelDescriptions(
+  pool: HanaPool,
+  version: VersionScope,
+  lang: string,
+  items: Array<{ PACKAGE_ID: string; OBJECT_NAME: string; OBJECT_SUFFIX: string }>,
+): Promise<Map<string, string>> {
+  if (items.length === 0) return new Map();
+  const table = quoteIdentifier(OBJECT_TEXT_CONTENT_TABLE[version]);
+  // 三元组 OR 条件：每个对象 3 个参数；当前页最大 100 → 300 个绑定参数
+  const triples = items.map(() => '(PACKAGE_ID = ? AND OBJECT_NAME = ? AND OBJECT_SUFFIX = ?)').join(' OR ');
+  const params: string[] = [lang];
+  for (const it of items) params.push(it.PACKAGE_ID, it.OBJECT_NAME, it.OBJECT_SUFFIX);
+  const rows = await pool.query<{
+    PACKAGE_ID: string;
+    OBJECT_NAME: string;
+    OBJECT_SUFFIX: string;
+    CONTENT: string | null;
+  }>(
+    `SELECT PACKAGE_ID, OBJECT_NAME, OBJECT_SUFFIX, CONTENT
+     FROM "_SYS_REPO".${table}
+     WHERE TEXT_ID = 'caption' AND LANG = ? AND (${triples})`,
+    params,
+  );
+  const out = new Map<string, string>();
+  for (const r of rows) {
+    if (typeof r.CONTENT === 'string' && r.CONTENT !== '') {
+      out.set(descriptionKey(r.PACKAGE_ID, r.OBJECT_NAME, r.OBJECT_SUFFIX), r.CONTENT);
+    }
+  }
+  return out;
+}
+
+/**
+ * 搜索仓库模型（视图定位用）：
  * - 来源随 version 切换：active（默认）= _SYS_REPO.ACTIVE_OBJECT；
  *   inactive = _SYS_REPO.INACTIVE_OBJECT（未激活/挂起版本，仅此类对象存在该行）
- * - 按 OBJECT_NAME 模糊匹配（UPPER 大小写不敏感）
+ * - `by`：name（默认，按 OBJECT_NAME 模糊匹配，UPPER 大小写不敏感）/ description（按 caption 文本模糊匹配，
+ *   不解析设计时 XML）/ both（名称或描述任一命中）
+ * - 结果始终附带 caption（TEXT_ID='caption'，LANG 可配）；description 过滤走 EXISTS，确保 count/明细
+ *   都是对象数，不会因文本行重复
  * - 默认只搜三种视图类型（calculationview/attributeview/analyticview），排除 UI5 仓库资源
  * - kind 指定时只搜该类型；带截断（LIMIT）+ count，供 "Showing N of M" 提示
  * 典型用途：hana_metadata_list_fields 报"未找到视图"时，先用本工具按片段定位包名/对象名。
  */
 export async function searchObjects(
   pool: HanaPool,
-  opts: { pattern: string; kind?: ViewKind; limit?: number; version?: VersionScope } = { pattern: '' },
+  opts: {
+    pattern: string;
+    by?: MetadataSearchMode;
+    kind?: ViewKind;
+    packageId?: string;
+    lang?: string;
+    limit?: number;
+    version?: VersionScope;
+  } = { pattern: '' },
 ): Promise<ObjectSearchResult> {
   const limit = clampLimit(opts.limit, 20, 1, 100);
+  const mode = opts.by ?? 'name';
+  const lang = opts.lang?.trim() || DEFAULT_CAPTION_LANG;
   const suffixes = suffixesOf(opts.kind);
   const suffixIn = suffixInClause(suffixes);
   const version = opts.version ?? 'active';
   // 表名来自 model/view-scope 的字面量映射（非用户输入）；列集合随版本切换
   const table = quoteIdentifier(OBJECT_TABLE[version]);
-  const versionColumns = version === 'active' ? 'ACTIVATED_AT, ACTIVATED_BY' : 'LAST_CHANGED_AT, OWNER, IS_DELETION';
+  const textTable = quoteIdentifier(OBJECT_TEXT_CONTENT_TABLE[version]);
+  const versionColumns =
+    version === 'active' ? 'A.ACTIVATED_AT, A.ACTIVATED_BY' : 'A.LAST_CHANGED_AT, A.OWNER, A.IS_DELETION';
+
+  // 值一律参数绑定；pattern 仅作为 LIKE 片段，UPPER 两侧做大小写不敏感匹配
+  const like = `%${opts.pattern}%`;
+  const clauses = [`A.OBJECT_SUFFIX IN ${suffixIn}`];
+  const params: Array<string | number> = [...suffixes];
+  if (opts.packageId) {
+    clauses.push('A.PACKAGE_ID = ?');
+    params.push(opts.packageId);
+  }
+  // caption 存在性判定：只认 caption 文本、按 lang 过滤；EXISTS 不改变对象行数
+  const captionExists = (): string =>
+    `EXISTS (SELECT 1 FROM "_SYS_REPO".${textTable} C
+       WHERE C.PACKAGE_ID = A.PACKAGE_ID AND C.OBJECT_NAME = A.OBJECT_NAME
+         AND C.OBJECT_SUFFIX = A.OBJECT_SUFFIX AND C.TEXT_ID = 'caption'
+         AND C.LANG = ? AND UPPER(C.CONTENT) LIKE UPPER(?))`;
+  if (mode === 'name') {
+    clauses.push('UPPER(A.OBJECT_NAME) LIKE UPPER(?)');
+    params.push(like);
+  } else if (mode === 'description') {
+    clauses.push(captionExists());
+    params.push(lang, like);
+  } else {
+    clauses.push(`(UPPER(A.OBJECT_NAME) LIKE UPPER(?) OR ${captionExists()})`);
+    params.push(like, lang, like);
+  }
+  const whereSql = clauses.join(' AND ');
+
   return runPaged('objects', limit, {
-    // 值一律参数绑定；pattern 仅作为 LIKE 片段，UPPER 两侧做大小写不敏感匹配
     count: async () => {
       const countRow = await pool.query<{ C: number }>(
-        `SELECT COUNT(*) AS C FROM "_SYS_REPO".${table}
-         WHERE UPPER(OBJECT_NAME) LIKE UPPER(?) AND OBJECT_SUFFIX IN ${suffixIn}`,
-        [`%${opts.pattern}%`, ...suffixes],
+        `SELECT COUNT(*) AS C FROM "_SYS_REPO".${table} A WHERE ${whereSql}`,
+        params,
       );
       return countRow[0]?.C ?? 0;
     },
@@ -932,28 +1099,312 @@ export async function searchObjects(
         OWNER?: string | null;
         IS_DELETION?: number | boolean | null;
       }>(
-        `SELECT PACKAGE_ID, OBJECT_NAME, OBJECT_SUFFIX, VERSION_ID, ${versionColumns}
-         FROM "_SYS_REPO".${table}
-         WHERE UPPER(OBJECT_NAME) LIKE UPPER(?) AND OBJECT_SUFFIX IN ${suffixIn}
-         ORDER BY PACKAGE_ID, OBJECT_NAME LIMIT ?`,
-        [`%${opts.pattern}%`, ...suffixes, limit],
+        `SELECT A.PACKAGE_ID, A.OBJECT_NAME, A.OBJECT_SUFFIX, A.VERSION_ID, ${versionColumns}
+         FROM "_SYS_REPO".${table} A
+         WHERE ${whereSql}
+         ORDER BY A.PACKAGE_ID, A.OBJECT_NAME LIMIT ?`,
+        [...params, limit],
       );
-      return rows.map((r) => ({
-        packageId: r.PACKAGE_ID,
-        objectName: r.OBJECT_NAME,
-        objectSuffix: r.OBJECT_SUFFIX,
-        versionId: r.VERSION_ID,
-        status: version,
-        ...(version === 'active'
-          ? { activatedAt: r.ACTIVATED_AT ?? undefined, activatedBy: r.ACTIVATED_BY ?? undefined }
-          : {
-              lastChangedAt: r.LAST_CHANGED_AT ?? undefined,
-              owner: r.OWNER ?? undefined,
-              isDeletion: Number(r.IS_DELETION) === 1,
-            }),
-      }));
+      const descriptions = await fetchModelDescriptions(pool, version, lang, rows);
+      return rows.map((r) => {
+        const description = descriptions.get(descriptionKey(r.PACKAGE_ID, r.OBJECT_NAME, r.OBJECT_SUFFIX));
+        return {
+          packageId: r.PACKAGE_ID,
+          objectName: r.OBJECT_NAME,
+          objectSuffix: r.OBJECT_SUFFIX,
+          versionId: r.VERSION_ID,
+          status: version,
+          ...(description !== undefined ? { description } : {}),
+          ...(version === 'active'
+            ? { activatedAt: r.ACTIVATED_AT ?? undefined, activatedBy: r.ACTIVATED_BY ?? undefined }
+            : {
+                lastChangedAt: r.LAST_CHANGED_AT ?? undefined,
+                owner: r.OWNER ?? undefined,
+                isDeletion: Number(r.IS_DELETION) === 1,
+              }),
+        };
+      });
     },
   });
+}
+
+/**
+ * 目录搜索的 schema 集：显式 schema 走白名单；省略时取「系统 schema + HANA_READ_SCHEMA 追加 + 当前 schema」，
+ * 即调用方本来就能读的范围，不枚举白名单外的 schema。
+ */
+async function resolveCatalogSchemas(pool: HanaPool, schema?: string): Promise<string[]> {
+  if (schema) {
+    assertSchemaAllowed(schema);
+    return [schema];
+  }
+  const current = await currentSchema(pool);
+  const out = listAllowedSchemas();
+  if (current && !out.includes(current)) out.push(current);
+  return out;
+}
+
+/**
+ * 目录对象的名称/注释匹配条件（列名来自内部字面量，安全）。
+ * 注释空值是 `''` 不是 NULL，按描述/两者匹配时显式排除；commentColumn=null（表函数）时退化为名称匹配。
+ */
+function catalogMatchClause(
+  by: MetadataSearchMode,
+  nameColumn: string,
+  commentColumn: string | null,
+  params: Array<string | number>,
+  pattern: string,
+): string {
+  const like = `%${pattern}%`;
+  if (by === 'name' || commentColumn === null) {
+    params.push(like);
+    return `UPPER(${nameColumn}) LIKE UPPER(?)`;
+  }
+  if (by === 'description') {
+    params.push(like);
+    return `(${commentColumn} IS NOT NULL AND ${commentColumn} <> '' AND UPPER(${commentColumn}) LIKE UPPER(?))`;
+  }
+  params.push(like, like);
+  return `(UPPER(${nameColumn}) LIKE UPPER(?) OR (${commentColumn} IS NOT NULL AND ${commentColumn} <> '' AND UPPER(${commentColumn}) LIKE UPPER(?)))`;
+}
+
+/** 目录搜索结果的行（三种目录的列并集；具体字段随类别取用） */
+interface CatalogRow {
+  SCHEMA_NAME: string;
+  TABLE_NAME?: string;
+  VIEW_NAME?: string;
+  FUNCTION_NAME?: string;
+  TABLE_TYPE?: string;
+  VIEW_TYPE?: string;
+  FUNCTION_TYPE?: string;
+  COMMENTS?: string | null;
+  OWNER_NAME?: string | null;
+  CREATE_TIME?: string | null;
+}
+
+/**
+ * 按名称/描述搜索目录对象（表/列视图/表函数）。
+ * - 表：SYS.TABLES（COMMENTS）；列视图：SYS.VIEWS（COMMENTS，实测与模型 caption 一致）；
+ * - 表函数：SYS.FUNCTIONS WHERE FUNCTION_USAGE_TYPE='TABLE'（**无描述列**，by=description 直接报错，
+ *   by=both 退化为名称匹配并在 notes 说明）；
+ * - schema 省略时搜索可读范围（见 resolveCatalogSchemas），显式 schema 走读范围白名单。
+ */
+export async function searchCatalogObjects(
+  pool: HanaPool,
+  opts: {
+    category: CatalogCategory;
+    pattern: string;
+    by?: MetadataSearchMode;
+    schema?: string;
+    /** 已解析的 schema 集（searchMetadata category=all 时复用，避免重复解析当前 schema） */
+    schemas?: string[];
+    limit?: number;
+  },
+): Promise<CatalogSearchResult> {
+  const limit = clampLimit(opts.limit, 20, 1, 100);
+  const by = opts.by ?? 'name';
+  if (opts.category === 'tableFunction' && by === 'description') {
+    throw new HanaBusinessError(
+      '表函数目录（SYS.FUNCTIONS）没有描述/注释列，无法按描述搜索；请用 by=name 或 by=both',
+      'DESCRIPTION_NOT_SUPPORTED',
+    );
+  }
+  const schemas = opts.schemas ?? (await resolveCatalogSchemas(pool, opts.schema));
+  const schemaIn = `(${schemas.map(() => '?').join(',')})`;
+
+  let tableName: string;
+  let columns: string;
+  let nameColumn: string;
+  let commentColumn: string | null;
+  let extraWhere: string | null;
+  let orderBy: string;
+  let mapRow: (r: CatalogRow) => CatalogSearchItem;
+
+  if (opts.category === 'table') {
+    tableName = 'SYS.TABLES';
+    columns = 'SCHEMA_NAME, TABLE_NAME, TABLE_TYPE, COMMENTS, CREATE_TIME';
+    nameColumn = 'TABLE_NAME';
+    commentColumn = 'COMMENTS';
+    extraWhere = null;
+    orderBy = 'SCHEMA_NAME, TABLE_NAME';
+    mapRow = (r) => ({
+      category: 'table',
+      schemaName: r.SCHEMA_NAME,
+      objectName: r.TABLE_NAME ?? '',
+      objectType: r.TABLE_TYPE ?? '',
+      ...(r.COMMENTS ? { description: r.COMMENTS } : {}),
+      ...(r.CREATE_TIME ? { createdAt: r.CREATE_TIME } : {}),
+    });
+  } else if (opts.category === 'columnView') {
+    tableName = 'SYS.VIEWS';
+    columns = 'SCHEMA_NAME, VIEW_NAME, VIEW_TYPE, COMMENTS, CREATE_TIME';
+    nameColumn = 'VIEW_NAME';
+    commentColumn = 'COMMENTS';
+    extraWhere = null;
+    orderBy = 'SCHEMA_NAME, VIEW_NAME';
+    mapRow = (r) => ({
+      category: 'columnView',
+      schemaName: r.SCHEMA_NAME,
+      objectName: r.VIEW_NAME ?? '',
+      objectType: r.VIEW_TYPE ?? '',
+      ...(r.COMMENTS ? { description: r.COMMENTS } : {}),
+      ...(r.CREATE_TIME ? { createdAt: r.CREATE_TIME } : {}),
+    });
+  } else {
+    tableName = 'SYS.FUNCTIONS';
+    columns = 'SCHEMA_NAME, FUNCTION_NAME, FUNCTION_TYPE, OWNER_NAME, CREATE_TIME';
+    nameColumn = 'FUNCTION_NAME';
+    commentColumn = null;
+    extraWhere = "FUNCTION_USAGE_TYPE = 'TABLE'";
+    orderBy = 'SCHEMA_NAME, FUNCTION_NAME';
+    mapRow = (r) => ({
+      category: 'tableFunction',
+      schemaName: r.SCHEMA_NAME,
+      objectName: r.FUNCTION_NAME ?? '',
+      objectType: r.FUNCTION_TYPE ?? '',
+      ...(r.OWNER_NAME ? { owner: r.OWNER_NAME } : {}),
+      ...(r.CREATE_TIME ? { createdAt: r.CREATE_TIME } : {}),
+    });
+  }
+
+  const clauses = [`SCHEMA_NAME IN ${schemaIn}`];
+  const params: Array<string | number> = [...schemas];
+  if (extraWhere) clauses.push(extraWhere);
+  clauses.push(catalogMatchClause(by, nameColumn, commentColumn, params, opts.pattern));
+  const whereSql = clauses.join(' AND ');
+
+  const page = await runPaged('items', limit, {
+    count: async () => {
+      const rows = await pool.query<{ C: number }>(`SELECT COUNT(*) AS C FROM ${tableName} WHERE ${whereSql}`, params);
+      return rows[0]?.C ?? 0;
+    },
+    items: async () => {
+      const rows = await pool.query<CatalogRow>(
+        `SELECT ${columns} FROM ${tableName} WHERE ${whereSql} ORDER BY ${orderBy} LIMIT ?`,
+        [...params, limit],
+      );
+      return rows.map(mapRow);
+    },
+  });
+
+  // 表函数没有描述列：by=both 时如实说明只按名称匹配
+  const notes =
+    opts.category === 'tableFunction' && by === 'both'
+      ? ['表函数目录（SYS.FUNCTIONS）没有描述/注释列，by=both 对表函数仅按名称匹配']
+      : [];
+  return { ...page, category: opts.category, ...(notes.length > 0 ? { notes } : {}) };
+}
+
+/**
+ * 元数据搜索总入口（对齐 HANA Studio Modeler Find 的类别页签）：
+ * - category=model（默认）：仓库视图，走 searchObjects（兼容既有 objects 字段）；
+ * - category=table/columnView/tableFunction：目录对象，走 searchCatalogObjects（items）；
+ * - category=all：四类并行搜索，返回 groups + counts；limit 为每个类别的上限。
+ * 表函数没有描述列：all + by=description 跳过表函数并在 notes 说明；all + by=both 对表函数只按名称匹配。
+ */
+export async function searchMetadata(
+  pool: HanaPool,
+  opts: {
+    pattern: string;
+    by?: MetadataSearchMode;
+    category?: MetadataCategory;
+    kind?: ViewKind;
+    packageId?: string;
+    schema?: string;
+    lang?: string;
+    limit?: number;
+    version?: VersionScope;
+  },
+): Promise<MetadataSearchResult> {
+  const category = opts.category ?? 'model';
+  const by = opts.by ?? 'name';
+  const limit = clampLimit(opts.limit, 20, 1, 100);
+
+  if (category === 'model') {
+    const r = await searchObjects(pool, {
+      pattern: opts.pattern,
+      by,
+      kind: opts.kind,
+      packageId: opts.packageId,
+      lang: opts.lang,
+      limit,
+      version: opts.version,
+    });
+    return { category, by, count: r.count, limit: r.limit, truncated: r.truncated, objects: r.objects };
+  }
+
+  if (category !== 'all') {
+    const r = await searchCatalogObjects(pool, {
+      category,
+      pattern: opts.pattern,
+      by,
+      schema: opts.schema,
+      limit,
+    });
+    return {
+      category,
+      by,
+      count: r.count,
+      limit: r.limit,
+      truncated: r.truncated,
+      items: r.items,
+      ...(r.notes ? { notes: r.notes } : {}),
+    };
+  }
+
+  const notes: string[] = ['category=all 的 limit 为每类上限，count/returnedCount 为各类合计'];
+  if (by === 'description') {
+    notes.push('表函数目录（SYS.FUNCTIONS）没有描述/注释列，本次未纳入描述搜索');
+  }
+  if (opts.version === 'inactive') {
+    notes.push('version=inactive 仅作用于模型（仓库对象）；目录对象只有当前状态');
+  }
+
+  // schema 只解析一次，三个目录类别复用（显式 schema 的 assert 也在解析时完成）
+  const schemas = await resolveCatalogSchemas(pool, opts.schema);
+  const catalogOpts = { pattern: opts.pattern, by, schemas, limit };
+  const [models, tables, columnViews, tableFunctions] = await Promise.all([
+    searchObjects(pool, {
+      pattern: opts.pattern,
+      by,
+      kind: opts.kind,
+      packageId: opts.packageId,
+      lang: opts.lang,
+      limit,
+      version: opts.version,
+    }),
+    searchCatalogObjects(pool, { category: 'table', ...catalogOpts }),
+    searchCatalogObjects(pool, { category: 'columnView', ...catalogOpts }),
+    by === 'description'
+      ? Promise.resolve(undefined)
+      : searchCatalogObjects(pool, { category: 'tableFunction', ...catalogOpts }),
+  ]);
+
+  // 目录搜索的 notes（表函数 by=both/无描述列）并入，去重保持稳定顺序
+  for (const n of [tables.notes, columnViews.notes, tableFunctions?.notes].flat()) {
+    if (n && !notes.includes(n)) notes.push(n);
+  }
+
+  const counts: MetadataSearchCounts = {
+    models: models.count,
+    tables: tables.count,
+    columnViews: columnViews.count,
+    tableFunctions: tableFunctions?.count ?? 0,
+  };
+  return {
+    category,
+    by,
+    count: counts.models + counts.tables + counts.columnViews + counts.tableFunctions,
+    limit,
+    truncated: models.truncated || tables.truncated || columnViews.truncated || (tableFunctions?.truncated ?? false),
+    counts,
+    groups: {
+      models: models.objects,
+      tables: tables.items,
+      columnViews: columnViews.items,
+      tableFunctions: tableFunctions?.items ?? [],
+    },
+    ...(notes.length > 0 ? { notes } : {}),
+  };
 }
 
 /** by=field 搜索的字段命中条目 */

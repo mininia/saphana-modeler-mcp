@@ -38,29 +38,34 @@ export const metadataCapabilities = {
     category: 'discovery',
     kind: 'read',
     effects: { destructive: false, idempotent: true, mutates: 'none' },
-    title: '搜索仓库视图（按名称 / 按字段）',
+    title: '搜索元数据对象（名称 / 描述 / 字段，跨类别）',
     description:
-      '两种模式（by）：\n' +
-      'by=name（默认）：按视图对象名片段模糊搜索仓库对象（大小写不敏感），返回包名/对象名/类型/版本/激活信息，用于定位完整包名与对象名；version 默认 active，可传 inactive。\n' +
-      'by=field：找哪些视图的输出里含某字段（field 为字段 ID 片段）——逐候选解析设计时 XML，受 maxCandidates（默认 100）与 limit 约束，回执带 candidatesScanned/truncated/asOf；pattern 可选，用于收窄候选。\n' +
-      '默认只搜三种视图类型；kind 可限定。典型场景：list_fields / get_field_logic 报「未找到视图」时先用本工具定位。字段级反查与依赖口径见 rules=metadata_graph。',
+      '按 by 搜索元数据：name（默认，对象名）/description（描述或注释）/both（名称或描述）/field（输出字段，仅 model）。\n' +
+      'category 对齐 HANA Studio Find：model（默认）/table/columnView/tableFunction/all（分组返回，limit 为每类上限）。\n' +
+      '描述来源：模型=仓库 caption 文本表（不解析 XML，可切 version）；表=SYS.TABLES.COMMENTS；列视图=SYS.VIEWS.COMMENTS；表函数无描述列、只能按名称。\n' +
+      '过滤：模型用 packageId/kind/version；目录类别用 schema（省略=可读范围）。返回 model=objects、目录=items、all=groups+counts；细则见 rules=metadata_graph。',
     inputSchema: z.object({
       pattern: z
         .string()
         .min(1)
         .max(100)
         .optional()
-        .describe('视图对象名片段（by=name 必填；by=field 可选，用于收窄候选），大小写不敏感'),
+        .describe('名称/描述片段（by=name/description/both 必填；by=field 可选）'),
       by: z
-        .enum(['name', 'field'])
+        .enum(['name', 'field', 'description', 'both'])
         .optional()
-        .describe('搜索维度：name=按对象名（默认）；field=按输出字段（需同时给 field）'),
+        .describe('name=对象名（默认）/description=描述/both=两者/field=输出字段（仅 model）'),
       field: z.string().min(1).max(100).optional().describe('字段 ID 片段（by=field 必填），如 MATERIAL'),
-      kind: VIEW_KIND.optional().describe('视图类型；省略时搜全部三种视图'),
-      version: VERSION_SCOPE.default('active').describe(
-        '版本视角：active=已激活对象（默认）；inactive=未激活/有挂起改动的对象',
-      ),
-      limit: z.number().int().min(1).max(100).default(20).describe('返回条数上限，默认 20，最大 100'),
+      category: z
+        .enum(['model', 'table', 'columnView', 'tableFunction', 'all'])
+        .default('model')
+        .describe('model（默认）/table/columnView/tableFunction/all'),
+      kind: VIEW_KIND.optional().describe('视图类型（仅 model/all 的模型部分）；省略时匹配三种视图'),
+      packageId: zReadPackageId('包名（仅 model/all 的模型部分，精确匹配）').optional(),
+      schema: tagResource(z.string().trim().optional().describe('schema（仅目录类别；省略=可读范围）'), 'readSchema'),
+      lang: z.string().trim().max(20).optional().describe('模型 caption 语言（默认空串，如 zh_CN）'),
+      version: VERSION_SCOPE.default('active').describe('模型版本（默认 active；inactive=未激活；仅 model/all）'),
+      limit: z.number().int().min(1).max(100).default(20).describe('每类返回上限（默认 20，最大 100）'),
       maxCandidates: z
         .number()
         .int()
@@ -168,15 +173,21 @@ export const metadataCapabilities = {
     category: 'discovery',
     kind: 'read',
     effects: { plan: planTableList, destructive: false, idempotent: true, mutates: 'none' },
-    title: '列出 schema 下的表',
+    title: '列出 schema 下的表（名称 / 注释）',
     description:
-      '列出指定 schema（默认当前用户 schema）下当前用户可访问的表（SYS.TABLES 按权限过滤），支持名称模糊匹配与条数限制。建模选数据源时用 hana_table_columns 查看列结构',
+      '列出指定 schema（默认当前用户 schema）下可访问的表（SYS.TABLES 按权限过滤）；by 可按表名/注释匹配，tableType 过滤类型。\n' +
+      '跨 schema 注释搜索用 hana_metadata_search_objects(category=table, by=description)；列结构用 hana_table_columns。',
     inputSchema: z.object({
       schema: tagResource(
         z.string().trim().optional().describe('schema 名（默认当前用户 schema；如 SAPABAP1/_SYS_BIC）'),
         'readSchema',
       ),
-      pattern: z.string().optional().describe('表名模糊匹配（LIKE %pattern%，大小写敏感）'),
+      pattern: z.string().optional().describe('按 by 匹配的片段（LIKE %pattern%；省略=不过滤）'),
+      by: z
+        .enum(['name', 'comment', 'both'])
+        .default('name')
+        .describe('name=表名（默认，大小写敏感）/comment=注释（不区分大小写）/both'),
+      tableType: z.enum(['ROW', 'COLUMN', 'VIRTUAL']).optional().describe('表类型（SYS.TABLES.TABLE_TYPE）'),
       limit: z.number().int().min(1).max(200).default(50).describe('返回条数上限，默认 50，最大 200'),
     }),
     annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },

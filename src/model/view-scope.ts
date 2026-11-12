@@ -28,3 +28,16 @@ export const CROSSREF_TABLE: Record<VersionScope, 'ACTIVE_OBJECTCROSSREF' | 'INA
   active: 'ACTIVE_OBJECTCROSSREF',
   inactive: 'INACTIVE_OBJECTCROSSREF',
 };
+
+/**
+ * 对象描述文本内容表（caption 所在表，与对象表同版本视角）。
+ * 实测（SPS08）：ACTIVE 侧 `TEXT_ID='caption'` 覆盖 2679/2680 个仓库视图；
+ * INACTIVE 侧用 INACTIVE_OBJECT_TEXT_CONTENT（有挂起改动的对象才有行）。
+ */
+export const OBJECT_TEXT_CONTENT_TABLE: Record<
+  VersionScope,
+  'ACTIVE_OBJECT_TEXT_CONTENT' | 'INACTIVE_OBJECT_TEXT_CONTENT'
+> = {
+  active: 'ACTIVE_OBJECT_TEXT_CONTENT',
+  inactive: 'INACTIVE_OBJECT_TEXT_CONTENT',
+};

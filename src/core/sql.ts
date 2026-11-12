@@ -67,6 +67,15 @@ export function isSchemaAllowed(schema: string): boolean {
 }
 
 /**
+ * 当前允许的 schema 全集（系统 schema + HANA_READ_SCHEMA 追加项）。
+ * 供跨 schema 的目录搜索（表/列视图/表函数）默认取「可读范围」——不枚举白名单外的 schema；
+ * 调用方仍需把每个值参数绑定，不拼进 SQL 文本。
+ */
+export function listAllowedSchemas(): string[] {
+  return [...SYSTEM_SCHEMAS, ...extraSchemas];
+}
+
+/**
  * 白名单的可读描述（供**所有**拒绝文案与排障提示共用）。
  *
  * 单点生成的原因：手写枚举曾在多处与实际白名单漂移 —— 报错文案漏列 SAPABAP1，

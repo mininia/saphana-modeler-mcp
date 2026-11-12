@@ -35,6 +35,8 @@ export const metadataGraphRules: readonly RuleObject[] = [
       '',
       '使用时机：修改/删除视图前用 hana_metadata_where_used 评估影响面；',
       '反向「哪些视图的输出里含某字段」用 hana_metadata_search_objects(by=field)；',
+      '描述搜索不解析 XML：模型读 _SYS_REPO 的 caption 文本表（ACTIVE/INACTIVE），',
+      '表/列视图读 SYS.TABLES/SYS.VIEWS.COMMENTS；表函数无描述列。category=all 按类别分组。',
       '扫描类结果一律带 asOf（构建时刻，进程时区 ISO 秒级）——读的是「哪个时点的图」，不是实时；截断时 truncated=true。',
     ].join('\n'),
     tools: ['hana_metadata_where_used', 'hana_metadata_get_field_logic', 'hana_metadata_search_objects'],

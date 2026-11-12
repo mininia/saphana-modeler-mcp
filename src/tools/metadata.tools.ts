@@ -13,9 +13,10 @@ import {
   getViewFieldList,
   getViewFieldLogic,
   listTables,
-  searchObjects,
+  searchMetadata,
   searchObjectsByField,
   whereUsed,
+  type MetadataSearchResult,
 } from '../services/metadata.service.js';
 import { capabilityRegistrar, type ToolContext } from './index.js';
 import { CAP } from '../capabilities/manifest.js';
@@ -30,6 +31,14 @@ const SEARCH_LIMIT_DEFAULT: number = CAP.hana_metadata_search_objects.inputSchem
 const TABLE_LIST_LIMIT_DEFAULT: number = CAP.hana_table_list.inputSchema.shape.limit.parse(undefined);
 const TABLE_COLUMNS_LIMIT_DEFAULT: number = CAP.hana_table_columns.inputSchema.shape.limit.parse(undefined);
 
+/** 搜索回执实际返回的条目数（model 用 objects；单目录用 items；all 用 groups 合计） */
+function returnedCountOf(data: MetadataSearchResult): number {
+  if (data.objects) return data.objects.length;
+  if (data.items) return data.items.length;
+  const g = data.groups;
+  return g ? g.models.length + g.tables.length + g.columnViews.length + g.tableFunctions.length : 0;
+}
+
 export function registerMetadataTools(server: McpServer, ctx: ToolContext): void {
   const regCap = capabilityRegistrar(server, ctx);
 
@@ -40,46 +49,108 @@ export function registerMetadataTools(server: McpServer, ctx: ToolContext): void
     return toToolResult(envelope);
   });
 
-  regCap(CAP.hana_metadata_search_objects, async ({ pattern, by, field, kind, limit, maxCandidates, version }) => {
-    // 跨字段条件必填：zod 表达不了（handler 级硬错误 + 可恢复指引）
-    const mode = by ?? 'name';
-    if (mode === 'name' && !pattern) {
-      return mcpErrorText('by=name（默认）需要 pattern', '按对象名搜索请给 pattern；按字段搜索用 by=field + field');
-    }
-    if (mode === 'field' && !field) {
-      return mcpErrorText('by=field 需要 field', '给出字段 ID 片段（如 MATERIAL）；pattern 可选，用于收窄对象名候选');
-    }
-    const envelope: Envelope = await withErrorEnvelope(async () => {
-      if (mode === 'field') {
-        const data = await searchObjectsByField(ctx.pool, {
-          field: field as string,
-          ...(pattern ? { pattern } : {}),
+  regCap(
+    CAP.hana_metadata_search_objects,
+    async ({ pattern, by, field, category, kind, packageId, schema, lang, limit, maxCandidates, version }) => {
+      // 跨字段条件必填/互斥：zod 表达不了（handler 级硬错误 + 可恢复指引）
+      const mode = by ?? 'name';
+      const cat = category ?? 'model';
+      if (mode === 'name' && !pattern) {
+        return mcpErrorText(
+          'by=name（默认）需要 pattern',
+          '按对象名搜索请给 pattern；按字段搜索用 by=field + field；按描述搜索用 by=description + pattern',
+        );
+      }
+      if ((mode === 'description' || mode === 'both') && !pattern) {
+        return mcpErrorText(
+          `by=${mode} 需要 pattern`,
+          '给出名称/描述片段；描述搜索覆盖模型/表/列视图，表函数目录无描述列',
+        );
+      }
+      if (mode === 'field' && !field) {
+        return mcpErrorText('by=field 需要 field', '给出字段 ID 片段（如 MATERIAL）；pattern 可选，用于收窄对象名候选');
+      }
+      if (mode === 'field' && cat !== 'model') {
+        return mcpErrorText(
+          'by=field 只支持 category=model',
+          '字段来自仓库视图设计时 XML；目录对象请用 by=name/description',
+        );
+      }
+      if (mode === 'field' && (packageId || schema || lang)) {
+        return mcpErrorText('by=field 不支持 packageId/schema/lang', '用 pattern 收窄候选对象名；字段反查只读仓库视图');
+      }
+      if (cat === 'tableFunction' && mode === 'description') {
+        return mcpErrorText('表函数目录没有描述/注释列', 'SYS.FUNCTIONS 无描述列；表函数请用 by=name 或 by=both');
+      }
+      if ((cat === 'table' || cat === 'columnView' || cat === 'tableFunction') && packageId) {
+        return mcpErrorText('packageId 只用于 category=model/all 的模型部分', '目录对象请用 schema 过滤');
+      }
+      if (cat === 'model' && schema) {
+        return mcpErrorText('schema 只用于目录类别', '仓库视图请用 packageId 过滤');
+      }
+      if ((cat === 'table' || cat === 'columnView' || cat === 'tableFunction') && kind) {
+        return mcpErrorText('kind 只用于 category=model/all 的模型部分', '目录对象请用 category/schema 过滤');
+      }
+      if ((cat === 'table' || cat === 'columnView' || cat === 'tableFunction') && version === 'inactive') {
+        return mcpErrorText('version 只用于 category=model/all 的模型部分', '目录对象只有当前状态');
+      }
+      if ((cat === 'table' || cat === 'columnView' || cat === 'tableFunction') && lang) {
+        return mcpErrorText('lang 只用于 category=model/all 的模型部分', '目录对象的注释没有语言变体');
+      }
+
+      const envelope: Envelope = await withErrorEnvelope(async () => {
+        if (mode === 'field') {
+          const data = await searchObjectsByField(ctx.pool, {
+            field: field as string,
+            ...(pattern ? { pattern } : {}),
+            kind,
+            limit,
+            version,
+            // 未给就用服务默认（100）：不在这里抄第二份默认值
+            ...(maxCandidates !== undefined ? { maxCandidates } : {}),
+          });
+          // 候选扫描被 maxCandidates 截断归 server-cap。零命中时同样保留 resultInfo：
+          // `{returnedCount:0, truncated:true, reason:'server-cap'}` 表示"扫过的部分没命中、但没扫完"，
+          // 不是合法空集（envelope 不会带 empty）——这正是不让模型误判"搜索已穷尽"的关键。
+          return attachResultInfo(
+            data,
+            resultInfoOf({
+              returnedCount: data.objects.length,
+              limit: data.limit,
+              requestedLimit: limit !== SEARCH_LIMIT_DEFAULT,
+              serverCapHit: data.candidatesScanned >= data.maxCandidates,
+              truncated: data.truncated,
+            }),
+          );
+        }
+        const data = await searchMetadata(ctx.pool, {
+          pattern: pattern as string,
+          by: mode,
+          category: cat,
           kind,
+          packageId,
+          schema,
+          lang,
           limit,
           version,
-          // 未给就用服务默认（100）：不在这里抄第二份默认值
-          ...(maxCandidates !== undefined ? { maxCandidates } : {}),
         });
-        // 候选扫描被 maxCandidates 截断归 server-cap。零命中时同样保留 resultInfo：
-        // `{returnedCount:0, truncated:true, reason:'server-cap'}` 表示"扫过的部分没命中、但没扫完"，
-        // 不是合法空集（envelope 不会带 empty）——这正是不让模型误判"搜索已穷尽"的关键。
-        return attachResultInfo(
+        const returned = returnedCountOf(data);
+        const enriched = attachResultInfo(
           data,
           resultInfoOf({
-            returnedCount: data.objects.length,
+            returnedCount: returned,
+            totalAvailable: data.count,
             limit: data.limit,
             requestedLimit: limit !== SEARCH_LIMIT_DEFAULT,
-            serverCapHit: data.candidatesScanned >= data.maxCandidates,
             truncated: data.truncated,
           }),
         );
-      }
-      return attachPagedInfo(await searchObjects(ctx.pool, { pattern: pattern as string, kind, limit, version }), {
-        requestedLimit: limit !== SEARCH_LIMIT_DEFAULT,
+        // 空集标记（P0-2）：零命中是合法结果，不是错误；与 package_list 等列表工具同口径
+        return returned === 0 ? markEmptyResult(enriched) : enriched;
       });
-    });
-    return toToolResult(envelope);
-  });
+      return toToolResult(envelope);
+    },
+  );
 
   regCap(
     CAP.hana_metadata_list_fields,
@@ -167,9 +238,9 @@ export function registerMetadataTools(server: McpServer, ctx: ToolContext): void
     return toToolResult(envelope);
   });
 
-  regCap(CAP.hana_table_list, async ({ schema, pattern, limit }) => {
+  regCap(CAP.hana_table_list, async ({ schema, pattern, by, tableType, limit }) => {
     const envelope: Envelope = await withErrorEnvelope(async () =>
-      attachPagedInfo(await listTables(ctx.pool, { schema, pattern, limit }), {
+      attachPagedInfo(await listTables(ctx.pool, { schema, pattern, by, tableType, limit }), {
         requestedLimit: limit !== TABLE_LIST_LIMIT_DEFAULT,
       }),
     );

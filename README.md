@@ -17,8 +17,8 @@ SAP HANA 经典 Modeler 能力的 MCP 服务器（TypeScript，Node >= 22.0.0）
 | 环境管理（多环境） | 环境列表、只读/可写标识、一次性 token 切换 | `hana_env_list`、`hana_env_switch` |
 | 稳定性诊断 | 实例体检（读数 + 12 项结论、三态）、会话与阻塞深潜、表存储画像、历史趋势 | `hana_system_health`、`hana_system_activity`、`hana_table_storage`、`hana_system_trend` |
 | 包 | 包清单/包树、包内对象、新建包 | `hana_package_list`、`hana_package_list_objects`、`hana_package_create` |
-| 元数据 | 完整定义、对象搜索、字段清单、单字段逻辑、血缘 | `hana_metadata_get_view`、`hana_metadata_search_objects`、`hana_metadata_list_fields`、`hana_metadata_get_field_logic`、`hana_metadata_where_used` |
-| 表目录 | 可访问表清单、列结构 | `hana_table_list`、`hana_table_columns` |
+| 元数据 | 完整定义、跨类别对象搜索（名称/描述）、字段清单、单字段逻辑、血缘 | `hana_metadata_get_view`、`hana_metadata_search_objects`、`hana_metadata_list_fields`、`hana_metadata_get_field_logic`、`hana_metadata_where_used` |
+| 表目录 | 可访问表清单、表注释搜索、列结构 | `hana_table_list`、`hana_table_columns` |
 | 数据预览 | 已激活视图预览（整体/节点/推导三通道）+ 权限诊断 | `hana_data_preview`、`hana_data_preview_diagnose` |
 | 建模写操作 | 新建/激活/更新/删除计算视图、设计时+运行时校验 | `hana_view_create`、`hana_view_activate`、`hana_view_update`、`hana_view_delete`、`hana_view_validate`、`hana_view_check_actions` |
 | 仓库传输 | 包导出备份、设计时文件导入、变更列表 | `hana_repo_export`、`hana_repo_import`、`hana_repo_changelist` |
