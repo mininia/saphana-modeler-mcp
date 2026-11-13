@@ -1,6 +1,6 @@
 {
   "name": "@mininia/saphana-modeler-mcp",
-  "version": "1.4.2",
+  "version": "1.4.3",
   "description": "SAP HANA Modeler MCP Server (TypeScript) - 经典 HANA 2.0 仓库建模能力（_SYS_REPO/_SYS_BI/_SYS_BIC）",
   "type": "module",
   "license": "MIT",
@@ -66,6 +66,7 @@
     "@modelcontextprotocol/node": "^2.0.0",
     "@modelcontextprotocol/server": "^2.0.0",
     "@sap/hana-client": "^2.26.26",
+    "debug": "3.1.0",
     "fast-xml-parser": "^5.11.0",
     "pino": "^10.3.1",
     "zod": "^4.4.3"

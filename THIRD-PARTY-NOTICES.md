@@ -9,6 +9,7 @@
 | 依赖 | 许可 | 说明 |
 | --- | --- | --- |
 | `@sap/hana-client` | **SAP Developer License Agreement 3.2**（非开源，见包内 `developer-license-3_2.txt`） | SAP HANA 官方 Node.js 驱动。许可授予使用者开发自有应用的权利，**禁止向第三方提供/转让 SAP Tools 本体**；本仓库不携带此包，由使用者自行安装并接受该许可 |
+| `debug` | MIT | `@sap/hana-client` 的运行时依赖（其 `lib/index.js` 与安装脚本顶层 `require`）。本项目直接声明 `3.1.0` 以兜底 npx/精简安装树缺失该传递依赖 |
 | `fast-xml-parser` | MIT | 设计时 XML 解析 |
 | `pino` | MIT | 日志 |
 | `zod` | MIT | 配置/工具参数 schema 校验 |
