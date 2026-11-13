@@ -1,8 +1,12 @@
 // @sap/hana-client 为 CJS 模块且 exports 为动态赋值，ESM 命名/namespace 导入拿不到真实导出
-// （cjs-module-lexer 静态检测失败，namespace 只有 default）。统一用 default 导入：运行时即 module.exports。
-import hanaClient from '@sap/hana-client';
+// （cjs-module-lexer 静态检测失败，namespace 只有 default）。统一用 createRequire 加载：
+// 这样可以在驱动模块求值前修补 net.createConnection（见下方 hdbpipe workaround）。
+import net from 'node:net';
+import { createRequire } from 'node:module';
+import type * as HanaClientTypes from '@sap/hana-client';
 import type { HanaConfig } from '../config/config.js';
 import { HanaBusinessError, normalizeHanaError } from './errors.js';
+import { logger } from './logger.js';
 import {
   POOL_ACQUIRE_TIMEOUT_MS_DEFAULT,
   POOL_MAX_DEFAULT,
@@ -11,17 +15,55 @@ import {
   SQL_TIMEOUT_MS_DEFAULT,
 } from './limits.js';
 
-type Connection = hanaClient.Connection;
-type ConnectionOptions = hanaClient.ConnectionOptions;
-type HanaParameterList = hanaClient.HanaParameterList;
+type Connection = HanaClientTypes.Connection;
+type ConnectionOptions = HanaClientTypes.ConnectionOptions;
+type HanaParameterList = HanaClientTypes.HanaParameterList;
+
+/**
+ * hdbpipe workaround（Windows / @sap/hana-client 2.26.x）：
+ *
+ * 驱动在模块求值期调用 setupPipe()，对内部 IPC 管道 `\\.\pipe\hdbpipe.<pid>` 执行
+ * `net.createConnection(...)`，但**只挂了 `data` 监听，没有挂 `error` 监听**。
+ * 管道连接偶发 ETIMEDOUT 时会触发未捕获的 `error` 事件，直接杀掉整个 MCP server
+ * （见 @sap/hana-client/lib/index.js 的 setupPipe）。这里在 require 驱动前给该端点的
+ * socket 补一个 `error` 监听：记录并标记驱动不可用，process 不再崩溃。
+ *
+ * 只影响 `hdbpipe` 端点，不改变其它 net 连接的语义。
+ */
+let hanaClientPipeUnavailable: Error | undefined;
+if (process.platform === 'win32') {
+  const netWithCreate = net as unknown as {
+    createConnection: (...args: unknown[]) => net.Socket;
+  };
+  const originalCreateConnection = netWithCreate.createConnection.bind(net);
+  netWithCreate.createConnection = (...args: unknown[]) => {
+    const socket = originalCreateConnection(...args);
+    const endpoint = typeof args[0] === 'string' ? args[0] : (args[0] as { path?: string } | undefined)?.path;
+    if (typeof endpoint === 'string' && endpoint.includes('hdbpipe')) {
+      socket.on('error', (err: Error) => {
+        if (hanaClientPipeUnavailable === undefined) {
+          hanaClientPipeUnavailable = err;
+          logger.error(
+            { err, endpoint },
+            'HANA 客户端内部 IPC 管道连接失败（hdbpipe）：进程内 HANA 驱动不可用，请重启 MCP server（该错误来自 @sap/hana-client 的未捕获 socket 事件，已拦截以避免整进程退出）',
+          );
+        }
+      });
+    }
+    return socket;
+  };
+}
+
+const require = createRequire(import.meta.url);
+const hanaClient = require('@sap/hana-client') as typeof HanaClientTypes;
 
 /**
  * 已持有连接与结果集类型（供服务层声明签名用）。
  * 服务层不应直接 import 驱动：驱动交互集中在本模块，这里只把类型转出去。
  */
-export type HanaConnection = hanaClient.Connection;
-export type HanaStatement = hanaClient.Statement;
-export type HanaResultSet = hanaClient.ResultSet;
+export type HanaConnection = HanaClientTypes.Connection;
+export type HanaStatement = HanaClientTypes.Statement;
+export type HanaResultSet = HanaClientTypes.ResultSet;
 
 /** 连接参数（security：真实凭据仅来自 config，不落日志） */
 function buildConnectionOptions(config: HanaConfig): ConnectionOptions {
@@ -166,6 +208,13 @@ export class HanaPool {
 
   /** 获取一个可用连接（池满则排队；队列满或等待超时以 HanaBusinessError 失败） */
   async acquire(): Promise<Connection> {
+    if (hanaClientPipeUnavailable !== undefined) {
+      // 驱动内部 IPC 管道已断：现有连接也无法执行语句，快速失败而不是让调用方挂到超时。
+      throw new HanaBusinessError(
+        `HANA 客户端内部 IPC 管道不可用（hdbpipe）：${hanaClientPipeUnavailable.message}。请重启 MCP server；若持续出现，检查 SAP HANA client 运行环境`,
+        'hana_client_pipe_unavailable',
+      );
+    }
     // 空闲连接可能已在服务端被掐断：逐条判定，失效的断开丢弃后继续找下一条（有存活者就不建连）
     while (this.idle.length > 0) {
       const conn = this.idle.pop() as Connection;
