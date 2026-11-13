@@ -7,7 +7,7 @@
  *   node scripts/migrate-env-config.mjs --file .env --suggest
  *
  * 检查项：
- * - 多环境下扁平连接键（必须改成 HANA_<PARAM>_ENV_<XXXX>）；
+ * - 多环境下扁平连接键（会被忽略；如需保留须改成 HANA_<PARAM>_ENV_<XXXX>）；
  * - HANA_LABEL / HANA_LABEL_ENV_*（已移除，建议用旧 LABEL 的大写形式做环境键）；
  * - 每个环境缺失的 HOST/PORT/USER/PASSWORD；
  * - 大小写不敏感的重复 _ENV_ 键；
@@ -96,14 +96,14 @@ function analyze(name, env) {
   lines.push(`[多环境] ${name}: 发现 ${scoped.length} 个 _ENV_ 变量。`);
   const suggestions = [];
 
-  // 扁平连接键
+  // 扁平连接键：多环境下直接忽略（不是错误）；如需保留该连接值，迁移到 _ENV_<XXXX>
   const flat = CONNECTION.filter((p) => (env[`HANA_${p}`] ?? '').trim() !== '');
   if (flat.length > 0) {
-    lines.push(`  ✖ 扁平连接键：${flat.map((p) => `HANA_${p}`).join(', ')}`);
-    lines.push('    → 多环境下必须改成 HANA_<PARAM>_ENV_<XXXX>；扁平值不会生效。');
+    lines.push(`  ⚠ 扁平连接键（多环境下忽略，不会生效）：${flat.map((p) => `HANA_${p}`).join(', ')}`);
+    lines.push('    → 如果你希望这些值属于某个环境，改成 HANA_<PARAM>_ENV_<XXXX>。');
     for (const p of flat) {
       suggestions.push(
-        `HANA_${p}_ENV_DEFAULT=${mask(`HANA_${p}`, env[`HANA_${p}`])}  # 迁移建议：原扁平值归到 DEFAULT 环境`,
+        `HANA_${p}_ENV_DEFAULT=${mask(`HANA_${p}`, env[`HANA_${p}`])}  # 如需保留：原扁平值归到 DEFAULT 环境`,
       );
     }
   }

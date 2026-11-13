@@ -5,7 +5,7 @@
  * - **单环境**（没有任何 `_ENV_` 变量）：扁平 `HANA_*` 就是唯一环境，行为与旧版一致；
  *   `HANA_LABEL` 残留静默忽略（不告警、不报错）。
  * - **多环境**（出现任意 `_ENV_` 变量）：
- *   - **连接参数**：扁平键硬报错；只能 `HANA_<PARAM>_ENV_<XXXX>`，每个环境必须解析到；
+ *   - **连接参数**：扁平键忽略（不参与解析）；只能 `HANA_<PARAM>_ENV_<XXXX>`，每个环境必须解析到；
  *   - **策略/授权参数**：扁平键 = 所有环境共享；`_ENV_<XXXX>` 覆盖单个环境；
  *   - **进程级参数**：只能扁平写；`_ENV_` 形式启动失败。
  * - 环境标识 = `_ENV_<XXXX>` 的 `<XXXX>`，大小写不敏感，内部规范化为大写；
@@ -383,20 +383,6 @@ function scanOverrides(env: NodeJS.ProcessEnv): ScannedOverrides {
   return { envKeys, cells };
 }
 
-/** 扁平连接键检查：多环境下不允许出现 */
-function assertNoFlatConnectionKeys(env: NodeJS.ProcessEnv): void {
-  const offending = PARAM_REGISTRY.filter((p) => p.scope === 'connection' && hasValue(env[p.envVar])).map(
-    (p) => p.envVar,
-  );
-  if (offending.length > 0) {
-    throw interceptionError(
-      'flat_connection_key_in_multi',
-      `检测到多环境配置，但仍在用扁平连接键：${offending.join(', ')}`,
-      '把连接参数改成 HANA_<PARAM>_ENV_<XXXX>（例如 HANA_HOST_ENV_DEFAULT）；每个环境都必须能解析到 HOST/PORT/USER/PASSWORD。',
-    );
-  }
-}
-
 function requireConnection(envKey: string, cells: Map<string, OverrideCell> | undefined, name: string): unknown {
   const cell = cells?.get(name);
   if (cell === undefined || cell.parsed === undefined) {
@@ -544,7 +530,7 @@ export function buildEnvironments(
     };
   }
 
-  // 多环境：LABEL 已移除；扁平连接键硬报错。
+  // 多环境：LABEL 已移除；扁平连接键忽略（不参与解析，环境只由 _ENV_ 键定义）。
   if (Object.keys(env).some((k) => k === 'HANA_LABEL')) {
     throw interceptionError(
       'label_removed',
@@ -552,7 +538,6 @@ export function buildEnvironments(
       '删除 HANA_LABEL；把 HANA_<PARAM>_ENV_<XXXX> 的 <XXXX> 用作环境标识。',
     );
   }
-  assertNoFlatConnectionKeys(env);
 
   const { envKeys, cells } = scanOverrides(env);
   if (envKeys.size === 0) {

@@ -30,23 +30,23 @@
 
 - **单环境**（没有任何 `_ENV_` 变量）：扁平 `HANA_*` 就是唯一环境的配置。
 - **多环境**（出现任意 `_ENV_` 变量）：
-  - **连接参数**：扁平键硬报错；只能 `HANA_<PARAM>_ENV_<XXXX>`；
+  - **连接参数**：扁平键**忽略**（不参与解析）；只能 `HANA_<PARAM>_ENV_<XXXX>`；
   - **策略/授权参数**：扁平键 = 所有环境共享；`_ENV_<XXXX>` 覆盖单个环境；
   - **进程级参数**：只能扁平写；写 `_ENV_` 启动失败。
 
 | 参数 | 类别 | 单环境 | 多环境（扁平） | 多环境（_ENV_） | 默认 | 说明 |
 |---|---|---|---|---|---|---|
-| `HANA_HOST` | 连接 | 生效 | 报错 | 必填 | — | HANA 主机名/IP |
-| `HANA_PORT` | 连接 | 生效 | 报错 | 必填 | — | SQL 端口（纯数字） |
-| `HANA_USER` | 连接 | 生效 | 报错 | 必填 | — | 数据库账号 |
-| `HANA_PASSWORD` | 连接 | 生效 | 报错 | 必填 | — | 数据库密码；加载后从 process.env 删除 |
-| `HANA_DB_NAME` | 连接 | 生效 | 报错 | 可选 | — | 租户数据库名（MDC 租户） |
-| `HANA_TLS` | 连接 | 生效 | 报错 | 可选 | true | SQL 连接 TLS（fail-closed，默认 true） |
-| `HANA_SSL_VALIDATE` | 连接 | 生效 | 报错 | 可选 | true | TLS 证书校验（默认 true） |
-| `HANA_LOCALE` | 连接 | 生效 | 报错 | 可选 | zh | 连接 Locale |
-| `HANA_XS_PORT` | 连接 | 生效 | 报错 | 可选 | 8010 | XS Classic 设计时 REST 端口 |
-| `HANA_XS_TLS` | 连接 | 生效 | 报错 | 可选 | false | XS 写通道走 HTTPS |
-| `HANA_XS_BASE_PATH` | 连接 | 生效 | 报错 | 可选 | /sap/hana/xs/dt/base | XS 设计时 REST 基础路径 |
+| `HANA_HOST` | 连接 | 生效 | 忽略 | 必填 | — | HANA 主机名/IP |
+| `HANA_PORT` | 连接 | 生效 | 忽略 | 必填 | — | SQL 端口（纯数字） |
+| `HANA_USER` | 连接 | 生效 | 忽略 | 必填 | — | 数据库账号 |
+| `HANA_PASSWORD` | 连接 | 生效 | 忽略 | 必填 | — | 数据库密码；加载后从 process.env 删除 |
+| `HANA_DB_NAME` | 连接 | 生效 | 忽略 | 可选 | — | 租户数据库名（MDC 租户） |
+| `HANA_TLS` | 连接 | 生效 | 忽略 | 可选 | true | SQL 连接 TLS（fail-closed，默认 true） |
+| `HANA_SSL_VALIDATE` | 连接 | 生效 | 忽略 | 可选 | true | TLS 证书校验（默认 true） |
+| `HANA_LOCALE` | 连接 | 生效 | 忽略 | 可选 | zh | 连接 Locale |
+| `HANA_XS_PORT` | 连接 | 生效 | 忽略 | 可选 | 8010 | XS Classic 设计时 REST 端口 |
+| `HANA_XS_TLS` | 连接 | 生效 | 忽略 | 可选 | false | XS 写通道走 HTTPS |
+| `HANA_XS_BASE_PATH` | 连接 | 生效 | 忽略 | 可选 | /sap/hana/xs/dt/base | XS 设计时 REST 基础路径 |
 | `HANA_ACCESS` | 策略/授权 | 生效 | 共享 | 覆盖 | readwrite | 环境只读/可写策略（readwrite / readonly） |
 | `HANA_READONLY_SQL` | 策略/授权 | 生效 | 共享 | 覆盖 | select-only | 只读环境的 SQL 策略（select-only / deny） |
 | `HANA_WRITE_PACKAGES` | 策略/授权 | 生效 | 共享 | 覆盖 | 空 | 允许写操作的仓库包前缀；空 = 无写包 |
@@ -149,7 +149,7 @@
 - **环境标识** = `_ENV_<XXXX>` 的 `<XXXX>`；大小写不敏感，内部规范化为大写。
   **不再有 `HANA_LABEL` / `HANA_LABEL_ENV_*`**：单环境残留 `HANA_LABEL` 静默忽略，多环境出现即 `label_removed`。
 - **连接参数**（`HOST` / `PORT` / `USER` / `PASSWORD` / `DB_NAME` / `TLS` / `SSL_VALIDATE` / `LOCALE` /
-  `XS_PORT` / `XS_TLS` / `XS_BASE_PATH`）：多环境下扁平键**硬报错**，只能写
+  `XS_PORT` / `XS_TLS` / `XS_BASE_PATH`）：多环境下扁平键**忽略**（不参与解析），只能写
   `HANA_<PARAM>_ENV_<XXXX>`；`HOST/PORT/USER/PASSWORD` 每个环境必须能解析到。
 - **策略/授权参数**（`ACCESS` / `READONLY_SQL` / `WRITE_PACKAGES` / `READ_SCHEMA` / 超时与池旋钮）：
   扁平键 = **所有环境共享**；`HANA_<PARAM>_ENV_<XXXX>` 覆盖单个环境。
@@ -179,7 +179,7 @@
 ### 示例（两个环境）
 
 ```dotenv
-# 连接参数：每个环境自己写（多环境下扁平 HANA_HOST 等会报错）
+# 连接参数：每个环境自己写（多环境下扁平 HANA_HOST 等会被忽略）
 HANA_HOST_ENV_BWD=hana-bwd.example
 HANA_PORT_ENV_BWD=30015
 HANA_USER_ENV_BWD=BWD_USER
@@ -402,7 +402,6 @@ MCP_HTTP_PORT=3000 MCP_HTTP_TOKENS='shared:your-long-random-token' node dist/ind
 |---|---|---|
 | `config_invalid` | 配置加载失败（通用明细码） | 按错误信息逐项修正；无法判断时先跑 scripts/migrate-env-config.mjs --check。 |
 | `env_mode_mismatch` | HANA_ENV_MODE 与实际检测到的单/多环境模式不一致 | 删掉 HANA_ENV_MODE 让服务自动判断，或改成与 _ENV_ 变量匹配的值。 |
-| `flat_connection_key_in_multi` | 多环境模式下仍使用扁平的连接参数 | 把扁平连接键改成 HANA_<PARAM>_ENV_<XXXX>；每个环境都要能解析到 HOST/PORT/USER/PASSWORD。 |
 | `label_removed` | HANA_LABEL / HANA_LABEL_ENV_* 已移除 | 删除 LABEL 变量；环境标识直接取 HANA_<PARAM>_ENV_<XXXX> 里的 <XXXX>。 |
 | `legacy_env_prefix` | 使用了已废弃的 HANA_ENV_<NAME>_<PARAM> 前缀 | 改成 HANA_<PARAM>_ENV_<NAME>，例如 HANA_ENV_QAS_HOST → HANA_HOST_ENV_QAS。 |
 | `env_config_unsupported` | 使用了不支持的 HANA_ENV_CONFIG 文件配置 | v2 只支持扁平环境变量；请把配置写成 HANA_<PARAM>_ENV_<XXXX> / 共享策略键。 |

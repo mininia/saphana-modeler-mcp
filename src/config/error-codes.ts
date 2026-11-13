@@ -32,12 +32,6 @@ export const ERROR_CODES: readonly ErrorCodeSpec[] = [
     remediation: '删掉 HANA_ENV_MODE 让服务自动判断，或改成与 _ENV_ 变量匹配的值。',
   },
   {
-    code: 'flat_connection_key_in_multi',
-    category: 'config',
-    summary: '多环境模式下仍使用扁平的连接参数',
-    remediation: '把扁平连接键改成 HANA_<PARAM>_ENV_<XXXX>；每个环境都要能解析到 HOST/PORT/USER/PASSWORD。',
-  },
-  {
     code: 'label_removed',
     category: 'config',
     summary: 'HANA_LABEL / HANA_LABEL_ENV_* 已移除',
