@@ -84,7 +84,7 @@ MDC 指定租户时需 `HANA_DB_NAME`；非 MDC 可省略。缺失必填项时�
 
 > 本地 clone 运行：把 `command`/`args` 换成 `"node"` / `["<仓库绝对路径>/dist/index.js"]`。
 
-**多 HANA 环境（可选）**：单环境不需要任何 `_ENV_` 变量。多环境用 `HANA_<PARAM>_ENV_<XXXX>` 只覆盖差异，`LABEL` 作为系统标识，切换用 `hana_env_list` + `hana_env_switch`；HTTP 用 `MCP_HTTP_CLIENT_ENVS` 做 Token→环境绑定。完整规则见 [CONFIG.md 的「多 HANA 环境」](CONFIG.md#多-hana-环境单进程单-active)。
+**多 HANA 环境（可选）**：单环境不需要任何 `_ENV_` 变量。多环境下连接参数只能写 `HANA_<PARAM>_ENV_<XXXX>`（扁平连接键会报错），策略/授权参数扁平写 = 所有环境共享、`_ENV_` 覆盖单个环境；环境标识直接取 `<XXXX>`（大小写不敏感，无 LABEL），切换用 `hana_env_list` + `hana_env_switch`；HTTP 用 `MCP_HTTP_CLIENT_ENVS` 做 Token→环境绑定。完整规则见 [CONFIG.md 的「多 HANA 环境」](CONFIG.md#多-hana-环境单进程单-active)。
 
 ## 运行方式
 

@@ -125,15 +125,13 @@ export interface CapabilityAuditEvent {
   transport?: 'http' | 'stdio';
   /** 调用方档案名（未配档案时为隐式 default） */
   profileId?: string;
-  /** 执行环境（LABEL）；仅多环境部署产生 */
+  /** 执行环境标识；仅多环境部署产生 */
   environment?: string;
   /** 执行时的环境 epoch；仅多环境部署产生 */
   epoch?: number;
   /** 执行环境的只读/可写策略；仅多环境部署产生 */
   access?: 'readwrite' | 'readonly';
-  /** 配置键命名空间（排障用）；仅多环境部署产生 */
-  configKey?: string;
-  /** 调用发起时的环境（LABEL）；仅多环境部署产生 */
+  /** 调用发起时的环境标识；仅多环境部署产生 */
   calledFromEnvironment?: string;
   /** 进程级归因标签（MCP_AGENT_LABEL；未配置时不产生该字段） */
   agentLabel?: string;
@@ -207,11 +205,10 @@ export function authorizeCall(
   // 单环境不产生环境字段，保持旧输出逐字兼容。
   const envAudit = runtime?.multiEnv
     ? {
-        environment: runtime.label,
+        environment: runtime.envKey,
         epoch: runtime.epoch,
         access: runtime.access,
-        configKey: runtime.configKey,
-        calledFromEnvironment: runtime.label,
+        calledFromEnvironment: runtime.envKey,
       }
     : {};
 

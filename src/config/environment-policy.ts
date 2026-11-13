@@ -4,8 +4,8 @@
  * 判据唯一：清单的 `effects.mutates`，不按 kind/组名推断。
  * - 只读闸门：ACCESS=readonly 只拦 persistent；transient/none 放行。
  *   hana_sql_execute 在 select-only 下交给 SQL 规则层，deny 下整体拒绝。
- * - expectedEnvironment：多环境下所有 mutates != none 的调用必须自报当前 LABEL
- *   （防环境漂移，不是授权凭证）。
+ * - expectedEnvironment：多环境下所有 mutates != none 的调用必须自报当前环境标识
+ *   （防环境漂移，不是授权凭证；大小写不敏感）。
  *
  * 本模块只产出 Grant（与 profile/资源维度同一条判定链），不改写任何配置。
  */
@@ -48,15 +48,15 @@ export function environmentGrants(
         block(
           capability.id,
           'env_assertion_missing',
-          `多环境非纯读调用必须显式携带 expectedEnvironment（当前 LABEL=${runtime.label}），本次未执行`,
+          `多环境非纯读调用必须显式携带 expectedEnvironment（当前环境标识=${runtime.envKey}），本次未执行`,
         ),
       );
-    } else if (expected.trim() !== runtime.label) {
+    } else if (expected.trim().toUpperCase() !== runtime.envKey) {
       grants.push(
         block(
           capability.id,
           'env_assertion_mismatch',
-          `expectedEnvironment=${expected} 与当前环境 LABEL=${runtime.label} 不一致，本次未执行；` +
+          `expectedEnvironment=${expected} 与当前环境标识=${runtime.envKey} 不一致，本次未执行；` +
             '请确认是否忘了切回（先 hana_env_list 查看当前环境）',
         ),
       );
@@ -72,7 +72,7 @@ export function environmentGrants(
         block(
           capability.id,
           'env_readonly',
-          `当前环境 ${runtime.label} 为只读（ACCESS=readonly），持久写入能力不可用；` +
+          `当前环境 ${runtime.envKey} 为只读（ACCESS=readonly），持久写入能力不可用；` +
             '临时对象与纯读不受影响，本次未执行',
         ),
       );
@@ -91,7 +91,7 @@ export function capabilityInputSchema(capability: Capability, multiEnv: boolean)
         .string()
         .min(1)
         .max(32)
-        .describe('当前环境 LABEL，必须与 hana_env_list 返回的 current 逐字一致（多环境非纯读调用必填）'),
+        .describe('当前环境标识，必须与 hana_env_list 返回的 current 一致（大小写不敏感；多环境非纯读调用必填）'),
     });
   }
   return schema;

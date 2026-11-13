@@ -1,6 +1,6 @@
 {
   "name": "@mininia/saphana-modeler-mcp",
-  "version": "1.4.3",
+  "version": "1.4.4",
   "description": "SAP HANA Modeler MCP Server (TypeScript) - 经典 HANA 2.0 仓库建模能力（_SYS_REPO/_SYS_BI/_SYS_BIC）",
   "type": "module",
   "license": "MIT",
@@ -42,6 +42,7 @@
     "smoke": "npm run build && node scripts/smoke-stdio.mjs",
     "smoke:http": "npm run build && node scripts/smoke-http.mjs",
     "preflight": "node scripts/preflight-write-packages.mjs",
+    "migrate:env-config": "node scripts/migrate-env-config.mjs --file mcp.json --check",
     "verify:system": "npm run build && node test-verification/verify-system.mjs",
     "verify:p1-5": "npm run build && node test-verification/verify-p1-5.mjs",
     "probe:repo": "node test-verification/probe-repo-read.mjs",

@@ -1,4 +1,5 @@
 import { HanaBusinessError } from './errors.js';
+import { currentEnvironmentRuntime } from './environment-context.js';
 
 /**
  * SQL 标识符与字面量防护：
@@ -52,6 +53,18 @@ export function configureExtraSchemas(schemas: string[]): void {
 }
 
 /**
+ * 当前生效的追加 schema：
+ * - 服务进程内（有环境 runtime 绑定）读当前环境的 `schemaAllow`（v2 策略参数可按环境不同）；
+ * - 独立脚本/测试直调（无 runtime）回退 configureExtraSchemas 的进程级值。
+ * 单一入口，避免“闸门按环境判、SQL 执行仍按全局白名单走”的分叉。
+ */
+function effectiveExtraSchemas(): readonly string[] {
+  const runtime = currentEnvironmentRuntime();
+  if (runtime !== undefined) return runtime.config.schemaAllow;
+  return [...extraSchemas];
+}
+
+/**
  * schema 是否在「系统 schema + 给定追加项」内（**纯函数**，不读也不改进程状态）。
  * 供预检层按任意配置来源（如某个 mcp.json）判定用，与运行时的 isSchemaAllowed 共用同一规则，
  * 避免出现两套白名单判定。
@@ -61,9 +74,9 @@ export function isSchemaAllowedWith(schema: string, extra: readonly string[]): b
   return SYSTEM_SCHEMAS.has(s) || extra.some((e) => e.toUpperCase() === s);
 }
 
-/** schema 是否在白名单内（含 configureExtraSchemas 配置的追加项） */
+/** schema 是否在白名单内（服务进程内按当前环境，独立脚本回退进程级配置） */
 export function isSchemaAllowed(schema: string): boolean {
-  return isSchemaAllowedWith(schema, [...extraSchemas]);
+  return isSchemaAllowedWith(schema, effectiveExtraSchemas());
 }
 
 /**
@@ -72,7 +85,7 @@ export function isSchemaAllowed(schema: string): boolean {
  * 调用方仍需把每个值参数绑定，不拼进 SQL 文本。
  */
 export function listAllowedSchemas(): string[] {
-  return [...SYSTEM_SCHEMAS, ...extraSchemas];
+  return [...SYSTEM_SCHEMAS, ...effectiveExtraSchemas()];
 }
 
 /**
@@ -83,14 +96,14 @@ export function listAllowedSchemas(): string[] {
  * 文案由 SYSTEM_SCHEMAS 生成后，白名单变更不可能再与文案脱节。
  */
 function describeSchemaWhitelist(): string {
-  return [...SYSTEM_SCHEMAS].join('/');
+  return [...SYSTEM_SCHEMAS, ...effectiveExtraSchemas()].join('/');
 }
 
 /** 校验 schema 名：不在白名单直接抛错（防注入与非授权 schema 探测） */
 export function assertSchemaAllowed(schema: string): void {
   if (!isSchemaAllowed(schema)) {
     throw new HanaBusinessError(
-      `schema "${schema}" 不在允许列表中（系统 schema：${describeSchemaWhitelist()}，${SCHEMA_HINT}）`,
+      `schema "${schema}" 不在允许列表中（允许的 schema：${describeSchemaWhitelist()}，${SCHEMA_HINT}）`,
       'SCHEMA_NOT_ALLOWED',
     );
   }

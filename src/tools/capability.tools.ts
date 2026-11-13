@@ -69,11 +69,10 @@ function blockAuditPayload(
     ...(ctx.config.agentLabel ? { agentLabel: ctx.config.agentLabel } : {}),
     ...(runtime?.multiEnv
       ? {
-          environment: runtime.label,
+          environment: runtime.envKey,
           epoch: runtime.epoch,
           access: runtime.access,
-          configKey: runtime.configKey,
-          calledFromEnvironment: runtime.label,
+          calledFromEnvironment: runtime.envKey,
         }
       : {}),
     via: facadeId,

@@ -23,38 +23,32 @@
       "command": "node",
       "args": ["dist/index.js"],
       "env": {
-        "HANA_HOST": "hana-dev.example",
-        "HANA_PORT": "31015",
-        "HANA_USER": "DEV_USER",
-        "HANA_PASSWORD": "DEV_PASSWORD",
-        "HANA_LOCALE": "zh",
-        "HANA_DB_NAME": "DEVDB",
-        "HANA_TLS": "true",
-        "HANA_SSL_VALIDATE": "true",
-        "HANA_TIMEZONE": "Asia/Shanghai",
-        "HANA_WRITE_PACKAGES": "ZDEMO1,ZDEMO2.ZDEMO_SD",
-        "HANA_XS_PORT": "8010",
-        "HANA_ACCESS": "readwrite",
-        "HANA_LABEL": "DEV",
-        "LOG_LEVEL": "info",
+        "HANA_HOST_ENV_DEV": "hana-dev.example",
+        "HANA_PORT_ENV_DEV": "31015",
+        "HANA_USER_ENV_DEV": "DEV_USER",
+        "HANA_PASSWORD_ENV_DEV": "DEV_PASSWORD",
+        "HANA_DB_NAME_ENV_DEV": "DEVDB",
+        "HANA_TLS_ENV_DEV": "true",
 
         "HANA_HOST_ENV_TEST": "hana-test.example",
+        "HANA_PORT_ENV_TEST": "31015",
         "HANA_USER_ENV_TEST": "TEST_USER",
         "HANA_PASSWORD_ENV_TEST": "TEST_PASSWORD",
         "HANA_DB_NAME_ENV_TEST": "TESTDB",
-        "HANA_ACCESS_ENV_TEST": "readonly",
-        "HANA_LABEL_ENV_TEST": "TEST",
 
         "HANA_HOST_ENV_PRD": "hana-prd.example",
+        "HANA_PORT_ENV_PRD": "31015",
         "HANA_USER_ENV_PRD": "PRD_USER",
         "HANA_PASSWORD_ENV_PRD": "PRD_PASSWORD",
         "HANA_DB_NAME_ENV_PRD": "PRDDB",
-        "HANA_ACCESS_ENV_PRD": "readonly",
-        "HANA_LABEL_ENV_PRD": "PRD",
 
+        "HANA_ACCESS": "readonly",
+        "HANA_ACCESS_ENV_DEV": "readwrite",
+        "HANA_WRITE_PACKAGES_ENV_DEV": "ZDEMO1,ZDEMO2.ZDEMO_SD",
         "HANA_ENV_START": "DEV",
         "HANA_ENV_SWITCHABLE": "DEV,TEST,PRD",
-        "HANA_READONLY_SQL": "select-only"
+        "HANA_READONLY_SQL": "select-only",
+        "LOG_LEVEL": "info"
       }
     }
   }
