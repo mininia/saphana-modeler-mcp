@@ -244,7 +244,8 @@ HANA_ENV_SWITCHABLE=BWD,BWU
 - `HANA_TOOL_ALLOW`：强制启用（即便分组未启用），支持组名与工具名 glob。
 - `HANA_TOOL_DENY`：强制禁用（优先级最高），支持组名与 glob。
 
-> **没有别名层**：`MCP_TOOL_*` 不再识别；未识别的 `HANA_*` / `MCP_*` / `LOG_*` 变量会在启动日志告警（防拼写错误静默失效）。
+> **没有别名层**：`MCP_TOOL_*` 不再识别。服务**按需读取**已知变量：无关的 `HANA_*` / `MCP_*` / `LOG_*`
+> 变量不会被扫描或告警；拼错的键不会生效，但也不会阻断启动。
 >
 > 组名可直接用于 allow/deny（`read` / `write` / `admin` / `sql`），展开为该组全部工具名。例：`HANA_TOOL_GROUPS=read,write` + `HANA_TOOL_DENY=write` ⇒ 等价只读部署。
 
@@ -409,7 +410,6 @@ MCP_HTTP_PORT=3000 MCP_HTTP_TOKENS='shared:your-long-random-token' node dist/ind
 | `env_key_conflict` | 同一参数存在仅大小写不同的两个 _ENV_ 键 | 只保留一个键，或把两个键统一成同一大小写。 |
 | `env_key_unknown` | HANA_ENV_START / HANA_ENV_SWITCHABLE / 切换请求引用了未配置的环境标识 | 先调用 hana_env_list（或看启动摘要）确认可用环境标识；匹配大小写不敏感。 |
 | `process_param_scoped` | 进程级参数被写成了 _ENV_ 形式 | 进程级参数只能扁平写；检查 HANA_TOOL_* / MCP_* / LOG_LEVEL / HANA_TIMEZONE 等是否误加 _ENV_。 |
-| `unknown_scoped_param` | _ENV_ 前缀引用了未注册的参数 | 对照本文件的参数作用域表使用已登记的参数名；拼写错误不会生效。 |
 | `missing_connection_param` | 某个多环境缺少连接参数 | 为该环境补 HANA_<PARAM>_ENV_<XXXX>；HOST/PORT/USER/PASSWORD 没有共享回退。 |
 | `env_start_required` | 多环境未指定启动环境 | 设置 HANA_ENV_START=<环境标识>；只有一个环境时可省略。 |
 | `env_switchable_in_single` | 单环境部署却配置了可切换列表 | 删除 HANA_ENV_SWITCHABLE，或补充 _ENV_ 变量进入多环境模式。 |

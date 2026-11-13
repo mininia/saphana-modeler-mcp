@@ -23,7 +23,6 @@ import {
   buildEnvironments,
   canonicalEnvKey,
   hasScopedEnvironmentKeys,
-  isEnvironmentConfigKey,
   type LoadedEnvironments,
 } from './environment-config.js';
 import { interceptionError } from './error-codes.js';
@@ -182,7 +181,7 @@ const envSchema = z.object({
    * 名称：HANA_ 前缀——与 HANA_WRITE_PACKAGES / HANA_READ_SCHEMA 同类，都是「这个 HANA 面
    * 向客户端暴露/放行多少」的部署级范围声明（2026-10-14 复核回退：曾于 2026-10-08 改名
    * MCP_TOOL_*，现改回 HANA_ 前缀并与其余两个范围声明对齐）。**无别名层**：MCP_TOOL_* 不再识别，
-   * 仍写旧名会命中「未识别 HANA_/MCP_/LOG_ 环境变量」启动告警（见 warnUnknownEnvKeys）。
+   * 仍写旧名会被当作未设置（按需拉取，不扫描/告警无关变量）。
    */
   HANA_TOOL_GROUPS: z
     .string()
@@ -244,7 +243,7 @@ const envSchema = z.object({
   /** 额外允许的 SQL 查询 schema（逗号分隔，追加到 core/sql.ts 白名单；默认仅系统 schema）。
    *  多环境下扁平值 = 所有环境共享；HANA_READ_SCHEMA_ENV_<XXXX> 覆盖单个环境。
    *  2026-10-14 由 HANA_SCHEMA_ALLOW 改名而来（原名只说明「allow」，看不出 allow 什么）；
-   *  **无别名层**：旧名不再识别，仍写旧名会命中未识别环境变量启动告警。 */
+   *  **无别名层**：旧名不再识别，会被当作未设置（按需拉取，不扫描/告警无关变量）。 */
   HANA_READ_SCHEMA: z.string().default('').transform(splitList),
   /**
    * 允许写操作的仓库包（逗号分隔的包前缀；含子包）。
@@ -750,43 +749,10 @@ export function tryLoadDotEnv(env: NodeJS.ProcessEnv = process.env): DotEnvLoadR
 }
 
 /**
- * 不经 envSchema、由运行期直读 process.env 的受支持变量：它们同样"生效"，必须进 known 集合，
- * 否则启动告警会把它们误报成「不生效（拼写错误？已改名？已移除？）」——运维按服务自己的处置建议
- * 设置了变量，反而被劝退（如撤回 HANA_XS_TLS 会静默退回 XS 明文通道）。
- * - HANA_XS_TLS：XS 写通道 scheme（core/xs-rest.ts 的 xsSchemeFromEnv 直读；core 层不依赖 config
- *   运行时模块，走不了 zod。deployment.ts 的 xs_plaintext 处置建议与 preflight 判定都指向它）。
- * 新增这类运行期直读变量时同步登记于此（与运行期直读点必须同名）。
- *
- * MCP_LOCAL_ROOT 已于 2026-10-14 删除（本地文件根的旋钮取消：导入/导出一律以客户端工作目录
- * 为根、只接受其内的相对路径，见 services/repo-transfer.service.ts）。它不再进 known 集合，
- * 存量配置里残留该键会命中未识别告警。
+ * 环境变量读取采用**按需拉取**：envSchema 只定义本服务认识的键，zod 会剥离其余键；
+ * 本服务不再扫描/校验整个 process.env。这样父进程/shell 里的无关变量（包括其它工具的
+ * `HANA_*` 残留）不会导致告警或启动失败。已知键的取值非法仍按 fail-fast 处理。
  */
-const RUNTIME_DIRECT_ENV_KEYS = ['HANA_XS_TLS'] as const;
-
-/**
- * 未识别的 HANA_/MCP_/LOG_ 环境变量告警（拼错、已改名、已被删除的名字）。
- *
- * 为什么值得一条告警：envSchema 对未知键**静默剥离**，于是一个拼错的变量名会表现为
- * 「该项配置没生效」，而运维看到的值与生效值不一致——本仓库已经踩过一次
- * （`.dsh/mcp.json` 里写成 `HANA_WRITE_PACKAGE`（少一个 S），写边界因此静默失效）。
- * 只对这三个前缀告警，避免把 PATH/无关变量卷进来。
- * known 集合 = envSchema 键 + 运行期直读键（见 RUNTIME_DIRECT_ENV_KEYS）：
- * **生效的**变量一个都不许进这条告警，否则就是反方向的「生效值 ≠ 运维以为的值」。
- * 2026-10-14 起本仓**没有别名层**（HANA_TOOL_* 回退正名、HANA_SCHEMA_ALLOW → HANA_READ_SCHEMA、
- * HANA_INSTANCE / MCP_LOCAL_ROOT 删除都是硬切换），所以这条告警也是旧名/已删名唯一的提示处。
- */
-function warnUnknownEnvKeys(env: Record<string, unknown>): void {
-  const known = new Set<string>([...Object.keys(envSchema.shape), ...RUNTIME_DIRECT_ENV_KEYS]);
-  const suspicious = Object.keys(env).filter(
-    (k) => /^(HANA_|MCP_|LOG_)/.test(k) && !known.has(k) && !isEnvironmentConfigKey(k),
-  );
-  if (suspicious.length > 0) {
-    logger.warn(
-      { keys: suspicious },
-      '存在未识别的 HANA_/MCP_/LOG_ 环境变量：它们不生效（拼写错误？已改名？已移除？）',
-    );
-  }
-}
 
 /**
  * 档案配置自检（启动即失败，不给"以为生效其实没有"的机会）：
@@ -874,9 +840,7 @@ function parseSurfaceMax(raw: string): number {
  */
 function loadInternal(env: NodeJS.ProcessEnv): LoadedEnvironments {
   const dotenv = tryLoadDotEnv(env);
-  // 无别名层（2026-10-14）：envSchema 是唯一真值源，旧名/已删名一律不认，
-  // 由 warnUnknownEnvKeys 以「未识别环境变量」告警兜住（不再做旧名归一）
-  warnUnknownEnvKeys(env);
+  // 按需拉取：envSchema 只读取本服务认识的键；不再扫描/告警无关环境变量。
   const parsed = envSchema.parse(env);
   const profiles = parseProfiles(parsed.MCP_PROFILES);
   assertProfileConfig(profiles, parsed.MCP_PROFILE, parsed.MCP_HTTP_TOKENS, parsed.MCP_HTTP_TOKEN);

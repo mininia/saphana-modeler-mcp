@@ -74,12 +74,6 @@ export const ERROR_CODES: readonly ErrorCodeSpec[] = [
     remediation: '进程级参数只能扁平写；检查 HANA_TOOL_* / MCP_* / LOG_LEVEL / HANA_TIMEZONE 等是否误加 _ENV_。',
   },
   {
-    code: 'unknown_scoped_param',
-    category: 'config',
-    summary: '_ENV_ 前缀引用了未注册的参数',
-    remediation: '对照 CONFIG.md《参数归类表》使用已登记的参数名；拼写错误不会生效。',
-  },
-  {
     code: 'missing_connection_param',
     category: 'config',
     summary: '某个多环境缺少连接参数',

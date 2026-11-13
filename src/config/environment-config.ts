@@ -275,23 +275,6 @@ export function canonicalEnvKey(raw: string, keyForError = '环境标识'): stri
   return canonical;
 }
 
-/** 环境标识是否合法（用于判断键是否属于本模块） */
-export function isValidEnvKey(raw: string): boolean {
-  return ENV_KEY_RE.test(raw.trim());
-}
-
-/** 是否由本模块负责的配置键（warnUnknownEnvKeys 跳过；真正解析时再决定报错/忽略） */
-export function isEnvironmentConfigKey(key: string): boolean {
-  if (GLOBAL_ENV_KEYS.has(key)) return false;
-  if (REMOVED_LABEL_KEYS.has(key)) return true;
-  if (key.startsWith('HANA_LABEL_ENV_')) return true;
-  if (key === 'HANA_ENV_CONFIG') return true;
-  if (key.startsWith('HANA_ENV_')) return true;
-  if (key.startsWith('HANA_') && key.includes('_ENV_')) return true;
-  if (/^(MCP|LOG)_.*_ENV_/.test(key)) return true;
-  return false;
-}
-
 /** 是否存在 `_ENV_` 形态的键（用于第一层模式判断；不含全局键） */
 export function hasScopedEnvironmentKeys(env: NodeJS.ProcessEnv): boolean {
   return Object.keys(env).some((key) => {
@@ -341,14 +324,8 @@ function scanOverrides(env: NodeJS.ProcessEnv): ScannedOverrides {
     const rest = key.slice('HANA_'.length);
     const found = findScopedParam(rest);
     if (!found) {
-      if (rest.includes('_ENV_')) {
-        throw interceptionError(
-          'unknown_scoped_param',
-          `未知的环境覆盖参数：${key}`,
-          '对照 CONFIG.md《参数归类表》使用已登记的参数名。',
-        );
-      }
-      continue; // 扁平 HANA_*（连接/策略）在后续步骤处理
+      // 按需拉取：不认识的 key 直接忽略（不扫描/校验无关环境变量）；拼写错误不会生效
+      continue;
     }
 
     const { spec, rawEnvKey } = found;
