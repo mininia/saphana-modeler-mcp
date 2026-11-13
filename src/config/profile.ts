@@ -23,7 +23,7 @@
  */
 
 import type { HanaPool } from '../core/hana-client.js';
-import { currentEnvironmentLabel } from '../core/environment-context.js';
+import { currentEnvironmentKey } from '../core/environment-context.js';
 import { logger, redactSensitive } from '../core/logger.js';
 
 /** 环境档案（经 hana_system_get_info 的 profile 字段暴露） */
@@ -149,7 +149,7 @@ async function probe(pool: HanaPool): Promise<EnvironmentProfile> {
   };
 }
 
-/** 进程内缓存（按环境 LABEL 分键；DEV 与 PRD 的版本/SPS 档案互不串用） */
+/** 进程内缓存（按环境标识分键；不同环境的版本/SPS 档案互不串用） */
 const cachedByEnv = new Map<string, EnvironmentProfile>();
 /** 并发去重：同一环境首次探测被多个请求同时触发时只探一次（HTTP 多客户端下这是常态路径） */
 const inflightByEnv = new Map<string, Promise<EnvironmentProfile>>();
@@ -160,7 +160,7 @@ const inflightByEnv = new Map<string, Promise<EnvironmentProfile>>();
  */
 export async function getEnvironmentProfile(pool: HanaPool, opts?: { refresh?: boolean }): Promise<EnvironmentProfile> {
   const refresh = opts?.refresh === true;
-  const env = currentEnvironmentLabel();
+  const env = currentEnvironmentKey();
   const cached = cachedByEnv.get(env);
   if (!refresh && cached !== undefined) return cached;
   const inflight = inflightByEnv.get(env);

@@ -2015,7 +2015,7 @@ export async function checkCalculationViewDesignTime(
   const { rest, file } = designTimeTarget(config, objectName, client);
   const tempObject = tempCheckName(objectName);
   const tempFile = designTimeFile(tempObject);
-  // 登记键按**物理库**分域：两个 LABEL 指向同一租户时，临时副本必须共享归属与互斥
+  // 登记键按**物理库**分域：两个环境标识指向同一租户时，临时副本必须共享归属与互斥
   // （锁键 writeLockKey 已按同一口径分域）。
   const registryKey = `${currentDatabaseScopeKey()}:${packageId}/${tempFile}`;
   // 临界区（keyed lock，key=包/归一后的对象名）：同一对象的并发校验会推导出同一个临时名，

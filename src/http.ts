@@ -140,12 +140,12 @@ export async function startHttpServer(
     const clientId = (req as AuthedRequest).auth?.clientId ?? ANONYMOUS_CLIENT_ID;
     // 档案名（Token 第三段）：随身份进 ALS，供调用期授权按调用方收紧（P10-c）
     const profileId = (req as AuthedRequest).auth?.extra?.profileId;
-    // 环境绑定（多环境 HTTP）：按 Token→LABEL 映射把本次请求钉在一个 runtime 上；
+    // 环境绑定（多环境 HTTP）：按 Token→环境标识映射把本次请求钉在一个 runtime 上；
     // 无状态 HTTP 没有会话，进程级 active 不能代表某个客户端。
-    const boundLabel = config.httpClientEnvs?.get(clientId);
-    const boundRuntime = boundLabel ? ctx.manager?.get(boundLabel) : undefined;
+    const boundEnvKey = config.httpClientEnvs?.get(clientId);
+    const boundRuntime = boundEnvKey ? ctx.manager?.get(boundEnvKey) : undefined;
     if (ctx.manager?.multiEnv && boundRuntime === undefined) {
-      logger.error({ clientId, boundLabel }, '多环境 HTTP 请求缺少环境绑定（配置校验应已拒绝启动）');
+      logger.error({ clientId, boundEnvKey }, '多环境 HTTP 请求缺少环境绑定（配置校验应已拒绝启动）');
       res.writeHead(500, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: 'environment binding missing for this client identity' }));
       return;

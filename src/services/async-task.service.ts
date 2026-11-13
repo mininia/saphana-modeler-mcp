@@ -28,7 +28,7 @@ import type { HanaPool } from '../core/hana-client.js';
 import type { XsRestClient } from '../core/xs-rest.js';
 import type { Envelope } from '../types/hana.js';
 import { HanaBusinessError, withErrorEnvelope } from '../core/errors.js';
-import { currentEnvironmentLabel, currentEnvironmentRuntime, runWithEnvironment } from '../core/environment-context.js';
+import { currentEnvironmentKey, currentEnvironmentRuntime, runWithEnvironment } from '../core/environment-context.js';
 import { logger } from '../core/logger.js';
 import { truncateWithNote } from '../core/text.js';
 import {
@@ -74,8 +74,7 @@ function auditTaskTerminal(
           environment: record.environment,
           epoch: record.envEpoch,
           access: record.envAccess,
-          configKey: record.envConfigKey,
-          calledFromEnvironment: currentEnvironmentLabel(),
+          calledFromEnvironment: currentEnvironmentKey(),
         }
       : {}),
     via: 'async-task',
@@ -110,7 +109,7 @@ export interface TaskSubmission {
   status: TaskStatus;
   kind: TaskKind;
   label: string;
-  /** 任务提交时绑定的环境（LABEL）；轮询时据此还原 */
+  /** 任务提交时绑定的环境标识；轮询时据此还原 */
   environment: string;
   envEpoch: number;
   submittedAt: string;
@@ -404,9 +403,8 @@ function viewOf(t: TaskRecord): TaskView {
     environment: t.environment,
     envEpoch: t.envEpoch,
     envAccess: t.envAccess,
-    envConfigKey: t.envConfigKey,
     multiEnv: t.multiEnv,
-    calledFromEnvironment: currentEnvironmentLabel(),
+    calledFromEnvironment: currentEnvironmentKey(),
     status: t.status,
     terminal,
     createdAt: t.createdAt,

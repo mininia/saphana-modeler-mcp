@@ -2,7 +2,7 @@
  * 环境管理工具：hana_env_list（root，只读）+ hana_env_switch（route-only，admin）。
  *
  * 只在多环境部署注册：
- * - list：看当前环境、每个环境的 access/state/任务数、可切列表与一次性 token；
+ * - list：看当前环境标识、每个环境的 access/state/任务数、可切列表与一次性 token；
  * - switch：必须经 hana_system 门面路由，校验 allowlist/from/epoch/token/confirm/在途调用/目标任务/目标连接。
  *
  * 两个 handler 都不碰 HANA（list 只读内存；switch 的预检由 manager 负责），
@@ -12,7 +12,7 @@
 import type { McpServer } from '@modelcontextprotocol/server';
 import { CAP } from '../capabilities/manifest.js';
 import type { Envelope } from '../types/hana.js';
-import { withErrorEnvelope } from '../core/errors.js';
+import { withErrorEnvelope, HanaBusinessError } from '../core/errors.js';
 import { currentEnvironmentRuntime } from '../core/environment-context.js';
 import { currentIdentity } from '../core/request-context.js';
 import { logger } from '../core/logger.js';
@@ -34,20 +34,19 @@ function listEnvelope(ctx: ToolContext): Envelope['data'] {
   // HTTP 模式不发放 token（多客户端共享进程，全局切换会串扰）
   const token = switchable ? manager.issueSwitchToken() : undefined;
   return {
-    current: current.label,
+    current: current.envKey,
     currentState: httpMode ? 'active' : current.state,
     epoch: current.epoch,
     switchable,
     ...(token ? { switchToken: token.token, switchTokenExpiresAt: new Date(token.expiresAt).toISOString() } : {}),
     environments: manager.list().map((rt) => ({
-      name: rt.label,
-      configKey: rt.configKey,
+      name: rt.envKey,
       access: rt.access,
       // HTTP 下进程级 state 不适用：以本请求绑定环境为 current，其余显示 idle
-      state: httpMode ? (rt.label === current.label ? 'active' : 'idle') : rt.state,
-      current: rt.label === current.label,
-      switchable: switchable && manager.switchable.includes(rt.label),
-      runningTasks: countRunningTasksForEnvironment(rt.label),
+      state: httpMode ? (rt.envKey === current.envKey ? 'active' : 'idle') : rt.state,
+      current: rt.envKey === current.envKey,
+      switchable: switchable && manager.switchable.includes(rt.envKey),
+      runningTasks: countRunningTasksForEnvironment(rt.envKey),
       poolOpen: rt.pool.stats().inUse + rt.pool.stats().idle > 0,
     })),
     hint: httpMode
@@ -81,7 +80,10 @@ export function registerEnvironmentTools(server: McpServer, ctx: ToolContext): v
       await withErrorEnvelope(async () => {
         const manager = ctx.manager;
         if (!manager?.multiEnv || manager.switchable.length === 0) {
-          throw new Error('环境切换未启用：需要多环境部署且 HANA_ENV_SWITCHABLE 非空');
+          throw new HanaBusinessError(
+            '环境切换未启用：需要多环境部署且 HANA_ENV_SWITCHABLE 非空',
+            'env_switch_disabled',
+          );
         }
         const outcome = await manager.switchTo({
           to,

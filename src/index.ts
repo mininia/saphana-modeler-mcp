@@ -82,15 +82,10 @@ async function main(): Promise<void> {
     logger.info({ writePackages: verdict.policy.resource.writePackages }, verdict.text);
   }
 
-  // 池与超时参数（HANA_POOL_*/HANA_SQL_TIMEOUT_MS，默认值见 core/limits.ts 单一事实源）。
+  // 池与超时参数按环境从各自 config 派生（见 EnvironmentManager 构造）；这里不再传全局选项。
   // 部署含义：max 是**每环境池大小**——N 个环境 × poolMax 是理论上限；连接仍懒建立，
   // 稳态通常只有 active 环境建连。多进程部署时 HANA 侧连接数按进程数线性放大，调大前先核对 DB 侧连接预算。
-  const manager = new EnvironmentManager(loaded, {
-    max: config.poolMax,
-    maxWaiters: config.poolMaxWaiters,
-    acquireTimeoutMs: config.poolWaitMs,
-    statementTimeoutMs: config.sqlTimeoutMs,
-  });
+  const manager = new EnvironmentManager(loaded);
   // 调用期 pool/config 取“本次调用绑定的 runtime”；未进入上下文（启动期/测试直调）回退 active。
   const ctx: ToolContext = {
     get pool() {
@@ -105,12 +100,11 @@ async function main(): Promise<void> {
   logger.info(
     {
       environments: manager.list().map((rt) => ({
-        label: rt.label,
-        configKey: rt.configKey,
+        envKey: rt.envKey,
         access: rt.access,
         state: rt.state,
       })),
-      start: manager.current().label,
+      start: manager.current().envKey,
       switchable: [...manager.switchable],
       multiEnv: manager.multiEnv,
     },

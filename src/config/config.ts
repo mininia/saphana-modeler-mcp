@@ -19,7 +19,14 @@ import {
 import { IDENTITY_NAME_HINT, IDENTITY_NAME_RE, splitList } from '../core/text.js';
 import { XS_BASE_PATH } from '../core/xs-rest.js';
 import { findInvalidWritePackages } from './write-boundary.js';
-import { buildEnvironments, isEnvironmentConfigKey, type LoadedEnvironments } from './environment-config.js';
+import {
+  buildEnvironments,
+  canonicalEnvKey,
+  hasScopedEnvironmentKeys,
+  isEnvironmentConfigKey,
+  type LoadedEnvironments,
+} from './environment-config.js';
+import { interceptionError } from './error-codes.js';
 import { IMPLICIT_DEFAULT_PROFILE_ID, parseProfiles, type CallerProfile } from './profiles.js';
 import { DEFAULT_HTTP_HOST, DEFAULT_SSL_VALIDATE, DEFAULT_TLS } from './deployment.js';
 
@@ -115,8 +122,9 @@ const SURFACE_MAX_DEFAULT = 50;
 
 const envSchema = z.object({
   // 安全要求：连接信息（主机/端口/库名/用户名/密码）一律只允许来自环境变量 / mcp.json，
-  // 禁止默认值或硬编码真实环境值
-  HANA_HOST: z.string().min(1),
+  // 禁止默认值或硬编码真实环境值。
+  // 单环境必填；多环境必须用 HANA_HOST_ENV_<XXXX>（扁平键在 buildEnvironments 里硬报错）。
+  HANA_HOST: z.string().min(1).optional(),
   /**
    * SQL 端口（**必填**）。2026-10-14 起不再有实例号（HANA_INSTANCE 已删除）：
    * 端口一律由部署方显式给出，服务端不按 `3<实例>13/15` 推导——那条规则只覆盖默认实例与
@@ -130,25 +138,27 @@ const envSchema = z.object({
     trimmedOrUnset,
     z
       .string({ error: 'HANA_PORT 必填：请给出 SQL 端口（如 30015 / 31041）' })
-      .regex(/^[0-9]+$/, '无效的 SQL 端口：必须是纯数字（如 30015；不含小数点/千分位等其它字符）'),
+      .regex(/^[0-9]+$/, '无效的 SQL 端口：必须是纯数字（如 30015；不含小数点/千分位等其它字符）')
+      .optional(),
   ),
-  HANA_USER: z.string().min(1),
-  HANA_PASSWORD: z.string().min(1),
+  HANA_USER: z.string().min(1).optional(),
+  HANA_PASSWORD: z.string().min(1).optional(),
   /** 连接 Locale（默认 zh），影响服务器端语言/错误消息 */
   HANA_LOCALE: z.string().min(1).default(DEFAULT_LOCALE),
   /** 租户数据库名（MDC 指定租户时填写，如 SYSTEMDB / 业务租户名；非 MDC 可省略） */
   HANA_DB_NAME: z.string().min(1).optional(),
   /**
-   * 环境的只读/可写策略（多环境）。基础环境用 HANA_ACCESS；命名环境用
+   * 环境的只读/可写策略（多环境）。扁平值 = 所有环境共享；命名环境用
    * HANA_ACCESS_ENV_<XXXX> 覆盖。只读闸门只看它，不按环境名推断。
    */
   HANA_ACCESS: z.enum(['readwrite', 'readonly']).default('readwrite'),
   /**
-   * 基础环境的系统标识（LABEL）。命名环境用 HANA_LABEL_ENV_<XXXX>；
-   * 不写时基础环境为 default、命名环境为 <XXXX>。LABEL 是 MCP 识别的标识，
-   * HANA_ENV_START / HANA_ENV_SWITCHABLE / 工具 / 审计都用它。
+   * 环境模式（可选）：single / multi。
+   * 不设置时自动判断：出现任意 `_ENV_` 变量 = multi。显式值与实际不一致时启动失败。
    */
-  HANA_LABEL: z
+  HANA_ENV_MODE: z.preprocess(emptyAsUnset, z.enum(['single', 'multi']).optional()),
+  /** 兼容模式开关：本版仅支持 strict；legacy 兼容层未实现（启动时拒绝） */
+  HANA_ENV_INHERIT: z
     .string()
     .default('')
     .transform((s) => s.trim()),
@@ -232,11 +242,14 @@ const envSchema = z.object({
       .transform((s) => s.trim()),
   ),
   /** 额外允许的 SQL 查询 schema（逗号分隔，追加到 core/sql.ts 白名单；默认仅系统 schema）。
+   *  多环境下扁平值 = 所有环境共享；HANA_READ_SCHEMA_ENV_<XXXX> 覆盖单个环境。
    *  2026-10-14 由 HANA_SCHEMA_ALLOW 改名而来（原名只说明「allow」，看不出 allow 什么）；
    *  **无别名层**：旧名不再识别，仍写旧名会命中未识别环境变量启动告警。 */
   HANA_READ_SCHEMA: z.string().default('').transform(splitList),
   /**
    * 允许写操作的仓库包（逗号分隔的包前缀；含子包）。
+   * 多环境下扁平值 = 所有环境共享；HANA_WRITE_PACKAGES_ENV_<XXXX> 覆盖单个环境
+   * （显式空 = 该环境无写包）。
    * 填写后仅允许指定包及其下级子包写操作。
    * **空/未填不是「所有包可写」**：端到端表现为写不可用——写工具已暴露时，任何声明写包的调用
    * 都会被运行期闸门以 boundary_off 拒绝（只有服务层的纵深防御是 fail-open，见 config/write-boundary.ts 头注）。
@@ -284,12 +297,12 @@ const envSchema = z.object({
    * 未给时回退进程级 HANA_XS_TLS。
    */
   HANA_XS_TLS: boolSchema(false),
-  /** 启动即激活的环境 LABEL；默认基础环境的 LABEL（未设 HANA_LABEL 时为 default） */
+  /** 启动即激活的环境标识；多环境默认取唯一的那个，多个环境时必须显式设置 */
   HANA_ENV_START: z
     .string()
     .default('')
     .transform((s) => s.trim()),
-  /** 可切换环境 LABEL 列表（逗号分隔）；默认空 = 不可切 */
+  /** 可切换环境标识列表（逗号分隔；大小写不敏感）；默认空 = 不可切 */
   HANA_ENV_SWITCHABLE: z.string().default('').transform(splitList),
   /** 只读环境的 SQL 策略：select-only（默认）/ deny；仍受 sql 工具组控制 */
   HANA_READONLY_SQL: z.enum(['select-only', 'deny']).default('select-only'),
@@ -364,8 +377,9 @@ const envSchema = z.object({
     .default('')
     .transform((s) => s.trim()),
   /**
-   * HTTP 多客户端 Token → 环境 LABEL 绑定（`clientId:LABEL`，逗号分隔）。
+   * HTTP 多客户端 Token → 环境标识绑定（`clientId:ENV`，逗号分隔）。
    * 仅 HTTP 模式有效；多环境 HTTP 必须为每个 Token 绑定环境（否则启动失败）。
+   * 环境标识大小写不敏感，内部规范化为大写。
    */
   MCP_HTTP_CLIENT_ENVS: z
     .string()
@@ -471,26 +485,27 @@ export function parseHttpClients(raw: string, singleToken?: string): HttpClientI
  * - 仅 HTTP 模式有效；stdio 配了即启动失败（避免“以为生效、其实没有”）。
  * - 多环境 HTTP 必须为每个 Token 绑定环境；缺少绑定或配置为空都拒绝启动——进程级 active
  *   在无会话 HTTP 下会跨客户端串环境。
- * - clientId 必须在 MCP_HTTP_TOKENS 中；LABEL 必须在已配置环境表中；重复绑定失败。
+ * - clientId 必须在 MCP_HTTP_TOKENS 中；环境标识必须在已配置环境表中；重复绑定失败。
  */
 export function parseHttpClientEnvironments(
   raw: string,
   clients: readonly HttpClientIdentity[],
-  labels: ReadonlySet<string>,
+  envKeys: ReadonlySet<string>,
   httpMode: boolean,
   multiEnv: boolean,
 ): Map<string, string> {
   const entries = splitList(raw);
   if (!httpMode) {
     if (entries.length > 0) {
-      throw new Error('MCP_HTTP_CLIENT_ENVS 仅在 HTTP 模式（设置 MCP_HTTP_PORT）下有效');
+      throw interceptionError('config_invalid', 'MCP_HTTP_CLIENT_ENVS 仅在 HTTP 模式（设置 MCP_HTTP_PORT）下有效');
     }
     return new Map();
   }
   if (multiEnv && clients.length === 0) {
-    throw new Error(
-      '多环境 HTTP 必须配置 MCP_HTTP_TOKENS，并用 MCP_HTTP_CLIENT_ENVS 为每个 Token 绑定环境 LABEL；' +
-        '或改用一进程一环境',
+    throw interceptionError(
+      'config_invalid',
+      '多环境 HTTP 必须配置 MCP_HTTP_TOKENS，并用 MCP_HTTP_CLIENT_ENVS 为每个 Token 绑定环境标识',
+      '或改用一进程一环境。',
     );
   }
 
@@ -498,31 +513,37 @@ export function parseHttpClientEnvironments(
   for (const entry of entries) {
     const parts = entry.split(':');
     if (parts.length !== 2 || parts[0].trim() === '' || parts[1].trim() === '') {
-      throw new Error(`MCP_HTTP_CLIENT_ENVS 条目格式非法：${entry}（应为 clientId:LABEL）`);
+      throw interceptionError('config_invalid', `MCP_HTTP_CLIENT_ENVS 条目格式非法：${entry}（应为 clientId:ENV）`);
     }
     const clientId = parts[0].trim();
-    const label = parts[1].trim();
+    const envKey = canonicalEnvKey(parts[1].trim(), 'MCP_HTTP_CLIENT_ENVS');
     if (!clients.some((c) => c.clientId === clientId)) {
-      throw new Error(
-        `MCP_HTTP_CLIENT_ENVS 引用了未配置的客户端身份：${clientId}；` +
-          `已配置身份：${clients.map((c) => c.clientId).join(', ') || '(无)'}`,
+      throw interceptionError(
+        'config_invalid',
+        `MCP_HTTP_CLIENT_ENVS 引用了未配置的客户端身份：${clientId}`,
+        `已配置身份：${clients.map((c) => c.clientId).join(', ') || '(无)'}。`,
       );
     }
-    if (!labels.has(label)) {
-      throw new Error(`MCP_HTTP_CLIENT_ENVS 引用了未知环境 LABEL：${label}；可用 LABEL：${[...labels].join(', ')}`);
+    if (!envKeys.has(envKey)) {
+      throw interceptionError(
+        'env_key_unknown',
+        `MCP_HTTP_CLIENT_ENVS 引用了未知环境标识：${envKey}`,
+        `可用环境标识：${[...envKeys].join(', ')}（大小写不敏感）。`,
+      );
     }
     if (byClient.has(clientId)) {
-      throw new Error(`MCP_HTTP_CLIENT_ENVS 客户端身份重复：${clientId}`);
+      throw interceptionError('config_invalid', `MCP_HTTP_CLIENT_ENVS 客户端身份重复：${clientId}`);
     }
-    byClient.set(clientId, label);
+    byClient.set(clientId, envKey);
   }
 
   if (multiEnv) {
     const missing = clients.map((c) => c.clientId).filter((id) => !byClient.has(id));
     if (missing.length > 0) {
-      throw new Error(
-        `多环境 HTTP 下每个 Token 都必须绑定环境；缺少：${missing.join(', ')}。` +
-          '请补 MCP_HTTP_CLIENT_ENVS（clientId:LABEL），或改用一进程一环境',
+      throw interceptionError(
+        'config_invalid',
+        `多环境 HTTP 下每个 Token 都必须绑定环境；缺少：${missing.join(', ')}`,
+        '请补 MCP_HTTP_CLIENT_ENVS（clientId:ENV），或改用一进程一环境。',
       );
     }
   }
@@ -586,16 +607,14 @@ export interface HanaConfig {
   httpTokens: HttpClientIdentity[];
   /** 允许的 Host 头主机名（DNS rebinding 防护，来自 MCP_HTTP_ALLOWED_HOSTS） */
   httpAllowedHosts: string[];
-  /** HTTP 客户端身份 → 环境 LABEL 绑定（MCP_HTTP_CLIENT_ENVS；仅 HTTP 模式） */
+  /** HTTP 客户端身份 → 环境标识绑定（MCP_HTTP_CLIENT_ENVS；仅 HTTP 模式） */
   httpClientEnvs?: Map<string, string>;
   /** 允许的 Origin 主机名（无 Origin 头放行，来自 MCP_HTTP_ALLOWED_ORIGINS） */
   httpAllowedOrigins: string[];
   /** 显式承认「对外监听且不认证」的风险（来自 MCP_HTTP_ALLOW_ANONYMOUS，默认 false） */
   httpAllowAnonymous: boolean;
-  /** 当前环境的系统标识（LABEL）；单环境默认 `default` */
-  environment?: string;
-  /** 配置键命名空间：`default` 或 `<XXXX>`（用于排障/审计，不参与授权） */
-  configKey?: string;
+  /** 环境标识（规范化为大写）；单环境为 DEFAULT */
+  envKey?: string;
   /** 只读/可写策略（HANA_ACCESS / HANA_ACCESS_ENV_<XXXX>） */
   access?: 'readwrite' | 'readonly';
   /** 只读环境 SQL 策略（HANA_READONLY_SQL） */
@@ -689,6 +708,11 @@ export function tryLoadDotEnv(env: NodeJS.ProcessEnv = process.env): DotEnvLoadR
   const sources: Partial<Record<ConnectionKey, string>> = {};
   for (const key of CONNECTION_KEYS) {
     if (hasValue(env[key])) sources[key] = SOURCE_PROCESS_ENV;
+  }
+  // 多环境配置（出现任意 _ENV_ 键）不读 .env：多环境要求连接参数与策略键来自同一来源
+  // （mcp.json env / shell / 容器注入），避免邻近 .env 的扁平凭据被当成多环境配置的一部分。
+  if (hasScopedEnvironmentKeys(env)) {
+    return { loadedFiles: [], sources };
   }
   // 三件套齐备 → 完全不读 .env（外部注入优先，不被邻近 .env 干扰）
   if (CREDENTIAL_KEYS.every((k) => hasValue(env[k]))) {
@@ -857,10 +881,10 @@ function loadInternal(env: NodeJS.ProcessEnv): LoadedEnvironments {
   const profiles = parseProfiles(parsed.MCP_PROFILES);
   assertProfileConfig(profiles, parsed.MCP_PROFILE, parsed.MCP_HTTP_TOKENS, parsed.MCP_HTTP_TOKEN);
 
-  // SQL 端口：schema 已保证非空且为纯数字，这里只做范围收口
-  const port = parseInt(parsed.HANA_PORT, 10);
-  if (port < 1 || port > 65535) {
-    throw new Error(`无效的 SQL 端口: ${parsed.HANA_PORT}`);
+  // SQL 端口：单环境必填（范围在 buildEnvironments 里校验）；多环境由 `_ENV_` 覆盖提供
+  const port = parsed.HANA_PORT === undefined ? 0 : parseInt(parsed.HANA_PORT, 10);
+  if (parsed.HANA_PORT !== undefined && (port < 1 || port > 65535)) {
+    throw interceptionError('config_invalid', `无效的 SQL 端口: ${parsed.HANA_PORT}`);
   }
 
   // XS 端口：默认 8010（envSchema 已给默认值）。'0'/'99999' 这类越界值若放行，要到首次
@@ -869,13 +893,6 @@ function loadInternal(env: NodeJS.ProcessEnv): LoadedEnvironments {
   const xsPort = parseInt(parsed.HANA_XS_PORT, 10);
   if (xsPort < 1 || xsPort > 65535) {
     throw new Error(`无效的 XS 端口: ${parsed.HANA_XS_PORT}`);
-  }
-  if (!hasValue(env.HANA_XS_PORT)) {
-    // 默认值 8010 是便利不是猜测的许可证：非默认实例/租户必须显式覆盖。XS 通道是明文 HTTP，
-    // 端口指错会把 HANA 账号与会话发到另一个服务——每次启动留一条可见告警。
-    logger.warn(
-      'HANA_XS_PORT 未配置，使用默认 8010；非默认实例/租户请显式覆盖（XS 通道为明文 HTTP，端口错误会把凭据发到错误端点）',
-    );
   }
 
   // 将解析后的时区应用到整个进程（影响 new Date() 等本地时间语义）
@@ -901,10 +918,10 @@ function loadInternal(env: NodeJS.ProcessEnv): LoadedEnvironments {
   }
 
   const baseConfig: HanaConfig = {
-    host: parsed.HANA_HOST,
+    host: parsed.HANA_HOST ?? '',
     port,
-    user: parsed.HANA_USER,
-    password: parsed.HANA_PASSWORD,
+    user: parsed.HANA_USER ?? '',
+    password: parsed.HANA_PASSWORD ?? '',
     locale: parsed.HANA_LOCALE,
     dbName: parsed.HANA_DB_NAME,
     tls: parsed.HANA_TLS,
@@ -945,24 +962,40 @@ function loadInternal(env: NodeJS.ProcessEnv): LoadedEnvironments {
     httpAllowAnonymous: parsed.MCP_HTTP_ALLOW_ANONYMOUS,
     connectionSources: dotenv.sources,
     connectionSourceMixed,
-    // 环境维度：基础环境是 default；命名环境在 buildEnvironments 里派生
-    environment: parsed.HANA_LABEL || 'default',
-    configKey: 'default',
+    // 环境维度：单环境在 buildEnvironments 里填 DEFAULT；多环境填各自 _ENV_ 标识
     access: parsed.HANA_ACCESS,
     readonlySql: parsed.HANA_READONLY_SQL,
     xsTls: parsed.HANA_XS_TLS,
   };
 
+  const inherit = parsed.HANA_ENV_INHERIT;
+  if (inherit !== '' && inherit !== 'strict') {
+    throw interceptionError(
+      'config_invalid',
+      `HANA_ENV_INHERIT=${inherit} 不支持`,
+      '本版仅支持 strict；legacy 兼容层未实现，请按 scripts/migrate-env-config.mjs 的报告迁移。',
+    );
+  }
+
   const loaded = buildEnvironments(env, baseConfig, {
     start: parsed.HANA_ENV_START,
     switchable: parsed.HANA_ENV_SWITCHABLE,
+    mode: parsed.HANA_ENV_MODE,
   });
+
+  if (!loaded.multiEnv && !hasValue(env.HANA_XS_PORT)) {
+    // 默认值 8010 是便利不是猜测的许可证：非默认实例/租户必须显式覆盖。XS 通道是明文 HTTP，
+    // 端口指错会把 HANA 账号与会话发到另一个服务——每次启动留一条可见告警。
+    logger.warn(
+      'HANA_XS_PORT 未配置，使用默认 8010；非默认实例/租户请显式覆盖（XS 通道为明文 HTTP，端口错误会把凭据发到错误端点）',
+    );
+  }
 
   // HTTP Token → 环境绑定（多环境 HTTP 必须为每个 Token 绑定；stdio 配了即失败）
   const httpClientEnvs = parseHttpClientEnvironments(
     parsed.MCP_HTTP_CLIENT_ENVS,
     baseConfig.httpTokens,
-    new Set(loaded.entries.map((e) => e.label)),
+    new Set(loaded.entries.map((e) => e.envKey)),
     parsed.MCP_HTTP_PORT != null,
     loaded.multiEnv,
   );

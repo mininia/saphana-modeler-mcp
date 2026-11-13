@@ -49,7 +49,7 @@ export const systemCapabilities = {
     effects: { destructive: false, idempotent: true, mutates: 'none' },
     title: '列出 HANA 环境',
     description:
-      '列出本进程配置的 HANA 环境：当前 active 环境（LABEL）、每个环境的 access/state/运行任务数，' +
+      '列出本进程配置的 HANA 环境：当前 active 环境标识、每个环境的 access/state/运行任务数，' +
       '以及可切列表与一次性 switchToken。多环境部署才注册；不连 HANA，当前环境不可用时也能查看。' +
       '切换用 hana_system({capability:"hana_env_switch"})，token 由本工具发放。',
     inputSchema: z.object({}),
@@ -65,14 +65,14 @@ export const systemCapabilities = {
     title: '切换 HANA 环境',
     description:
       '切换当前 active 环境（多环境、stdio）。必须先用 hana_env_list 获取 from/epoch/switchToken，' +
-      'confirm 逐字等于目标 LABEL；目标有运行中任务时需 acknowledgeRunningTasks=true。' +
+      'confirm 等于目标环境标识（大小写不敏感）；目标有运行中任务时需 acknowledgeRunningTasks=true。' +
       'HTTP 模式拒绝（多客户端共享进程）。只经 hana_system 门面路由，不注册为平铺工具。',
     inputSchema: z.object({
-      to: z.string().min(1).max(32).describe('目标环境 LABEL（见 hana_env_list 返回的 name）'),
-      from: z.string().min(1).max(32).describe('当前环境 LABEL；必须与 hana_env_list 的 current 一致'),
+      to: z.string().min(1).max(32).describe('目标环境标识（见 hana_env_list 返回的 name；大小写不敏感）'),
+      from: z.string().min(1).max(32).describe('当前环境标识；必须与 hana_env_list 的 current 一致（大小写不敏感）'),
       epoch: z.number().int().min(1).describe('hana_env_list 返回的 epoch；过期则拒绝'),
       switchToken: z.string().min(8).max(128).describe('hana_env_list 发放的一次性 token'),
-      confirm: z.string().min(1).max(32).describe('必须逐字等于 to'),
+      confirm: z.string().min(1).max(32).describe('必须等于 to（大小写不敏感）'),
       acknowledgeRunningTasks: z
         .boolean()
         .optional()

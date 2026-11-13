@@ -1,12 +1,14 @@
 /**
  * 多环境运行时：每个环境一个独立 HanaPool / config / 缓存作用域。
  *
- * P1/P2 已建立“环境表 + 单 active + per-call runtime 绑定 + 任务环境捕获”；
- * 本文件在 P3 补切换状态机：
+ * v2 模型：环境标识（envKey）直接取自 `HANA_<PARAM>_ENV_<XXXX>` 的 `<XXXX>`，
+ * 大小写不敏感，内部规范化为大写。没有 LABEL / configKey 两层概念。
+ *
+ * 切换状态机：
  * - 切换前校验 allowlist / from / epoch / token / confirm / 在途调用 / 目标任务 / 目标连接；
  * - 校验与 active+epoch 更新在同步临界区内完成（中间无 await）；
  * - 旧环境有运行中任务 → task-draining（保留池）；否则 idle 并只关闭空闲连接；
- * - 池引用计数用于后续延迟关闭（P3 先记录 callRefs/taskRefs）。
+ * - 池选项按环境从各自 config 派生（POOL_* / SQL_TIMEOUT_MS 可按环境不同）。
  */
 
 import { randomUUID } from 'node:crypto';
@@ -14,29 +16,28 @@ import { HanaPool, type HanaPoolOptions } from '../core/hana-client.js';
 import { HanaBusinessError } from '../core/errors.js';
 import { countRunningTasksForEnvironment } from '../core/task-registry.js';
 import type { HanaConfig } from './config.js';
-import type { EnvironmentAccess, LoadedEnvironments } from './environment-config.js';
+import { canonicalEnvKey, type EnvironmentAccess, type LoadedEnvironments } from './environment-config.js';
 
 export type EnvironmentState = 'active' | 'task-draining' | 'idle';
 
-/** 一个可运行环境；label 是系统标识，configKey 是配置键命名空间。 */
+/** 一个可运行环境；envKey 是环境标识（规范化为大写）。 */
 export interface EnvironmentRuntime {
-  label: string;
-  configKey: string;
+  envKey: string;
   access: EnvironmentAccess;
   config: HanaConfig;
   pool: HanaPool;
   state: EnvironmentState;
   /** 每次实际切换递增；任务/回执据此还原执行时的环境版本 */
   epoch: number;
-  /** 业务调用对池的租约（P3 切换时用于延迟关闭） */
+  /** 业务调用对池的租约（切换时用于延迟关闭） */
   callRefs: number;
-  /** 运行中异步任务对池的租约（P2/P3） */
+  /** 运行中异步任务对池的租约 */
   taskRefs: number;
   /** 是否多环境部署（单环境不产生环境字段，保持旧输出） */
   multiEnv: boolean;
 }
 
-/** 切换入参（工具层已做 schema 校验） */
+/** 切换入参（工具层已做 schema 校验；to/from/confirm 大小写不敏感） */
 export interface SwitchEnvironmentInput {
   to: string;
   from: string;
@@ -70,13 +71,13 @@ const SWITCH_TOKEN_TTL_MS = 60_000;
 const SWITCH_TOKEN_MAX = 64;
 
 /** 池工厂（测试注入用；生产默认 new HanaPool） */
-export type EnvironmentPoolFactory = (config: HanaConfig) => HanaPool;
+export type EnvironmentPoolFactory = (config: HanaConfig, options: HanaPoolOptions) => HanaPool;
 
-/** 进程内环境管理器：单 active、按 LABEL 索引。 */
+/** 进程内环境管理器：单 active、按环境标识索引。 */
 export class EnvironmentManager {
   private readonly runtimes = new Map<string, EnvironmentRuntime>();
   private readonly loaded: LoadedEnvironments;
-  private activeLabel: string;
+  private activeKey: string;
   private currentEpoch = 1;
   private activeCalls = 0;
   private readonly switchTokens = new Map<string, SwitchTokenRecord>();
@@ -84,18 +85,25 @@ export class EnvironmentManager {
   constructor(
     loaded: LoadedEnvironments,
     poolOptions: HanaPoolOptions = {},
-    poolFactory: EnvironmentPoolFactory = (config) => new HanaPool(config, poolOptions),
+    poolFactory: EnvironmentPoolFactory = (config, options) => new HanaPool(config, options),
   ) {
     this.loaded = loaded;
-    this.activeLabel = loaded.startLabel;
+    this.activeKey = loaded.startKey;
     for (const entry of loaded.entries) {
-      this.runtimes.set(entry.label, {
-        label: entry.label,
-        configKey: entry.configKey,
+      // 池选项按环境派生：POOL_* / SQL_TIMEOUT_MS 在 v2 属于策略层，可按环境不同。
+      const options: HanaPoolOptions = {
+        ...poolOptions,
+        max: entry.config.poolMax ?? poolOptions.max,
+        maxWaiters: entry.config.poolMaxWaiters ?? poolOptions.maxWaiters,
+        acquireTimeoutMs: entry.config.poolWaitMs ?? poolOptions.acquireTimeoutMs,
+        statementTimeoutMs: entry.config.sqlTimeoutMs ?? poolOptions.statementTimeoutMs,
+      };
+      this.runtimes.set(entry.envKey, {
+        envKey: entry.envKey,
         access: entry.access,
         config: entry.config,
-        pool: poolFactory(entry.config),
-        state: entry.label === loaded.startLabel ? 'active' : 'idle',
+        pool: poolFactory(entry.config, options),
+        state: entry.envKey === loaded.startKey ? 'active' : 'idle',
         epoch: 1,
         callRefs: 0,
         taskRefs: 0,
@@ -106,26 +114,26 @@ export class EnvironmentManager {
 
   /** 当前 active 环境（调用入口绑定的就是它） */
   current(): EnvironmentRuntime {
-    const rt = this.runtimes.get(this.activeLabel);
+    const rt = this.runtimes.get(this.activeKey);
     if (!rt) {
-      // 构造期已校验 startLabel 必然存在；这里只防未来代码改动破坏不变量
-      throw new Error(`内部错误：active 环境 ${this.activeLabel} 不在环境表中`);
+      // 构造期已校验 startKey 必然存在；这里只防未来代码改动破坏不变量
+      throw new Error(`内部错误：active 环境 ${this.activeKey} 不在环境表中`);
     }
     return rt;
   }
 
-  /** 按 LABEL 取环境；未知返回 undefined（工具层负责转成业务错误） */
-  get(label: string): EnvironmentRuntime | undefined {
-    return this.runtimes.get(label);
+  /** 按环境标识取环境；未知返回 undefined（工具层负责转成业务错误） */
+  get(envKey: string): EnvironmentRuntime | undefined {
+    return this.runtimes.get(envKey);
   }
 
-  /** 全部环境（基础环境在前，其余按配置键排序） */
+  /** 全部环境（按环境标识排序） */
   list(): EnvironmentRuntime[] {
     return [...this.runtimes.values()];
   }
 
-  get startLabel(): string {
-    return this.loaded.startLabel;
+  get startKey(): string {
+    return this.loaded.startKey;
   }
 
   get switchable(): readonly string[] {
@@ -172,7 +180,7 @@ export class EnvironmentManager {
     }
     const token = randomUUID();
     const expiresAt = now + SWITCH_TOKEN_TTL_MS;
-    this.switchTokens.set(token, { from: this.activeLabel, epoch: this.currentEpoch, expiresAt });
+    this.switchTokens.set(token, { from: this.activeKey, epoch: this.currentEpoch, expiresAt });
     return { token, expiresAt };
   }
 
@@ -185,9 +193,13 @@ export class EnvironmentManager {
   /**
    * 事务式切换：校验 → 目标连接预检 → 同步提交 active+epoch → 异步清理旧池。
    * 任何失败都保持原 active/epoch 不变（不先关旧池、不先改状态）。
+   * to/from/confirm 大小写不敏感，内部按规范化后的环境标识比较。
    */
   async switchTo(input: SwitchEnvironmentInput): Promise<SwitchEnvironmentOutcome> {
-    const { to, from, epoch, switchToken, confirm, acknowledgeRunningTasks } = input;
+    const { epoch, switchToken, acknowledgeRunningTasks } = input;
+    const to = canonicalEnvKey(input.to, 'hana_env_switch.to');
+    const from = canonicalEnvKey(input.from, 'hana_env_switch.from');
+    const confirm = canonicalEnvKey(input.confirm, 'hana_env_switch.confirm');
     const base = this.loaded.base.config;
 
     if (base.httpPort != null) {
@@ -201,10 +213,10 @@ export class EnvironmentManager {
     const target = this.runtimes.get(to);
     if (!target) {
       throw new HanaBusinessError(
-        `未知环境：${to}。可用 LABEL：${this.list()
-          .map((r) => r.label)
+        `未知环境：${to}。可用环境标识：${this.list()
+          .map((r) => r.envKey)
           .join(', ')}`,
-        'env_unknown',
+        'env_key_unknown',
       );
     }
     if (!this.loaded.switchable.includes(to)) {
@@ -213,12 +225,12 @@ export class EnvironmentManager {
         'env_switch_target_not_allowed',
       );
     }
-    if (this.activeLabel === to) {
+    if (this.activeKey === to) {
       throw new HanaBusinessError(`环境 ${to} 已经是当前 active，无需切换`, 'env_already_active');
     }
-    if (from !== this.activeLabel) {
+    if (from !== this.activeKey) {
       throw new HanaBusinessError(
-        `切换基线不匹配：请求 from=${from}，当前 active=${this.activeLabel}。请重新调用 hana_env_list`,
+        `切换基线不匹配：请求 from=${from}，当前 active=${this.activeKey}。请重新调用 hana_env_list`,
         'env_switch_from_mismatch',
       );
     }
@@ -236,7 +248,7 @@ export class EnvironmentManager {
     }
     if (confirm !== to) {
       throw new HanaBusinessError(
-        `确认串不匹配：confirm 必须逐字等于目标 LABEL（${to}）`,
+        `确认串不匹配：confirm 必须等于目标环境标识（${to}，大小写不敏感）`,
         'env_switch_confirm_mismatch',
       );
     }
@@ -247,10 +259,10 @@ export class EnvironmentManager {
       );
     }
 
-    const targetTasks = countRunningTasksForEnvironment(target.label);
+    const targetTasks = countRunningTasksForEnvironment(target.envKey);
     if (targetTasks > 0 && acknowledgeRunningTasks !== true) {
       throw new HanaBusinessError(
-        `目标环境 ${target.label} 还有 ${targetTasks} 个运行中的任务；` +
+        `目标环境 ${target.envKey} 还有 ${targetTasks} 个运行中的任务；` +
           '如确认要切过去（新调用会与该任务共享池），请传 acknowledgeRunningTasks=true',
         'env_switch_target_has_running_tasks',
       );
@@ -261,7 +273,7 @@ export class EnvironmentManager {
       await target.pool.query('SELECT 1 FROM DUMMY', undefined, { timeoutMs: 5_000 });
     } catch (e) {
       throw new HanaBusinessError(
-        `目标环境 ${target.label} 连接预检失败，切换未执行（当前环境保持不变）：` +
+        `目标环境 ${target.envKey} 连接预检失败，切换未执行（当前环境保持不变）：` +
           (e instanceof Error ? e.message : '未知错误'),
         'env_switch_target_unreachable',
       );
@@ -270,9 +282,9 @@ export class EnvironmentManager {
     // ── 同步提交临界区：从这里到返回不得有 await ────────────────────────────
     const previous = this.current();
     const previousEpoch = this.currentEpoch;
-    const sourceTasks = countRunningTasksForEnvironment(previous.label);
+    const sourceTasks = countRunningTasksForEnvironment(previous.envKey);
     this.currentEpoch += 1;
-    this.activeLabel = target.label;
+    this.activeKey = target.envKey;
 
     // 本次 switch 调用自己也持有 1 个 callRef；>1 才代表还有别的在途调用。
     // 有运行中任务或别的在途调用 → task-draining（保留池）；否则 idle（只 closeIdle）。
@@ -286,17 +298,17 @@ export class EnvironmentManager {
     const kept: string[] = [];
     const closed: string[] = [];
     if (previous.state === 'idle') {
-      closed.push(previous.label);
+      closed.push(previous.envKey);
       // 提交后才异步清空闲连接；不清 pwd，池对象仍可复用
       void previous.pool.closeIdle();
     } else {
-      kept.push(previous.label);
+      kept.push(previous.envKey);
     }
-    if (targetTasks > 0) kept.push(target.label);
+    if (targetTasks > 0) kept.push(target.envKey);
 
     return {
-      previous: previous.label,
-      current: target.label,
+      previous: previous.envKey,
+      current: target.envKey,
       previousEpoch,
       epoch: this.currentEpoch,
       previousState: previous.state,
@@ -306,7 +318,7 @@ export class EnvironmentManager {
       pools: { kept: [...new Set(kept)], closed },
       notice:
         '切换只影响本次响应之后的调用；已开始的调用仍绑定原环境。' +
-        '非纯读调用（含临时对象）请携带 expectedEnvironment=<当前 LABEL>；需要切回时重新调用 hana_env_list 获取新 token。',
+        '非纯读调用（含临时对象）请携带 expectedEnvironment=<当前环境标识>；需要切回时重新调用 hana_env_list 获取新 token。',
     };
   }
 

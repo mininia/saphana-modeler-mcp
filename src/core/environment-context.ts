@@ -22,19 +22,19 @@ export function currentEnvironmentRuntime(): EnvironmentRuntime | undefined {
 }
 
 /**
- * 当前环境的系统标识（LABEL）。缓存 key / 锁 key 用它分键：
- * 同一进程内 DEV 与 PRD 的同名对象不会互相命中或互相阻塞。
- * 未进入上下文（启动期/测试直调）回退 `default`——与单环境行为一致。
+ * 当前环境的系统标识（环境标识）。缓存 key / 锁 key 用它分键：
+ * 同一进程内不同环境（如 DEV 与 PRD）的同名对象不会互相命中或互相阻塞。
+ * 未进入上下文（启动期/测试直调）回退 `DEFAULT`——与单环境行为一致。
  */
-export function currentEnvironmentLabel(): string {
-  return storage.getStore()?.label ?? 'default';
+export function currentEnvironmentKey(): string {
+  return storage.getStore()?.envKey ?? 'DEFAULT';
 }
 
 /**
  * 当前环境指向的**物理库**作用域（host:port/dbName）。
  *
- * 锁 key / 临时校验副本登记 / 预览中间视图归属必须按物理库分键：两个 LABEL 指向同一租户时，
- * 它们共享同一份对象命名空间，按 LABEL 分键会让 check-then-act 失去互斥（并发写丢 ETag 基线、
+ * 锁 key / 临时校验副本登记 / 预览中间视图归属必须按物理库分键：两个环境标识指向同一租户时，
+ * 它们共享同一份对象命名空间，按环境标识分键会让 check-then-act 失去互斥（并发写丢 ETag 基线、
  * 校验互删副本、预览提前 DROP）。未进入上下文（启动期/测试直调）回退 `default`。
  */
 export function currentDatabaseScopeKey(): string {

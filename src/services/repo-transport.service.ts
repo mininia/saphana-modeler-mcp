@@ -3,7 +3,7 @@ import { toHanaDateTime } from '../core/datetime.js';
 import { BLOCKED_PREFIX, HanaBusinessError } from '../core/errors.js';
 import { withKeyedLock } from '../core/keyed-mutex.js';
 import { logger } from '../core/logger.js';
-import { currentDatabaseScopeKey } from '../core/environment-context.js';
+import { currentDatabaseScopeKey, currentEnvironmentRuntime } from '../core/environment-context.js';
 import { currentAgentLabel, currentClientId } from '../core/request-context.js';
 import { PACKAGE_ID_RE } from '../core/sql.js';
 import { isPackageAllowed } from '../config/write-boundary.js';
@@ -20,7 +20,8 @@ import { viewDefinitionCache } from '../model/view-cache.js';
 import { VIEW_SUFFIXES } from './metadata.service.js';
 
 /**
- * 允许写操作的仓库包前缀（大写）。进程级，由 configureWritePackages 接线。
+ * 允许写操作的仓库包前缀（大写）。服务进程内按当前环境的 `writePackages` 取；
+ * 独立脚本/测试直调（无环境 runtime）回退 configureWritePackages 的进程级值。
  * - 空数组 = 本判定层不限制（fail-open，配置项未填时的默认）；**端到端不等于「所有包可写」**——
  *   写工具暴露时，声明写包的调用会被运行期闸门以 boundary_off 拒绝（两层口径见 config/write-boundary.ts 文件头）
  * - 非空 = 仅允许这些包及其下级子包（包名以「配置前缀」或「配置前缀.」开头）
@@ -28,13 +29,17 @@ import { VIEW_SUFFIXES } from './metadata.service.js';
 let WRITE_ALLOWED_PACKAGES: string[] = [];
 
 /**
- * 接线写操作包白名单（来自 HANA_WRITE_PACKAGES）。
- * 由 index.ts 启动时调用一次；输入统一转大写、去空白。
- * 空数组 = 本判定层不限制（fail-open；端到端表现为「声明写包的调用被闸门拒绝」，见文件头两层口径）；
- * 非空 = 仅配置包及其子包可写。
+ * 接线写操作包白名单（独立脚本/测试的进程级回退；服务进程内实际按环境 runtime 取）。
+ * 输入统一转大写、去空白。
  */
 export function configureWritePackages(packages: string[]): void {
   WRITE_ALLOWED_PACKAGES = packages.map((p) => p.trim().toUpperCase()).filter((p) => p.length > 0);
+}
+
+/** 当前生效的可写包：优先当前环境 runtime（v2 策略参数可按环境不同），否则进程级回退 */
+function effectiveWritePackages(): string[] {
+  const runtime = currentEnvironmentRuntime();
+  return runtime !== undefined ? runtime.config.writePackages : WRITE_ALLOWED_PACKAGES;
 }
 
 /**
@@ -64,12 +69,12 @@ export function assertWritePackageAllowed(packageId: string, objectName?: string
   if (!isSafePackageName(packageId)) {
     throw new HanaBusinessError(`包名 "${packageId}" 含非法字符，已拒绝`);
   }
-  if (!isPackageAllowed(packageId, WRITE_ALLOWED_PACKAGES)) {
+  if (!isPackageAllowed(packageId, effectiveWritePackages())) {
     // 纵深防御（脚本/内部调用不经过工具层闸门）。消息只陈述拦截事实，**不给**绕过方法：
     // 本消息会随 envelope 返回给调用方（通常是模型），写明"改哪项配置可放行"等于教它绕过。
     throw new HanaBusinessError(
       `${BLOCKED_PREFIX}：目标包 "${packageId}" 不在服务端配置的可写包范围内` +
-        `（生效范围：${WRITE_ALLOWED_PACKAGES.join(', ') || '(空)'}）。请求未执行。`,
+        `（生效范围：${effectiveWritePackages().join(', ') || '(空)'}）。请求未执行。`,
     );
   }
   // §4.4 归因：agentLabel 是进程级标签（MCP_AGENT_LABEL）——多代理拓扑下每个子代理一个进程，
@@ -99,7 +104,7 @@ export function assertWritePackageAllowed(packageId: string, objectName?: string
  * 现有各路径均满足「各自只取一次、不嵌套」（详见各调用点注释）。
  */
 export function writeLockKey(packageId: string, objectName: string): string {
-  // **物理库**维度（host:port/dbName）：同一租户下的同名包/对象必须互斥——两个 LABEL 指向
+  // **物理库**维度（host:port/dbName）：同一租户下的同名包/对象必须互斥——两个环境标识指向
   // 同一库时仍是同一份仓库状态；不同库的同名对象则互不阻塞。未进入环境上下文时回退 default。
   return `${currentDatabaseScopeKey()}:${packageId}/${objectName}`;
 }

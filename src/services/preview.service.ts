@@ -202,7 +202,7 @@ function intermediateViewName(viewRef: string, node: string): string {
   return name;
 }
 
-/** 中间视图占用/归属状态的 key：物理库 + 视图名（同库多 LABEL 共享同一份 dp 视图与占用计数） */
+/** 中间视图占用/归属状态的 key：物理库 + 视图名（同库多环境标识共享同一份 dp 视图与占用计数） */
 function intermediateScopeKey(viewName: string): string {
   return `${currentDatabaseScopeKey()}:${viewName}`;
 }

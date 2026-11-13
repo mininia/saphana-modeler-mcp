@@ -60,10 +60,9 @@ export interface SystemInfo {
   };
   /** 环境档案：首次调用时探测一次并进程内缓存；探测失败 fail-open（detected:false + note），不影响其余信息 */
   profile: EnvironmentProfile;
-  /** 多环境身份（单环境不产生）：当前 LABEL / access / epoch / state */
+  /** 多环境身份（单环境不产生）：当前环境标识 / access / epoch / state */
   environment?: {
     name: string;
-    configKey: string;
     access: 'readwrite' | 'readonly';
     epoch: number;
     state: string;
@@ -170,8 +169,7 @@ export async function getSystemInfo(pool: HanaPool, opts?: SystemInfoOptions): P
     ...(rt?.multiEnv
       ? {
           environment: {
-            name: rt.label,
-            configKey: rt.configKey,
+            name: rt.envKey,
             access: rt.access,
             epoch: rt.epoch,
             state: rt.state,

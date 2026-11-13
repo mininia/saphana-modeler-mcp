@@ -124,11 +124,10 @@ export async function withErrorEnvelope<T>(fn: () => Promise<T>): Promise<Envelo
   // 单环境不产生环境字段，保持旧输出逐字兼容；多环境附执行环境与入口环境。
   const envFields = runtime?.multiEnv
     ? {
-        environment: runtime.label,
+        environment: runtime.envKey,
         epoch: runtime.epoch,
         access: runtime.access,
-        configKey: runtime.configKey,
-        calledFromEnvironment: runtime.label,
+        calledFromEnvironment: runtime.envKey,
       }
     : {};
   const withIdentity = (e: Envelope): Envelope => ({
