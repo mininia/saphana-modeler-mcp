@@ -438,6 +438,7 @@ MCP_HTTP_PORT=3000 MCP_HTTP_TOKENS='shared:your-long-random-token' node dist/ind
 | `unknown_capability` | 能力 id 不存在 | 通过门面索引获取可用能力 id。 |
 | `schema_not_allowed` | schema 不在读取白名单内 | 把 schema 加入 HANA_READ_SCHEMA（或对应的 _ENV_ 覆盖）。 |
 | `tls_plaintext` | SQL 连接未启用 TLS | 设置 HANA_TLS=true（或对应环境的 HANA_TLS_ENV_<XXXX>=true）。 |
+| `hana_client_pipe_unavailable` | @sap/hana-client 的内部 IPC 管道（hdbpipe）不可用 | 重启 MCP server；若持续出现，检查 SAP HANA client 运行环境（杀毒软件/临时目录/残留的 HANA 客户端进程）。 |
 | `xs_plaintext` | XS 写通道使用明文 HTTP | 设置 HANA_XS_TLS=true，或把 XS 端点限制在可信网络内。 |
 | `http_exposed_without_auth` | HTTP 对外监听但未配置认证 | 配置 MCP_HTTP_TOKENS，或显式设置 MCP_HTTP_ALLOW_ANONYMOUS=true 承担风险。 |
 | `encrypted_but_unauthenticated` | TLS 未校验证书 | 设置 HANA_SSL_VALIDATE=true，或确认内网自签场景的风险。 |

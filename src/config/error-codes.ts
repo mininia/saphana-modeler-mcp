@@ -248,6 +248,13 @@ export const ERROR_CODES: readonly ErrorCodeSpec[] = [
     remediation: '设置 HANA_TLS=true（或对应环境的 HANA_TLS_ENV_<XXXX>=true）。',
   },
   {
+    code: 'hana_client_pipe_unavailable',
+    category: 'connection',
+    summary: '@sap/hana-client 的内部 IPC 管道（hdbpipe）不可用',
+    remediation:
+      '重启 MCP server；若持续出现，检查 SAP HANA client 运行环境（杀毒软件/临时目录/残留的 HANA 客户端进程）。',
+  },
+  {
     code: 'xs_plaintext',
     category: 'connection',
     summary: 'XS 写通道使用明文 HTTP',
