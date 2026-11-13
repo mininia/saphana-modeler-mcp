@@ -4,6 +4,11 @@
 >
 > 约定：每次提交前把变化补到对应版本条目下；每条 1–3 行，只写对外可见变化。
 
+## 1.4.3 - 2026-11-13
+
+- 依赖：把 `debug@3.1.0` 声明为直接依赖，兜底 `@sap/hana-client` 运行时与安装脚本对它的 `require`——部分用户 npx 安装树缺失该传递依赖时会报 `Cannot find module 'debug'`。
+- 同步 `THIRD-PARTY-NOTICES` 的 `debug`（MIT）许可声明。
+
 ## 1.4.2 - 2026-11-12
 
 - 元数据查询功能优化：`hana_metadata_search_objects` 支持按描述/注释搜索（`by=description|both`）——模型读仓库 caption 文本表（不解析 XML），表/列视图读 `COMMENTS`；表函数目录无描述列。
