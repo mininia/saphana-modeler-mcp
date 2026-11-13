@@ -123,7 +123,7 @@ const SURFACE_MAX_DEFAULT = 50;
 const envSchema = z.object({
   // 安全要求：连接信息（主机/端口/库名/用户名/密码）一律只允许来自环境变量 / mcp.json，
   // 禁止默认值或硬编码真实环境值。
-  // 单环境必填；多环境必须用 HANA_HOST_ENV_<XXXX>（扁平键在 buildEnvironments 里硬报错）。
+  // 单环境必填；多环境必须用 HANA_HOST_ENV_<XXXX>（扁平连接键在多环境下被忽略）。
   HANA_HOST: z.string().min(1).optional(),
   /**
    * SQL 端口（**必填**）。2026-10-14 起不再有实例号（HANA_INSTANCE 已删除）：

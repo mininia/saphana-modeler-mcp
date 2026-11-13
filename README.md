@@ -13,17 +13,17 @@ SAP HANA 经典 Modeler 能力的 MCP 服务器（TypeScript，Node >= 22.0.0）
 
 | 分类 | 能力 | 工具 |
 | --- | --- | --- |
-| 系统 | 版本信息（HANA 与本 MCP 服务自身版本）、用户权限与建模能力自检 | `hana_system_get_info`、`hana_check_privileges` |
+| 基础信息 | 版本信息（HANA 与本 MCP 服务自身版本）、用户权限与建模能力自检 | `hana_system_get_info`、`hana_check_privileges` |
 | 环境管理（多环境） | 环境列表、只读/可写标识、一次性 token 切换 | `hana_env_list`、`hana_env_switch` |
-| 稳定性诊断 | 实例体检（读数 + 12 项结论、三态）、会话与阻塞深潜、表存储画像、历史趋势 | `hana_system_health`、`hana_system_activity`、`hana_table_storage`、`hana_system_trend` |
+| 稳定性诊断 | 实例体检、会话与阻塞深潜、表存储画像、历史趋势 | `hana_system_health`、`hana_system_activity`、`hana_table_storage`、`hana_system_trend` |
 | 包 | 包清单/包树、包内对象、新建包 | `hana_package_list`、`hana_package_list_objects`、`hana_package_create` |
-| 元数据 | 完整定义、跨类别对象搜索（名称/描述）、字段清单、单字段逻辑、血缘 | `hana_metadata_get_view`、`hana_metadata_search_objects`、`hana_metadata_list_fields`、`hana_metadata_get_field_logic`、`hana_metadata_where_used` |
+| 元数据 | 对象搜索（名称/描述）、字段清单、字段逻辑、血缘 | `hana_metadata_get_view`、`hana_metadata_search_objects`、`hana_metadata_list_fields`、`hana_metadata_get_field_logic`、`hana_metadata_where_used` |
 | 表目录 | 可访问表清单、表注释搜索、列结构 | `hana_table_list`、`hana_table_columns` |
-| 数据预览 | 已激活视图预览（整体/节点/推导三通道）+ 权限诊断 | `hana_data_preview`、`hana_data_preview_diagnose` |
+| 数据预览 | 已激活视图预览（整体/节点）+ 数据预览权限诊断 | `hana_data_preview`、`hana_data_preview_diagnose` |
 | 建模写操作 | 新建/激活/更新/删除计算视图、设计时+运行时校验 | `hana_view_create`、`hana_view_activate`、`hana_view_update`、`hana_view_delete`、`hana_view_validate`、`hana_view_check_actions` |
 | 仓库传输 | 包导出备份、设计时文件导入、变更列表 | `hana_repo_export`、`hana_repo_import`、`hana_repo_changelist` |
-| SQL 分析 | 可读分析结论；`analyze=true` 走 PlanViz 逐算子实测；`async=true` 后台执行并轮询；`raw=true` 给原始计划 | `hana_sql_analyze` |
-| SQL 直接执行 | 独立第七根工具：在 HANA 上直接执行 SQL（读/写/管理类），返回列名+行或受影响行数；`maxRows`/`timeoutMs` 为调用参数，`async=true` 返回 taskId。**sql 组默认关闭**，需显式启用 | `hana_sql_execute` |
+| SQL 分析 | 可读分析结论；PlanViz 逐算子实测 | `hana_sql_analyze` |
+| SQL 执行 | 在 HANA 上直接执行 SQL（读/写/管理类）。**sql 组默认关闭**，需显式启用 | `hana_sql_execute` |
 
 ## 快速开始
 
@@ -35,7 +35,7 @@ npx -y @mininia/saphana-modeler-mcp
 
 最小 `mcp.json` 见下方「配置」。
 
-> 从源码安装（会本地构建，需 Node >= 22）：`npx -y github:mininia/saphana-modeler-mcp`。
+> 从源码安装（需 Node >= 22）：`npx -y github:mininia/saphana-modeler-mcp`。
 
 **克隆本地运行：**
 
@@ -50,16 +50,16 @@ node scripts/smoke-stdio.mjs   # 冒烟：握手 + 工具注册（无需真实 H
 
 ## 配置
 
-**必填参数：**
+**必填参数（单环境）：**
 
 | 参数 | 说明 |
 | --- | --- |
 | `HANA_HOST` / `HANA_PORT` | HANA 主机与 SQL 端口（端口必填，纯数字） |
 | `HANA_USER` / `HANA_PASSWORD` | 数据库用户名与密码 |
 
-MDC 指定租户时需 `HANA_DB_NAME`；非 MDC 可省略。缺失必填项时服务启动即失败。
+单环境下 MDC 指定租户时需 `HANA_DB_NAME`；非 MDC 可省略。单环境缺失必填项时服务启动即失败。
 
-`HANA_XS_PORT`（XS 设计时 REST 端口）**非必填，默认 8010**；非默认实例/租户请显式覆盖。
+单环境下 `HANA_XS_PORT`（XS 设计时 REST 端口）**非必填，默认 8010**；非默认实例/租户请显式覆盖。
 
 **完整参数、配置来源、工具分组与可见性、调用方档案、传输方式、安全边界、HANA 授权要求：见 [CONFIG.md](CONFIG.md)。**
 
@@ -82,9 +82,52 @@ MDC 指定租户时需 `HANA_DB_NAME`；非 MDC 可省略。缺失必填项时�
 }
 ```
 
-> 本地 clone 运行：把 `command`/`args` 换成 `"node"` / `["<仓库绝对路径>/dist/index.js"]`。
+**多 HANA 环境（可选）**：用 `HANA_<PARAM>_ENV_<XXXX>` 定义多个环境。连接参数按环境写（扁平 `HANA_HOST` 等会被忽略），`HOST/PORT/USER/PASSWORD` 每个环境必填；`HANA_ACCESS` 等策略参数扁平写 = 共享，`_ENV_` 覆盖单个环境。环境标识就是 `<XXXX>`（大小写不敏感），用 `hana_env_list` / `hana_env_switch` 切换；HTTP 用 `MCP_HTTP_CLIENT_ENVS` 绑定 Token。完整规则见 [CONFIG.md 的「多 HANA 环境」](CONFIG.md#多-hana-环境单进程单-active)。
 
-**多 HANA 环境（可选）**：单环境不需要任何 `_ENV_` 变量。多环境下连接参数只能写 `HANA_<PARAM>_ENV_<XXXX>`（扁平连接键会报错），策略/授权参数扁平写 = 所有环境共享、`_ENV_` 覆盖单个环境；环境标识直接取 `<XXXX>`（大小写不敏感，无 LABEL），切换用 `hana_env_list` + `hana_env_switch`；HTTP 用 `MCP_HTTP_CLIENT_ENVS` 做 Token→环境绑定。完整规则见 [CONFIG.md 的「多 HANA 环境」](CONFIG.md#多-hana-环境单进程单-active)。
+多环境 `mcp.json` 示例（npx 启动，三个环境）：
+
+```jsonc
+{
+  "mcpServers": {
+    "saphana-modeler-mcp-multi": {
+      "command": "npx",
+      "args": ["-y", "@mininia/saphana-modeler-mcp"],
+      "env": {
+        "HANA_HOST_ENV_DEV": "hana-dev.example",
+        "HANA_PORT_ENV_DEV": "31015",
+        "HANA_USER_ENV_DEV": "DEV_USER",
+        "HANA_PASSWORD_ENV_DEV": "***",
+
+        "HANA_HOST_ENV_UAT": "hana-uat.example",
+        "HANA_PORT_ENV_UAT": "31015",
+        "HANA_USER_ENV_UAT": "UAT_USER",
+        "HANA_PASSWORD_ENV_UAT": "***",
+
+        "HANA_HOST_ENV_PROD": "hana-prod.example",
+        "HANA_PORT_ENV_PROD": "31015",
+        "HANA_USER_ENV_PROD": "PROD_USER",
+        "HANA_PASSWORD_ENV_PROD": "***",
+
+        "HANA_ACCESS": "readonly",
+        "HANA_ACCESS_ENV_DEV": "readwrite",
+        "HANA_WRITE_PACKAGES_ENV_DEV": "ZDEMO",
+
+        "HANA_ENV_START": "DEV",
+        "HANA_ENV_SWITCHABLE": "DEV,UAT,PROD"
+      }
+    }
+  }
+}
+```
+
+> 说明：
+> 多环境下扁平的连接参数(`HANA_HOST`等)，此类配置会被忽略。
+> 每个环境必须显式提供 `HANA_HOST_ENV_*` / `HANA_PORT_ENV_*` / `HANA_USER_ENV_*` / `HANA_PASSWORD_ENV_*`。
+> `HANA_ACCESS` 为所有环境共享的策略值，`HANA_ACCESS_ENV_DEV` 仅覆盖 DEV；
+> `HANA_WRITE_PACKAGES_ENV_DEV` 仅为 DEV 启用写边界，UAT 与 PROD 不启用。
+> 非默认 XS 端口通过`HANA_XS_PORT_ENV_<XXXX>` 配置；HTTP 模式下使用 `MCP_HTTP_CLIENT_ENVS` 将 Token 绑定到环境。
+
+> **stdio 下的环境切换是进程级的**：只影响之后的调用，已提交任务与在途调用仍绑定原环境；并发 agent 共享同一 active 环境，建议一进程一环境。
 
 ## 运行方式
 
@@ -93,46 +136,36 @@ MDC 指定租户时需 `HANA_DB_NAME`；非 MDC 可省略。缺失必填项时�
   对外暴露需配置 `MCP_HTTP_HOST` / `MCP_HTTP_ALLOWED_HOSTS` / `MCP_HTTP_TOKENS`；无 Token 的非回环监听默认拒绝启动。
   详见 [CONFIG.md](CONFIG.md) 的「传输方式」。
 
-## 工具面：六个分类门面 + 按需提升
+## 工具面：六个分类门面 + 独立 SQL 工具
 
-`tools/list` 常驻的只有六个分类门面；具体能力默认隐藏，经门面索引 + 路由调用，调门面时按分类提升进工具面。
-另有一个独立根工具：显式启用 `sql` 组后，`hana_sql_execute` 与门面同级常驻（默认不可见，不属于任何门面）。它仅在用户明确要求执行 SQL 时调用；语句/事务/管理类规则与 `maxRows`、`timeoutMs`、`async` 见 [CONFIG.md](CONFIG.md)。
+`tools/list` 常驻 6 个分类门面；显式启用 `sql` 组后，`hana_sql_execute` 与门面同级常驻（默认不可见）。具体能力默认隐藏，经门面索引 + 路由调用，调门面时按分类提升进工具面。
 
-| 门面 | 方向 | 成员数 |
+| 工具 | 方向 | 成员数 |
 | --- | --- | --- |
-| `hana_system` | 连接与环境：当前连接是谁、连到哪；多环境时含环境列表与切换 | 2（多环境 3） |
+| `hana_system` | 连接与环境：当前连接是谁、连到哪；多环境时含环境列表与切换 | 3 |
 | `hana_discovery` | 浏览与查找：找包/对象/表，读定义与字段结构 | 7 |
 | `hana_data` | 取数预览：看已激活视图/基表的数据 | 2 |
 | `hana_insights` | 结构与血缘分析：影响面、字段级计算逻辑 | 2 |
 | `hana_modeling` | 建模与仓库变更：创建/修改/校验/激活/删除、导入导出 | 11 |
 | `hana_diagnostics` | 运维与性能：健康/会话/存储/趋势、SQL 分析、变更审计 | 6 |
+| `hana_sql_execute` | 执行 HANA SQL | — |
 
-```jsonc
-// 取本类索引（id / 标题 / kind / 摘要 / 参数名）
-hana_modeling({})
-// 调具体能力（不提升也能调）
-hana_modeling({ "capability": "hana_view_update", "args": { … } })
-// 提升整类：此后可平铺直调，带完整 schema
-hana_view_update({ … })
-```
-
-- 权限只有**一层（能力层）**：门面是入口，常驻；索引/路由/提升/调用一律按**目标能力**判。环境副作用是另一条正交维度：`HANA_ACCESS=readonly` 按清单 `effects.mutates` 只拦持久写入，临时对象（节点预览中间视图、`_CHKTMP`）与纯读放行，且不改变工具可见性。
+- 权限模型见 [CONFIG.md 的「权限维度分工（三层正交）」](CONFIG.md#权限维度分工三层正交)。
 - 多环境部署时 `hana_system` 额外包含 `hana_env_list` / `hana_env_switch`；单环境不出现。
 - 拒绝不泄漏存在性：未知能力、无权能力、跨类路由**逐字同形**。
-- 操作级别名 `hana_view_update#<op>`（8 条）只经门面路由，不注册为工具。
-- 工具分组、档案与动态面细节见 [CONFIG.md](CONFIG.md)。
+- 工具分组与动态面规则见 [CONFIG.md 的「工具分组与可见性控制」](CONFIG.md#工具分组与可见性控制)；调用方档案见 [「调用方档案（MCP_PROFILES）」](CONFIG.md#调用方档案mcp_profiles)。
 
 ## 数据预览
 
 `hana_data_preview` 三条通道（返回 `via` 标识）：
 
-| 通道 | 触发 | 机制 |
-| --- | --- | --- |
-| `direct` | 不传 `node` | 直查 `_SYS_BIC` 运行时视图 |
-| `intermediate` | 传 `node` | HANA 原生中间视图 `<包/对象>/dp/<节点>`，存在即复用，按占用释放 |
-| `derived` | 传 `node` + `forceDerive=true` | 依据视图 XML 推导 SQL，纯只读 |
+| 通道 | 触发 | 场景 | 机制 |
+| --- | --- | --- | --- |
+| `direct` | 不传 `node` | 看视图最终结果 | 直查 `_SYS_BIC` 运行时视图 |
+| `intermediate` | 传 `node` | 看某个中间节点的真实输出（Join/Aggregation 等） | HANA 原生中间视图 `<包/对象>/dp/<节点>`；执行用户需 EXECUTE 权限 |
+| `derived` | 传 `node` + `forceDerive=true` | 无中间视图权限，或不想创建临时对象时看节点 | 依据视图 XML 推导 SQL，纯只读 |
 
-无筛选默认 10 行，有筛选默认 100 行，显式 `limit` 上限 1000；截断见回执 `resultInfo`。
+无筛选默认 10 行，有筛选默认 100 行，显式 `limit` 上限 1000。
 权限类失败自动附诊断报告（`raw.diagnosis`），也可用 `hana_data_preview_diagnose` 手动排查。
 
 ## 常用命令

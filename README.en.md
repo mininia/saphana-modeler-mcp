@@ -25,17 +25,17 @@ operations actions are among the plans for the future.
 
 | Category | Capability | Tools |
 | --- | --- | --- |
-| System | Version info (HANA and the MCP server itself), user privileges & modeling capability self-check | `hana_system_get_info`, `hana_check_privileges` |
-| Environment (multi-env) | Environment list with read-only/readwrite flags, one-time token switching | `hana_env_list`, `hana_env_switch` |
-| Package | Package list/tree, objects in a package (with activation status), create package | `hana_package_list`, `hana_package_list_objects`, `hana_package_create` |
-| Metadata | Full definition read, cross-category object search (name/description), field list, single-field logic tracing, lineage | `hana_metadata_get_view`, `hana_metadata_search_objects`, `hana_metadata_list_fields`, `hana_metadata_get_field_logic`, `hana_metadata_where_used` |
-| Table catalog | Accessible table list, table column structure | `hana_table_list`, `hana_table_columns` |
-| Data preview | Activated-view data preview (overall / node / derived — three channels, with filtering & input parameters) + preview privilege diagnosis | `hana_data_preview`, `hana_data_preview_diagnose` |
-| Modeling write | Create/activate/update/delete calculation views, design-time + runtime validation, validation action query | `hana_view_create`, `hana_view_activate`, `hana_view_update`, `hana_view_delete`, `hana_view_validate`, `hana_view_check_actions` |
-| Repository transport | Package export backup (zip), design-time file import, change list | `hana_repo_export`, `hana_repo_import`, `hana_repo_changelist` |
-| SQL analysis | SQL analysis conclusion (default): per-item findings + advice + statistics on scans/sizes/joins/engine switches/structure; `analyze=true` goes through the PlanViz channel for **per-operator measured** six panels (bottleneck / actual rows / timeline / parallelism); raw plan only via `raw=true` | `hana_sql_analyze` |
-| SQL execution | Execute SQL directly on HANA (read/write/admin), returning columns+rows or affected rows. Standalone seventh root tool; the **`sql` group is off by default** and must be enabled explicitly | `hana_sql_execute` |
-| Stability diagnostics | Instance health check (**readings layer**: memory %, disk & volume IO, backup age, memory allocation failure rate … + **conclusions layer**: twelve checks — disk / services / backup / memory / CPU / alerts / blocked / long transactions / replication / config / deprecated features / encryption; **three states**: ok / abnormal / invisible), session & blocking deep dive, table storage profile (memory / disk / fragmentation / hotness / partition / column / index), historical trend (CPU / memory / disk / network over the past N hours) | `hana_system_health`, `hana_system_activity`, `hana_table_storage`, `hana_system_trend` |
+| Basic info | Version info (HANA and the MCP server itself), user privileges & modeling capability self-check | `hana_system_get_info`, `hana_check_privileges` |
+| Environment (multi-env) | Environment list, read-only/readwrite flags, one-time token switching | `hana_env_list`, `hana_env_switch` |
+| Stability diagnostics | Instance health, session & blocking deep dive, table storage profile, historical trend | `hana_system_health`, `hana_system_activity`, `hana_table_storage`, `hana_system_trend` |
+| Package | Package list/tree, objects in a package, create package | `hana_package_list`, `hana_package_list_objects`, `hana_package_create` |
+| Metadata | Object search (name/description), field list, field logic, lineage | `hana_metadata_get_view`, `hana_metadata_search_objects`, `hana_metadata_list_fields`, `hana_metadata_get_field_logic`, `hana_metadata_where_used` |
+| Table catalog | Accessible table list, table comment search, column structure | `hana_table_list`, `hana_table_columns` |
+| Data preview | Activated-view preview (overall / node) + preview privilege diagnosis | `hana_data_preview`, `hana_data_preview_diagnose` |
+| Modeling write | Create/activate/update/delete calculation views, design-time + runtime validation | `hana_view_create`, `hana_view_activate`, `hana_view_update`, `hana_view_delete`, `hana_view_validate`, `hana_view_check_actions` |
+| Repository transport | Package export backup, design-time file import, change list | `hana_repo_export`, `hana_repo_import`, `hana_repo_changelist` |
+| SQL analysis | Readable analysis conclusions; PlanViz per-operator measurement | `hana_sql_analyze` |
+| SQL execution | Execute SQL directly on HANA (read/write/admin). **`sql` group off by default**; must be enabled explicitly | `hana_sql_execute` |
 
 > Full definition read (json/xml) of view objects is provided by `hana_metadata_get_view`; field-level inspection uses `hana_metadata_list_fields` / `hana_metadata_get_field_logic`.
 
@@ -49,20 +49,18 @@ npx -y @mininia/saphana-modeler-mcp
 
 The minimal `mcp.json` is under Configuration below.
 
-> Source install (builds locally, requires Node >= 22): `npx -y github:mininia/saphana-modeler-mcp`.
+> Source install (requires Node >= 22): `npx -y github:mininia/saphana-modeler-mcp`.
 
 **Option 2: clone & run locally (development / customization)**
 
 ```bash
 git clone https://github.com/mininia/saphana-modeler-mcp.git
 cd saphana-modeler-mcp
-npm install          # the @sap/hana-client install-script approval ships in package.json's allowScripts; only if your local npm still flags the script as unreviewed do you need: npm approve-scripts @sap/hana-client
+npm install          # the build toolchain lives in optionalDependencies; do not use --omit=optional
 cp .env.example .env # fill in real HANA connection
 npm run build
 node scripts/smoke-stdio.mjs   # smoke test: handshake + tool registration (no real HANA needed)
 ```
-
-> Cloning builds from source: `prepare` compiles right after install, and the build toolchain (`typescript`, `@types/node`) lives in `optionalDependencies` — do **not** install with `--omit=optional` (`NODE_ENV=production` and `--omit=dev` are unaffected).
 
 ## Configuration
 
@@ -75,14 +73,16 @@ Connection info is only allowed from environment variables / `mcp.json` `env` (*
 
 `.env` is looked up in the **working directory first, then the project root** (`dist/` two levels up), and it applies **per variable** — `process.loadEnvFile` never overwrites variables that already exist. So if only part of the credential triple comes from the external environment, the two sources get mixed (the classic case: a leftover `HANA_USER` in your shell silently wins over the one in `.env` while everything else comes from `.env`), which can connect you to a different environment. When the server detects connection targets/credentials coming from more than one source it logs a startup **warning** naming each variable's source — use it to clean up the stray variables.
 
-**Multiple HANA environments (optional):** a single environment needs no `_ENV_` variables. In multi-environment mode connection parameters must use `HANA_<PARAM>_ENV_<XXXX>` (flat connection keys are rejected), while policy/authorization parameters are shared when set flat and overridden per environment with `_ENV_`; the environment identifier is the `<XXXX>` itself (case-insensitive, no LABEL). Switch with `hana_env_list` + `hana_env_switch`; over HTTP use `MCP_HTTP_CLIENT_ENVS` for Token→environment binding. Full rules and examples: [CONFIG.md](CONFIG.md).
+**Multiple HANA environments (optional):** define environments with `HANA_<PARAM>_ENV_<XXXX>`. Connection parameters must be per-environment (flat `HANA_HOST` etc. are ignored; `HOST`/`PORT`/`USER`/`PASSWORD` are required for each), while policy parameters set flat are shared and `_ENV_` overrides one environment. The environment identifier is `<XXXX>` (case-insensitive); use `hana_env_list` / `hana_env_switch` to inspect and switch, and `MCP_HTTP_CLIENT_ENVS` to bind tokens over HTTP. Full rules: [CONFIG.md](CONFIG.md).
+
+**The option table below is the single-environment (flat-key) set.** Multi-environment deployments use the `_ENV_<XXXX>` forms for connection parameters and per-environment overrides; the process-level options apply unchanged.
 
 | Option | Required | Description | Example |
 | --- | --- | --- | --- |
-| `HANA_HOST` | ✅ | HANA hostname/IP | `hana-host.example` |
-| `HANA_PORT` | ✅ | SQL port (**required**; no longer derived from an instance number — `3<instance>13/15` cannot express non-default tenants; digits only) | `31015` / `31041` |
-| `HANA_USER` | ✅ | Database username | — |
-| `HANA_PASSWORD` | ✅ | Password | — |
+| `HANA_HOST` | ✅ (single env) | HANA hostname/IP; multi-env uses `HANA_HOST_ENV_<XXXX>` | `hana-host.example` |
+| `HANA_PORT` | ✅ (single env) | SQL port (**required**; no longer derived from an instance number — `3<instance>13/15` cannot express non-default tenants; digits only); multi-env uses `HANA_PORT_ENV_<XXXX>` | `31015` |
+| `HANA_USER` | ✅ (single env) | Database username; multi-env uses `HANA_USER_ENV_<XXXX>` | — |
+| `HANA_PASSWORD` | ✅ (single env) | Password; multi-env uses `HANA_PASSWORD_ENV_<XXXX>` | — |
 | `HANA_LOCALE` | optional | Connection locale, default `zh` | `zh` |
 | `HANA_DB_NAME` | optional | Tenant database name (set when targeting a tenant in MDC; omit otherwise) | `SYSTEMDB` / tenant name |
 | `HANA_TLS` | optional | TLS encryption, default `true` (fail-closed; set `false` only on trusted links) | `true` |
@@ -92,6 +92,10 @@ Connection info is only allowed from environment variables / `mcp.json` `env` (*
 | `HANA_WRITE_PACKAGES` | optional | Writable repository package prefixes (comma-separated, incl. sub-packages). **Empty = write boundary not enabled**: requests that declare write packages are hard-blocked by the runtime gate with `boundary_off` (writing requires an explicit configuration; only the service layer is fail-open — see the write-boundary note below); when set, only configured packages and their sub-packages are writable | `ZDEMO1,ZDEMO2.ZDEMO_SD` |
 | `HANA_XS_PORT` | optional | XS Classic design-time REST port; **defaults to `8010`** (override for non-default instances/tenants; it is still not derived from the instance number) | `8000` |
 | `HANA_XS_BASE_PATH` | optional | XS design-time REST base path, default `/sap/hana/xs/dt/base` | — |
+| `HANA_ENV_MODE` | optional | Environment mode: `single` / `multi`; auto-detected when unset, mismatch with the detected mode fails startup | `multi` |
+| `HANA_ENV_START` | optional | Start environment identifier; multi-env must point to a configured environment (may be omitted when there is only one); single env may omit it or use `DEFAULT` | `DEV` |
+| `HANA_ENV_SWITCHABLE` | optional | Switchable environment identifiers (comma-separated; empty = no switching; case-insensitive) | `DEV,UAT,PROD` |
+| `HANA_ENV_INHERIT` | optional | Compatibility switch; **this version only supports `strict`** (`legacy` is not implemented and is rejected at startup) | — |
 | `HANA_POOL_MAX` | optional | HANA connection pool size, default `4` (saturation behavior and deployment sizing: see "Transports → Timeouts & resource governance") | `8` |
 | `HANA_POOL_WAIT_MS` | optional | Queue wait timeout when the pool is saturated (ms), default `30000` | `60000` |
 | `HANA_POOL_MAX_WAITERS` | optional | Queue cap (entries), default `64` | `128` |
@@ -114,6 +118,7 @@ Connection info is only allowed from environment variables / `mcp.json` `env` (*
 | `MCP_HTTP_HOST` | optional | HTTP listen address, default `127.0.0.1` (loopback only, fail-closed); set explicitly (e.g. `0.0.0.0`) to expose | `127.0.0.1` |
 | `MCP_HTTP_TOKEN` | **deprecated** | Kept for backward compatibility only; equivalent to `MCP_HTTP_TOKENS=shared:<token>` (read into the same token→identity table; 401 semantics and attribution unchanged). Scheduled for removal in the next major version — use `MCP_HTTP_TOKENS` for new deployments | — |
 | `MCP_HTTP_TOKENS` | optional | Comma-separated `name:token[:profile]` — each token maps to a `clientId` (+ optional caller profile; the two together enter the envelope and the audit log — the only attribution source when clients share one HANA account). `name` is limited to `[A-Za-z0-9_.-]{1,32}`; each `token` must be ≥16 characters (weak-credential guard) **and must not contain `:`** (the colon separates identity from profile); duplicates/invalid entries fail startup; may coexist with `MCP_HTTP_TOKEN` | `alice:<token>:dev,bob:<token>` |
+| `MCP_HTTP_CLIENT_ENVS` | optional | HTTP identity → environment identifier binding (`clientId:ENV`, comma-separated). **Required for every token in multi-environment HTTP** (otherwise the process-level active would leak across clients); HTTP mode only; environment identifiers are case-insensitive | `alice:PRD_CN,bob:PRD_EU` |
 | `MCP_HTTP_ALLOWED_HOSTS` | optional | Allowed `Host` header hostnames (DNS rebinding protection; comma-separated, no ports, IPv6 in brackets), defaults to loopback names only | `localhost,myhost.corp` |
 | `MCP_HTTP_ALLOWED_ORIGINS` | optional | Allowed `Origin` hostnames (comma-separated, no scheme/port; requests without an Origin header pass). **Defaults to inheriting `MCP_HTTP_ALLOWED_HOSTS`**; explicitly empty = reject every request carrying an Origin | `localhost` |
 | `MCP_HTTP_ALLOW_ANONYMOUS` | optional | Explicitly accepts the risk of "listening externally with no Bearer token" (default `false`). **A non-loopback bind with no token is refused at startup** (in that posture the write boundary, tool groups and schema allowlist are all moot); set it to `true` only when something in front already authenticates (e.g. a reverse proxy) | `false` |
@@ -137,7 +142,51 @@ Minimal `mcp.json` (npx startup):
 }
 ```
 
-> Local clone: replace `command`/`args` with `"node"` / `["<absolute-repo-path>/dist/index.js"]`.
+Multi-environment `mcp.json` example (npx startup, three environments):
+
+```jsonc
+{
+  "mcpServers": {
+    "saphana-modeler-mcp-multi": {
+      "command": "npx",
+      "args": ["-y", "@mininia/saphana-modeler-mcp"],
+      "env": {
+        "HANA_HOST_ENV_DEV": "hana-dev.example",
+        "HANA_PORT_ENV_DEV": "31015",
+        "HANA_USER_ENV_DEV": "DEV_USER",
+        "HANA_PASSWORD_ENV_DEV": "***",
+
+        "HANA_HOST_ENV_UAT": "hana-uat.example",
+        "HANA_PORT_ENV_UAT": "31015",
+        "HANA_USER_ENV_UAT": "UAT_USER",
+        "HANA_PASSWORD_ENV_UAT": "***",
+
+        "HANA_HOST_ENV_PROD": "hana-prod.example",
+        "HANA_PORT_ENV_PROD": "31015",
+        "HANA_USER_ENV_PROD": "PROD_USER",
+        "HANA_PASSWORD_ENV_PROD": "***",
+
+        "HANA_ACCESS": "readonly",
+        "HANA_ACCESS_ENV_DEV": "readwrite",
+        "HANA_WRITE_PACKAGES_ENV_DEV": "ZDEMO",
+
+        "HANA_ENV_START": "DEV",
+        "HANA_ENV_SWITCHABLE": "DEV,UAT,PROD"
+      }
+    }
+  }
+}
+```
+
+> Note:
+> Flat connection parameters such as `HANA_HOST` are ignored in multi-environment mode.
+> Every environment must explicitly define `HANA_HOST_ENV_*` / `HANA_PORT_ENV_*` /
+> `HANA_USER_ENV_*` / `HANA_PASSWORD_ENV_*`. `HANA_ACCESS` is a shared policy value, while
+> `HANA_ACCESS_ENV_DEV` overrides DEV only; `HANA_WRITE_PACKAGES_ENV_DEV` enables the write
+> boundary for DEV only (UAT and PROD have none). A non-default XS port is configured via
+> `HANA_XS_PORT_ENV_<XXXX>`; in HTTP mode, `MCP_HTTP_CLIENT_ENVS` binds tokens to environments.
+
+> **Switching in stdio is process-wide**: it affects only subsequent calls; in-flight calls and submitted tasks stay on their original environment. Concurrent agents share one active environment — prefer one process per environment.
 
 ## Transports
 
@@ -196,13 +245,23 @@ MCP_HTTP_PORT=3000 MCP_HTTP_TOKENS='shared:your-long-random-token' node dist/ind
 
 ## Dynamic surface (category facades + per-category promotion)
 
-Every concrete capability stays (nothing was removed — all of them are still reachable); **the registered surface holds only
+Every concrete capability stays (nothing was removed — all of them are still reachable); **the registered surface holds
 the six category facades** — concrete capabilities are indexed and promoted on demand
 (mirrors SAP hana-cli's `discover_by_category` + `hana_execute`). There is one standalone seventh root tool: `hana_sql_execute` — after the
 `sql` group is explicitly enabled it is resident alongside the facades (when the group is off it is
 completely invisible — not in `tools/list`, not in any facade description/index, and never mentioned in hints). It is not a member of any facade.
 
 `hana_sql_execute` is **called only when the user explicitly asks to execute SQL** — not for probing, verification, or replacing dedicated tools. Statement/transaction/admin rules plus `maxRows`, `timeoutMs` and `async` are documented in CONFIG.md.
+
+| Root tool | Direction | Members |
+| --- | --- | --- |
+| `hana_system` | Connection & environment: who you are and where you are connected; multi-env also includes environment list & switching | 3 |
+| `hana_discovery` | Browse & find: packages / objects / tables, definitions and field structure | 7 |
+| `hana_data` | Data preview: activated views / base tables | 2 |
+| `hana_insights` | Structure & lineage: impact analysis, field-level calculation logic | 2 |
+| `hana_modeling` | Modeling & repository changes: create / update / validate / activate / delete, import & export | 11 |
+| `hana_diagnostics` | Ops & performance: health / sessions / storage / trends, SQL analysis, change audit | 6 |
+| `hana_sql_execute` | Execute HANA SQL | — |
 
 ```
 registered surface = (six facades ∪ entitled root tools ∪ members of promoted categories) ∩ deployment policy ∩ caller profile
@@ -242,9 +301,11 @@ up in an index, and routing/promotion cannot reach them either.
 
 Live verification: `npm run verify:authz` (covers all of the above).
 
+Permission model (capability layer / environment side effects / resource scope): see CONFIG.md's「权限维度分工（三层正交）」; tool groups and caller profiles: see「工具分组与可见性控制」/「调用方档案（MCP_PROFILES）」.
+
 ## Tool Groups & Visibility Control
 
-31 business capabilities (29 plus the async task query/cancel pair) are divided into four functional groups. **Note (facade model): only the six category facades are on the registered surface** — concrete capabilities never enter `tools/list` and arrive via facade index + facade routing (see "Dynamic surface"). The visibility settings in this section define the **reachable ceiling** (which tools "exist and may be used"), not the registered surface. You can control visibility via `mcp.json` / `.env` environment variables — invisible capabilities never appear in `tools/list`, cannot be called directly, and do not show up in a facade index. An empty `HANA_TOOL_GROUPS` enables **read/write/admin only**; **`sql` is off by default** and must be enabled explicitly.
+31 business capabilities (29 plus the async task query/cancel pair) are divided into four functional groups. **Note (facade model): the six category facades are on the registered surface** (plus the standalone `hana_sql_execute` when the `sql` group is enabled) — concrete capabilities never enter `tools/list` and arrive via facade index + facade routing (see "Dynamic surface"). The visibility settings in this section define the **reachable ceiling** (which tools "exist and may be used"), not the registered surface. You can control visibility via `mcp.json` / `.env` environment variables — invisible capabilities never appear in `tools/list`, cannot be called directly, and do not show up in a facade index. An empty `HANA_TOOL_GROUPS` enables **read/write/admin only**; **`sql` is off by default** and must be enabled explicitly.
 
 ### Four groups
 
@@ -340,7 +401,7 @@ Beyond the basic facts, `hana_system_get_info` returns two **on-demand** items (
 
 31 business capabilities + 8 `hana_view_update#<op>` operation aliases (route-only; never registered as tools) + 6 facades derived from them, all carrying annotations (`readOnlyHint` / `destructiveHint` / `idempotentHint`) so hosts can auto-approve and confirm dangerous operations. Multi-environment deployments additionally expose two control capabilities (`hana_env_list`, `hana_env_switch`), which are not part of the 31 and disappear entirely in single-environment mode.
 
-> **These capabilities are not on the registered surface**: `tools/list` holds only the six category facades, and every row below is reached via "call a facade with no arguments → take the category index → call the facade with `capability` + `args`". The id in this table is both the capability id and the value for the router's `capability` field.
+> **These capabilities are not on the registered surface**: `tools/list` holds the six category facades (plus the standalone `hana_sql_execute` when the `sql` group is enabled), and every row below is reached via "call a facade with no arguments → take the category index → call the facade with `capability` + `args`". The id in this table is both the capability id and the value for the router's `capability` field.
 
 | Capability id | Facade | Type | Description |
 | --- | --- | --- |
@@ -429,13 +490,13 @@ Every facade takes `{ capability?, args? }`: **with no arguments** → the categ
 
 `hana_data_preview` offers three preview channels (the `via` field in the return identifies which was used):
 
-| Channel | Trigger | Mechanism | Privileges required |
+| Channel | Trigger | Scenario | Mechanism |
 | --- | --- | --- | --- |
-| `direct` (overall preview) | no `node` passed | `SELECT * FROM "_SYS_BIC"."package/view-name"` | `_SYS_BIC` data access |
-| `intermediate` (node preview · default) | `node` passed | HANA native intermediate view `SYS.CREATE_INTERMEDIATE_CALCULATION_VIEW_DEV` (same as Studio node preview): the view is always named `<pkg/object>/dp/<node>`, an existing one is reused instead of recreated, and after the query it is dropped only when no call in this process is using it and this server created it | `EXECUTE` on the above procedure |
-| `derived` (node preview · read-only) | `node` + `forceDerive=true` (explicit) | Derives SQL from the view XML, purely read-only | `_SYS_REPO` read + base-table SELECT |
+| `direct` (overall preview) | no `node` passed | View the final result of the view | `SELECT * FROM "_SYS_BIC"."package/view-name"` (requires `_SYS_BIC` data access) |
+| `intermediate` (node preview · default) | `node` passed | Inspect the real output of an intermediate node (Join / Aggregation etc.) | HANA native intermediate view `SYS.CREATE_INTERMEDIATE_CALCULATION_VIEW_DEV` (same as Studio node preview): the view is always named `<pkg/object>/dp/<node>`, an existing one is reused instead of recreated, and it is dropped only when no call in this process is using it and this server created it; the executing user needs `EXECUTE` on the procedure |
+| `derived` (node preview · read-only) | `node` + `forceDerive=true` (explicit) | Inspect a node without intermediate-view privilege, or without creating temporary objects | Derives SQL from the view XML, purely read-only (requires `_SYS_REPO` read + base-table SELECT) |
 
-Row-count rules: 10 rows by default without filter, 100 with filter, explicit `limit` capped at 1000; `LIMIT n+1` probe for truncation → `truncated`.
+Row-count rules: 10 rows by default without filter, 100 with filter, explicit `limit` capped at 1000.
 Node preview defaults to the `intermediate` channel only: on missing EXECUTE privilege it directly returns "not supported" (with a grant hint), and does NOT auto-fall-back to derived.
 
 **Auto-diagnosis on permission failure**: when preview fails due to a permission-class reason (missing EXECUTE/SELECT, `_SYS_BIC` object invisible — error codes 258/259, etc.), a privilege diagnosis runs automatically and the report is attached at `envelope.raw.diagnosis` — no extra call needed to locate the blocking point.
@@ -455,7 +516,8 @@ You can also use `hana_data_preview_diagnose` to pre-check manually, focusing on
 | `npm run smoke:http` | Build + Streamable HTTP smoke test (handshake/tool registration/Host guard; no real HANA needed) |
 | `npm run typecheck` | Type-check only (also acts as the dead-code gate: `noUnusedLocals` rejects unused imports and variables) |
 | `npm run format` | Prettier formatting (`format:check` verifies without writing) |
-| `npm run check` | `typecheck` + `test` — run this before committing |
+| `npm run preflight -- <packages...>` | Write-operation permission preflight (exit code 0/1/2) |
+| `npm run check` | Tool-name guard + typecheck + test — run this before committing |
 | `npm run verify:system` | Build + real-HANA system-tool verification |
 | `npm run verify:p1-5` | Build + read-path/preview/field-logic black-box verification |
 | `npm run verify:lifecycle` | Build + write-path full-lifecycle verification (create→validate→activate→preview→update-conflict→delete→import; scripts in local `test-verification/`, not in repo) |

@@ -2,18 +2,21 @@
 
 > 本文是 [README.md](README.md) 的详细配置参考：连接参数、工具分组、调用方档案、传输方式、安全边界与 HANA 授权要求。
 
-## 必填参数
+## 必填参数（单环境 / 多环境）
 
-| 配置项 | 说明 |
-| --- | --- |
-| `HANA_HOST` | HANA 主机名/IP |
-| `HANA_PORT` | SQL 端口（纯数字；不再由实例号推导） |
-| `HANA_USER` | 数据库用户名 |
-| `HANA_PASSWORD` | 密码 |
+| 参数 | 单环境 | 多环境 |
+| --- | --- | --- |
+| `HANA_HOST` / `HANA_PORT` | 扁平键，必填 | `HANA_HOST_ENV_<XXXX>` / `HANA_PORT_ENV_<XXXX>`，每个环境必填 |
+| `HANA_USER` / `HANA_PASSWORD` | 扁平键，必填 | `HANA_USER_ENV_<XXXX>` / `HANA_PASSWORD_ENV_<XXXX>`，每个环境必填 |
 
-缺失必填项时服务**启动即失败**。连接信息只允许来自环境变量 / `mcp.json` 的 `env`（**仅 stdio 模式生效**）/ `.env` 文件，不提供默认值。
+单环境缺失必填项、或多环境某个环境解析不到 `HOST/PORT/USER/PASSWORD`，服务均**启动即失败**。
+多环境**不使用扁平连接键**（会被忽略），见下方《参数作用域与完整参数表（单环境 / 多环境）》与《多 HANA 环境》。
 
-`HANA_XS_PORT`（XS 设计时 REST 端口）**非必填，默认 8010**；非默认实例/租户请显式覆盖。
+连接信息只允许来自环境变量 / `mcp.json` 的 `env`（**仅 stdio 模式生效**）/ `.env` 文件（单环境），
+不提供默认值；多环境**完全不读 `.env`**。
+
+`HANA_XS_PORT`（XS 设计时 REST 端口）**非必填，默认 8010**；非默认实例/租户请显式覆盖：
+单环境用 `HANA_XS_PORT`，多环境用 `HANA_XS_PORT_ENV_<XXXX>`。
 
 ## 配置来源
 
@@ -24,119 +27,75 @@
 
 `.env` 查找顺序为 **工作目录 → 项目根**（`dist/` 上两级），且**逐变量生效**——`process.loadEnvFile` 不覆盖已存在的环境变量。因此三件套只有一部分来自外部环境时会跨来源混用（典型：shell 里残留的 `HANA_USER` 覆盖 `.env` 中的用户名，其余仍取 `.env`），可能连接到另一套环境。服务检测到连接目标/凭据来自多个来源时，会在启动日志 **warn** 并列出每个变量的来源，请据此清理多余的环境变量。
 
-## 参数作用域（v2）
+## 参数作用域与完整参数表（单环境 / 多环境）
 
 多环境模型按参数性质分三类；**扁平键的含义取决于模式**：
 
 - **单环境**（没有任何 `_ENV_` 变量）：扁平 `HANA_*` 就是唯一环境的配置。
-- **多环境**（出现任意 `_ENV_` 变量）：
-  - **连接参数**：扁平键硬报错；只能 `HANA_<PARAM>_ENV_<XXXX>`；
+- **多环境**（出现任意**已识别参数**的 `_ENV_` 变量）：
+  - **连接参数**：扁平键**忽略**（不参与解析）；只能 `HANA_<PARAM>_ENV_<XXXX>`；
   - **策略/授权参数**：扁平键 = 所有环境共享；`_ENV_<XXXX>` 覆盖单个环境；
   - **进程级参数**：只能扁平写；写 `_ENV_` 启动失败。
 
-| 参数 | 类别 | 单环境 | 多环境（扁平） | 多环境（_ENV_） | 默认 | 说明 |
-|---|---|---|---|---|---|---|
-| `HANA_HOST` | 连接 | 生效 | 报错 | 必填 | — | HANA 主机名/IP |
-| `HANA_PORT` | 连接 | 生效 | 报错 | 必填 | — | SQL 端口（纯数字） |
-| `HANA_USER` | 连接 | 生效 | 报错 | 必填 | — | 数据库账号 |
-| `HANA_PASSWORD` | 连接 | 生效 | 报错 | 必填 | — | 数据库密码；加载后从 process.env 删除 |
-| `HANA_DB_NAME` | 连接 | 生效 | 报错 | 可选 | — | 租户数据库名（MDC 租户） |
-| `HANA_TLS` | 连接 | 生效 | 报错 | 可选 | true | SQL 连接 TLS（fail-closed，默认 true） |
-| `HANA_SSL_VALIDATE` | 连接 | 生效 | 报错 | 可选 | true | TLS 证书校验（默认 true） |
-| `HANA_LOCALE` | 连接 | 生效 | 报错 | 可选 | zh | 连接 Locale |
-| `HANA_XS_PORT` | 连接 | 生效 | 报错 | 可选 | 8010 | XS Classic 设计时 REST 端口 |
-| `HANA_XS_TLS` | 连接 | 生效 | 报错 | 可选 | false | XS 写通道走 HTTPS |
-| `HANA_XS_BASE_PATH` | 连接 | 生效 | 报错 | 可选 | /sap/hana/xs/dt/base | XS 设计时 REST 基础路径 |
-| `HANA_ACCESS` | 策略/授权 | 生效 | 共享 | 覆盖 | readwrite | 环境只读/可写策略（readwrite / readonly） |
-| `HANA_READONLY_SQL` | 策略/授权 | 生效 | 共享 | 覆盖 | select-only | 只读环境的 SQL 策略（select-only / deny） |
-| `HANA_WRITE_PACKAGES` | 策略/授权 | 生效 | 共享 | 覆盖 | 空 | 允许写操作的仓库包前缀；空 = 无写包 |
-| `HANA_READ_SCHEMA` | 策略/授权 | 生效 | 共享 | 覆盖 | 空 | 追加允许按名读取的 schema |
-| `HANA_SQL_TIMEOUT_MS` | 策略/授权 | 生效 | 共享 | 覆盖 | 60000 | 写路径 SQL 语句超时（ms） |
-| `HANA_SQL_ALLOW_MULTI_STATEMENT` | 策略/授权 | 生效 | 共享 | 覆盖 | false | hana_sql_execute 多行/多语句开关 |
-| `HANA_SQL_MAX_RESULT_BYTES` | 策略/授权 | 生效 | 共享 | 覆盖 | 1000000 | 单次 SQL 结果字节上限 |
-| `HANA_SQL_MAX_STATEMENTS` | 策略/授权 | 生效 | 共享 | 覆盖 | 20 | 单次调用 SQL 语句条数上限 |
-| `HANA_XS_TIMEOUT_MS` | 策略/授权 | 生效 | 共享 | 覆盖 | 30000 | XS REST 请求超时（ms） |
-| `HANA_XS_XFER_TIMEOUT_MS` | 策略/授权 | 生效 | 共享 | 覆盖 | 300000 | XS 传输（xfer）超时（ms） |
-| `HANA_POOL_MAX` | 策略/授权 | 生效 | 共享 | 覆盖 | 4 | 每环境连接池上限 |
-| `HANA_POOL_WAIT_MS` | 策略/授权 | 生效 | 共享 | 覆盖 | 30000 | 池排队等待超时（ms） |
-| `HANA_POOL_MAX_WAITERS` | 策略/授权 | 生效 | 共享 | 覆盖 | 64 | 池排队上限 |
-| `HANA_TOOL_GROUPS` | 进程级·能力面 | 生效 | 进程级 | 报错 | — | 启用的工具功能分组 |
-| `HANA_TOOL_ALLOW` | 进程级·能力面 | 生效 | 进程级 | 报错 | — | 强制启用的工具名/组名 glob |
-| `HANA_TOOL_DENY` | 进程级·能力面 | 生效 | 进程级 | 报错 | — | 强制禁用的工具名/组名 glob |
-| `HANA_EXPLAIN_SURFACE` | 进程级·能力面 | 生效 | 进程级 | 报错 | — | 工具面省略说明的调试开关 |
-| `MCP_CAPABILITY_SURFACE_MAX` | 进程级·能力面 | 生效 | 进程级 | 报错 | — | 单调用方提升预算（按工具数） |
-| `MCP_PROFILES` | 进程级·能力面 | 生效 | 进程级 | 报错 | — | 调用方档案表（只能在部署策略内收紧） |
-| `MCP_PROFILE` | 进程级·能力面 | 生效 | 进程级 | 报错 | — | stdio / 无档案身份的默认档案名 |
-| `LOG_LEVEL` | 进程级·运行时 | 生效 | 进程级 | 报错 | — | 进程日志级别 |
-| `HANA_TIMEZONE` | 进程级·运行时 | 生效 | 进程级 | 报错 | — | 进程时区（设置 TZ） |
-| `MCP_AGENT_LABEL` | 进程级·运行时 | 生效 | 进程级 | 报错 | — | 进程级归因标签 |
-| `HANA_ACTIVATION_CONCURRENCY` | 进程级·运行时 | 生效 | 进程级 | 报错 | — | 进程内激活并发上限（全局信号量） |
-| `MCP_HTTP_PORT` | 进程级·运行时 | 生效 | 进程级 | 报错 | — | Streamable HTTP 端口；未设置 = stdio |
-| `MCP_HTTP_HOST` | 进程级·运行时 | 生效 | 进程级 | 报错 | — | HTTP 监听地址 |
-| `MCP_HTTP_TOKEN` | 进程级·运行时 | 生效 | 进程级 | 报错 | — | HTTP Bearer Token（已废弃，等价 shared） |
-| `MCP_HTTP_TOKENS` | 进程级·运行时 | 生效 | 进程级 | 报错 | — | HTTP Token → 身份映射 |
-| `MCP_HTTP_CLIENT_ENVS` | 进程级·运行时 | 生效 | 进程级 | 报错 | — | HTTP 身份 → 环境标识绑定 |
-| `MCP_HTTP_ALLOWED_HOSTS` | 进程级·运行时 | 生效 | 进程级 | 报错 | — | 允许的 Host 头主机名 |
-| `MCP_HTTP_ALLOWED_ORIGINS` | 进程级·运行时 | 生效 | 进程级 | 报错 | — | 允许的 Origin 主机名 |
-| `MCP_HTTP_ALLOW_ANONYMOUS` | 进程级·运行时 | 生效 | 进程级 | 报错 | — | 显式承认对外监听且无认证的风险 |
-| `HANA_ENV_MODE` | 进程级·治理 | 生效 | 进程级 | 报错 | — | 模式判断：single / multi（可选，默认自动判断） |
-| `HANA_ENV_START` | 进程级·治理 | 生效 | 进程级 | 报错 | — | 启动环境标识 |
-| `HANA_ENV_SWITCHABLE` | 进程级·治理 | 生效 | 进程级 | 报错 | — | 可切换环境标识列表 |
-| `HANA_ENV_INHERIT` | 进程级·治理 | 生效 | 进程级 | 报错 | — | 兼容模式开关；**本版仅支持 strict** |
+**「扁平键」指不带环境后缀的普通变量名，「`_ENV_` 键」指 `HANA_<参数>_ENV_<环境标识>`。** 以 `HANA_HOST` 为例：
+
+- 单环境（扁平键）：`HANA_HOST=hana-dev.example`
+- 多环境（`_ENV_` 键）：`HANA_HOST_ENV_DEV=hana-dev.example`、`HANA_HOST_ENV_PROD=hana-prod.example`
+
+表中的「单环境」表示该参数**直接按扁平键读取**：「生效（必填）」= 单环境下必须提供；「生效（可选）」= 可不填（使用默认值或不启用）。多环境列：「必填」= 每个环境必须提供；「可选」= 可不写（使用默认值/共享值）；「不可用」= 该形式启动失败。
+
+| 参数 | 说明 | 默认 | 示例 | 类别 | 单环境（扁平键） | 多环境下的扁平键（如 `HANA_HOST`） | 多环境下的 _ENV_ 键（如 `HANA_HOST_ENV_DEV`） |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `HANA_HOST` | HANA 主机名/IP | — | `hana-host.example` | 连接 | 生效（必填） | 忽略（不生效） | 必填 |
+| `HANA_PORT` | SQL 端口（纯数字；不再由实例号推导） | — | `31015` | 连接 | 生效（必填） | 忽略（不生效） | 必填 |
+| `HANA_USER` | 数据库账号 | — | — | 连接 | 生效（必填） | 忽略（不生效） | 必填 |
+| `HANA_PASSWORD` | 数据库密码；加载后从 process.env 删除 | — | — | 连接 | 生效（必填） | 忽略（不生效） | 必填 |
+| `HANA_DB_NAME` | 租户数据库名（MDC 指定租户时填写；非 MDC 可省略） | — | `SYSTEMDB` / 业务租户名 | 连接 | 生效（可选） | 忽略（不生效） | 可选 |
+| `HANA_TLS` | SQL 连接 TLS（fail-closed，默认 true；仅可信链路显式 false） | true | `true` | 连接 | 生效（可选） | 忽略（不生效） | 可选 |
+| `HANA_SSL_VALIDATE` | TLS 证书校验（默认 true；自签证书环境显式 false） | true | `true` | 连接 | 生效（可选） | 忽略（不生效） | 可选 |
+| `HANA_LOCALE` | 连接 Locale | zh | `zh` | 连接 | 生效（可选） | 忽略（不生效） | 可选 |
+| `HANA_XS_PORT` | XS Classic 设计时 REST 端口（非默认实例/租户需覆盖，不按实例号推导） | 8010 | `8000` | 连接 | 生效（可选） | 忽略（不生效） | 可选 |
+| `HANA_XS_TLS` | XS 写通道走 HTTPS（默认明文 http://，须网络侧隔离） | false | `true` | 连接 | 生效（可选） | 忽略（不生效） | 可选 |
+| `HANA_XS_BASE_PATH` | XS 设计时 REST 基础路径 | /sap/hana/xs/dt/base | — | 连接 | 生效（可选） | 忽略（不生效） | 可选 |
+| `HANA_ACCESS` | 环境只读/可写策略（readwrite / readonly）；只读仅拒绝持久写入，临时对象与纯读放行 | readwrite | `readonly` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
+| `HANA_READONLY_SQL` | 只读环境的 SQL 策略（select-only / deny）；仍受 sql 工具组控制 | select-only | `deny` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
+| `HANA_WRITE_PACKAGES` | 允许写操作的仓库包前缀；空 = 未启用写边界（`boundary_off`）；`_ENV_` 显式空 = 该环境无写包 | 空 | `ZDEMO1,ZDEMO2.ZDEMO_SD` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
+| `HANA_READ_SCHEMA` | 追加允许按名读取的 schema | 空 | `SAPABAP1,OTHER_SCHEMA` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
+| `HANA_SQL_TIMEOUT_MS` | 写路径 SQL 语句超时（ms） | 60000 | `120000` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
+| `HANA_SQL_ALLOW_MULTI_STATEMENT` | hana_sql_execute 多行/多语句开关（有写时自动事务） | false | `true` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
+| `HANA_SQL_MAX_RESULT_BYTES` | 单次 SQL 结果字节上限（1024..52428800） | 1000000 | `2000000` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
+| `HANA_SQL_MAX_STATEMENTS` | 单次调用 SQL 语句条数上限（最大 100） | 20 | `50` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
+| `HANA_XS_TIMEOUT_MS` | XS REST 请求超时（ms） | 30000 | `60000` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
+| `HANA_XS_XFER_TIMEOUT_MS` | XS 传输（xfer）超时（ms） | 300000 | `600000` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
+| `HANA_POOL_MAX` | 每环境连接池上限 | 4 | `8` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
+| `HANA_POOL_WAIT_MS` | 池排队等待超时（ms） | 30000 | `60000` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
+| `HANA_POOL_MAX_WAITERS` | 池排队上限 | 64 | `128` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
+| `HANA_TOOL_GROUPS` | 启用的工具功能分组；空 = read/write/admin，sql 默认关闭 | — | `read` / `read,sql` | 进程级·能力面 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
+| `HANA_TOOL_ALLOW` | 强制启用的工具名/组名 glob（支持 `*`） | — | `hana_view_validate` / `write` | 进程级·能力面 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
+| `HANA_TOOL_DENY` | 强制禁用的工具名/组名 glob（优先级最高） | — | `hana_data_preview*` | 进程级·能力面 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
+| `HANA_EXPLAIN_SURFACE` | 工具面省略说明的调试开关 | — | `names` | 进程级·能力面 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
+| `MCP_CAPABILITY_SURFACE_MAX` | 单调用方提升预算（按工具数，默认 50） | — | `100` | 进程级·能力面 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
+| `MCP_PROFILES` | 调用方档案表（只能收紧部署策略；配了必须定义 default） | — | `analyst=read;dev=read+write:hana_view_*;default=read` | 进程级·能力面 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
+| `MCP_PROFILE` | stdio / 无档案身份的默认档案名 | — | `default` | 进程级·能力面 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
+| `LOG_LEVEL` | 进程日志级别（默认 info） | — | `debug` | 进程级·运行时 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
+| `HANA_TIMEZONE` | 进程时区（设置 TZ；不下发 HANA 会话） | — | `Asia/Shanghai` | 进程级·运行时 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
+| `MCP_AGENT_LABEL` | 进程级归因标签 | — | `prod-cn-01` | 进程级·运行时 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
+| `HANA_ACTIVATION_CONCURRENCY` | 进程内激活并发上限（默认 2，全局信号量） | — | `4` | 进程级·运行时 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
+| `MCP_HTTP_PORT` | Streamable HTTP 端口；未设置 = stdio；`0` = 随机端口 | — | `3000` | 进程级·运行时 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
+| `MCP_HTTP_HOST` | HTTP 监听地址（默认 127.0.0.1，fail-closed） | — | `0.0.0.0` | 进程级·运行时 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
+| `MCP_HTTP_TOKEN` | HTTP Bearer Token（已废弃，等价 `shared`） | — | — | 进程级·运行时 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
+| `MCP_HTTP_TOKENS` | HTTP Token → 身份映射（token ≥16 字符且不得含冒号） | — | `alice:<token>:dev,bob:<token>` | 进程级·运行时 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
+| `MCP_HTTP_CLIENT_ENVS` | HTTP 身份 → 环境标识绑定（多环境 HTTP 必填，仅 HTTP 模式） | — | `alice:PRD_CN,bob:PRD_EU` | 进程级·运行时 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
+| `MCP_HTTP_ALLOWED_HOSTS` | 允许的 Host 头主机名（默认仅本机名） | — | `localhost,myhost.corp` | 进程级·运行时 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
+| `MCP_HTTP_ALLOWED_ORIGINS` | 允许的 Origin 主机名（未设置时继承 `MCP_HTTP_ALLOWED_HOSTS`） | — | `localhost` | 进程级·运行时 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
+| `MCP_HTTP_ALLOW_ANONYMOUS` | 显式承认对外监听且无认证的风险 | — | `false` | 进程级·运行时 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
+| `HANA_ENV_MODE` | 模式判断：single / multi（可选，默认自动判断） | — | `multi` | 进程级·治理 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
+| `HANA_ENV_START` | 启动环境标识 | — | `DEV` | 进程级·治理 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
+| `HANA_ENV_SWITCHABLE` | 可切换环境标识列表（逗号分隔；空 = 不可切） | — | `DEV,UAT,PROD` | 进程级·治理 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
+| `HANA_ENV_INHERIT` | 兼容模式开关；**本版仅支持 strict** | — | — | 进程级·治理 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
 
 > `HANA_LABEL` / `HANA_LABEL_ENV_*` 已移除：环境标识直接取 `_ENV_<XXXX>` 的 `<XXXX>`，
 > 大小写不敏感，内部规范化为大写。单环境残留 `HANA_LABEL` 静默忽略；多环境出现即启动失败（`label_removed`）。
-
-## 完整参数表
-
-| 配置项 | 必填 | 说明 | 示例 |
-| --- | --- | --- | --- |
-| `HANA_HOST` | ✅ | HANA 主机名/IP | `hana-host.example` |
-| `HANA_PORT` | ✅ | SQL 端口（**必填**，不再由实例号推导——`3<实例>13/15` 推不出非默认租户；只接受纯数字） | `31015` / `31041` |
-| `HANA_USER` | ✅ | 数据库用户名 | — |
-| `HANA_PASSWORD` | ✅ | 密码 | — |
-| `HANA_LOCALE` | 可选 | 连接语言，默认 `zh` | `zh` |
-| `HANA_DB_NAME` | 可选 | 租户数据库名（MDC 指定租户时填写；非 MDC 可省略） | `SYSTEMDB` / 业务租户名 |
-| `HANA_ACCESS` | 可选 | 环境只读/可写策略：`readwrite`（默认）/ `readonly`（只拒绝**持久写入**：仓库设计时对象与数据；临时对象与纯读放行；单环境同样生效）。多环境下扁平=共享，`HANA_ACCESS_ENV_<XXXX>` 覆盖单个环境 | `readonly` |
-| `HANA_LABEL` | **已移除** | 环境标识直接取 `_ENV_<XXXX>` 的 `<XXXX>`；单环境残留静默忽略，多环境出现即 `label_removed` | — |
-| `HANA_ENV_START` | 可选 | 启动环境标识；多环境必须指向已配置的环境标识（只有一个环境时可省略）；单环境可留空或写 `DEFAULT` | `BWD` |
-| `HANA_ENV_SWITCHABLE` | 可选 | 可切环境标识（逗号分隔）；空 = 不可切；大小写不敏感 | `BWD,BWU` |
-| `HANA_READONLY_SQL` | 可选 | 只读环境的 SQL 策略：`select-only`（默认）/ `deny`；仍受 `sql` 工具组控制；`HANA_READONLY_SQL_ENV_<XXXX>` 可覆盖单个环境 | `deny` |
-| `HANA_TLS` | 可选 | TLS 加密，默认 `true`（fail-closed；仅可信链路显式 `false`） | `true` |
-| `HANA_SSL_VALIDATE` | 可选 | TLS 下校验证书，默认 `true`；自签证书环境显式 `false` | `true` |
-| `HANA_TIMEZONE` | 可选 | 进程时区（设置 `TZ`，影响日志时间戳与本地时间语义）；**不下发 HANA 会话**。默认 `Asia/Shanghai` | `Asia/Shanghai` |
-| `HANA_READ_SCHEMA` | 可选 | 追加允许查询的 schema（逗号分隔，追加到内置白名单）。多环境下扁平=共享，`HANA_READ_SCHEMA_ENV_<XXXX>` 覆盖单个环境 | `SAPABAP1,OTHER_SCHEMA` |
-| `HANA_WRITE_PACKAGES` | 可选 | 允许写操作的仓库包前缀（逗号分隔，含子包）。**空 = 未启用写边界**：声明写包的请求会被运行期闸门以 `boundary_off` 硬拦（要写就必须显式配置）；填写后仅允许配置包及其下级子包写操作。多环境下扁平=共享，`HANA_WRITE_PACKAGES_ENV_<XXXX>` 覆盖单个环境（显式空 = 该环境无写包） | `ZDEMO1,ZDEMO2.ZDEMO_SD` |
-| `HANA_XS_PORT` | 可选 | XS Classic 设计时 REST 端口；**默认 `8010`**（非默认实例/租户需覆盖，仍不按实例号推导） | `8000` |
-| `HANA_XS_BASE_PATH` | 可选 | XS 设计时 REST 基础路径，默认 `/sap/hana/xs/dt/base` | — |
-| `HANA_XS_TLS` | 可选 | XS 写通道走 HTTPS（默认明文 `http://`，须网络侧隔离） | `true` |
-| `HANA_POOL_MAX` | 可选 | HANA 连接池并发上限，默认 `4` | `8` |
-| `HANA_POOL_WAIT_MS` | 可选 | 池满后的排队等待超时（ms），默认 `30000` | `60000` |
-| `HANA_POOL_MAX_WAITERS` | 可选 | 排队上限（个），默认 `64` | `128` |
-| `HANA_SQL_TIMEOUT_MS` | 可选 | 写路径五条 SQL 语句的语句超时，默认 `60000` | `120000` |
-| `HANA_SQL_ALLOW_MULTI_STATEMENT` | 可选 | `hana_sql_execute`：同时解锁“多物理行”与“多语句”，默认 `false`；有写时服务端自动事务（全部成功才 commit） | `true` |
-| `HANA_SQL_MAX_RESULT_BYTES` | 可选 | `hana_sql_execute`：单次结果累计字节上限，默认 `1000000`（最小 `1024`，最大 `52428800`） | `2000000` |
-| `HANA_SQL_MAX_STATEMENTS` | 可选 | `hana_sql_execute`：单次调用语句条数上限，默认 `20`（最大 `100`） | `50` |
-| `HANA_XS_TIMEOUT_MS` | 可选 | XS REST 请求默认超时（ms），默认 `30000` | `60000` |
-| `HANA_XS_XFER_TIMEOUT_MS` | 可选 | XS Transfer（xfer）导入/导出超时（ms），默认 `300000` | `600000` |
-| `HANA_ACTIVATION_CONCURRENCY` | 可选 | 服务端激活的并发上限（进程内信号量），默认 `2` | `4` |
-| `HANA_TOOL_GROUPS` | 可选 | 启用的工具功能分组（逗号分隔 `read`/`write`/`admin`/`sql`）；**空 = read/write/admin 启用，sql 默认关闭** | `read` / `read,sql` |
-| `HANA_TOOL_ALLOW` | 可选 | 强制启用的工具名/组名 glob（逗号分隔，支持 `*`） | `hana_view_validate` / `write` |
-| `HANA_TOOL_DENY` | 可选 | 强制禁用的工具名/组名 glob（优先级最高） | `hana_data_preview*` |
-| `HANA_EXPLAIN_SURFACE` | 可选 | 仅调试：置 `names` 时门面索引的 `surface` 说明列出被隐藏/加载失败的能力名 | `names` |
-| `MCP_PROFILES` | 可选 | 调用方档案（见下）。档案只能收紧部署策略；配了就必须定义 `default` | `analyst=read;dev=read+write:hana_view_*;default=read` |
-| `MCP_PROFILE` | 可选 | 本进程（stdio）与"无档案身份调用方"使用的档案名 | `default` |
-| `MCP_AGENT_LABEL` | 可选 | 进程级归因标签：写进 envelope 与每条 `capability-audit` | `prod-cn-01` |
-| `MCP_CAPABILITY_SURFACE_MAX` | 可选 | 单调用方的提升预算（默认 50，按工具数算，超出时最旧分类整体淘汰） | `100` |
-| `LOG_LEVEL` | 可选 | 日志级别，默认 `info` | `debug` |
-| `MCP_HTTP_PORT` | 可选 | Streamable HTTP 端口；设置后以 HTTP 模式启动（端点 `/mcp`），未设置 = stdio。`0` = 随机端口 | `3000` |
-| `MCP_HTTP_HOST` | 可选 | HTTP 监听地址，默认 `127.0.0.1`（fail-closed） | `0.0.0.0` |
-| `MCP_HTTP_TOKEN` | **已废弃** | 等价于 `MCP_HTTP_TOKENS=shared:<token>`；计划在下一个大版本删除 | — |
-| `MCP_HTTP_TOKENS` | 可选 | 多客户端 Token → 身份映射（`name:token[:profile]`）；`token` ≥16 字符且不得含冒号 | `alice:<token>:dev,bob:<token>` |
-| `MCP_HTTP_CLIENT_ENVS` | 可选 | HTTP 身份 → 环境标识绑定（`clientId:ENV`，逗号分隔）；**多环境 HTTP 必填，且每个 Token 都要绑定**；仅 HTTP 模式；环境标识大小写不敏感 | `alice:PRD_CN,bob:PRD_EU` |
-| `MCP_HTTP_ALLOWED_HOSTS` | 可选 | 允许的 Host 头主机名（逗号分隔，默认仅本机名） | `localhost,myhost.corp` |
-| `MCP_HTTP_ALLOWED_ORIGINS` | 可选 | 允许的 Origin 主机名；未设置时继承 `MCP_HTTP_ALLOWED_HOSTS` | `localhost` |
-| `MCP_HTTP_ALLOW_ANONYMOUS` | 可选 | 显式承认「对外监听且不配置 Token」的风险，默认 `false`（非回环 + 无 Token 时拒绝启动） | `false` |
 
 ## 多 HANA 环境（单进程、单 active）
 
@@ -149,7 +108,7 @@
 - **环境标识** = `_ENV_<XXXX>` 的 `<XXXX>`；大小写不敏感，内部规范化为大写。
   **不再有 `HANA_LABEL` / `HANA_LABEL_ENV_*`**：单环境残留 `HANA_LABEL` 静默忽略，多环境出现即 `label_removed`。
 - **连接参数**（`HOST` / `PORT` / `USER` / `PASSWORD` / `DB_NAME` / `TLS` / `SSL_VALIDATE` / `LOCALE` /
-  `XS_PORT` / `XS_TLS` / `XS_BASE_PATH`）：多环境下扁平键**硬报错**，只能写
+  `XS_PORT` / `XS_TLS` / `XS_BASE_PATH`）：多环境下扁平键**忽略**（不参与解析），只能写
   `HANA_<PARAM>_ENV_<XXXX>`；`HOST/PORT/USER/PASSWORD` 每个环境必须能解析到。
 - **策略/授权参数**（`ACCESS` / `READONLY_SQL` / `WRITE_PACKAGES` / `READ_SCHEMA` / 超时与池旋钮）：
   扁平键 = **所有环境共享**；`HANA_<PARAM>_ENV_<XXXX>` 覆盖单个环境。
@@ -176,34 +135,39 @@
   出现即启动失败（单环境 `HANA_LABEL` 例外：静默忽略）。
 - 密码：加载后 `HANA_PASSWORD` 与所有 `HANA_PASSWORD_ENV_*` 从 `process.env` 删除。
 
-### 示例（两个环境）
+### 示例（三个环境）
 
 ```dotenv
-# 连接参数：每个环境自己写（多环境下扁平 HANA_HOST 等会报错）
-HANA_HOST_ENV_BWD=hana-bwd.example
-HANA_PORT_ENV_BWD=30015
-HANA_USER_ENV_BWD=BWD_USER
-HANA_PASSWORD_ENV_BWD=***
-HANA_TLS_ENV_BWD=false
+# 连接参数：每个环境自己写（多环境下扁平 HANA_HOST 等会被忽略）
+HANA_HOST_ENV_DEV=hana-dev.example
+HANA_PORT_ENV_DEV=30015
+HANA_USER_ENV_DEV=DEV_USER
+HANA_PASSWORD_ENV_DEV=***
+HANA_TLS_ENV_DEV=false
 
-HANA_HOST_ENV_BWU=hana-bwu.example
-HANA_PORT_ENV_BWU=30015
-HANA_USER_ENV_BWU=BWU_USER
-HANA_PASSWORD_ENV_BWU=***
+HANA_HOST_ENV_UAT=hana-uat.example
+HANA_PORT_ENV_UAT=30015
+HANA_USER_ENV_UAT=UAT_USER
+HANA_PASSWORD_ENV_UAT=***
 
-# 策略/授权：扁平 = 所有环境共享；只给 BWD 写包
+HANA_HOST_ENV_PROD=hana-prod.example
+HANA_PORT_ENV_PROD=30015
+HANA_USER_ENV_PROD=PROD_USER
+HANA_PASSWORD_ENV_PROD=***
+
+# 策略/授权：扁平 = 所有环境共享；只给 DEV 写包
 HANA_ACCESS=readonly
-HANA_ACCESS_ENV_BWD=readwrite
-HANA_WRITE_PACKAGES_ENV_BWD=ZDEMO
+HANA_ACCESS_ENV_DEV=readwrite
+HANA_WRITE_PACKAGES_ENV_DEV=ZDEMO
 HANA_READ_SCHEMA=SHARED_SCHEMA
 HANA_READONLY_SQL=select-only
 
 # 启动/可切列表用环境标识（大小写不敏感）
-HANA_ENV_START=BWD
-HANA_ENV_SWITCHABLE=BWD,BWU
+HANA_ENV_START=DEV
+HANA_ENV_SWITCHABLE=DEV,UAT,PROD
 ```
 
-如果两个环境共用同一端口/账号，也没有“默认继承”：要么各自写 `_ENV_`，要么把策略键写成扁平共享值
+如果环境间共用同一端口/账号，也没有“默认继承”：要么各自写 `_ENV_`，要么把策略键写成扁平共享值
 （连接参数不能共享）。
 
 ### `.env` 加载陷阱
@@ -402,10 +366,9 @@ MCP_HTTP_PORT=3000 MCP_HTTP_TOKENS='shared:your-long-random-token' node dist/ind
 |---|---|---|
 | `config_invalid` | 配置加载失败（通用明细码） | 按错误信息逐项修正；无法判断时先跑 scripts/migrate-env-config.mjs --check。 |
 | `env_mode_mismatch` | HANA_ENV_MODE 与实际检测到的单/多环境模式不一致 | 删掉 HANA_ENV_MODE 让服务自动判断，或改成与 _ENV_ 变量匹配的值。 |
-| `flat_connection_key_in_multi` | 多环境模式下仍使用扁平的连接参数 | 把扁平连接键改成 HANA_<PARAM>_ENV_<XXXX>；每个环境都要能解析到 HOST/PORT/USER/PASSWORD。 |
 | `label_removed` | HANA_LABEL / HANA_LABEL_ENV_* 已移除 | 删除 LABEL 变量；环境标识直接取 HANA_<PARAM>_ENV_<XXXX> 里的 <XXXX>。 |
 | `legacy_env_prefix` | 使用了已废弃的 HANA_ENV_<NAME>_<PARAM> 前缀 | 改成 HANA_<PARAM>_ENV_<NAME>，例如 HANA_ENV_QAS_HOST → HANA_HOST_ENV_QAS。 |
-| `env_config_unsupported` | 使用了不支持的 HANA_ENV_CONFIG 文件配置 | v2 只支持扁平环境变量；请把配置写成 HANA_<PARAM>_ENV_<XXXX> / 共享策略键。 |
+| `env_config_unsupported` | 使用了不支持的 HANA_ENV_CONFIG 文件配置 | 本版只支持扁平环境变量；请把配置写成 HANA_<PARAM>_ENV_<XXXX> / 共享策略键。 |
 | `env_key_invalid` | 环境标识非法 | 环境标识必须匹配 [A-Za-z][A-Za-z0-9_]{0,31}；旧 LABEL 里的 - 请改成 _。 |
 | `env_key_conflict` | 同一参数存在仅大小写不同的两个 _ENV_ 键 | 只保留一个键，或把两个键统一成同一大小写。 |
 | `env_key_unknown` | HANA_ENV_START / HANA_ENV_SWITCHABLE / 切换请求引用了未配置的环境标识 | 先调用 hana_env_list（或看启动摘要）确认可用环境标识；匹配大小写不敏感。 |
