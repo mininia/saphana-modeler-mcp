@@ -275,33 +275,27 @@ export function canonicalEnvKey(raw: string, keyForError = '环境标识'): stri
   return canonical;
 }
 
-/** 环境标识是否合法（用于判断键是否属于本模块） */
-export function isValidEnvKey(raw: string): boolean {
-  return ENV_KEY_RE.test(raw.trim());
-}
-
-/** 是否由本模块负责的配置键（warnUnknownEnvKeys 跳过；真正解析时再决定报错/忽略） */
-export function isEnvironmentConfigKey(key: string): boolean {
-  if (GLOBAL_ENV_KEYS.has(key)) return false;
-  if (REMOVED_LABEL_KEYS.has(key)) return true;
-  if (key.startsWith('HANA_LABEL_ENV_')) return true;
-  if (key === 'HANA_ENV_CONFIG') return true;
-  if (key.startsWith('HANA_ENV_')) return true;
-  if (key.startsWith('HANA_') && key.includes('_ENV_')) return true;
-  if (/^(MCP|LOG)_.*_ENV_/.test(key)) return true;
-  return false;
-}
-
-/** 是否存在 `_ENV_` 形态的键（用于第一层模式判断；不含全局键） */
+/**
+ * 是否存在会改变模式的 `_ENV_` 形态键（用于第一层模式判断；不含全局键）。
+ *
+ * 只有**已识别参数**的 `_ENV_` 键才算多环境；无法识别的 `_ENV_` 键按按需读取直接忽略——
+ * 父进程/其它工具残留的 `HANA_*_ENV_*` 不能把单环境部署拖进多环境模式。
+ * 需要响亮失败的旧形态（`HANA_LABEL_ENV_*` / `HANA_ENV_*` / `MCP|LOG_*_ENV_*`）仍返回 true，
+ * 由 scanOverrides 给出对应错误码。
+ */
 export function hasScopedEnvironmentKeys(env: NodeJS.ProcessEnv): boolean {
   return Object.keys(env).some((key) => {
     if (GLOBAL_ENV_KEYS.has(key)) return false;
-    if (key.startsWith('HANA_') && key.includes('_ENV_')) return true;
-    return /^(MCP|LOG)_.*_ENV_/.test(key);
+    if (key.startsWith('HANA_LABEL_ENV_')) return true;
+    // 旧前缀 HANA_ENV_<NAME>_<PARAM> 与 HANA_ENV_CONFIG：进入多环境分支后由 scanOverrides 响亮失败
+    if (key.startsWith('HANA_ENV_')) return true;
+    if (/^(MCP|LOG)_.*_ENV_/.test(key)) return true;
+    if (!key.startsWith('HANA_')) return false;
+    return findScopedParam(key.slice('HANA_'.length)) !== undefined;
   });
 }
 
-/** 扫描所有 `_ENV_` 键；进程级/未知/旧前缀/标签一律响亮失败 */
+/** 扫描所有 `_ENV_` 键；进程级/旧前缀/标签一律响亮失败，无法识别的参数键忽略 */
 function scanOverrides(env: NodeJS.ProcessEnv): ScannedOverrides {
   const envKeys = new Set<string>();
   const cells = new Map<string, Map<string, OverrideCell>>();
@@ -341,14 +335,8 @@ function scanOverrides(env: NodeJS.ProcessEnv): ScannedOverrides {
     const rest = key.slice('HANA_'.length);
     const found = findScopedParam(rest);
     if (!found) {
-      if (rest.includes('_ENV_')) {
-        throw interceptionError(
-          'unknown_scoped_param',
-          `未知的环境覆盖参数：${key}`,
-          '对照 CONFIG.md《参数归类表》使用已登记的参数名。',
-        );
-      }
-      continue; // 扁平 HANA_*（连接/策略）在后续步骤处理
+      // 按需拉取：不认识的 key 直接忽略（不扫描/校验无关环境变量）；拼写错误不会生效
+      continue;
     }
 
     const { spec, rawEnvKey } = found;

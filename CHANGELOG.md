@@ -9,6 +9,7 @@
 - 修复多环境参数配置无法按预期生效的问题：连接参数改为严格按环境解析（`HANA_<PARAM>_ENV_<XXXX>`，扁平连接键直接忽略、不再隐式扩散），策略/授权参数支持扁平共享 + `_ENV_` 按环境覆盖（含 `HANA_WRITE_PACKAGES_ENV_*` / `HANA_READ_SCHEMA_ENV_*` / `HANA_READONLY_SQL_ENV_*`）。
 - 多环境环境标识直接取 `_ENV_<XXXX>` 的 `<XXXX>`，大小写不敏感；`HANA_LABEL` / `HANA_LABEL_ENV_*` 移除（单环境残留静默忽略，多环境报 `label_removed`）。
 - 新增错误码注册表、CONFIG.md《参数作用域》/《错误码速查》与 `scripts/migrate-env-config.mjs --check` 迁移报告；多环境不再读取 `.env`；旧多环境配置需按迁移报告调整。
+- 环境变量改为**按需读取**：不再扫描/告警无关的 `HANA_*` / `MCP_*` / `LOG_*` 变量；未知 `_ENV_` 键直接忽略（已知键的非法取值仍启动失败）。
 
 ## 1.4.3 - 2026-11-13
 

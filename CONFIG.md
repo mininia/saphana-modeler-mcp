@@ -94,46 +94,36 @@
 | `HANA_ENV_SWITCHABLE` | 可切换环境标识列表（逗号分隔；空 = 不可切） | — | `DEV,UAT,PROD` | 进程级·治理 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
 | `HANA_ENV_INHERIT` | 兼容模式开关；**本版仅支持 strict** | — | — | 进程级·治理 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
 
-> `HANA_LABEL` / `HANA_LABEL_ENV_*` 已移除：环境标识直接取 `_ENV_<XXXX>` 的 `<XXXX>`，
-> 大小写不敏感，内部规范化为大写。单环境残留 `HANA_LABEL` 静默忽略；多环境出现即启动失败（`label_removed`）。
-
 ## 多 HANA 环境（单进程、单 active）
 
-默认是单环境，**不需要任何 `_ENV_` 变量**。出现任意 `HANA_<PARAM>_ENV_<XXXX>` 才进入多环境模式；
-`HANA_ENV_START` / `HANA_ENV_SWITCHABLE` 不触发多环境。可用 `HANA_ENV_MODE=single|multi` 显式声明，
-与自动判断不一致时启动失败。
+默认是单环境，**不需要任何 `_ENV_` 变量**。出现**已识别参数**的 `HANA_<PARAM>_ENV_<XXXX>` 才进入多环境模式；
+无法识别的 `_ENV_` 键按按需读取直接忽略（不会把单环境拖入多环境）。`HANA_ENV_START` / `HANA_ENV_SWITCHABLE`
+不触发多环境；可用 `HANA_ENV_MODE=single|multi` 显式声明，与自动判断不一致时启动失败。
 
 ### 规则
 
-- **环境标识** = `_ENV_<XXXX>` 的 `<XXXX>`；大小写不敏感，内部规范化为大写。
-  **不再有 `HANA_LABEL` / `HANA_LABEL_ENV_*`**：单环境残留 `HANA_LABEL` 静默忽略，多环境出现即 `label_removed`。
-- **连接参数**（`HOST` / `PORT` / `USER` / `PASSWORD` / `DB_NAME` / `TLS` / `SSL_VALIDATE` / `LOCALE` /
-  `XS_PORT` / `XS_TLS` / `XS_BASE_PATH`）：多环境下扁平键**忽略**（不参与解析），只能写
-  `HANA_<PARAM>_ENV_<XXXX>`；`HOST/PORT/USER/PASSWORD` 每个环境必须能解析到。
-- **策略/授权参数**（`ACCESS` / `READONLY_SQL` / `WRITE_PACKAGES` / `READ_SCHEMA` / 超时与池旋钮）：
-  扁平键 = **所有环境共享**；`HANA_<PARAM>_ENV_<XXXX>` 覆盖单个环境。
-  `HANA_WRITE_PACKAGES_ENV_<XXXX>=`（显式空）= 该环境无写包，不继承共享值。
-- **进程级参数**（`HANA_TOOL_*` / `MCP_PROFILES` / `MCP_HTTP_*` / `LOG_LEVEL` / `HANA_TIMEZONE` /
-  `MCP_AGENT_LABEL` / `MCP_CAPABILITY_SURFACE_MAX` / `HANA_ACTIVATION_CONCURRENCY` / `HANA_ENV_*`）：
-  只能扁平写；出现 `_ENV_` 形式启动失败（`process_param_scoped`）。
-- 环境集合 = 所有 `_ENV_` 键的 `<XXXX>`；`HANA_ENV_START` 必须是其中之一（只有一个环境时可省略）；
+- **键与作用域**：见上方《参数作用域与完整参数表》。简言之：连接参数只能按环境写 `HANA_<PARAM>_ENV_<XXXX>`
+  （扁平键忽略，`HOST/PORT/USER/PASSWORD` 每个环境必填）；策略参数扁平写 = 所有环境共享、`_ENV_` 覆盖单个环境
+  （`HANA_WRITE_PACKAGES_ENV_<XXXX>=` 显式空 = 该环境无写包）；进程级参数只能扁平写，写 `_ENV_` 启动失败
+  （`process_param_scoped`）。
+- **环境标识** = `_ENV_<XXXX>` 的 `<XXXX>`，大小写不敏感，内部规范化为大写。`HANA_ENV_START` /
+  `HANA_ENV_SWITCHABLE` / `hana_env_switch` 的 `to`/`from`/`confirm` / `MCP_HTTP_CLIENT_ENVS` /
+  `expectedEnvironment` 都用它；回执与审计显示大写形式。
+- **环境集合** = 所有已识别参数的 `_ENV_` 键的 `<XXXX>`；`HANA_ENV_START` 必须是其中之一（只有一个环境时可省略）；
   `HANA_ENV_SWITCHABLE` 只接受环境标识，仅大小写不同的重复项失败。
-- `expectedEnvironment` / `hana_env_switch` 的 `to` / `from` / `confirm` / `MCP_HTTP_CLIENT_ENVS`
-  全部使用环境标识，**大小写不敏感**；回执与审计显示大写规范形式。
-- 只读环境（`ACCESS=readonly`）：只拒绝**持久写入能力**（清单 `effects.mutates='persistent'`：
-  改仓库设计时对象或数据）；临时对象（`hana_data_preview` 的节点预览中间视图、`hana_view_validate`
-  的 `_CHKTMP`）与纯读放行；`hana_sql_execute` 由 `HANA_READONLY_SQL` 控制（`select-only` 下只允许
-  SELECT，并拒绝 `FOR UPDATE` / `FOR SHARE` / `NEXTVAL`）。**单环境同样生效**。
-- 多环境下所有非纯读调用（`effects.mutates != none`，**含临时对象**）必须带
-  `expectedEnvironment=<当前环境标识>`（门面索引的 `params` 已包含该字段）。
-- `hana_env_list` 发放一次性 `switchToken`（仅 stdio 且 switch 可达时）；`hana_env_switch` 是 route-only，
-  HTTP 拒绝且不进索引；目标有运行中任务时需 `acknowledgeRunningTasks=true`。
-- 切换只影响之后的调用；旧环境有运行中任务时进入 `task-draining`，任务/调用结束后回 `idle`；
-  切换前会预检目标连接。
-- 同一物理库（`host:port/dbName`）的多个环境标识共享对象锁、临时校验登记与预览占用。
-- **旧前缀 `HANA_ENV_<NAME>_*`、`HANA_LABEL` / `HANA_LABEL_ENV_*`、JSON/YAML 配置文件不支持**，
-  出现即启动失败（单环境 `HANA_LABEL` 例外：静默忽略）。
-- 密码：加载后 `HANA_PASSWORD` 与所有 `HANA_PASSWORD_ENV_*` 从 `process.env` 删除。
+- **只读环境**（`ACCESS=readonly`）：只拒绝持久写入（清单 `effects.mutates='persistent'`）；临时对象（节点预览
+  中间视图、`_CHKTMP`）与纯读放行；`hana_sql_execute` 由 `HANA_READONLY_SQL` 控制（`select-only` 下只允许
+  SELECT，拒绝 `FOR UPDATE` / `FOR SHARE` / `NEXTVAL`）。**单环境同样生效**。
+- **expectedEnvironment**：多环境下所有非纯读调用（`effects.mutates != none`，含临时对象）必须带当前环境标识；
+  门面索引的 `params` 已包含该字段。
+- **切换**：`hana_env_list` 发放一次性 `switchToken`（仅 stdio 且 switch 可达）；`hana_env_switch` 是 route-only、
+  HTTP 拒绝且不进索引；只影响之后的调用，已提交任务与在途调用仍绑定原环境；旧环境有运行中任务时进入
+  `task-draining`，任务/调用结束后回 `idle`；切换前会预检目标连接，目标有运行中任务时需
+  `acknowledgeRunningTasks=true`。
+- **清理与共享**：`HANA_LABEL` / `HANA_LABEL_ENV_*` / 旧前缀 `HANA_ENV_<NAME>_*` / JSON/YAML 配置文件均不支持
+  （单环境残留 `HANA_LABEL` 静默忽略，多环境出现即 `label_removed`）；加载后 `HANA_PASSWORD` 与所有
+  `HANA_PASSWORD_ENV_*` 从 `process.env` 删除；同一物理库（`host:port/dbName`）的多个环境标识共享对象锁、
+  临时校验登记与预览占用。
 
 ### 示例（三个环境）
 
@@ -170,10 +160,28 @@ HANA_ENV_SWITCHABLE=DEV,UAT,PROD
 如果环境间共用同一端口/账号，也没有“默认继承”：要么各自写 `_ENV_`，要么把策略键写成扁平共享值
 （连接参数不能共享）。
 
-### `.env` 加载陷阱
+### `.env` 加载规则
 
-多环境（出现任意 `_ENV_` 键）时服务**完全不读 `.env`**：多环境的连接/策略必须来自同一来源
-（`mcp.json` 的 `env` / shell / 容器注入）。单环境仍按原规则：扁平主机+用户+密码三件套齐备时跳过 `.env`。
+`.env` 只在**启动时进程环境还缺少配置**时作为回退读取；它是逐变量补充，不覆盖已有键。
+
+**何时读**（进程环境 = `mcp.json` 的 `env` / shell / 容器注入；启动时按顺序判断）：
+
+1. 已有任一**已识别参数**的 `_ENV_` 键 → **不读 `.env`**。
+2. 否则 `HANA_HOST` + `HANA_USER` + `HANA_PASSWORD` 都非空 → **不读 `.env`**。
+3. 否则读取：先 `<工作目录>/.env`，再 `<项目根>/.env`。
+
+**怎么读**：
+
+- 用 `process.loadEnvFile` 加载；它**不覆盖**进程环境里已存在的键，只补缺失项。
+- 每加载完一个文件检查一次扁平凭据三件套；三件套齐全就停止，不再加载下一个文件。
+- 加载结束后，配置解析看到的是“进程环境 + `.env` 补充”的合并结果。
+
+**边界**：
+
+- 多环境配置可以完全写在 `.env` 里；此时进程环境没有 `_ENV_` 键，`.env` 是唯一来源。
+- 进程环境已有 `_ENV_` 键时，`.env` 整个被跳过；即使 `.env` 里还有其它环境键也不会补进来。
+- 进程环境只有扁平策略键（如 `HANA_ACCESS`）而没有 `_ENV_` 键时，`.env` 仍会加载，可能出现“策略来自进程环境、连接来自 `.env`”的混源；多环境建议把连接与策略放在同一来源。
+- 多环境从 `.env` 加载且三件套始终不齐时，会继续尝试项目根 `.env`；两个文件的键按“先加载者优先”合并，建议只保留一个多环境 `.env`。
 
 ## 工具分组与可见性控制
 
@@ -187,10 +195,9 @@ HANA_ENV_SWITCHABLE=DEV,UAT,PROD
 | **sql** 直接执行（**默认关闭**） | 独立第七根工具：在 HANA 上直接执行任意 SQL（读/写/管理类）。**空 `HANA_TOOL_GROUPS` 不会启用它**；须显式 `HANA_TOOL_GROUPS=sql` 或 `HANA_TOOL_ALLOW=hana_sql_execute`。未启用时它不进 `tools/list`、不进任何门面描述/索引，提示里也不提及 | `hana_sql_execute` |
 
 > 分组（kind）是**权限层级**而非"行为画像"：稳定性诊断四件套、`hana_repo_changelist` 行为只读但归 admin；`hana_sql_analyze` 接受任意 SQL 但归 write。客户端注解（`readOnlyHint`）描述行为，两者不互相推导。**环境副作用另由清单的 `effects.mutates` 表达**（`none` / `transient` / `persistent`），不按 kind 推断。
->
 > `hana_view_validate` design 模式会短暂写入 `_CHKTMP` 临时对象，故整工具归 write；其环境口径是 `transient`（只读环境放行）。
->
 > **门面层不做限制**：六个门面在任何分组配置下都常驻 `tools/list`（只有显式 `HANA_TOOL_DENY` 命中门面 id、或 deny 掉它全部成员才会消失）。分组开关只决定**能力层**；索引/路由/提升/调用一律按**目标能力**的 kind 判。
+》
 
 ### 权限维度分工（三层正交）
 
@@ -208,39 +215,68 @@ HANA_ENV_SWITCHABLE=DEV,UAT,PROD
 - `HANA_TOOL_ALLOW`：强制启用（即便分组未启用），支持组名与工具名 glob。
 - `HANA_TOOL_DENY`：强制禁用（优先级最高），支持组名与 glob。
 
-> **没有别名层**：`MCP_TOOL_*` 不再识别；未识别的 `HANA_*` / `MCP_*` / `LOG_*` 变量会在启动日志告警（防拼写错误静默失效）。
+> **没有别名层**：`MCP_TOOL_*` 不再识别。服务**按需读取**已知变量：无关的 `HANA_*` / `MCP_*` / `LOG_*`
+> 变量不会被扫描或告警；拼错的键不会生效，但也不会阻断启动。
 >
 > 组名可直接用于 allow/deny（`read` / `write` / `admin` / `sql`），展开为该组全部工具名。例：`HANA_TOOL_GROUPS=read,write` + `HANA_TOOL_DENY=write` ⇒ 等价只读部署。
 
-### 直接执行 HANA SQL（hana_sql_execute）
+### 典型部署
 
-`sql` 组默认关闭：未显式启用时该能力对模型**完全不可见**（不注册、不进任何门面描述/索引、提示不提及）。
-启用方式：`HANA_TOOL_GROUPS` 里加 `sql`（如 `read,write,admin,sql`），或 `HANA_TOOL_ALLOW=hana_sql_execute`；`HANA_TOOL_DENY` 仍最高。
-它是**独立的第七个根工具**（`category=sql`，不属于任何业务门面），启用后直接出现在 `tools/list`，不需要先调门面提升。
-
-安全默认（规则层 + 服务层双重校验）：
-
-- **调用时机**：仅在用户明确要求执行 SQL 时调用；不用于探测、验证或替代专用工具。该约束写在工具说明里，服务端无法读取用户原始消息，属模型侧软约束；需要硬拦截请在客户端把该工具设为需人工确认。
-- **默认单条 + 单物理行**：多语句或换行符（`\n`/`\r`/U+2028/U+2029）被拒绝；`HANA_SQL_ALLOW_MULTI_STATEMENT=true` 同时解锁两者。
-  多语句在同一池连接上顺序执行，**有写**时服务端自动开事务（全部成功才 commit，失败 rollback，finally 恢复 `autoCommit=true`）。
-- **显式事务控制一律拒绝**：`BEGIN` / `COMMIT` / `ROLLBACK` / `SAVEPOINT` / `RELEASE` / `SET TRANSACTION`。
-- **修改会话状态的 `SET` 一律拒绝**（连接归还池后会污染后续调用，例如 `SET SCHEMA` 改变 `CURRENT_SCHEMA`）。
-- **管理类默认允许**：`CALL` / `GRANT` / `REVOKE` / `ALTER SYSTEM` / `RECONFIGURE` / `IMPORT` / `EXPORT` / `EXECUTE` 等不再有单独开关，直接受数据库账号权限约束；`EXPLAIN` 始终拒绝并提示改用 `hana_sql_analyze`；`DO` 匿名块明确不支持（请改用 `CALL` 或拆成多条语句）。
-- **`maxRows` / `timeoutMs` 是工具参数**：默认 500 行 / 60000ms，上限 10000 行 / 3600000ms；不是环境变量。
-- **部署级结果上限**：`HANA_SQL_MAX_RESULT_BYTES` / `HANA_SQL_MAX_STATEMENTS`（见上表）。SELECT 流式取行、到上限即关闭结果集；二进制值 base64 包装并限制单格大小；超限标记 `truncated` 并挂 `resultInfo`。
-- **`async=true`**：立即返回 `taskId`，用 `hana_task_get` 轮询终态（需 `read` 组可见；取消还需 `write` 组的 `hana_task_cancel`）；执行中的 SQL 无法中途取消。只启用 `sql` 组的部署不要使用 `async`。
-- **服务端不做 schema 级拦截**：不扫描 FROM/JOIN、不查 CURRENT_SCHEMA、不参与 `HANA_READ_SCHEMA` / 写 schema 白名单判定；能访问哪些对象由 HANA 账号权限决定。启用前请按最小权限原则使用专用数据库账号。
-- **审计不落 SQL 原文**：`capability-audit` 的 target 只记 `op: "sql"` + SQL 的 sha256 前 12 位 + 字符数。
-- **DDL 的固有风险**：HANA 可能隐式提交，多语句事务回滚不保证撤销已执行的 DDL；回执会如实提示。
-
-**典型部署形态：**
-
-- **只读分析师**：`HANA_TOOL_GROUPS=read` —— 可触达上限收窄到 read 档能力；`hana_diagnostics` 索引为空，`hana_modeling` 只剩 `hana_task_get`。
+- **只读分析师**：`HANA_TOOL_GROUPS=read` —— 可触达上限收窄到 read 档能力；`hana_diagnostics` 索引为空，
+  `hana_modeling` 只剩 `hana_task_get`。
 - **建模开发者**：`HANA_TOOL_GROUPS=read,write` —— admin 档不可达。
-- **需要直接执行 SQL**：`HANA_TOOL_GROUPS=read,write,admin,sql`（或 `HANA_TOOL_ALLOW=hana_sql_execute`）；再按需打开 `HANA_SQL_ALLOW_MULTI_STATEMENT`；`maxRows`/`timeoutMs` 在工具调用时传。
+- **需要直接执行 SQL**：`HANA_TOOL_GROUPS=read,write,admin,sql`（或 `HANA_TOOL_ALLOW=hana_sql_execute`）；
+  按需打开 `HANA_SQL_ALLOW_MULTI_STATEMENT`；`maxRows` / `timeoutMs` 在调用时传。
 - **关闭特定能力**：`HANA_TOOL_DENY=hana_view_delete` —— 索引、路由、提升都够不着。
 
 未知分组名（如 `HANA_TOOL_GROUPS=read,bogus`）启动即失败（fail-closed）。
+
+### 直接执行 HANA SQL（hana_sql_execute）
+
+`sql` 组默认关闭：未显式启用时该工具对模型**完全不可见**（不注册、不进索引/描述）。启用方式：
+`HANA_TOOL_GROUPS` 加 `sql`（如 `read,write,admin,sql`），或 `HANA_TOOL_ALLOW=hana_sql_execute`；
+`HANA_TOOL_DENY` 优先级最高。它是独立的第七个根工具（`category=sql`，不属于任何门面），启用后直接出现在
+`tools/list`，不需要先调门面提升。
+
+**语句分类与权限**
+
+| 类别 | 典型语句 | 默认行为 | 权限/控制 |
+|---|---|---|---|
+| 查询 `read` | `SELECT`、`WITH ... SELECT` | 允许 | 只读环境：`select-only` 允许，但 `FOR UPDATE` / `FOR SHARE` / `NEXTVAL` 拒绝；`deny` 全部拒绝。对象权限由 HANA 账号决定 |
+| 写数据 `dml` | `INSERT` / `UPDATE` / `DELETE` / `UPSERT` / `MERGE` | 允许 | 数据库账号权限；只读环境（`ACCESS=readonly`）拒绝 |
+| DDL | `CREATE` / `ALTER` / `DROP` / `TRUNCATE` / `RENAME` / `COMMENT`（非 USER/REMOTE/SYSTEM） | 允许 | 数据库账号权限；只读环境拒绝；DDL 可能隐式提交 |
+| 管理/调用 | `CALL` / `GRANT` / `REVOKE` / `ALTER SYSTEM` / `RECONFIGURE` / `IMPORT` / `EXPORT` / `EXECUTE`、`CREATE/ALTER/DROP USER、REMOTE、SYSTEM` | 允许 | 数据库账号权限；只读环境拒绝 |
+| 事务控制 | `BEGIN` / `COMMIT` / `ROLLBACK` / `SAVEPOINT` / `RELEASE` / `SET TRANSACTION` | 拒绝 | 规则层硬拒绝：连接池跨调用无法保证事务原子性 |
+| 会话状态 | `SET ...`（非 `SET TRANSACTION`） | 拒绝 | 规则层硬拒绝：会污染连接池后续调用 |
+| 执行计划 | `EXPLAIN ...` | 拒绝 | 改用 `hana_sql_analyze` |
+| 匿名块 | `DO ...` | 不支持 | 改用 `CALL` 或拆成多条语句 |
+| 无法判定 | 过程体、动态 SQL 等 | 拒绝 | 规则层硬拒绝（`sql_statement_unsupported`） |
+
+> **先做形状检查（与语句类型无关）**：多语句/多物理行默认拒绝；如需允许，需设置
+> `HANA_SQL_ALLOW_MULTI_STATEMENT=true`；单次语句条数受 `HANA_SQL_MAX_STATEMENTS` 限制。
+> 通过形状检查后，再按上表做语句分类与权限控制。
+
+**执行细节**
+
+- **多语句事务**：多语句在同一池连接上顺序执行；**有写**时服务端自动开事务（全部成功才 commit，失败 rollback，
+  结束后恢复 `autoCommit=true`）。
+- **不做 schema 级拦截**：不扫描 FROM/JOIN、不查 CURRENT_SCHEMA、不参与 `HANA_READ_SCHEMA` / 写 schema 白名单；
+  能访问哪些对象由 HANA 账号权限决定。请按最小权限原则使用专用数据库账号。
+- **DDL 风险**：HANA 可能隐式提交，多语句事务回滚不保证撤销已执行的 DDL；回执会如实提示。
+
+**结果与审计**
+
+- **`maxRows` / `timeoutMs` 是工具参数**：默认 500 行 / 60000ms，上限 10000 行 / 3600000ms；不是环境变量。
+- **部署级结果上限**：`HANA_SQL_MAX_RESULT_BYTES` / `HANA_SQL_MAX_STATEMENTS`。SELECT 流式取行、到上限即关闭
+  结果集；二进制值 base64 包装并限制单格大小；超限标记 `truncated` 并挂 `resultInfo`。
+- **审计不落 SQL 原文**：`capability-audit` 的 target 只记 `op: "sql"` + SQL 的 sha256 前 12 位 + 字符数。
+- **`async=true`**：立即返回 `taskId`，用 `hana_task_get` 轮询终态（需 `read` 组可见；取消还需 `write` 组的
+  `hana_task_cancel`）；执行中的 SQL 无法中途取消。只启用 `sql` 组的部署不要使用 `async`。
+
+**调用时机（软约束）**
+
+仅在用户明确要求执行 SQL 时调用；不用于探测、验证或替代专用工具。该约束写在工具说明里，服务端无法读取
+用户原始消息，属模型侧软约束；需要硬拦截请在客户端把该工具设为需人工确认。
 
 ### 调用方档案（MCP_PROFILES）
 
@@ -271,36 +307,38 @@ MCP_HTTP_TOKENS="alice:<token>:dev,bob:<token>:analyst"        # 第三段 = 该
 | **stdio**（默认） | 不设置 `MCP_HTTP_PORT` | Claude Desktop / Cursor / VS Code 等本地客户端 |
 | **Streamable HTTP** | 设置 `MCP_HTTP_PORT`（如 `3000`）后 `npm start`（或 `node dist/index.js`） | 远程/容器化部署、多客户端共享实例 |
 
-HTTP 模式要点：
+**HTTP 要点**
 
-- 端点 `http://<host>:<port>/mcp`（仅此路径，其余 404）；无状态按请求服务（2025/2026 协议版本客户端均可接入），连接池共享。
-- **无会话**：每个请求新建协议实例、无 `Mcp-Session-Id`、无会话级状态，因此不存在跨会话串扰与会话劫持面；隔离粒度 = 单个服务进程：所有客户端共享同一连接池、同一工具可见性配置、同一可写包白名单。
-- **安全默认（fail-closed）**：仅绑定 `127.0.0.1`，Host/Origin 白名单默认仅本机名。对外暴露需同时：`MCP_HTTP_HOST=0.0.0.0` + `MCP_HTTP_ALLOWED_HOSTS` 放行对外主机名（浏览器类客户端再放行 `MCP_HTTP_ALLOWED_ORIGINS`）。
-- **认证**：设置 `MCP_HTTP_TOKENS`（或向后兼容的 `MCP_HTTP_TOKEN`）后所有请求强制 Bearer Token 校验（缺失/不匹配 → 401）；未设置时回环监听即为访问边界。**对外监听且无 Token 时默认拒绝启动**，确需如此须显式 `MCP_HTTP_ALLOW_ANONYMOUS=true`。
-- **多环境 + HTTP**：无会话 HTTP 不能用进程级 active；必须 `MCP_HTTP_TOKENS` + `MCP_HTTP_CLIENT_ENVS`（每个 Token 绑定一个环境标识）。请求入口把该 Token 的 runtime 钉进 ALS，工具/审计/任务都按它执行；`hana_env_switch` 在 HTTP 下拒绝，且不会出现在门面索引/描述中。多环境 HTTP 缺少绑定或存在未绑定 Token → 启动失败。单环境 HTTP 不需要该项。
-- 请求体上限 10MB（按字节计）：声明的 `Content-Length` 超限直接 413；流式上传同样按字节计数、本地拦截。
-- **客户端身份归因**：`MCP_HTTP_TOKENS` 把每个 Token 映射为独立 `clientId`，随请求上下文贯穿到工具层；每次工具调用返回的 envelope 带 `clientId`（stdio 无此字段）；每个写操作在服务端日志留一条审计记录（`clientId` + 包 + 对象）。
-- **并发与锁**（进程内 keyed lock，按「包/对象」串行化）：
-  - **新建**：进程内按对象互斥，并发同名创建后者显式报冲突。**已知例外**：XS PUT 是 create-or-update，跨进程同名创建 = last-write-wins。
-  - **更新**：锁内先读基线（读时取 ETag），再读内容、PUT；并发改动以 412 显式冲突返回。
-  - **激活**：锁内「读元数据取基线 → 读内容 → 带 If-Match 的 PUT」在同一临界区。
-  - **删除**：锁内取基线后删除；正确基线 → 204、陈旧基线 → 412、对象已不存在 → 404。
-  - **设计时校验**：临时对象 `_CHKTMP` 名带短哈希（总长 ≤29）；只删除本次调用创建过的临时名——重名时拒绝执行（不删不改）。
-  - **导入**：按目标文件名加锁；存在性检查仅把 404 视为不存在；写入后回读校验。**跨进程竞态无服务端前置**，属已知例外。
-  - **冲突回执**：412 与 delete 的 404 返回业务失败信封（`success=false` + 机读码），412 带 `raw.conflict`（`currentETag` 是冲突时点补读值，不是新基线）。成功回执带新基线 `etag` 与 `etagSource`（`response-header` / `read-back` / `unavailable`）。
-  - **已知边界**：同一设计时文件并发写可能以 555 写错误被拒（写未发生），回执不带 `raw.conflict`；调用方应重读最新版本后重放。
-  - **预演与破坏性判定**：`hana_view_update(dryRun=true)` 只读预演（结构 diff + 影响半径 + 破坏性判定，零写入）；破坏性变更须声明 `migration.strategy`（`cast` / `preserve_column` / `move` / `acknowledge_dependents`），未声明 ⇒ `migration_required` 拒绝且零写入。声明只被记录，不触发自动迁移。
-- **超时与资源治理**：
-  - XS REST 全部请求都有超时（登录/取 CSRF 更短）；xfer 导入导出单独放宽：`HANA_XS_TIMEOUT_MS` / `HANA_XS_XFER_TIMEOUT_MS`。
-  - 写路径五条 SQL 语句有语句超时（`HANA_SQL_TIMEOUT_MS`）；不设全局默认是有意的（`hana_sql_analyze` 与元数据搜索是合法长语句）。
-  - 连接池上限/排队超时/排队上限可配（默认 4 / 30s / 64）；部署建议：每个代理一个进程，N 个代理 = N×`HANA_POOL_MAX` 条连接。
-  - 服务端激活有进程内并发信号量（`HANA_ACTIVATION_CONCURRENCY`，默认 2）：本 SPS 写入即激活，保护面是**所有会触发激活的写**；import 上传通道、建包 POST 与 DELETE 不在覆盖内。
-  - keyed lock 排队等待超时默认 60s：超时者不执行该次写。
-- 视图定义缓存：TTL 60s + 容量 200 条 LRU；写路径成功后立即失效本进程缓存（跨进程由 `VERSION_ID` 轻校验兜底）。
-- 上述锁均为**进程内**：多进程/多实例部署同一 HANA 时需外部串行化（本服务设计为单实例）。
-- **多代理编排建议**：按依赖连通分量切分，一个分量一个写者；写者数量 2–4 个后集成开销上升；冲突后按 REFRESH（412 的 `currentETag` 重读）→ REPLAN 处理。
-- 未内置 OAuth 等完整认证体系：暴露到网络时配置 `MCP_HTTP_TOKENS` 并置于反向代理 / VPN / 防火墙之后。
-- 日志走 stderr，不污染 HTTP 协议通道；401 日志不记录 Authorization 头内容。
+- 端点 `http://<host>:<port>/mcp`（仅此路径）；无状态按请求服务，连接池共享。
+- **无会话**：每请求新建协议实例，无 `Mcp-Session-Id`；隔离粒度 = 单进程，所有客户端共享连接池、工具可见性与可写包白名单。
+- **安全默认**：仅绑定 `127.0.0.1`，Host/Origin 默认仅本机名；对外暴露需 `MCP_HTTP_HOST=0.0.0.0` + `MCP_HTTP_ALLOWED_HOSTS`（浏览器再放行 `MCP_HTTP_ALLOWED_ORIGINS`）。
+- **认证**：`MCP_HTTP_TOKENS`（或旧 `MCP_HTTP_TOKEN`）启用 Bearer 校验，缺失/不匹配 → 401；对外监听且无 Token 默认拒绝启动，确需如此显式 `MCP_HTTP_ALLOW_ANONYMOUS=true`。
+- **多环境**：HTTP 下不能用进程级 active，必须 `MCP_HTTP_TOKENS` + `MCP_HTTP_CLIENT_ENVS`，为每个 Token 绑定一个环境标识（即 `_ENV_<XXXX>` 的 `<XXXX>`，大小写不敏感）；`hana_env_switch` 拒绝且不进索引；缺少绑定或存在未绑定 Token → 启动失败。单环境不需要该项。
+- 请求体上限 10MB（按字节计）；`Content-Length` 超限直接 413。
+- **身份归因**：`MCP_HTTP_TOKENS` 把 Token 映射为 `clientId`，envelope 带 `clientId`（stdio 无）；写操作日志留 `clientId` + 包 + 对象。
+
+**并发与锁（进程内 keyed lock，按包/对象串行化）**
+
+- 写路径按包/对象/目标文件串行化；更新/激活在锁内取 ETag 基线，并发改动返回 412。
+- 设计时校验的 `_CHKTMP` 名带短哈希（≤29），只删本次创建过的临时名。
+- 412 / delete 404 返回业务失败信封（412 带 `raw.conflict`）；成功回执带 `etag` + `etagSource`。
+- 已知例外：跨进程同名创建 last-write-wins；同一设计时文件并发写可能 555（写未发生）；导入跨进程竞态无服务端前置。
+- `dryRun=true` 只读预演；破坏性变更须声明 `migration.strategy`，否则 `migration_required` 且零写入。
+- 锁均为进程内；多进程/多实例需外部串行化。
+
+**超时与资源**
+
+- XS REST 全部请求有超时（登录/CSRF 更短），xfer 单独放宽：`HANA_XS_TIMEOUT_MS` / `HANA_XS_XFER_TIMEOUT_MS`。
+- 写路径 SQL 有语句超时 `HANA_SQL_TIMEOUT_MS`，不设全局默认。
+- 池上限/排队超时/排队上限默认 4 / 30s / 64；建议一代理一进程，N 个代理 = N×`HANA_POOL_MAX` 连接。
+- 激活有进程内信号量（`HANA_ACTIVATION_CONCURRENCY`，默认 2）；import 上传、建包 POST/DELETE 不在覆盖内。
+- keyed lock 排队超时默认 60s，超时不执行。
+
+**缓存与多代理**
+
+- 视图定义缓存 60s TTL + 200 条 LRU；写成功后立即失效本进程缓存。
+- 多代理：按依赖连通分量切分，一个分量一个写者；写者 2–4 个后集成开销上升；冲突后 REFRESH（412 的 `currentETag` 重读）→ REPLAN。
+- 未内置 OAuth；暴露网络时用 `MCP_HTTP_TOKENS` + 反向代理/VPN/防火墙。日志走 stderr，401 不记录 Authorization 头。
 
 ```bash
 MCP_HTTP_PORT=3000 MCP_HTTP_TOKENS='shared:your-long-random-token' node dist/index.js
@@ -373,7 +411,6 @@ MCP_HTTP_PORT=3000 MCP_HTTP_TOKENS='shared:your-long-random-token' node dist/ind
 | `env_key_conflict` | 同一参数存在仅大小写不同的两个 _ENV_ 键 | 只保留一个键，或把两个键统一成同一大小写。 |
 | `env_key_unknown` | HANA_ENV_START / HANA_ENV_SWITCHABLE / 切换请求引用了未配置的环境标识 | 先调用 hana_env_list（或看启动摘要）确认可用环境标识；匹配大小写不敏感。 |
 | `process_param_scoped` | 进程级参数被写成了 _ENV_ 形式 | 进程级参数只能扁平写；检查 HANA_TOOL_* / MCP_* / LOG_LEVEL / HANA_TIMEZONE 等是否误加 _ENV_。 |
-| `unknown_scoped_param` | _ENV_ 前缀引用了未注册的参数 | 对照本文件的参数作用域表使用已登记的参数名；拼写错误不会生效。 |
 | `missing_connection_param` | 某个多环境缺少连接参数 | 为该环境补 HANA_<PARAM>_ENV_<XXXX>；HOST/PORT/USER/PASSWORD 没有共享回退。 |
 | `env_start_required` | 多环境未指定启动环境 | 设置 HANA_ENV_START=<环境标识>；只有一个环境时可省略。 |
 | `env_switchable_in_single` | 单环境部署却配置了可切换列表 | 删除 HANA_ENV_SWITCHABLE，或补充 _ENV_ 变量进入多环境模式。 |
