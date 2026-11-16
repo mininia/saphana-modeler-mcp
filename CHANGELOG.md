@@ -4,13 +4,11 @@
 >
 > 约定：每次提交前把变化补到对应版本条目下；每条 1–3 行，只写对外可见变化。
 
-## 1.4.4 - 2026-11-13
+## 1.4.5 - 2026-11-16
 
-- 修复多环境参数配置无法按预期生效的问题：连接参数改为严格按环境解析（`HANA_<PARAM>_ENV_<XXXX>`，扁平连接键直接忽略、不再隐式扩散），策略/授权参数支持扁平共享 + `_ENV_` 按环境覆盖（含 `HANA_WRITE_PACKAGES_ENV_*` / `HANA_READ_SCHEMA_ENV_*` / `HANA_READONLY_SQL_ENV_*`）。
-- 多环境环境标识直接取 `_ENV_<XXXX>` 的 `<XXXX>`，大小写不敏感；`HANA_LABEL` / `HANA_LABEL_ENV_*` 移除（单环境残留静默忽略，多环境报 `label_removed`）。
-- 新增错误码注册表、CONFIG.md《参数作用域》/《错误码速查》与 `scripts/migrate-env-config.mjs --check` 迁移报告；多环境不再读取 `.env`；旧多环境配置需按迁移报告调整。
-- 环境变量改为**按需读取**：不再扫描/告警无关的 `HANA_*` / `MCP_*` / `LOG_*` 变量；未知 `_ENV_` 键直接忽略（已知键的非法取值仍启动失败）。
-- 规避 `@sap/hana-client` 的 hdbpipe 未捕获 socket 错误：驱动内部 IPC 管道偶发 `ETIMEDOUT` 时不再整进程崩溃，改为记录错误并让 HANA 调用快速返回 `hana_client_pipe_unavailable`（重启 server 即可恢复）。
+- 修复多环境参数配置无法按预期生效：连接参数严格按 `HANA_<PARAM>_ENV_<XXXX>` 解析，扁平连接键忽略；策略/授权参数支持扁平共享 + `_ENV_` 按环境覆盖。
+- 环境标识取 `_ENV_<XXXX>` 的 `<XXXX>`（大小写不敏感），移除 `HANA_LABEL`；环境变量改为按需读取，未知 `_ENV_` 键忽略。
+- `package-lock.json` 依赖源改用 npmjs，修复 npm 12 安装报 `EALLOWREMOTE`；规避 `@sap/hana-client` 内部 IPC 管道未捕获错误导致的进程崩溃。
 
 ## 1.4.3 - 2026-11-13
 
