@@ -19,11 +19,21 @@ export const sqlAnalyzeCapabilities = {
     category: 'diagnostics',
     kind: 'write',
     effects: { plan: planSqlAnalyze, destructive: false, idempotent: false, mutates: 'persistent' },
+    routing: {
+      intent: '分析一条 SELECT/WITH 的执行计划与性能',
+      whenToUse: ['用户明确问执行计划、慢 SQL、算子或性能', '需要估计计划或真执行后的算子分析'],
+      notFor: ['权限探测、预览失败诊断（用 hana_data_preview_diagnose）', '只读环境会被 env_readonly 拦截'],
+      priority: 'advanced',
+      requires: 'access=readwrite（EXPLAIN 计划表属持久写入）',
+      constraints: ['sql 与 planId 二选一；只读环境不可用'],
+      exampleArgs: { sql: 'SELECT * FROM "_SYS_BIC"."PKG/VIEW" LIMIT 5', analyze: false },
+    },
     title: 'SQL 分析（执行计划）',
     // 三态命名、PlanViz 六栏与降级口径见 rules=sql_analyze；这里保留取数方式、默认输出与护栏。
     description:
-      'SQL 分析：对一条 SELECT/WITH 给出可读的分析结论（默认输出，不需要自己读算子表）。\n' +
+      'SQL 分析：分析一条 SELECT/WITH 的执行计划与性能（默认给可读结论，不需要自己读算子表）。\n' +
       '三种取数方式（sql 与 planId 二选一）：① sql=只编译不执行，给估计计划；② planId=分析计划缓存里已执行过的语句（需 OPTIMIZER ADMIN）；③ sql + analyze=true=先真执行再分析（默认走 PlanViz 通道拿逐算子实测；通道不可用时降级为估计计划 + 语句级统计，source=sqlExecuted）。\n' +
+      '不用于权限探测/预览失败：权限问题用 hana_data_preview_diagnose；只读环境（access=readonly）会被 env_readonly 拦截。\n' +
       '返回：conclusion（一句话结论 + 逐条发现[risk/warn/info，带依据与建议] + 统计）；默认不返回原始执行计划，raw=true 才附算子明细（verbose=true 再加 OPERATOR_DETAILS/PROPERTIES）。\n' +
       `护栏：只允许单条 SELECT/WITH、不返回数据行、单次执行最多 ${ANALYZE_EXECUTION_TIMEOUT_MS / 60_000} 分钟、最多取 ${ANALYZE_MAX_ROWS} 行即关闭结果集；语句内 schema 须在服务端允许范围内（sql/analyze 模式未限定表名按当前用户默认 schema 判定，planId 模式按条目编译时的 schema 判定）。\n` +
       '长分析可加 async=true：立即返回 taskId，用 hana_task_get 轮询（不受客户端单次调用超时限制）；执行中的 SQL 无法取消。\n' +

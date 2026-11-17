@@ -107,6 +107,10 @@ export interface DiagnosisBrief {
     code?: string;
     message?: string;
   }>;
+  /** SQL 结构化权限（SQL analytic privilege）检测结果（仅视图注册该检查时 checked=true） */
+  structuredPrivilege?: StructuredPrivilegeStatus;
+  /** 可执行的下一步建议（精简模式也返回；默认缺省） */
+  nextActions?: string[];
   /** 是否可预览（综合判定） */
   canPreview: boolean;
 }
@@ -133,6 +137,52 @@ export interface AnalyticPrivilegeStatus {
   detail: string;
 }
 
+/** 一条 SQL 结构化权限（SQL analytic privilege）的有效性条目 */
+export interface StructuredPrivilegeEntry {
+  /** 层级中对象所在 schema（通常是 _SYS_BIC 或其上游） */
+  schemaName?: string;
+  /** 层级中对象名（如 "ZDEMO.ZDEMO_MGF/ZDEMO02_CV008"） */
+  objectName?: string;
+  privilegeSchemaName?: string;
+  privilegeName?: string;
+  /** APPLIED / NOT AUTHORIZED / NOT GRANTED / NO MATCHING ATTRIBUTE / NO FILTER VALUES FOUND（HANA 原值） */
+  status?: string;
+  /** 生效过滤器（截断展示） */
+  filter?: string;
+}
+
+/**
+ * SQL 结构化权限（SQL analytic privilege）检测结果。
+ *
+ * 与经典 ANALYTICAL_PRIVILEGE 分开：HANA 2.0 的 BW 视图常用
+ * `applyPrivilegeType="SQL_ANALYTIC_PRIVILEGE"` 注册 **structured privilege** 检查，
+ * 此时 `checkAnalyticPrivileges` 为 false 并不代表「无需分析权限」。
+ */
+export interface StructuredPrivilegeStatus {
+  /** 是否检测了 SQL 结构化权限（仅 applyPrivilegeType=SQL_ANALYTIC_PRIVILEGE 时为 true） */
+  checked: boolean;
+  /** 查询是否成功；false = 无法判定（不是「未授权」） */
+  determined: boolean;
+  /** false = 确认缺授权或状态异常；无法判定时为 true（不阻断，留给运行时探测） */
+  passed: boolean;
+  /** APPLIED 条目数；0 = 已确认没有任何生效授权；无法判定时缺省 */
+  grantedCount?: number;
+  /** 按 HANA STATUS 聚合的计数（便于一眼看出 NOT AUTHORIZED / NOT GRANTED / NO MATCHING ATTRIBUTE 等） */
+  statusCounts?: Record<string, number>;
+  /**
+   * 没有 APPLIED 授权且状态为 NOT AUTHORIZED / NOT GRANTED 的对象（按层级中的 schema.object 去重）。
+   * 这是“哪个对象没有权限”的机器可读答案；根对象在其中时优先看根对象。
+   */
+  deniedObjects?: string[];
+  /** 有效条目（按 HANA 返回顺序；不含 UNCHECKED——未受结构化权限保护的对象只计数在 statusCounts） */
+  privileges: StructuredPrivilegeEntry[];
+  /** 是否因 200 条上限被截断 */
+  truncated?: boolean;
+  /** 设计时 XML 的 applyPrivilegeType 原值 */
+  applyPrivilegeType?: string;
+  detail: string;
+}
+
 export interface ViewActivationStatus {
   exists: boolean;
   activated: boolean;
@@ -156,6 +206,8 @@ export interface DiagnosisReport {
   baseTables?: BaseTableAccess[];
   /** 分析权限检测结果（视图受分析权限保护时） */
   analyticPrivilege?: AnalyticPrivilegeStatus;
+  /** SQL 结构化权限（SQL analytic privilege）检测结果（仅 applyPrivilegeType=SQL_ANALYTIC_PRIVILEGE 时检测） */
+  structuredPrivilege?: StructuredPrivilegeStatus;
   /** 精简结果（verbose=false 时填）：聚焦上游不可达 + 分析权限两个核心结论 */
   brief?: DiagnosisBrief;
   summary: {
@@ -255,6 +307,51 @@ export async function diagnosePreview(
     hints.push('若仅需排障验证，可临时让 DBA 授予该用户覆盖本视图的分析权限，或用一个已分配分析权限的账号验证');
   }
 
+  // 4b. SQL 结构化权限（SQL analytic privilege）：HANA 2.0 的 BW 视图常用
+  //     applyPrivilegeType=SQL_ANALYTIC_PRIVILEGE 注册 structured privilege 检查；
+  //     此时 checkAnalyticPrivileges=false 只表示 XML-based AP 未启用，不代表无需分析权限。
+  const structuredPrivilege = await checkStructuredPrivilege(
+    pool,
+    packageId,
+    objectName,
+    analyticCheck.applyPrivilegeType,
+    analyticCheck.kind !== 'undetermined',
+    verbose ? checks : [],
+  );
+  const structuredMissing =
+    structuredPrivilege.checked && structuredPrivilege.determined && !structuredPrivilege.passed;
+  const nextActions: string[] = [];
+  if (structuredMissing) {
+    if (verbose) {
+      blockers.push(
+        `视图注册了 SQL 分析权限检查（applyPrivilegeType=SQL_ANALYTIC_PRIVILEGE），但 ${structuredPrivilege.detail}`,
+      );
+      hints.push(
+        '由 BW 管理员/DBA 授予覆盖该视图的 STRUCTURED PRIVILEGE（SQL analytic privilege）；HANA 层 GRANT SELECT 不能替代',
+      );
+      hints.push(
+        '若已有授权仍失败，检查 SYS.EFFECTIVE_STRUCTURED_PRIVILEGES 的 STATUS：' +
+          'NOT AUTHORIZED=命中检查但未获授权；NOT GRANTED=未授予；NO MATCHING ATTRIBUTE=过滤器属性不在视图；NO FILTER VALUES FOUND=动态过滤器无值',
+      );
+    }
+    nextActions.push('由 BW 管理员/DBA 授予覆盖该视图的 STRUCTURED PRIVILEGE（SQL analytic privilege）');
+    nextActions.push(
+      '检查 SYS.EFFECTIVE_STRUCTURED_PRIVILEGES 的 STATUS：NOT AUTHORIZED / NOT GRANTED / NO MATCHING ATTRIBUTE / NO FILTER VALUES FOUND',
+    );
+    if (structuredPrivilege.deniedObjects?.length) {
+      nextActions.push(
+        `优先处理未授权对象：${structuredPrivilege.deniedObjects.slice(0, 3).join('、')}` +
+          (structuredPrivilege.deniedObjects.length > 3 ? ` 等 ${structuredPrivilege.deniedObjects.length} 个` : ''),
+      );
+    }
+    nextActions.push(
+      '上游逐个确认用 hana_data_preview_diagnose(channel=direct)；不要用 hana_data_preview 取数验证（宽视图按 SELECT * 投影会慢）',
+    );
+  } else if (structuredPrivilege.checked && !structuredPrivilege.determined) {
+    if (verbose) hints.push(`SQL 结构化权限不可判定：${structuredPrivilege.detail}`);
+    nextActions.push('SQL 结构化权限不可判定：用 DBA 账号或 HANA Authorization Dependency Viewer 核对');
+  }
+
   // 5 & 6. 运行时实测 + 上游实测：两者相互独立，并行执行避免串行往返。
   //   - 运行时实测（runtimeProbe）：探测 _SYS_BIC."包/视图" 是否真能 SELECT（金标准）。仅对象已激活时探测。
   //   - 上游实测（upstream）：derived 通道精简模式追溯 XML 叶子数据源并实测可达性。
@@ -307,16 +404,76 @@ export async function diagnosePreview(
             `错误码 258/2950：设计时 XML 读不到，分析权限保护与否不可判定（${analyticCheck.detail}）——` +
               '先按 _SYS_BIC SELECT、上游对象可访问性逐项排查',
           );
+        } else if (structuredMissing) {
+          // 结构化权限缺失已在 4b 写入 blocker/hints，这里不再重复泛化提示
+        } else if (structuredPrivilege.checked && !structuredPrivilege.determined) {
+          hints.push(
+            `错误码 258/2950：SQL 结构化权限不可判定（${structuredPrivilege.detail}）——` +
+              '用 DBA 账号或 HANA Authorization Dependency Viewer 核对',
+          );
+        } else if (structuredPrivilege.checked && structuredPrivilege.determined && structuredPrivilege.passed) {
+          hints.push(
+            '错误码 258/2950：SQL 结构化权限检查已通过；已排除本工具能建模的根因（schema SELECT、经典分析权限、SQL 结构化权限、上游可达性）——按未建模根因排查',
+          );
         } else {
           hints.push('错误码 258/2950 通常为权限不足：检查 _SYS_BIC SELECT、分析权限、以及上游对象的可访问性');
         }
       }
     }
     if (runtimeProbe?.accessible) {
-      // 实测可达：清除前面因分析权限「推断未授权」产生的 blocker（实测成功才是金标准）
+      // 实测可达：清除前面因分析权限/结构化权限「推断未授权」产生的 blocker（实测成功才是金标准）
       const apBlockIdx = blockers.findIndex((b) => b.includes('视图受分析权限保护'));
       if (apBlockIdx >= 0) blockers.splice(apBlockIdx, 1);
+      const spBlockIdx = blockers.findIndex((b) => b.includes('SQL 分析权限检查'));
+      if (spBlockIdx >= 0) blockers.splice(spBlockIdx, 1);
+      // 同理，不要把「补结构化权限」作为下一步：运行时已证明可查，元数据推断可能是 stale 的
+      for (let i = nextActions.length - 1; i >= 0; i -= 1) {
+        if (nextActions[i].includes('STRUCTURED PRIVILEGE') || nextActions[i].includes('SQL 结构化权限')) {
+          nextActions.splice(i, 1);
+        }
+      }
     }
+  }
+
+  if (upstreamInaccessible.length > 0) {
+    const names = upstreamInaccessible.slice(0, 3).map((u) => u.table);
+    nextActions.push(
+      `先核对上游不可达对象：${names.join(', ')}${upstreamInaccessible.length > 3 ? ' 等' : ''}` +
+        '（其权限错误可能与本视图的结构化权限/分析权限同源）',
+    );
+    nextActions.push(
+      '对不可达上游逐个调用 hana_data_preview_diagnose（channel=direct/derived）确认其自身缺的是结构化权限还是对象权限',
+    );
+  }
+
+  // 7. 「所有能建模的根因都排除，但运行时仍 258/2950」：明确报未建模根因，不再给泛化提示。
+  //    精简模式没有 checks 明细，用 brief 字段（AP/结构化/上游）做同口径判定。
+  const permissionFailure =
+    runtimeProbe !== undefined &&
+    !runtimeProbe.accessible &&
+    isPermissionError({ code: runtimeProbe.code, message: runtimeProbe.message ?? '' }, INSUFFICIENT_PRIVILEGE_CODES);
+  const modeledNotExcluded =
+    checks.some((c) => !c.passed) ||
+    upstreamInaccessible.length > 0 ||
+    (analyticPrivilege?.protectedByAnalyticPrivilege === true && analyticPrivilege.passed === false) ||
+    structuredMissing ||
+    (analyticCheck.kind === 'unprotected' && analyticCheck.declaredApplyPrivilegeType !== undefined) ||
+    analyticCheck.kind === 'undetermined' ||
+    (structuredPrivilege.checked && !structuredPrivilege.determined);
+  if (permissionFailure && !modeledNotExcluded) {
+    if (verbose) {
+      blockers.push(
+        '已排除本工具能建模的根因（schema SELECT、经典分析权限、SQL 结构化权限、上游可达性、过程 EXECUTE），' +
+          '但运行时仍报权限错误——存在未建模根因',
+      );
+      hints.push(
+        '用 HANA Authorization Dependency Viewer 或错误 guid 查缺失授权；重点检查视图 owner 对上游对象的 GRANT OPTION、' +
+          'SQL SECURITY/definer 语义、对象级 SELECT/结构化权限',
+      );
+    }
+    nextActions.push(
+      '已排除本工具能建模的根因；用 HANA Authorization Dependency Viewer 或错误 guid 查未建模授权（对象级/SQL SECURITY/owner GRANT OPTION）',
+    );
   }
 
   // 组装 brief（精简结论）：上游不可达 + 分析权限 + 运行时可达 + canPreview
@@ -329,6 +486,8 @@ export async function diagnosePreview(
     // 实测未执行（激活状态不可判定 / 未激活）时缺省：不把「没测」写成「不可达」（评审 #1118 同型失配）
     ...(runtimeProbe !== undefined ? { runtimeAccessible: runtimeProbe.accessible } : {}),
     upstreamInaccessible,
+    structuredPrivilege,
+    ...(nextActions.length > 0 ? { nextActions } : {}),
     // canPreview 判定：运行时实测可达（金标准）且无上游不可达。
     // 分析权限「受保护 + 0 授权」只是设计时推断出的「疑似缺权限」，实测可达即证明可查，故不参与此判定
     // ——运行时探测不可达时 canPreview 已为假，无需再叠加推断；结论由 brief.analyticPrivilege 独立给出。
@@ -344,6 +503,7 @@ export async function diagnosePreview(
     checks,
     baseTables,
     analyticPrivilege,
+    structuredPrivilege,
     brief,
     summary: { canPreview: brief.canPreview, blockers, hints },
     triggeredBy: opts.triggeredBy,
@@ -824,9 +984,9 @@ async function probeRuntimeAccess(pool: HanaPool, packageId: string, objectName:
  * - 'protected'：checkAnalyticPrivileges=true，附授权数检测状态。
  */
 type AnalyticPrivilegeOutcome =
-  | { kind: 'undetermined'; detail: string }
-  | { kind: 'unprotected'; declaredApplyPrivilegeType?: string }
-  | { kind: 'protected'; status: AnalyticPrivilegeStatus };
+  | { kind: 'undetermined'; detail: string; applyPrivilegeType?: string }
+  | { kind: 'unprotected'; declaredApplyPrivilegeType?: string; applyPrivilegeType?: string }
+  | { kind: 'protected'; status: AnalyticPrivilegeStatus; applyPrivilegeType?: string };
 
 /** brief 的分析权限子对象（评审 #1118）：不可判定时不写 protected=false/grantedCount=0 这类肯定值 */
 function briefAnalyticPrivilege(check: AnalyticPrivilegeOutcome): DiagnosisBrief['analyticPrivilege'] {
@@ -895,8 +1055,8 @@ async function checkAnalyticPrivilege(
         : '无需分析权限',
     });
     return declaredAnalyticPrivilege
-      ? { kind: 'unprotected', declaredApplyPrivilegeType: applyPrivilegeType }
-      : { kind: 'unprotected' };
+      ? { kind: 'unprotected', declaredApplyPrivilegeType: applyPrivilegeType, applyPrivilegeType }
+      : { kind: 'unprotected', applyPrivilegeType };
   }
 
   // 查当前用户被授予的 ANALYTICAL_PRIVILEGE 条数（EFFECTIVE_PRIVILEGES 含角色继承的）
@@ -919,6 +1079,7 @@ async function checkAnalyticPrivilege(
     });
     return {
       kind: 'protected',
+      applyPrivilegeType,
       status: {
         protectedByAnalyticPrivilege: true,
         applyPrivilegeType,
@@ -935,7 +1096,168 @@ async function checkAnalyticPrivilege(
     checks.push({ item: '分析权限', required: 'ANALYTICAL_PRIVILEGE 授权', passed: true, detail });
     return {
       kind: 'protected',
+      applyPrivilegeType,
       status: { protectedByAnalyticPrivilege: true, applyPrivilegeType, checkAnalyticPrivileges, passed: true, detail },
     };
   }
+}
+
+/**
+ * SQL 结构化权限（SQL analytic privilege）检测。
+ *
+ * 触发条件：设计时 XML 的 `applyPrivilegeType="SQL_ANALYTIC_PRIVILEGE"`。此时
+ * `checkAnalyticPrivileges` 为 false 只表示 **XML-based** 分析权限未启用，不代表「无需分析权限」——
+ * HANA 2.0 的 BW 视图常用 structured privilege 做运行时授权（与 XML-based AP 互斥）。
+ *
+ * 查询 `SYS.EFFECTIVE_STRUCTURED_PRIVILEGES`（该视图要求 ROOT_SCHEMA_NAME / ROOT_OBJECT_NAME /
+ * USER_NAME 三个等值谓词）。STATUS 语义：
+ * - APPLIED：权限已生效；
+ * - NOT AUTHORIZED：命中检查但未获授权（该对象没有 APPLIED 条目；官方文档未列此值，实测环境会返回）；
+ * - NOT GRANTED：未授予；
+ * - NO MATCHING ATTRIBUTE：权限过滤器引用了视图里不存在的属性（配置问题）；
+ * - NO FILTER VALUES FOUND：动态过滤器没取到值（配置/数据问题）。
+ * 无行 = 没有适用于该根对象的结构化权限——视图已注册 SQL AP 检查时通常意味着缺授权。
+ *
+ * 无法查询（权限/版本不支持）时返回 `determined:false` 且 `passed:true`：不把「未知」渲染成「缺授权」，
+ * 最终以运行时探测为准。
+ */
+export async function checkStructuredPrivilege(
+  pool: HanaPool,
+  packageId: string,
+  objectName: string,
+  applyPrivilegeType: string | undefined,
+  definitionAvailable: boolean,
+  checks: DiagnosisCheck[],
+): Promise<StructuredPrivilegeStatus> {
+  if (!definitionAvailable) {
+    const detail = '设计时 XML 读不到，无法判定视图是否注册 SQL 结构化权限';
+    checks.push({ item: 'SQL 结构化权限（不可判定）', required: '读取设计时 XML', passed: true, detail });
+    return { checked: false, determined: false, passed: true, privileges: [], applyPrivilegeType, detail };
+  }
+
+  const type = applyPrivilegeType?.toUpperCase();
+  if (type !== 'SQL_ANALYTIC_PRIVILEGE') {
+    return {
+      checked: false,
+      determined: true,
+      passed: true,
+      privileges: [],
+      applyPrivilegeType,
+      detail: applyPrivilegeType
+        ? `视图未注册 SQL 分析权限检查（applyPrivilegeType=${applyPrivilegeType}）`
+        : '设计时 XML 未提供 applyPrivilegeType，未检测 SQL 结构化权限',
+    };
+  }
+
+  type StructuredRow = {
+    SCHEMA_NAME?: string;
+    OBJECT_NAME?: string;
+    STRUCTURED_PRIVILEGE_SCHEMA_NAME?: string;
+    STRUCTURED_PRIVILEGE_NAME?: string;
+    STRUCTURED_PRIVILEGE_STATUS?: string;
+    EFFECTIVE_FILTER?: string;
+  };
+  const rootObject = `${packageId}/${objectName}`;
+  let rows: StructuredRow[];
+  try {
+    rows = await pool.query<StructuredRow>(
+      `SELECT SCHEMA_NAME, OBJECT_NAME, STRUCTURED_PRIVILEGE_SCHEMA_NAME, STRUCTURED_PRIVILEGE_NAME,
+              STRUCTURED_PRIVILEGE_STATUS, EFFECTIVE_FILTER
+       FROM SYS.EFFECTIVE_STRUCTURED_PRIVILEGES
+       WHERE ROOT_SCHEMA_NAME = '_SYS_BIC' AND ROOT_OBJECT_NAME = ? AND USER_NAME = CURRENT_USER
+       LIMIT 201`,
+      [rootObject],
+    );
+  } catch (e) {
+    const norm = e instanceof HanaBusinessError ? e : normalizeHanaError(e);
+    const detail =
+      `无法查询 SYS.EFFECTIVE_STRUCTURED_PRIVILEGES（${norm.code ? `错误码 ${norm.code}：` : ''}${norm.message}）：` +
+      'SQL 结构化权限不可判定（不是「未授权」；最终以运行时探测为准）';
+    checks.push({
+      item: 'SQL 结构化权限（不可判定）',
+      required: 'SYS.EFFECTIVE_STRUCTURED_PRIVILEGES 可读',
+      passed: true,
+      detail,
+    });
+    logger.warn({ packageId, objectName, err: e }, '无法查询 SQL 结构化权限，降级为运行时探测兜底');
+    return { checked: true, determined: false, passed: true, privileges: [], applyPrivilegeType, detail };
+  }
+
+  const truncated = rows.length > 200;
+  const visible = rows.slice(0, 200);
+  const statusCounts: Record<string, number> = {};
+  // 按层级中的对象聚合：同一对象可能有多条权限记录（OR 组合），
+  // 只要有一条 APPLIED 就视为该对象已授权；只有 NOT AUTHORIZED / NOT GRANTED 且无 APPLIED 才算未授权。
+  const byObject = new Map<string, { applied: boolean; denied: boolean }>();
+  for (const row of visible) {
+    const status = (row.STRUCTURED_PRIVILEGE_STATUS ?? 'UNKNOWN').toString().toUpperCase();
+    statusCounts[status] = (statusCounts[status] ?? 0) + 1;
+    const key = `${row.SCHEMA_NAME ?? ''}.${row.OBJECT_NAME ?? ''}`;
+    const stat = byObject.get(key) ?? { applied: false, denied: false };
+    if (status === 'APPLIED') stat.applied = true;
+    else if (status === 'NOT AUTHORIZED' || status === 'NOT GRANTED') stat.denied = true;
+    byObject.set(key, stat);
+  }
+  const appliedCount = statusCounts['APPLIED'] ?? 0;
+  const appliedObjects = [...byObject.values()].filter((stat) => stat.applied).length;
+  const deniedObjects = [...byObject.entries()].filter(([, stat]) => stat.denied && !stat.applied).map(([key]) => key);
+  // 根对象自己 NOT AUTHORIZED 时，上游有 APPLIED 也不能放行；上游未授权对象同样阻断。
+  const passed = deniedObjects.length === 0 && appliedObjects > 0;
+  // UNCHECKED 条目只是“该对象未受结构化权限保护”，全部列出会把输出淹没；计数留在 statusCounts。
+  const privileges: StructuredPrivilegeEntry[] = visible
+    .filter((row) => (row.STRUCTURED_PRIVILEGE_STATUS ?? '').toString().toUpperCase() !== 'UNCHECKED')
+    .map((row) => ({
+      ...(row.SCHEMA_NAME ? { schemaName: row.SCHEMA_NAME } : {}),
+      ...(row.OBJECT_NAME ? { objectName: row.OBJECT_NAME } : {}),
+      ...(row.STRUCTURED_PRIVILEGE_SCHEMA_NAME ? { privilegeSchemaName: row.STRUCTURED_PRIVILEGE_SCHEMA_NAME } : {}),
+      ...(row.STRUCTURED_PRIVILEGE_NAME ? { privilegeName: row.STRUCTURED_PRIVILEGE_NAME } : {}),
+      ...(row.STRUCTURED_PRIVILEGE_STATUS ? { status: row.STRUCTURED_PRIVILEGE_STATUS } : {}),
+      ...(row.EFFECTIVE_FILTER ? { filter: String(row.EFFECTIVE_FILTER).slice(0, 500) } : {}),
+    }));
+  const statusText = Object.entries(statusCounts)
+    .map(([status, count]) => `${status}=${count}`)
+    .join('、');
+  // 非 APPLIED 状态的语义随 detail 一起返回：模型在 brief 里只看到 statusCounts 时不会把
+  // NOT AUTHORIZED 误读成“没有匹配条目”。官方文档列了四种，NOT AUTHORIZED 是实测值。
+  const statusMeaning = (
+    [
+      ['NOT AUTHORIZED', '命中检查但未获授权'],
+      ['NOT GRANTED', '未授予'],
+      ['NO MATCHING ATTRIBUTE', '过滤器属性不在视图'],
+      ['NO FILTER VALUES FOUND', '动态过滤器无值'],
+    ] as const
+  )
+    .filter(([status]) => (statusCounts[status] ?? 0) > 0)
+    .map(([status, meaning]) => `${status}=${meaning}`)
+    .join('；');
+  const statusSuffix = statusMeaning ? `；${statusMeaning}` : '';
+  const deniedText =
+    deniedObjects.slice(0, 5).join('、') + (deniedObjects.length > 5 ? ` 等 ${deniedObjects.length} 个` : '');
+  const detail = passed
+    ? `SQL 结构化权限已生效（APPLIED ${appliedCount} 条；${statusText || '无其它状态'}${statusSuffix}）`
+    : deniedObjects.length > 0
+      ? `SQL 结构化权限存在未授权对象：${deniedText}（${statusText}${statusSuffix}）`
+      : visible.length === 0
+        ? 'SYS.EFFECTIVE_STRUCTURED_PRIVILEGES 没有适用于该根对象的条目（通常意味着当前用户缺结构化权限授权）'
+        : `当前用户没有 APPLIED 的结构化权限（${statusText}${statusSuffix}）`;
+  checks.push({
+    item: 'SQL 结构化权限',
+    required:
+      '视图注册 SQL 分析权限检查（applyPrivilegeType=SQL_ANALYTIC_PRIVILEGE）时，' +
+      'SYS.EFFECTIVE_STRUCTURED_PRIVILEGES 需有 APPLIED 条目且无未授权对象',
+    passed,
+    detail,
+  });
+  return {
+    checked: true,
+    determined: true,
+    passed,
+    grantedCount: appliedCount,
+    statusCounts,
+    ...(deniedObjects.length > 0 ? { deniedObjects } : {}),
+    privileges,
+    ...(truncated ? { truncated: true } : {}),
+    applyPrivilegeType,
+    detail,
+  };
 }

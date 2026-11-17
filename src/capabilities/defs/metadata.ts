@@ -15,6 +15,13 @@ export const metadataCapabilities = {
     category: 'discovery',
     kind: 'read',
     effects: { destructive: false, idempotent: true, mutates: 'none' },
+    routing: {
+      intent: '读取指定视图的完整定义（数据源/节点/输出字段/变量/计算逻辑）',
+      whenToUse: ['理解视图逻辑/数据源/节点结构', '需要 XML 备份或全量 update'],
+      notFor: ['只看字段清单用 hana_metadata_list_fields', '权限/预览失败用 hana_data_preview_diagnose'],
+      priority: 'primary',
+      exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV008' },
+    },
     title: '读取视图完整定义',
     description:
       '读取指定视图的完整定义：format=json 返回结构化定义（数据源/节点/输出字段/变量/计算逻辑），format=xml 返回仓库原始设计时 XML（备份/人工编辑回传用）。\n' +
@@ -38,6 +45,13 @@ export const metadataCapabilities = {
     category: 'discovery',
     kind: 'read',
     effects: { destructive: false, idempotent: true, mutates: 'none' },
+    routing: {
+      intent: '按名称/描述/字段跨类别搜索，定位包名或对象名',
+      whenToUse: ['只有对象名片段、不知道包名', '按注释或字段找对象'],
+      notFor: ['已知 packageId+objectName 时直接 get_view/list_fields'],
+      priority: 'primary',
+      exampleArgs: { pattern: 'ZDEMO02_CV', by: 'name', category: 'model' },
+    },
     title: '搜索元数据对象（名称 / 描述 / 字段，跨类别）',
     description:
       '按 by 搜索元数据：name（默认，对象名）/description（描述或注释）/both（名称或描述）/field（输出字段，仅 model）。\n' +
@@ -82,6 +96,13 @@ export const metadataCapabilities = {
     category: 'discovery',
     kind: 'read',
     effects: { destructive: false, idempotent: true, mutates: 'none' },
+    routing: {
+      intent: '列出视图字段清单（ID/描述/类型/聚合/来源/是否带逻辑）',
+      whenToUse: ['回答有哪些字段/有没有某字段', '拿字段 ID 后再看计算逻辑'],
+      notFor: ['看单字段计算逻辑用 hana_metadata_get_field_logic'],
+      priority: 'primary',
+      exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV008' },
+    },
     title: '列出视图字段清单',
     description:
       '列出视图字段清单：字段 ID、中文描述、类型（属性/度量）、聚合方式、来源（节点.列）、是否带计算逻辑。默认只列输出字段；pattern 按字段 ID 片段过滤，exact=true 精确匹配。version 默认 active，可传 inactive。\n' +
@@ -105,6 +126,13 @@ export const metadataCapabilities = {
     category: 'insights',
     kind: 'read',
     effects: { destructive: false, idempotent: true, mutates: 'none' },
+    routing: {
+      intent: '回答某字段怎么算的（公式原文/源字段/溯源/字段级下游）',
+      whenToUse: ['字段来源/计算逻辑', '字段级下游血缘（includeUsage=true）'],
+      notFor: ['视图级依赖用 hana_metadata_where_used', '字段 ID 不确定先用 hana_metadata_list_fields'],
+      priority: 'primary',
+      exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV008', fieldId: 'MATERIAL' },
+    },
     title: '获取单字段计算逻辑',
     description:
       '获取单个字段的计算逻辑：公式原文（SQL/COLUMN_ENGINE）、引用的源字段、沿节点映射的溯源、字段元数据（描述/类型/长度）。SqlScriptView 节点返回脚本源码。version 默认 active，可传 inactive（字段逻辑与血缘同视角）。\n' +
@@ -143,6 +171,13 @@ export const metadataCapabilities = {
     category: 'insights',
     kind: 'read',
     effects: { destructive: false, idempotent: true, mutates: 'none' },
+    routing: {
+      intent: '查视图上下游依赖（它依赖谁/谁依赖它）',
+      whenToUse: ['改/删前查影响面', '找视图的上游数据源'],
+      notFor: ['字段级逻辑用 hana_metadata_get_field_logic'],
+      priority: 'primary',
+      exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV008', direction: 'both' },
+    },
     title: '血缘/依赖关系搜索',
     description:
       '查询视图的依赖关系：upstream=该视图引用了哪些对象（数据源/上游视图），downstream=哪些对象引用了该视图。\n' +
@@ -173,6 +208,13 @@ export const metadataCapabilities = {
     category: 'discovery',
     kind: 'read',
     effects: { plan: planTableList, destructive: false, idempotent: true, mutates: 'none' },
+    routing: {
+      intent: '列出 schema 下可访问的表/视图名与注释',
+      whenToUse: ['找表名/确认当前用户可访问的表'],
+      notFor: ['跨 schema 注释搜索用 hana_metadata_search_objects(category=table, by=description)'],
+      priority: 'primary',
+      exampleArgs: { schema: 'SAPABAP1', pattern: '/BIC/AZDEMO', limit: 50 },
+    },
     title: '列出 schema 下的表（名称 / 注释）',
     description:
       '列出指定 schema（默认当前用户 schema）下可访问的表（SYS.TABLES 按权限过滤）；by 可按表名/注释匹配，tableType 过滤类型。\n' +
@@ -198,6 +240,13 @@ export const metadataCapabilities = {
     category: 'discovery',
     kind: 'read',
     effects: { plan: planTableColumns, destructive: false, idempotent: true, mutates: 'none' },
+    routing: {
+      intent: '取指定表的列结构（列名/类型/长度/可空/默认值/注释）',
+      whenToUse: ['已知表名，查列定义'],
+      notFor: ['视图字段用 hana_metadata_list_fields；表不存在先用 hana_table_list 确认'],
+      priority: 'primary',
+      exampleArgs: { schema: 'SAPABAP1', table: '/BIC/AZDEMO001' },
+    },
     title: '获取表列结构',
     description:
       '返回指定表的列结构：列名/位置/数据类型/长度/精度/可空/默认值/注释（来源：SYS.TABLE_COLUMNS）。表不存在或当前用户无权限时返回 isError，可先用 hana_table_list 确认可访问的表',

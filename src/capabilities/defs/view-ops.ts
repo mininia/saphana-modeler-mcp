@@ -76,6 +76,11 @@ export function buildViewOpCapabilities(parent: Capability): Record<string, Capa
         // 别名是父工具的一次 operations 调用：副作用口径与父能力同源
         mutates: parent.effects.mutates,
       },
+      routing: {
+        intent: `${decl.title}（操作级别名 op=${decl.id}）`,
+        priority: 'advanced',
+        requires: `经 ${parent.id} 门面路由；不注册为工具`,
+      },
       title: decl.title,
       description:
         `op=${decl.id}：${decl.summary}。${decl.detail ?? ''}\n` +

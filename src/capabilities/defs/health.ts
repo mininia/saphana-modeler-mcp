@@ -159,6 +159,13 @@ export const healthCapabilities = {
       idempotent: true,
       mutates: 'none',
     },
+    routing: {
+      intent: '对 HANA 实例做稳定性体检（内存/CPU/磁盘/备份/阻塞/告警）',
+      whenToUse: ['整体健康/资源/告警排查', '需要 verdict + 读数两层结论'],
+      notFor: ['会话阻塞细节用 hana_system_activity', '表存储/碎片用 hana_table_storage'],
+      priority: 'primary',
+      exampleArgs: { checks: ['disk', 'memory', 'cpu'], includeOk: false },
+    },
     title: 'HANA 稳定性体检',
     // 口径解释与实测说明在 rules=health_check（按需经 hana_system_get_info 查询）——描述只留骨架与查询指针。
     description:
@@ -195,6 +202,13 @@ export const healthCapabilities = {
       idempotent: true,
       mutates: 'none',
     },
+    routing: {
+      intent: '回答“问题在哪、谁造成的”：阻塞/长事务/长语句深潜',
+      whenToUse: ['谁堵了谁、长时间未提交事务', '长时间运行语句'],
+      notFor: ['整体健康用 hana_system_health'],
+      priority: 'primary',
+      exampleArgs: { minDurationSec: 30, limit: 20 },
+    },
     title: 'HANA 会话与阻塞深潜',
     // 描述只留骨架与高频踩坑的一句（M_LOCKS 不存在）；逐项口径见 rules=activity_locks。
     description:
@@ -223,6 +237,13 @@ export const healthCapabilities = {
     category: 'diagnostics',
     kind: 'admin',
     effects: { plan: planTableStorage, destructive: false, idempotent: true, mutates: 'none' },
+    routing: {
+      intent: '列存表存储与碎片画像（内存/磁盘/碎片/分区/热表）',
+      whenToUse: ['表级存储/碎片/分区/读写热度排查'],
+      notFor: ['实例整体资源用 hana_system_health'],
+      priority: 'primary',
+      exampleArgs: { mode: 'memory', topN: 20 },
+    },
     title: 'HANA 表存储与碎片画像',
     // 实测坑、成本量级与逐列口径在 rules=storage_profile；这里只留口径名、返回结构与单位。
     description:
@@ -284,6 +305,13 @@ export const healthCapabilities = {
       destructive: false,
       idempotent: true,
       mutates: 'none',
+    },
+    routing: {
+      intent: '回答“这周比上周差了吗”：历史趋势时间轴聚合',
+      whenToUse: ['需要时间轴对比/趋势判断', '确认历史保留期是否覆盖'],
+      notFor: ['当前状态用 hana_system_health'],
+      priority: 'primary',
+      exampleArgs: { hours: 24, bucketMinutes: 60 },
     },
     title: 'HANA 历史趋势',
     // 实测结构（采样粒度、TIME vs SERVER_TIMESTAMP）与保留期口径见 rules=trend_timeline。

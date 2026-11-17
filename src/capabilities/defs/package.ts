@@ -15,6 +15,13 @@ export const packageCapabilities = {
     category: 'discovery',
     kind: 'read',
     effects: { destructive: false, idempotent: true, mutates: 'none' },
+    routing: {
+      intent: '列出 _SYS_REPO 仓库包树（包路径/负责人/层级）',
+      whenToUse: ['不知道包路径、需要看包层级'],
+      notFor: ['已知包时用 hana_package_list_objects 直接列对象'],
+      priority: 'fallback',
+      exampleArgs: { pattern: 'ZDEMO' },
+    },
     title: '列出仓库包（包树）',
     description:
       '列出 _SYS_REPO 仓库包（PACKAGE_CATALOG）：包路径、负责人、层级深度、原始语言、传递单元。packageId 为 . 分隔的完整路径（level 供客户端组树）；pattern 按包路径片段模糊过滤（大小写不敏感）。结果带截断与总命中数。',
@@ -30,6 +37,13 @@ export const packageCapabilities = {
     category: 'discovery',
     kind: 'read',
     effects: { destructive: false, idempotent: true, mutates: 'none' },
+    routing: {
+      intent: '列出指定包内的仓库对象与激活状态',
+      whenToUse: ['看某包有哪些对象/哪些未激活', '按对象名片段在包内过滤'],
+      notFor: ['跨包按名称片段搜索用 hana_metadata_search_objects'],
+      priority: 'primary',
+      exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', pattern: 'CV' },
+    },
     title: '列出包内对象',
     description:
       '列出指定包内的仓库对象（ACTIVE_OBJECT 已激活 + INACTIVE_OBJECT 未激活合并）：对象名、类型后缀、版本号、激活状态、变更时间/人。kind 可限定视图类型；pattern 按对象名片段过滤（大小写不敏感）。结果带截断。',
@@ -47,6 +61,14 @@ export const packageCapabilities = {
     category: 'modeling',
     kind: 'write',
     effects: { plan: planPackageCreate, destructive: false, idempotent: true, mutates: 'persistent' },
+    routing: {
+      intent: '在仓库中新建包（目录）',
+      whenToUse: ['需要新建包来组织设计时对象'],
+      notFor: ['只读环境/不可写包会被 boundary_off 拒绝'],
+      priority: 'primary',
+      requires: '目标包在 HANA_WRITE_PACKAGES 可写范围内',
+      exampleArgs: { packageId: 'ZDEMO.NEW_PKG' },
+    },
     title: '新建包（目录）',
     description:
       '在仓库中新建包（目录），用于组织设计时对象（XS REST：POST /base/file/<pkg>/）。重复建包 200/201 均被接受（幂等），故不加锁。目标包须在 HANA_WRITE_PACKAGES 可写范围内。创建后可用 hana_package_list / hana_package_list_objects 观察。',
@@ -64,6 +86,13 @@ export const packageCapabilities = {
     category: 'modeling',
     kind: 'admin',
     effects: { plan: planRepoExport, destructive: false, idempotent: true, mutates: 'none' },
+    routing: {
+      intent: '把仓库包导出为 zip 归档（备份/迁移）',
+      whenToUse: ['改/导入前留档', '迁移包到另一个环境'],
+      notFor: ['只读单个视图定义用 hana_metadata_get_view(format=xml)'],
+      priority: 'fallback',
+      exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', saveTo: 'backup/ZDEMO_MGF.zip' },
+    },
     title: '导出包为 zip 备份（Transfer API）',
     description:
       '把仓库包导出为 zip 归档（Transfer API：GET /base/xfer/export），用于设计时对象备份与迁移。对 HANA 仓库只读。\n' +
@@ -86,6 +115,14 @@ export const packageCapabilities = {
     category: 'modeling',
     kind: 'admin',
     effects: { plan: planRepoImport, destructive: true, idempotent: false, mutates: 'persistent' },
+    routing: {
+      intent: '把本地设计时文件导入仓库（导入即激活）',
+      whenToUse: ['从 zip/xml 恢复或迁移新对象'],
+      notFor: ['修改已有对象用 hana_view_update，不要 delete+重建或覆盖导入'],
+      priority: 'advanced',
+      requires: '目标包在 HANA_WRITE_PACKAGES 可写范围内；覆盖需 overwrite=true',
+      exampleArgs: { targetPackageId: 'ZDEMO.ZDEMO_MGF', filePath: 'import/ZDEMO02_CV009.calculationview' },
+    },
     title: '导入设计时文件（Transfer API）',
     description:
       '把本地设计时文件（.calculationview XML 或导出的 zip）导入仓库（Transfer API：POST 目录目标 + PUT /base/xfer/import）。实测（SPS08）导入即激活，不存在 inactive 暂存；修改已有对象请走 hana_view_update。\n' +
@@ -123,6 +160,13 @@ export const packageCapabilities = {
     category: 'diagnostics',
     kind: 'admin',
     effects: { plan: planRepoChangelist, destructive: false, idempotent: true, mutates: 'none' },
+    routing: {
+      intent: '查询仓库变更列表（写操作后的审计观察）',
+      whenToUse: ['写操作后核对变更记录', '按用户/状态过滤变更'],
+      notFor: ['不要用它判断对象是否存在/是否激活'],
+      priority: 'fallback',
+      exampleArgs: { status: 0 },
+    },
     title: '查询仓库变更列表（只读）',
     description:
       '查询当前用户的仓库变更列表（Change-Tracking API：GET /base/change，只读）。可按 user/status 过滤；用于写操作后的审计观察。未启用 Change Tracking 时返回空列表。',

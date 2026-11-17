@@ -387,9 +387,13 @@ async function casePromotion() {
     if (!promoted?.inputSchema?.properties || Object.keys(promoted.inputSchema.properties).length === 0) {
       throw new Error('提升后的工具必须带完整 inputSchema（否则提升没有意义）');
     }
-    if (!notifications.some((n) => n.method === 'notifications/tools/list_changed')) {
+    // 批量注册只应发一次 list_changed（SDK 默认每个 registerTool 各发一次；
+    // 多次通知会让宿主做多次整代替换，把当前步的 toolSet 打失效）。
+    const listChangedCount = notifications.filter((n) => n.method === 'notifications/tools/list_changed').length;
+    if (listChangedCount !== 1) {
       throw new Error(
-        `应收到 notifications/tools/list_changed（实际：${JSON.stringify(notifications.map((n) => n.method))}）`,
+        `提升 2 个工具应只发 1 次 notifications/tools/list_changed（批量通知），实际 ${listChangedCount} 次：` +
+          JSON.stringify(notifications.map((n) => n.method)),
       );
     }
     console.log('[case C] PASS —— 提升把该类能力挂成平铺工具并通知客户端刷新');

@@ -83,27 +83,31 @@ export function facadeDescription(
   }
   // 描述常驻：只列主干能力；routeOnly 别名/控制面能力只报数量，全量由调门面取索引给出。
   const primary = members.filter((m) => m.routeOnly !== true && isVisible(m));
+  // 高级/低频能力不混在主干里：它们仍是可路由成员，但不应在“第一眼”与高频能力同权。
+  const main = primary.filter((m) => m.routing?.priority !== 'advanced');
+  const advanced = primary.filter((m) => m.routing?.priority === 'advanced');
   const aliases = members.filter((m) => m.routeOnly === true && m.id.includes('#') && isVisible(m));
   const controls = members.filter((m) => m.routeOnly === true && !m.id.includes('#') && isVisible(m));
   return [
     `${entry.name}：${entry.description}。`,
     `本类共 ${primary.length} 项能力：`,
     // 按声明顺序（= 生命周期顺序，如 create → validate → activate → update → delete），非字典序
-    ...primary.map((m) => `- ${m.id}：${m.title}`),
+    ...main.map((m) => `- ${m.id}：${m.title}`),
+    ...(advanced.length > 0
+      ? [`高级/低频（用户明确要求时再用）：`, ...advanced.map((m) => `- ${m.id}：${m.title}`)]
+      : []),
     ...(aliases.length > 0
       ? [
-          `另有 ${aliases.length} 项**操作级别名**（\`<工具>#<操作>\`，如 \`hana_view_update#add_join\`）：` +
-            `不常驻、不注册为工具，只经本门面路由调用——调本门面取索引可看全量（含别名）。`,
+          `另有 ${aliases.length} 项**操作级别名**（\`<工具>#<操作>\`）：不注册为工具，只经本门面路由；` +
+            `调本门面取索引可看全量（含别名）。`,
         ]
       : []),
     ...(controls.length > 0
       ? [
-          `另有 ${controls.length} 项**控制面能力**（${controls.map((m) => m.id).join('、')}）：` +
-            `不注册为工具，只经本门面路由调用；受调用期闸门与运行期状态校验约束。`,
+          `另有 ${controls.length} 项**控制面能力**（${controls.map((m) => m.id).join('、')}）：不注册为工具，只经本门面路由。`,
         ]
       : []),
-    `调用：\`{ capability: "<上表 id>", args: { … } }\`；不带参数只返回索引。调本门面会把本类能力提升进工具面（此后可按工具名平铺调用）。`,
-    `授权与参数校验按目标能力判定；不在你权限内的能力不会出现在索引里。`,
+    // 用法/提升/授权口径是**全局**的，统一放在 SERVER_INSTRUCTIONS，避免六个门面各抄一份（易漂移且占常驻预算）。
   ].join('\n');
 }
 

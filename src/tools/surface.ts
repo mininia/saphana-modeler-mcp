@@ -209,24 +209,91 @@ export function surfaceCapabilities(ids: ReadonlySet<string>): Capability[] {
   return CAPABILITY_LIST.filter((c) => ids.has(c.id)).sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
-/** 能力的一句话摘要（门面索引用）：取描述的首句 */
+/** 能力的一句话摘要（门面索引用）：优先 routing.intent，其次描述首句 */
 export function summaryOf(cap: Capability): string {
-  const firstLine = cap.description.split('\n')[0];
+  const firstLine = (cap.routing?.intent ?? cap.description.split('\n')[0] ?? '').replace(/\s+/g, ' ').trim();
   const stop = firstLine.search(/[。；]/);
   const head = stop > 0 ? firstLine.slice(0, stop) : firstLine;
   return head.length > 120 ? `${head.slice(0, 119)}…` : head;
 }
 
+/** 索引里的单个参数信息（够模型决定怎么填，但不是完整 schema） */
+export interface ParamDetail {
+  name: string;
+  required: boolean;
+  type: string;
+  description?: string;
+}
+
+function unwrapZodField(field: unknown): any {
+  let f: any = field;
+  for (let i = 0; i < 8 && f && typeof f === 'object' && f._def; i += 1) {
+    const t = f._def.type;
+    if (t === 'optional' || t === 'default' || t === 'nullable' || t === 'readonly' || t === 'catch') {
+      f = f._def.innerType;
+      continue;
+    }
+    break;
+  }
+  return f;
+}
+
+function zodTypeLabel(field: unknown): string {
+  const f = unwrapZodField(field);
+  const t = f?._def?.type as string | undefined;
+  switch (t) {
+    case 'array':
+      return `${zodTypeLabel(f?._def?.element)}[]`;
+    case 'string':
+    case 'number':
+    case 'boolean':
+    case 'enum':
+    case 'literal':
+    case 'union':
+    case 'record':
+    case 'object':
+      return t;
+    default:
+      return t ?? 'unknown';
+  }
+}
+
+function zodDescription(field: unknown): string | undefined {
+  let f: any = field;
+  for (let i = 0; i < 8 && f && typeof f === 'object'; i += 1) {
+    if (typeof f.description === 'string' && f.description.length > 0) return f.description;
+    f = f._def?.innerType;
+  }
+  return undefined;
+}
+
 /**
- * 能力的参数名清单（门面索引用；只给名字不给 schema）。
- * 完整 schema 由提升给出（提升后它是 tools/list 的一等工具）。
- * 多环境下非纯读能力（mutates != none，含临时对象）会被追加必填 expectedEnvironment——索引必须与路由校验同源，
- * 否则按索引参数调用会直接 input_schema_invalid。
+ * 能力的参数面（门面索引）：名字 + 必填 + 粗类型 + 参数说明。
+ * 不返回完整 schema（那是提升后平铺工具的收益）；但索引必须自足到“按它填参数不会 schema 失败”：
+ * 多环境下非纯读能力（mutates != none）会被追加必填 expectedEnvironment（见 capabilityInputSchema）。
  */
-export function paramNamesOf(cap: Capability, multiEnv = false): string[] {
+export function paramDetailsOf(cap: Capability, multiEnv = false): ParamDetail[] {
   const schema = capabilityInputSchema(cap, multiEnv);
   const shape = (schema as unknown as { shape?: Record<string, unknown> }).shape;
-  return shape ? Object.keys(shape) : [];
+  if (!shape) return [];
+  return Object.entries(shape).map(([name, field]) => {
+    let required = false;
+    try {
+      const parsed = (field as { safeParse?: (value: unknown) => { success: boolean } }).safeParse?.(undefined);
+      required = parsed ? !parsed.success : false;
+    } catch {
+      required = false;
+    }
+    const description = zodDescription(field);
+    return { name, required, type: zodTypeLabel(field), ...(description ? { description } : {}) };
+  });
+}
+
+/** 必填参数名（门面索引的 required 快捷字段；与 paramDetailsOf 同源） */
+export function requiredParamsOf(cap: Capability, multiEnv = false): string[] {
+  return paramDetailsOf(cap, multiEnv)
+    .filter((p) => p.required)
+    .map((p) => p.name);
 }
 
 /** 按 id 解析能力（路由用）；未登记返回 undefined */

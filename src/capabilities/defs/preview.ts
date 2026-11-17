@@ -30,6 +30,20 @@ export const previewCapabilities = {
     category: 'data',
     kind: 'read',
     effects: { plan: planDataPreview, destructive: false, idempotent: true, mutates: 'transient' },
+    routing: {
+      intent: '预览已激活视图/基表数据（含节点预览与基表画像）',
+      whenToUse: ['需要看实际数据/抽样值（不是权限验证）', '跨表建模前做基表画像'],
+      notFor: [
+        '权限/可达性验证（含上游逐个确认）一律用 hana_data_preview_diagnose；本工具是取数工具',
+        '节点预览成功不代表整体视图可预览；整体权限以不带 node 的预览/诊断为准',
+      ],
+      priority: 'primary',
+      constraints: [
+        '视图预览需 packageId+objectName；基表勘察需 schema+table',
+        '权限/可达性验证用 diagnose；不要用本工具逐个预览上游（SELECT * 投影全部列，宽视图即使 limit=1 也可能很慢）',
+      ],
+      exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV008', limit: 5 },
+    },
     title: '数据预览 / 基表勘察',
     // 细则（勘察画像、节点预览机制、权限诊断）见 rules=preview；此处只留目标形态与参数面。
     description:
@@ -37,6 +51,8 @@ export const previewCapabilities = {
       '① 基表勘察（schema + table [+ columns] [+ sampleRows]）：对源表采样并逐列画像（去重值样例/长度区间/前导零/NULL 数），跨表建模前先做；统计只基于采样行（默认 200）。\n' +
       '② 视图预览（packageId + objectName [+ kind]）：对已激活视图整体预览（_SYS_BIC 直查），支持 filter（AND 连接、值参数绑定）、parameters（VIRTUAL 输入参数）、limit（省略时按有无筛选默认 10/100，上限 1000）。\n' +
       '仅当明确要求看某节点时才传 node（原生中间视图机制，需 EXECUTE 权限）；forceDerive=true = 只读 XML 推导模式。\n' +
+      '节点预览/派生 SQL 成功只证明该节点数据链路可达，不代表整体运行时视图的权限校验通过；整体权限以不带 node 的预览/诊断为准。\n' +
+      '本工具是取数工具，按 SELECT * 投影全部列；宽视图即使 limit=1 也可能很慢。权限/可达性验证（含上游逐个确认）用 hana_data_preview_diagnose（内部 SELECT 1 LIMIT 1，不返回业务数据）。\n' +
       '权限类失败自动附诊断报告（raw.diagnosis），手动排查用 hana_data_preview_diagnose；支持范围与细则见 rules=preview。',
     inputSchema: z.object({
       schema: tagResource(
@@ -97,14 +113,35 @@ export const previewCapabilities = {
     category: 'data',
     kind: 'read',
     effects: { destructive: false, idempotent: true, mutates: 'none' },
+    routing: {
+      intent: '回答某个视图/对象为什么不能预览/没权限（258/2950）',
+      whenToUse: [
+        '已激活视图预览报 258/2950',
+        '判断是经典分析权限、SQL 结构化权限、上游不可达还是运行时权限',
+        '逐个确认上游对象是否可访问（根对象与上游都用本工具）',
+      ],
+      notFor: [
+        '只是读定义/字段用 hana_metadata_get_view / list_fields',
+        '只是看用户全局权限用 hana_check_privileges',
+        'SQL 执行计划/性能用 hana_sql_analyze（只读环境不可用）',
+      ],
+      priority: 'primary',
+      exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV008', channel: 'derived' },
+      constraints: [
+        '根对象与上游逐个确认都用本工具；内部 SELECT 1 LIMIT 1，不返回业务数据',
+        '不要用 hana_data_preview 取数验证权限（宽视图按 SELECT * 投影会慢）',
+      ],
+    },
     title: '诊断数据预览权限',
     // 通道语义与 brief 字段解释见 rules=preview。
     description:
-      '定位「为什么某视图数据预览失败」，聚焦两大根因：①是否受经典分析权限（Analytic Privilege）保护、当前用户是否被授权；②上游数据源是否不可达。只读。\n' +
+      '定位「为什么某视图数据预览失败」，覆盖三类根因：①经典分析权限（ANALYTICAL_PRIVILEGE，checkAnalyticPrivileges=true）；②SQL 结构化权限（SQL analytic privilege：applyPrivilegeType=SQL_ANALYTIC_PRIVILEGE，查 SYS.EFFECTIVE_STRUCTURED_PRIVILEGES）；③上游数据源不可达/运行时对象不可访问。只读。\n' +
       '用法：最简只传 packageId + objectName（默认 derived + verbose=false），一次返回 brief 结论。\n' +
-      '返回（data.brief）：analyticPrivilege.protected / grantedCount（0=确认没有任何授权；缺省=无法判定，determined=false 表示设计时 XML 读不到、保护与否不可判定）、upstreamInaccessible（仅不可达项）、runtimeAccessible（SELECT 1 实测；缺省≠不可达）、canPreview（false=有阻塞）。\n' +
-      '参数：channel=direct（不追溯上游）/ intermediate（节点预览场景，另查中间视图过程 EXECUTE）/ derived（默认）；verbose=true 才给完整 checks/baseTables 明细与 blockers/hints。\n' +
-      '注意：hana_data_preview 权限类失败时已自动附完整诊断，通常无需手动调用本工具。',
+      '返回（data.brief）：analyticPrivilege（经典 AP 三态）、structuredPrivilege（checked/determined/passed/grantedCount/statusCounts/deniedObjects/privileges；deniedObjects 直接给出未授权对象，privileges 含各对象 STATUS，不含 UNCHECKED）、upstreamInaccessible、runtimeAccessible（SELECT 1 实测；缺省≠不可达）、canPreview、nextActions（可执行下一步）。\n' +
+      'STATUS 语义：APPLIED=已生效；NOT AUTHORIZED=命中检查但未获授权（该对象无 APPLIED 条目，实测会出现）；NOT GRANTED=未授予；NO MATCHING ATTRIBUTE=过滤器属性不在视图；NO FILTER VALUES FOUND=动态过滤器无值。无行=没有适用条目（通常缺授权）。\n' +
+      '参数：channel=direct/intermediate/derived；verbose=true 才返回完整 checks/baseTables/privileges 明细与 blockers/hints。\n' +
+      '若所有能建模的根因都通过但运行时仍 258/2950，会明确报「未建模根因」并给 Authorization Dependency Viewer / owner GRANT OPTION / SQL SECURITY 等下一步。\n' +
+      '注意：根对象权限类失败时，hana_data_preview 已自动附完整诊断，通常无需再手动调用；但上游逐个确认仍用本工具（channel=direct 或 derived），不要用 hana_data_preview 取数验证。',
     inputSchema: z.object({
       packageId: zReadPackageId('视图包名，层级用 . 分隔，如 ZDEMO.ZDEMO_MGF'),
       objectName: zObjectName('视图对象名，如 ZDEMO02_CV008'),

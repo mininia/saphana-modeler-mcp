@@ -26,6 +26,14 @@ export const sqlExecuteCapabilities = {
     kind: 'sql',
     rootTool: true,
     effects: { plan: planSqlExecute, destructive: true, idempotent: false, mutates: 'persistent' },
+    routing: {
+      intent: '在 HANA 上直接执行 SQL（读/写/管理类；默认关闭）',
+      whenToUse: ['用户明确要求执行某条 SQL，且部署已启用 sql 组'],
+      notFor: ['建模/读元数据/预览用专用工具；EXPLAIN 用 hana_sql_analyze'],
+      priority: 'advanced',
+      requires: 'sql 组显式启用（HANA_TOOL_GROUPS=sql 或 HANA_TOOL_ALLOW=hana_sql_execute）',
+      exampleArgs: { sql: 'SELECT * FROM DUMMY' },
+    },
     title: '直接执行 HANA SQL',
     description:
       '在 HANA 上直接执行 SQL（读/写/管理类）；SELECT 返回列名+行，DML/DDL 返回 affectedRows。\n' +

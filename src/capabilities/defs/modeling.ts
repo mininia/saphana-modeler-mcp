@@ -286,6 +286,14 @@ const baseModelingCapabilities = {
     category: 'modeling',
     kind: 'write',
     effects: { plan: planViewCreate, destructive: false, idempotent: false, mutates: 'persistent' },
+    routing: {
+      intent: '在仓库中新建 Calculation View（projection / SQL 模式）',
+      whenToUse: ['用户明确要新建视图', '需要零 XML 的 SQL 模式建视图'],
+      notFor: ['修改已有视图用 hana_view_update，不要 delete+重建'],
+      priority: 'primary',
+      requires: '目标包在 HANA_WRITE_PACKAGES 可写范围内',
+      exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV009', mode: 'projection' },
+    },
     title: '新建 Calculation View（计算视图）',
     // SQL 方言、实测边界与并发解释见规则 sql_mode / activation_measure / write_transport / write_receipt。
     description:
@@ -335,6 +343,13 @@ const baseModelingCapabilities = {
     category: 'modeling',
     kind: 'write',
     effects: { plan: planViewValidate, destructive: false, idempotent: true, mutates: 'transient' },
+    routing: {
+      intent: '校验计算视图一致性（激活前设计时 / 运行时）',
+      whenToUse: ['改完或激活前做 CheckResult 校验', '对已激活运行时视图做一致性校验'],
+      notFor: ['只是预览数据用 hana_data_preview'],
+      priority: 'primary',
+      exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV008', target: 'design' },
+    },
     title: '校验计算视图一致性',
     description:
       '双模式校验：\n' +
@@ -370,6 +385,12 @@ const baseModelingCapabilities = {
     category: 'modeling',
     kind: 'write',
     effects: { plan: planViewCheckActions, destructive: false, idempotent: true, mutates: 'none' },
+    routing: {
+      intent: '查询校验过程支持的动作清单',
+      whenToUse: ['不确定 hana_view_validate 支持哪些检查动作'],
+      notFor: ['普通校验直接调 hana_view_validate'],
+      priority: 'advanced',
+    },
     title: '查询校验过程支持的动作清单',
     description:
       '查询 SYS.GET_CHECK_ACTIONS：某 CHECK 过程支持的 ACTION 全集及说明。用于调用 hana_view_validate 前确认动作名，或了解 HANA 的表/目录一致性检查能力。默认列出计算视图相关（CHECK_CALCULATION_VIEW）。',
@@ -388,6 +409,14 @@ const baseModelingCapabilities = {
     category: 'modeling',
     kind: 'write',
     effects: { plan: planViewActivate, destructive: false, idempotent: false, mutates: 'persistent' },
+    routing: {
+      intent: '把设计时 Calculation View 激活为运行时视图',
+      whenToUse: ['设计时对象改完需要生效', '激活失败需要看编译错误明细'],
+      notFor: ['写入/导入即激活的场景不要重复激活'],
+      priority: 'primary',
+      requires: '目标包在 HANA_WRITE_PACKAGES 可写范围内',
+      exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV008' },
+    },
     title: '激活 Calculation View（设计时对象）',
     description:
       '将可写包下的 Calculation View 设计时对象激活为运行时视图（XS REST：PUT + SapBackPack {"Activate":true}）。并发改动以 412 机读回执暴露，不静默回退。失败透传编译错误明细，不误报成功。\n' +
@@ -404,6 +433,14 @@ const baseModelingCapabilities = {
     category: 'modeling',
     kind: 'write',
     effects: { plan: planViewUpdate, destructive: true, idempotent: false, mutates: 'persistent' },
+    routing: {
+      intent: '更新已有 Calculation View（声明式 operations / 全量 XML / 变更集）',
+      whenToUse: ['修改已有视图（默认走 operations）', '需要 dryRun 预演破坏性变更'],
+      notFor: ['新建用 hana_view_create；不要 delete+重建'],
+      priority: 'primary',
+      requires: '目标包在 HANA_WRITE_PACKAGES 可写范围内',
+      exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV008', operations: [] },
+    },
     title: '更新 Calculation View（声明式 operations / 全量 XML / 变更集）',
     // 硬保留（验收脚本断言）：三方式互斥、关键参数名、migration 合法值、机读码全集、回执字段名、零写入语义。
     description:
@@ -516,6 +553,14 @@ const baseModelingCapabilities = {
     category: 'modeling',
     kind: 'write',
     effects: { plan: planViewDelete, destructive: true, idempotent: false, mutates: 'persistent' },
+    routing: {
+      intent: '删除可写包下的 Calculation View 设计时对象',
+      whenToUse: ['用户明确要求删除对象'],
+      notFor: ['修改已有视图不要 delete+重建（用 hana_view_update）'],
+      priority: 'advanced',
+      requires: '目标包在 HANA_WRITE_PACKAGES 可写范围内；有下游引用需 migration.strategy=acknowledge_dependents',
+      exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV008' },
+    },
     title: '删除 Calculation View（设计时对象）',
     description:
       '删除可写包下的 Calculation View 设计时对象（XS REST：DELETE + If-Match）：陈旧基线 412、对象已不存在 OBJECT_NOT_FOUND（均机读），回执带删除前 etag/version。\n' +
@@ -549,6 +594,13 @@ const baseModelingCapabilities = {
     category: 'modeling',
     kind: 'read',
     effects: { destructive: false, idempotent: true, mutates: 'none' },
+    routing: {
+      intent: '轮询异步任务状态与结果（change set / SQL 长分析）',
+      whenToUse: ['调用返回 taskId 后轮询', '查任务终态 result'],
+      notFor: ['同步调用不需要任务查询'],
+      priority: 'primary',
+      exampleArgs: { taskId: 'task-...' },
+    },
     title: '查询异步任务状态与结果',
     description:
       '轮询异步任务：`hana_view_update(async=true)` 的变更集、或 `hana_sql_analyze(async=true)` 的长分析。返回 kind、status（working/completed/failed/cancelled）、进度与终态 result（与同步调用同形的回执信封）。\n' +
@@ -565,6 +617,13 @@ const baseModelingCapabilities = {
     category: 'modeling',
     kind: 'write',
     effects: { plan: planTaskCancel, destructive: false, idempotent: true, mutates: 'none' },
+    routing: {
+      intent: '取消异步任务（协作式，动作边界生效）',
+      whenToUse: ['用户明确要求取消正在运行的任务'],
+      notFor: ['不要用它代替失败重试；执行中的 SQL 无法取消'],
+      priority: 'advanced',
+      exampleArgs: { taskId: 'task-...' },
+    },
     title: '取消异步任务（协作式）',
     description:
       '请求取消一个运行中的异步任务。变更集（changeset）：当前动作不打断，结束后停止后续项并触发与失败相同的逆序补偿（终态 raw.code=changeset_cancelled 带完整报告）。SQL 分析：执行中的语句无法取消，分析会跑完并如实返回结果，终态会说明取消未生效。已到终态的任务不可取消（如实回执、不报错）。只对本调用方可见。',

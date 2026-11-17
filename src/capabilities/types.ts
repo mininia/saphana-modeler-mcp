@@ -45,6 +45,29 @@ export type ToolKind = 'read' | 'write' | 'admin' | 'sql';
 export type MutationScope = 'none' | 'transient' | 'persistent';
 
 /**
+ * 能力路由卡（呈现元数据，**不参与授权判定**）。
+ *
+ * 目的不是关键词检索，而是让模型在门面索引/平铺工具里**选得对**：
+ * - `intent` 回答“这是什么问题的工具”，门面索引的摘要优先取它；
+ * - `whenToUse` / `notFor` 做正负例消歧（尤其是权限、预览、SQL 分析这几组近邻能力）；
+ * - `priority` 决定门面描述的主干/高级分组与索引排序信号；
+ * - `requires` 写前置条件（如只读环境不可用）；
+ * - `exampleArgs` 给一条 canonical 参数示例，避免模型猜参数名；
+ * - `constraints` 写跨字段约束（如“视图预览需 packageId+objectName”）。
+ *
+ * 全部字段可选：未声明的能力仍按描述首句/声明顺序呈现。
+ */
+export interface CapabilityRouting {
+  intent?: string;
+  whenToUse?: readonly string[];
+  notFor?: readonly string[];
+  priority?: 'primary' | 'fallback' | 'advanced' | 'admin';
+  requires?: string;
+  exampleArgs?: Readonly<Record<string, unknown>>;
+  constraints?: readonly string[];
+}
+
+/**
  * 能力分类（**AI 能力视角**，2026-10-09 重构；参照 SAP HANA MCP Server 的 six areas）：
  * 分类轴 = "AI 想干什么"，而不是"代码长在哪"——门面、索引、提升都按它分组。
  *
@@ -67,7 +90,7 @@ export const CAPABILITY_CATALOG = [
   // 校验能力清单（hana_view_check_actions）自本次分类调整起归 modeling——它服务于校验流程，
   // 与 hana_view_validate 同类；本域只留"看结构、看血缘"两件事。
   { id: 'modeling', name: '建模与仓库变更', description: '创建/修改/校验/激活/删除设计时对象，导入导出' },
-  { id: 'diagnostics', name: '运维与性能', description: '健康/会话/存储/趋势、SQL 分析与仓库变更审计' },
+  { id: 'diagnostics', name: '运维与性能', description: '健康/会话/存储/趋势与仓库审计（SQL 分析为高级/低频）' },
 ] as const;
 
 /**
@@ -188,6 +211,8 @@ export interface Capability<S extends z.ZodType = z.ZodType> {
    */
   control?: boolean;
   title: string;
+  /** 路由卡：门面索引/平铺描述的选择辅助（可选；不参与授权判定） */
+  routing?: CapabilityRouting;
   description: string;
   inputSchema: S;
   /** 客户端提示（protocol hints），**不参与任何授权判定** */

@@ -220,33 +220,44 @@ export function registerCapabilitiesDynamically(
 ): DynamicRegistrationResult {
   const registered: string[] = [];
   const failures: { capabilityId: string; reason: string }[] = [];
-  for (const cap of caps) {
-    const name = registeredNameOf(cap);
-    if (hasDynamicHandle(server, name)) continue; // 幂等：重复提升同一分类不重复挂
-    // 根工具（hana_sql_execute）在 entitled 时已由注册器**静态**注册；提升时再挂一次会撞名。
-    // 它本来就是常驻的（rootTool 语义），不需要也不应该经“分类提升”进入工具面。
-    if (cap.rootTool === true) continue;
-    const raw = getRawHandler(server, cap.id);
-    if (!raw) {
-      // 面内但本进程没有 handler：编程错误，响亮记录而非静默跳过
-      logger.error({ capabilityId: cap.id }, '提升：目标能力的 handler 未注册（清单与注册不同步），本次跳过');
-      failures.push({ capabilityId: cap.id, reason: 'handler_missing' });
-      continue;
+  // SDK 的 registerTool 每注册一个工具就发一次 notifications/tools/list_changed。
+  // 一次提升 N 个工具会产生 N 次通知；宿主（如 DSH）收到后会做整代替换，多次替换会把
+  // 当前步的 toolSet 打失效（表现为整步 UNKNOWN_TOOL）。批量注册期间静默，结束后只发一次。
+  // 测试里的 duck-typed server 可能没有该方法：有则批量，没有则跳过（真实 McpServer 恒有）。
+  const originalNotify = typeof server.sendToolListChanged === 'function' ? server.sendToolListChanged : undefined;
+  if (originalNotify) server.sendToolListChanged = () => {};
+  try {
+    for (const cap of caps) {
+      const name = registeredNameOf(cap);
+      if (hasDynamicHandle(server, name)) continue; // 幂等：重复提升同一分类不重复挂
+      // 根工具（hana_sql_execute）在 entitled 时已由注册器**静态**注册；提升时再挂一次会撞名。
+      // 它本来就是常驻的（rootTool 语义），不需要也不应该经“分类提升”进入工具面。
+      if (cap.rootTool === true) continue;
+      const raw = getRawHandler(server, cap.id);
+      if (!raw) {
+        // 面内但本进程没有 handler：编程错误，响亮记录而非静默跳过
+        logger.error({ capabilityId: cap.id }, '提升：目标能力的 handler 未注册（清单与注册不同步），本次跳过');
+        failures.push({ capabilityId: cap.id, reason: 'handler_missing' });
+        continue;
+      }
+      try {
+        const handle = server.registerTool(
+          name,
+          registrationOf(cap, surfaceOf(ctx), ctx.manager?.multiEnv === true),
+          gatedHandler(ctx, cap, raw as CapabilityHandler<typeof cap.inputSchema>) as never,
+        ) as unknown as { remove(): void };
+        recordDynamicHandle(server, name, handle);
+        registered.push(name);
+      } catch (e) {
+        // 单个注册失败不拖垮整类：记 warning，交由调用方回报 partial（可重试）
+        logger.error({ capabilityId: cap.id, err: e }, '提升：能力注册失败（本次跳过，重试门面调用可补齐）');
+        failures.push({ capabilityId: cap.id, reason: 'register_failed' });
+      }
     }
-    try {
-      const handle = server.registerTool(
-        name,
-        registrationOf(cap, surfaceOf(ctx), ctx.manager?.multiEnv === true),
-        gatedHandler(ctx, cap, raw as CapabilityHandler<typeof cap.inputSchema>) as never,
-      ) as unknown as { remove(): void };
-      recordDynamicHandle(server, name, handle);
-      registered.push(name);
-    } catch (e) {
-      // 单个注册失败不拖垮整类：记 warning，交由调用方回报 partial（可重试）
-      logger.error({ capabilityId: cap.id, err: e }, '提升：能力注册失败（本次跳过，重试门面调用可补齐）');
-      failures.push({ capabilityId: cap.id, reason: 'register_failed' });
-    }
+  } finally {
+    if (originalNotify) server.sendToolListChanged = originalNotify;
   }
+  if (registered.length > 0 && originalNotify) server.sendToolListChanged();
   return { registered, failures };
 }
 

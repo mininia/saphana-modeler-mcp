@@ -11,7 +11,7 @@
  */
 
 import type { McpServer, ServerContext } from '@modelcontextprotocol/server';
-import { FACADE_CATEGORIES, registeredNameOf, type FacadeCategory } from '../capabilities/types.js';
+import { FACADE_CATEGORIES, registeredNameOf, type Capability, type FacadeCategory } from '../capabilities/types.js';
 import { FACADE_SCHEMA, facadeIdOf } from '../capabilities/facades.js';
 import { CAPABILITY_LIST, FACADES, membersOfCategory } from '../capabilities/manifest.js';
 import { blockedCallResult, dispatchAuthorized } from '../config/authorize.js';
@@ -36,8 +36,9 @@ import {
   computeSurface,
   entitlementOf,
   explainSurface,
-  paramNamesOf,
+  paramDetailsOf,
   promoteCategories,
+  requiredParamsOf,
   resolveCapability,
   summaryOf,
   surfaceCapabilities,
@@ -175,6 +176,15 @@ async function promoteOnFacadeCall(
     );
   }
 
+  // P1-7：策略性省略只说到类别，不点名被隐藏的能力（names 调试开关才列 id）。
+  const explainNames = ctx.config.explainSurface === 'names';
+  const hiddenMembers = membersOfCategory(category).filter((m) => !before.entitlementIds.has(m.id));
+  // 有策略性省略时，**不要**把“工具面刷新可重试”说成通用建议：那会诱导模型为隐藏能力重试。
+  const refreshHint =
+    hiddenMembers.length > 0
+      ? `提升后工具面会刷新一次：紧接着的下一步若报 unknown tool，下一步再调用一次即可。被策略省略的能力不会被提升出来。`
+      : `提升后工具面会刷新一次：紧接着的下一步若报 unknown tool，下一步重试即可；也可以始终用 { capability, args } 经本门面路由。`;
+
   // 回执不撒谎：promoted 只认真正进面的新增；hint 按可触达成员与新增结果分支。
   const baseHint =
     failures.length > 0
@@ -185,18 +195,10 @@ async function promoteOnFacadeCall(
           ? `本类可触达的只有经门面路由的操作级别名（不注册为工具），提升不会产生新工具；` +
             `直接用 { capability, args } 调用即可。`
           : added.length > 0 && registered.length > 0
-            ? `本类能力已**提升进你的工具面**：下一次 tools/list 即可见（带完整参数 schema），可直接按工具名平铺调用，` +
-              `也可以继续用 { capability, args } 经本门面调用。提升在本连接内保持有效。`
-            : `本类能力此前已提升过，仍在你的工具面上（tools/list 里可直接调用）。`;
-  const evictedHint =
-    evictedTools.length > 0
-      ? ` 已达面上限（MCP_CAPABILITY_SURFACE_MAX），以下工具被移出你的工具面：${evictedTools.join(', ')}` +
-        `（仍可经门面路由调用）。`
-      : '';
-
-  // P1-7：策略性省略只说到类别，不点名被隐藏的能力（names 调试开关才列 id）。
-  const explainNames = ctx.config.explainSurface === 'names';
-  const hiddenMembers = membersOfCategory(category).filter((m) => !before.entitlementIds.has(m.id));
+            ? `本类能力已**提升进你的工具面**：下一次 tools/list 即可见（带完整参数 schema），可直接按工具名平铺调用。` +
+              refreshHint
+            : `本类能力此前已提升过，仍在你的工具面上（tools/list 里可直接调用）。` +
+              (hiddenMembers.length > 0 ? '' : '若下一步报 unknown tool，重试即可。');
   const notes: string[] = [];
   if (hiddenMembers.length > 0) {
     notes.push(`本类有 ${hiddenMembers.length} 项能力因部署策略或调用方档案不可见，未提升。`);
@@ -210,6 +212,11 @@ async function promoteOnFacadeCall(
         ]
       : [];
   const status = failures.length > 0 ? 'partial' : registered.length > 0 ? 'loaded' : 'already-loaded';
+  const evictedHint =
+    evictedTools.length > 0
+      ? ` 已达面上限（MCP_CAPABILITY_SURFACE_MAX），以下工具被移出你的工具面：${evictedTools.join(', ')}` +
+        `（仍可经门面路由调用）。`
+      : '';
 
   return {
     report: {
@@ -224,6 +231,48 @@ async function promoteOnFacadeCall(
   };
 }
 
+/**
+ * 参数校验失败时返回给模型的“参数卡”。
+ *
+ * 把门面索引里该能力的参数面直接推到失败点：模型不必再调一次 `{}` 取索引，
+ * 也不会因为只看到“参数不符合 schema”而继续换工具/猜参数名。
+ * 只带 required + 本次实际传过的参数，避免把整张索引塞进错误回执。
+ */
+function schemaErrorHint(target: Capability, facadeId: string, args: unknown, multiEnv: boolean): string {
+  const details = paramDetailsOf(target, multiEnv);
+  const required = details.filter((p) => p.required).map((p) => p.name);
+  const record =
+    typeof args === 'object' && args !== null && !Array.isArray(args) ? (args as Record<string, unknown>) : {};
+  const passed = Object.keys(record);
+  const wanted = new Set([...required, ...passed]);
+  const params = details.filter((p) => wanted.has(p.name));
+  const unexpectedArgs = passed.filter((name) => !details.some((p) => p.name === name));
+  const envKey = multiEnv ? currentEnvironmentRuntime()?.envKey : undefined;
+  // 错误回执只用来纠偏，不搬运大对象：字符串截断，数组/对象只给规模
+  const summarize = (value: unknown): unknown => {
+    if (typeof value === 'string') return value.length > 120 ? `${value.slice(0, 120)}…` : value;
+    if (value === null || typeof value === 'number' || typeof value === 'boolean') return value;
+    if (Array.isArray(value)) return `[${value.length} items]`;
+    if (typeof value === 'object') return `{${Object.keys(value).length} keys}`;
+    return typeof value;
+  };
+  const card = {
+    capability: target.id,
+    required,
+    params,
+    ...(target.routing?.exampleArgs ? { exampleArgs: target.routing.exampleArgs } : {}),
+    ...(target.routing?.requires ? { requires: target.routing.requires } : {}),
+    ...(target.routing?.constraints?.length ? { constraints: target.routing.constraints } : {}),
+    ...(envKey ? { currentEnvironment: envKey } : {}),
+    ...(unexpectedArgs.length > 0 ? { unexpectedArgs } : {}),
+    got: Object.fromEntries(passed.map((name) => [name, summarize(record[name])])),
+  };
+  return (
+    `该能力的参数卡：\n\`\`\`json\n${JSON.stringify(card, null, 2)}\n\`\`\`\n` +
+    `按 required/exampleArgs 修正后重试；不要猜参数名（完整索引可调 ${facadeId}({})）。`
+  );
+}
+
 /** 某个门面的 handler（索引 + 路由两用） */ function facadeHandler(
   server: McpServer,
   ctx: ToolContext,
@@ -236,11 +285,14 @@ async function promoteOnFacadeCall(
     const { ids, profile } = entitlementOf(ctx, identity);
 
     // ── 提升：调门面 = 选定这一类（hana-cli 的 discover_by_category 语义）──────────
-    // 提升只改呈现，不改授权（每次调用照旧按目标能力过闸门）。
-    const promotion = await promoteOnFacadeCall(server, ctx, identity, category);
+    // 提升只改呈现，不改授权。提升**不在这里**做：索引调用在返回索引前提升；路由调用要等
+    // 目标解析 + schema 校验 + 授权都通过后才提升——无效/未知/被拒的调用不应改动工具面，
+    // 否则同批或下一步的合法调用会被 DSH 的整代替换打失效（UNKNOWN_TOOL）。
 
     // ── 索引调用：不带目标 = 取本类可触达能力的索引 ─────────────────────────
     if (capability === undefined) {
+      // 索引调用明确表达「要在这个分类里干活」：返回索引前提升，回执里带提升报告。
+      const promotion = await promoteOnFacadeCall(server, ctx, identity, category);
       // 排除门面自己（它的 category 等于它的 facadeOf，不过滤会把自己列进自己的索引）
       const members = surfaceCapabilities(new Set(ids)).filter(
         (c) => c.category === category && c.facadeOf === undefined,
@@ -248,17 +300,35 @@ async function promoteOnFacadeCall(
       const surfaceExplanation = explainSurface(ctx, identity, {
         names: ctx.config.explainSurface === 'names',
       });
+      const multiEnv = ctx.manager?.multiEnv === true;
+      // 索引按路由卡的优先级排序：primary → fallback → advanced → admin（同档保持 id 序）。
+      // 高级/低频能力（如 hana_sql_analyze）不应在“第一眼”排在高频能力前面。
+      const priorityRank = (p: string | undefined): number =>
+        p === 'fallback' ? 1 : p === 'advanced' ? 2 : p === 'admin' ? 3 : 0;
+      const orderedMembers = [...members].sort(
+        (a, b) => priorityRank(a.routing?.priority) - priorityRank(b.routing?.priority),
+      );
       const envelope: Envelope = await withErrorEnvelope(async () => ({
         facade: facadeId,
         category,
         total: members.length,
-        items: members.map((c) => ({
-          id: c.id,
-          title: c.title,
-          kind: c.kind,
-          summary: summaryOf(c),
-          params: paramNamesOf(c, ctx.manager?.multiEnv === true),
-        })),
+        items: orderedMembers.map((c) => {
+          const routing = c.routing;
+          return {
+            id: c.id,
+            title: c.title,
+            kind: c.kind,
+            summary: summaryOf(c),
+            priority: routing?.priority ?? 'primary',
+            ...(routing?.whenToUse?.length ? { whenToUse: routing.whenToUse } : {}),
+            ...(routing?.notFor?.length ? { notFor: routing.notFor } : {}),
+            ...(routing?.requires ? { requires: routing.requires } : {}),
+            ...(routing?.constraints?.length ? { constraints: routing.constraints } : {}),
+            ...(routing?.exampleArgs ? { exampleArgs: routing.exampleArgs } : {}),
+            required: requiredParamsOf(c, multiEnv),
+            params: paramDetailsOf(c, multiEnv),
+          };
+        }),
         // P1-7：面被收窄时才说明（全量面不追加噪音）；默认只到类别，不点名被隐藏的能力。
         ...(surfaceExplanation.status === 'restricted' ? { surface: surfaceExplanation } : {}),
         ...promotion.report,
@@ -281,7 +351,8 @@ async function promoteOnFacadeCall(
 
     // 服务端按目标能力的 schema 校验（客户端 schema 只是便利，不是校验层）。
     // 多环境下非纯读目标（mutates != none）会多一个必填 expectedEnvironment（与注册面同源）。
-    const parsed = capabilityInputSchema(target, ctx.manager?.multiEnv === true).safeParse(args ?? {});
+    const multiEnv = ctx.manager?.multiEnv === true;
+    const parsed = capabilityInputSchema(target, multiEnv).safeParse(args ?? {});
     if (!parsed.success) {
       // 审计不能缺席：schema 失败也是按目标能力的拒绝，否则与纯索引调用在审计里不可区分。
       logger.warn(
@@ -294,7 +365,7 @@ async function promoteOnFacadeCall(
         .join('；');
       return mcpErrorText(
         `参数不符合 ${target.id} 的 schema：${issues}`,
-        `用 ${facadeId}({}) 取本类索引可看它的参数名；完整 schema 由服务端按目标能力校验`,
+        schemaErrorHint(target, facadeId, args, multiEnv),
       );
     }
 
@@ -310,7 +381,7 @@ async function promoteOnFacadeCall(
         agentLabel: ctx.config.agentLabel,
         via: facadeId,
       },
-      () => {
+      async () => {
         // 派发到原始 handler（闸门已在执行壳里按目标能力跑过；不走 SDK callTool 以免二次过闸）
         const handler = getRawHandler(server, target.id) as CapabilityHandler<typeof target.inputSchema> | undefined;
         if (!handler) {
@@ -321,6 +392,8 @@ async function promoteOnFacadeCall(
           );
           return mcpErrorText(UNKNOWN_CAPABILITY_TEXT);
         }
+        // 到这里才提升：目标存在、属于本类、参数通过 schema、授权也通过。
+        await promoteOnFacadeCall(server, ctx, identity, category);
         return handler(parsed.data as never, serverCtx as ServerContext);
       },
       (blocked) => blockedCallResult(blocked),
