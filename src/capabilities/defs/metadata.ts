@@ -9,6 +9,79 @@ import { cap, type Capability } from '../types.js';
 import { planTableColumns, planTableList } from '../planners.js';
 import { VIEW_KIND, VERSION_SCOPE, zObjectName, zReadPackageId } from '../schemas.js';
 
+/**
+ * hana_metadata_search_objects 的跨字段规则（纯函数）。
+ *
+ * 门面**提升前预检**与 handler 共用同一份实现：这些规则 zod 表达不了（条件必填/互斥），
+ * 过去只在 handler 入口拒绝，而门面在 handler 之前已提升分类——无效调用也会改动工具面。
+ */
+export function validateSearchObjectsArgs(args: {
+  pattern?: string;
+  by?: 'name' | 'field' | 'description' | 'both';
+  field?: string;
+  category?: 'model' | 'table' | 'columnView' | 'tableFunction' | 'all';
+  kind?: string;
+  packageId?: string;
+  schema?: string;
+  lang?: string;
+  version?: string;
+}): { message: string; hint: string } | undefined {
+  const mode = args.by ?? 'name';
+  const cat = args.category ?? 'model';
+  if (mode === 'name' && !args.pattern) {
+    return {
+      message: 'by=name（默认）需要 pattern',
+      hint: '按对象名搜索请给 pattern；按字段搜索用 by=field + field；按描述搜索用 by=description + pattern',
+    };
+  }
+  if ((mode === 'description' || mode === 'both') && !args.pattern) {
+    return {
+      message: `by=${mode} 需要 pattern`,
+      hint: '给出名称/描述片段；描述搜索覆盖模型/表/列视图，表函数目录无描述列',
+    };
+  }
+  if (mode === 'field' && !args.field) {
+    return {
+      message: 'by=field 需要 field',
+      hint: '给出字段 ID 片段（如 MATERIAL）；pattern 可选，用于收窄对象名候选',
+    };
+  }
+  if (mode === 'field' && cat !== 'model') {
+    return {
+      message: 'by=field 只支持 category=model',
+      hint: '字段来自仓库视图设计时 XML；目录对象请用 by=name/description',
+    };
+  }
+  if (mode === 'field' && (args.packageId || args.schema || args.lang)) {
+    return {
+      message: 'by=field 不支持 packageId/schema/lang',
+      hint: '用 pattern 收窄候选对象名；字段反查只读仓库视图',
+    };
+  }
+  if (cat === 'tableFunction' && mode === 'description') {
+    return {
+      message: '表函数目录没有描述/注释列',
+      hint: 'SYS.FUNCTIONS 无描述列；表函数请用 by=name 或 by=both',
+    };
+  }
+  if ((cat === 'table' || cat === 'columnView' || cat === 'tableFunction') && args.packageId) {
+    return { message: 'packageId 只用于 category=model/all 的模型部分', hint: '目录对象请用 schema 过滤' };
+  }
+  if (cat === 'model' && args.schema) {
+    return { message: 'schema 只用于目录类别', hint: '仓库视图请用 packageId 过滤' };
+  }
+  if ((cat === 'table' || cat === 'columnView' || cat === 'tableFunction') && args.kind) {
+    return { message: 'kind 只用于 category=model/all 的模型部分', hint: '目录对象请用 category/schema 过滤' };
+  }
+  if ((cat === 'table' || cat === 'columnView' || cat === 'tableFunction') && args.version === 'inactive') {
+    return { message: 'version 只用于 category=model/all 的模型部分', hint: '目录对象只有当前状态' };
+  }
+  if ((cat === 'table' || cat === 'columnView' || cat === 'tableFunction') && args.lang) {
+    return { message: 'lang 只用于 category=model/all 的模型部分', hint: '目录对象的注释没有语言变体' };
+  }
+  return undefined;
+}
+
 export const metadataCapabilities = {
   hana_metadata_get_view: cap({
     id: 'hana_metadata_get_view',
@@ -51,6 +124,10 @@ export const metadataCapabilities = {
       notFor: ['已知 packageId+objectName 时直接 get_view/list_fields'],
       priority: 'primary',
       exampleArgs: { pattern: 'ZDEMO02_CV', by: 'name', category: 'model' },
+    },
+    preflight: (args) => {
+      const rule = validateSearchObjectsArgs(args as Parameters<typeof validateSearchObjectsArgs>[0]);
+      return rule ? { issues: [rule.message], hint: rule.hint } : undefined;
     },
     title: '搜索元数据对象（名称 / 描述 / 字段，跨类别）',
     description:
@@ -102,6 +179,15 @@ export const metadataCapabilities = {
       notFor: ['看单字段计算逻辑用 hana_metadata_get_field_logic'],
       priority: 'primary',
       exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV008' },
+    },
+    preflight: (args) => {
+      const v = args as { exact?: boolean; pattern?: string };
+      return v.exact === true && !v.pattern
+        ? {
+            issues: ['exact=true 需要同时提供 pattern（精确匹配的字段 ID）。'],
+            hint: '要精确匹配请给 pattern；想看全部字段请去掉 exact（默认 false = 片段匹配）',
+          }
+        : undefined;
     },
     title: '列出视图字段清单',
     description:

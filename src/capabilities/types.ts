@@ -67,6 +67,24 @@ export interface CapabilityRouting {
   constraints?: readonly string[];
 }
 
+/** 路由预检结果：issues 非空 = 无效调用；hint 是恢复指引（可选）。 */
+export interface CapabilityPreflightResult {
+  issues: string[];
+  hint?: string;
+}
+
+/**
+ * 路由预检：schema 通过后、**提升/派发之前**的纯跨字段校验。
+ *
+ * 为什么需要它：zod 只表达单字段类型/枚举，表达不了「by=name 需要 pattern」「勘察与视图目标二选一」
+ * 这类跨字段规则；这些规则此前在 handler 入口才拒绝，而门面在 handler 之前已经提升分类——
+ * 结果是**无效调用也会改动工具面**，把同批/下一步的合法调用打成 `UNKNOWN_TOOL`。
+ *
+ * 约束：纯函数、无 I/O；返回 issues 即无效调用，门面返回参数卡且不提升。handler 仍保留自己的
+ * 校验作为防御纵深（防绕过门面直接平铺调用）。
+ */
+export type CapabilityPreflight = (args: unknown) => CapabilityPreflightResult | undefined;
+
 /**
  * 能力分类（**AI 能力视角**，2026-10-09 重构；参照 SAP HANA MCP Server 的 six areas）：
  * 分类轴 = "AI 想干什么"，而不是"代码长在哪"——门面、索引、提升都按它分组。
@@ -213,6 +231,8 @@ export interface Capability<S extends z.ZodType = z.ZodType> {
   title: string;
   /** 路由卡：门面索引/平铺描述的选择辅助（可选；不参与授权判定） */
   routing?: CapabilityRouting;
+  /** 纯跨字段预检：schema 通过后、提升/派发前执行；返回 issues 即无效调用（不提升）。 */
+  preflight?: CapabilityPreflight;
   description: string;
   inputSchema: S;
   /** 客户端提示（protocol hints），**不参与任何授权判定** */

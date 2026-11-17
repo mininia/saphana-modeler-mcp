@@ -7,6 +7,7 @@
 import { z } from 'zod';
 import { tagResource } from '../resources.js';
 import { cap, type Capability } from '../types.js';
+import { resolvePreviewTarget, SAMPLE_ROWS_DEFAULT } from '../preview-target.js';
 import { planDataPreview } from '../planners.js';
 import { VIEW_KIND, zObjectName } from '../schemas.js';
 import { zReadPackageId } from '../schemas.js';
@@ -44,6 +45,10 @@ export const previewCapabilities = {
       ],
       exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV008', limit: 5 },
     },
+    preflight: (args) => {
+      const target = resolvePreviewTarget(args as Parameters<typeof resolvePreviewTarget>[0]);
+      return target.mode === 'invalid' ? { issues: [target.error], hint: target.hint } : undefined;
+    },
     title: '数据预览 / 基表勘察',
     // 细则（勘察画像、节点预览机制、权限诊断）见 rules=preview；此处只留目标形态与参数面。
     description:
@@ -74,7 +79,7 @@ export const previewCapabilities = {
         .int()
         .min(1)
         .max(2000)
-        .default(200)
+        .default(SAMPLE_ROWS_DEFAULT)
         .describe('勘察模式：采样行数（统计口径，非全表统计），默认 200'),
       packageId: zReadPackageId('预览模式：包名，层级用 . 分隔，如 ZDEMO.ZDEMO_MGF').optional(),
       objectName: zObjectName('预览模式：视图对象名，如 ZDEMO02_CV008').optional(),

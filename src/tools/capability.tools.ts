@@ -369,6 +369,21 @@ function schemaErrorHint(target: Capability, facadeId: string, args: unknown, mu
       );
     }
 
+    // 跨字段预检：schema 通过但业务约束不成立（如 by=name 缺 pattern、勘察/视图目标混用）。
+    // 必须在提升之前拦下——否则无效调用也会改动工具面，把同批/下一步的合法调用打成 UNKNOWN_TOOL。
+    const preflight = target.preflight?.(parsed.data);
+    if (preflight) {
+      logger.warn(
+        blockAuditPayload(ctx, identity, profile, facadeId, target.id, ['input_schema_invalid']),
+        'capability-audit',
+      );
+      const card = schemaErrorHint(target, facadeId, args, multiEnv);
+      return mcpErrorText(
+        `参数不符合 ${target.id} 的调用约束：${preflight.issues.join('；')}`,
+        preflight.hint ? `${preflight.hint}\n${card}` : card,
+      );
+    }
+
     // 按目标能力授权 → 派发 → 写能力终态审计：与平铺直调**同一个执行壳**（dispatchAuthorized）。
     // 归因 via=门面 id（审计里能区分「经门面路由」与「提升后平铺直调」）。
     return dispatchAuthorized(

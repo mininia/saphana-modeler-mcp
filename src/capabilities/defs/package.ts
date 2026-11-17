@@ -123,6 +123,15 @@ export const packageCapabilities = {
       requires: '目标包在 HANA_WRITE_PACKAGES 可写范围内；覆盖需 overwrite=true',
       exampleArgs: { targetPackageId: 'ZDEMO.ZDEMO_MGF', filePath: 'import/ZDEMO02_CV009.calculationview' },
     },
+    preflight: (args) => {
+      const v = args as { filePath?: string; content?: unknown };
+      return v.filePath && v.content !== undefined
+        ? {
+            issues: ['导入来源二选一：filePath（本地文件）与 content（内联内容）不能同时提供。'],
+            hint: '导本地文件只给 filePath；导内联内容给 content + fileName',
+          }
+        : undefined;
+    },
     title: '导入设计时文件（Transfer API）',
     description:
       '把本地设计时文件（.calculationview XML 或导出的 zip）导入仓库（Transfer API：POST 目录目标 + PUT /base/xfer/import）。实测（SPS08）导入即激活，不存在 inactive 暂存；修改已有对象请走 hana_view_update。\n' +

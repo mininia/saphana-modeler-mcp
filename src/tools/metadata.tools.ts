@@ -20,6 +20,7 @@ import {
 } from '../services/metadata.service.js';
 import { capabilityRegistrar, type ToolContext } from './index.js';
 import { CAP } from '../capabilities/manifest.js';
+import { validateSearchObjectsArgs } from '../capabilities/defs/metadata.js';
 import { toToolResult } from './common.js';
 import type { Envelope } from '../types/hana.js';
 
@@ -52,51 +53,11 @@ export function registerMetadataTools(server: McpServer, ctx: ToolContext): void
   regCap(
     CAP.hana_metadata_search_objects,
     async ({ pattern, by, field, category, kind, packageId, schema, lang, limit, maxCandidates, version }) => {
-      // 跨字段条件必填/互斥：zod 表达不了（handler 级硬错误 + 可恢复指引）
+      // 跨字段条件必填/互斥：与门面提升前的 preflight 共用同一份实现。
+      const rule = validateSearchObjectsArgs({ pattern, by, field, category, kind, packageId, schema, lang, version });
+      if (rule) return mcpErrorText(rule.message, rule.hint);
       const mode = by ?? 'name';
       const cat = category ?? 'model';
-      if (mode === 'name' && !pattern) {
-        return mcpErrorText(
-          'by=name（默认）需要 pattern',
-          '按对象名搜索请给 pattern；按字段搜索用 by=field + field；按描述搜索用 by=description + pattern',
-        );
-      }
-      if ((mode === 'description' || mode === 'both') && !pattern) {
-        return mcpErrorText(
-          `by=${mode} 需要 pattern`,
-          '给出名称/描述片段；描述搜索覆盖模型/表/列视图，表函数目录无描述列',
-        );
-      }
-      if (mode === 'field' && !field) {
-        return mcpErrorText('by=field 需要 field', '给出字段 ID 片段（如 MATERIAL）；pattern 可选，用于收窄对象名候选');
-      }
-      if (mode === 'field' && cat !== 'model') {
-        return mcpErrorText(
-          'by=field 只支持 category=model',
-          '字段来自仓库视图设计时 XML；目录对象请用 by=name/description',
-        );
-      }
-      if (mode === 'field' && (packageId || schema || lang)) {
-        return mcpErrorText('by=field 不支持 packageId/schema/lang', '用 pattern 收窄候选对象名；字段反查只读仓库视图');
-      }
-      if (cat === 'tableFunction' && mode === 'description') {
-        return mcpErrorText('表函数目录没有描述/注释列', 'SYS.FUNCTIONS 无描述列；表函数请用 by=name 或 by=both');
-      }
-      if ((cat === 'table' || cat === 'columnView' || cat === 'tableFunction') && packageId) {
-        return mcpErrorText('packageId 只用于 category=model/all 的模型部分', '目录对象请用 schema 过滤');
-      }
-      if (cat === 'model' && schema) {
-        return mcpErrorText('schema 只用于目录类别', '仓库视图请用 packageId 过滤');
-      }
-      if ((cat === 'table' || cat === 'columnView' || cat === 'tableFunction') && kind) {
-        return mcpErrorText('kind 只用于 category=model/all 的模型部分', '目录对象请用 category/schema 过滤');
-      }
-      if ((cat === 'table' || cat === 'columnView' || cat === 'tableFunction') && version === 'inactive') {
-        return mcpErrorText('version 只用于 category=model/all 的模型部分', '目录对象只有当前状态');
-      }
-      if ((cat === 'table' || cat === 'columnView' || cat === 'tableFunction') && lang) {
-        return mcpErrorText('lang 只用于 category=model/all 的模型部分', '目录对象的注释没有语言变体');
-      }
 
       const envelope: Envelope = await withErrorEnvelope(async () => {
         if (mode === 'field') {
