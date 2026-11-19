@@ -83,7 +83,10 @@ export const systemCapabilities = {
     kind: 'admin',
     routeOnly: true,
     control: true,
-    effects: { destructive: true, idempotent: false, mutates: 'none', plan: () => planReadless('hana_env_switch') },
+    // 控制面切换不是数据破坏：不写 HANA（mutates=none）、可再次切换回退，且自带
+    // 一次性 switchToken + epoch/from 校验 + confirm=目标 的两段确认。若标成 destructive，
+    // 审批闸门会要求宿主 elicitation；不支持该能力的客户端将永远无法切换（P3 前的死锁）。
+    effects: { destructive: false, idempotent: false, mutates: 'none', plan: () => planReadless('hana_env_switch') },
     routing: {
       intent: '切换当前 active 环境（多环境、stdio）',
       whenToUse: ['用户明确要求切换环境', '需要写另一个可写环境时'],
@@ -102,6 +105,7 @@ export const systemCapabilities = {
     description:
       '切换当前 active 环境（多环境、stdio）。必须先用 hana_env_list 获取 from/epoch/switchToken，' +
       'confirm 等于目标环境标识（大小写不敏感）；目标有运行中任务时需 acknowledgeRunningTasks=true。' +
+      '确认由一次性 token + epoch/from + confirm 完成，不依赖客户端的 elicitation 能力。' +
       'HTTP 模式拒绝（多客户端共享进程）。经 hana_tool_search 披露后用 hana_invoke 执行，不注册为工具。',
     inputSchema: z.object({
       to: z.string().min(1).max(32).describe('目标环境标识（见 hana_env_list 返回的 name；大小写不敏感）'),
@@ -114,6 +118,6 @@ export const systemCapabilities = {
         .optional()
         .describe('目标环境有运行中任务时必须显式 true，表示接受新调用与任务共享池'),
     }),
-    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   }),
 } satisfies Record<string, Capability<z.ZodType>>;

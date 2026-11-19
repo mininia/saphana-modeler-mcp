@@ -5,7 +5,7 @@ import { logger } from '../core/logger.js';
 import { currentIdentity } from '../core/request-context.js';
 import { activeProfile } from '../config/profiles.js';
 import { policyFromConfig } from '../config/preflight.js';
-import { approvalGate } from '../config/approval.js';
+import { approvalGate, clientSupportsElicitation } from '../config/approval.js';
 import { blockedCallResult, dispatchAuthorized } from '../config/authorize.js';
 import { capabilityInputSchema } from '../config/environment-policy.js';
 import { registeredNameOf, type Capability } from '../capabilities/types.js';
@@ -142,7 +142,7 @@ export function capabilityRegistrar(server: McpServer, ctx: ToolContext): Capabi
     (register as (n: string, c: unknown, f: unknown) => unknown)(
       registeredNameOf(cap),
       registrationOf(cap, surface, ctx.manager?.multiEnv === true, ctx.config.toolSearchGoalEnabled !== false),
-      gatedHandler(ctx, cap, handler),
+      gatedHandler(server, ctx, cap, handler),
     );
   } as CapabilityRegistrar;
   registrar.routeOnly = <S extends z.ZodType>(cap: Capability<S>, handler: CapabilityHandler<S>): void => {
@@ -160,6 +160,7 @@ export function capabilityRegistrar(server: McpServer, ctx: ToolContext): Capabi
  * 具体能力的派发由 hana_invoke 里的 dispatchAuthorized 负责；两条路径共用同一判定壳。
  */
 function gatedHandler<S extends z.ZodType>(
+  server: McpServer,
   ctx: ToolContext,
   cap: Capability<S>,
   handler: CapabilityHandler<S>,
@@ -183,7 +184,16 @@ function gatedHandler<S extends z.ZodType>(
         },
         () => (handler as (a: unknown, e: unknown) => unknown)(args, extra),
         (auth) => blockedCallResult(auth) as never,
-        () => approvalGate(cap, args, ctx.config.approvalPolicy, extra as ServerContext, identity?.clientId),
+        () =>
+          approvalGate(
+            cap,
+            args,
+            ctx.config.approvalPolicy,
+            extra as ServerContext,
+            identity?.clientId,
+            undefined,
+            clientSupportsElicitation(server, extra as ServerContext),
+          ),
       );
     // 多环境：入口取一次 runtime 并绑定到本次调用（含异步续体）。捕获发生在任何 await 之前，
     // 因此之后切换 active 不会影响这次调用；policyFromConfig(ctx.config) 也读绑定值。

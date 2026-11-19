@@ -219,7 +219,7 @@ HANA_ENV_SWITCHABLE=DEV,UAT,PROD
 
 - **只读/可写（非 SQL 能力）**：由 `HANA_WRITE_PACKAGES` 是否为空推导。空 = 只拦 `persistent`，`transient` 与纯读放行。
 - **SQL 模式**：由 `HANA_SQL_ACCESS` 独立决定，**与全局写包无关**。`select-only` 只允许 SELECT 类；`readwrite` 才允许 DML/DDL/管理类。对象级 schema/对象访问由 HANA 账号权限决定。
-- **审批固定启用**：`effects.destructive=true` 的能力在策略放行后**固定**走一次人工确认（`input_required`），无配置开关。
+- **审批固定启用**：`effects.destructive=true` 的能力在策略放行后**固定**走一次人工确认（`input_required`），无配置开关。确认由宿主发起，客户端须声明 `elicitation`（2025：initialize；2026：每请求 envelope）；未声明时服务端直接返回硬错误、不派发（不会静默放行）。控制面 `hana_env_switch` 自带 token/epoch/confirm 两段确认，不属于审批范围。
 - **档案**：`MCP_PROFILES` / `MCP_PROFILE` 仍是可选高级项；档案只能在上述参数范围内收紧。
 
 **已移除、忽略（不生效）**：`HANA_ACCESS`、`HANA_READONLY_SQL`、`HANA_APPROVAL`、`HANA_TOOL_ALLOW`、`MCP_POLICY`（前两者的 `_ENV_` 变体同样识别）。出现时只记一条启动 warn，不阻断启动。

@@ -20,7 +20,7 @@
  * `agentLabel`（MCP_AGENT_LABEL）取进程级标签（未配置时不产生该字段）。
  */
 
-import type { InputRequiredResult } from '@modelcontextprotocol/server';
+import type { ApprovalGateResult } from './approval.js';
 import { assembleVerdict, checkDeployment, type Policy, type Verdict } from './preflight.js';
 import { evaluate, type EvaluationResult } from './evaluate.js';
 import { environmentMutationScope, type EnvironmentAssertion } from './environment-policy.js';
@@ -352,13 +352,20 @@ export async function dispatchAuthorized<T>(
   ctx: AuthorizationContext,
   dispatch: () => T | Promise<T>,
   onBlocked: (result: AuthorizationResult) => T,
-  /** 审批：策略放行后、派发前调用；返回 input_required 则本次不执行 */
-  approval?: () => InputRequiredResult | undefined,
+  /** 审批：策略放行后、派发前调用；返回 input_required（等待确认）或硬错误（无法发起确认）则本次不执行 */
+  approval?: () => ApprovalGateResult | undefined,
 ): Promise<T> {
   const auth = authorizeCall(capability, args, { ...ctx, deferAllowAudit: true });
   if (!auth.allowed) return onBlocked(auth);
   const gate = approval?.();
-  if (gate) return gate as T;
+  if (gate) {
+    // 审批无法发起（如客户端未声明 elicitation）：派发没有发生；持久写入补一条终态，
+    // 保持「每次写尝试恰好一条终态」的口径。等待确认仍只记 approval 事件。
+    if ((gate as { isError?: unknown }).isError === true) {
+      auditTerminal(capability, auth, 'failed', 'approval_unsupported');
+    }
+    return gate as T;
+  }
   // 审批已通过（或不需要）：非持久能力在这里补放行记录，确认前不记 allowed。
   const dryRun = args['dryRun'] === true;
   const dryRunField = dryRun ? { dryRun: true } : {};

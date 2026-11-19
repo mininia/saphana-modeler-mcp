@@ -4,6 +4,11 @@
 >
 > 约定：每次提交前把变化补到对应版本条目下；每条 1–3 行，只写对外可见变化。
 
+## 1.5.1 - 2026-11-19
+
+- 修复 `hana_env_switch` 在未声明 `elicitation` 的客户端上永远无法切换：控制面切换改为非破坏性（不写 HANA、可再次切回，确认由一次性 `switchToken` + epoch/from + `confirm` 完成），不再要求宿主审批。
+- 审批闸门在派发前检查客户端是否声明表单式 `elicitation`（2025 initialize / 2026 每请求 envelope）：未声明时返回明确硬错误且不派发（审计记 `failed/approval_unsupported`），不再把无法满足的 `input_required` 交给 SDK 变成晦涩的协议层失败。
+
 ## 1.5.0 - 2026-11-19
 
 - **破坏性变更（单一入口）**：`tools/list` 只保留 `hana_tool_search`（discover/contract/goal 三模式）与 `hana_invoke`（唯一执行入口）；删除六个分类门面、`hana_sql_execute` 根工具、分类提升与 `list_changed`、`MCP_CAPABILITY_SURFACE_MAX`。

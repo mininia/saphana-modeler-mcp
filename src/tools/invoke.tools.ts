@@ -13,7 +13,7 @@ import { isPlatformToolId, type Capability } from '../capabilities/types.js';
 import { INVOKE_SCHEMA } from '../capabilities/defs/invoke.js';
 import { blockedCallResult, dispatchAuthorized } from '../config/authorize.js';
 import { policyFromConfig } from '../config/preflight.js';
-import { approvalGate } from '../config/approval.js';
+import { approvalGate, clientSupportsElicitation } from '../config/approval.js';
 import { capabilityInputSchema, type EnvironmentAssertion } from '../config/environment-policy.js';
 import { verifyContextToken } from '../config/context-token.js';
 import type { CallerProfile } from '../config/profiles.js';
@@ -227,6 +227,8 @@ export function registerInvokeTools(server: McpServer, ctx: ToolContext): void {
           ctx.config.approvalPolicy,
           serverCtx as ServerContext,
           identity?.clientId,
+          undefined,
+          clientSupportsElicitation(server, serverCtx as ServerContext),
         ),
     );
   };

@@ -171,7 +171,7 @@ hana_tool_search({ "mode": "goal", "goal": "diagnose_preview_permission",
 - 契约的 `policy` 预判：`bindings` 未覆盖写包/读 schema 时状态为 `partial`（演示参数不作为资源判定依据）；补 `bindings` 后按真实目标预判。
 - **可显式关闭 goal 模式**：`HANA_TOOL_SEARCH_GOAL=off` 时只保留 `discover`/`contract`，`mode=goal` 返回可恢复错误；工具面与 `hana_invoke` 不变。
 - **调用上下文**：推荐 `hana_invoke({ capability, args, contextToken })`；`expectedEnvironment` / `disclosure` 是兼容字段。
-- **审批固定启用**：`effects.destructive=true` 的能力在策略放行后返回 `input_required`，确认绑定 args/调用方/5 分钟过期；无 `HANA_APPROVAL` 开关。
+- **审批固定启用**：`effects.destructive=true` 的能力在策略放行后返回 `input_required`，确认绑定 args/调用方/5 分钟过期；无 `HANA_APPROVAL` 开关。宿主须声明 `elicitation`，未声明时直接返回硬错误、不派发；`hana_env_switch` 自带 token/epoch/confirm，不在审批范围。
 - **SQL 访问模式**：`HANA_SQL_ACCESS=select-only`（默认）只允许 SELECT 类；`readwrite` 才允许 SQL 写；对象级 schema/对象访问由 HANA 账号权限决定。
 - 权限模型见 [CONFIG.md 的「权限参数（4 个 + SQL 模式）」](CONFIG.md#权限参数4-个--sql-模式)。
 - 多环境部署时 `hana_env_list` / `hana_env_switch` 经本体层发现与执行（仍受分组/档案可达性约束）；单环境不可见。

@@ -419,7 +419,9 @@ Beyond the basic facts, `hana_system_get_info` returns two **on-demand** items:
 
 Business capabilities + 8 `hana_view_update#<op>` operation aliases (route-only; never registered as tools). The two
 platform tools carry annotations (`readOnlyHint` / `idempotentHint`); for capabilities, the contract exposes
-`effects` (`mutates` / `destructive` / `idempotent`) and the server itself enforces approval for destructive ones.
+`effects` (`mutates` / `destructive` / `idempotent`) and the server itself enforces approval for destructive ones
+(requiring the host to declare `elicitation`; otherwise the call fails closed without dispatching). `hana_env_switch`
+is a control capability with its own token/epoch/confirm handshake and is not subject to approval.
 Multi-environment deployments additionally offer two control capabilities (`hana_env_list`, `hana_env_switch`),
 which disappear entirely in single-environment mode.
 
