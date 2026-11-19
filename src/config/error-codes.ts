@@ -1,7 +1,7 @@
 /**
  * 拦截错误码注册表（用户可查的单一真源）。
  *
- * 约定（见 docs/multi-hana-environment-redesign.md §5.1/§5.2）：
+ * 约定：
  * - 所有主动拦截显式抛错，错误信息 = 错误码 + 原因 + 处理方案；不得静默忽略/回退；
  * - 启动期与运行期共用同一张表；CONFIG.md 的《错误码速查》从这里生成/校验；
  * - 错误信息不得包含密码/Token；`interceptionError` 只拼接原因与处理方案，不回显环境变量值。
@@ -97,19 +97,31 @@ export const ERROR_CODES: readonly ErrorCodeSpec[] = [
     code: 'env_readonly',
     category: 'environment',
     summary: '只读环境拒绝了持久写入能力',
-    remediation: '切到 ACCESS=readwrite 的环境，或为该环境使用只读账号；临时对象与纯读不受影响。',
+    remediation: '为该环境配置非空的 HANA_WRITE_PACKAGES（或切到可写环境）；临时对象与纯读不受影响。',
   },
   {
     code: 'env_assertion_missing',
     category: 'environment',
-    summary: '多环境调用缺少 expectedEnvironment',
-    remediation: '传入当前环境标识（与 hana_env_list 的 current 一致，大小写不敏感）。',
+    summary: '多环境调用缺少上下文令牌/环境断言',
+    remediation: '传入 hana_tool_search 回执里的 contextToken（旧写法：当前环境标识 + epoch）。',
   },
   {
     code: 'env_assertion_mismatch',
     category: 'environment',
-    summary: 'expectedEnvironment 与当前环境不一致',
-    remediation: '先确认是否忘了切回；用 hana_env_list 查看当前环境后重试。',
+    summary: '环境断言与当前环境不一致',
+    remediation: '先确认是否忘了切回；用 hana_env_list 查看当前环境后重新取 contextToken。',
+  },
+  {
+    code: 'env_epoch_missing',
+    category: 'environment',
+    summary: '多环境调用缺少 epoch',
+    remediation: '重新调用 hana_tool_search 取 contextToken（旧写法：传入 hana_env_list 返回的 epoch）。',
+  },
+  {
+    code: 'env_epoch_stale',
+    category: 'environment',
+    summary: '环境代际已过期',
+    remediation: '重新调用 hana_tool_search / hana_env_list 取当前代际后重试；旧披露不可复用。',
   },
   {
     code: 'env_switch_disabled',
@@ -145,7 +157,7 @@ export const ERROR_CODES: readonly ErrorCodeSpec[] = [
     code: 'env_switch_token_invalid',
     category: 'environment',
     summary: '切换 token 无效或已使用/过期',
-    remediation: '重新调用 hana_env_list 获取一次性 token（默认 60s 有效）。',
+    remediation: '重新调用 hana_env_list 获取一次性 token（默认 5 分钟有效）。',
   },
   {
     code: 'env_switch_confirm_mismatch',
@@ -231,7 +243,31 @@ export const ERROR_CODES: readonly ErrorCodeSpec[] = [
     code: 'unknown_capability',
     category: 'authorization',
     summary: '能力 id 不存在',
-    remediation: '通过门面索引获取可用能力 id。',
+    remediation: '先用 hana_tool_search({mode:"discover"}) 获取可用能力 id。',
+  },
+  {
+    code: 'context_stale',
+    category: 'authorization',
+    summary: 'contextToken 已过期，或身份/环境/代际/策略/清单已变化',
+    remediation: '重新调用 hana_tool_search（discover/contract/goal）获取新 contextToken；切环境后必须重新获取。',
+  },
+  {
+    code: 'disclosure_stale',
+    category: 'authorization',
+    summary: '旧披露包已过期、不属于本次调用或属于其它工具',
+    remediation: '重新调用 hana_tool_search 披露，或改用 contextToken。',
+  },
+  {
+    code: 'policy_stale',
+    category: 'authorization',
+    summary: '披露包的策略代际与当前策略不一致',
+    remediation: '重新调用 hana_tool_search 披露（策略/档案/环境已变化）。',
+  },
+  {
+    code: 'manifest_stale',
+    category: 'authorization',
+    summary: '披露包的能力清单代际与当前清单不一致',
+    remediation: '重新披露；服务端可能已升级。',
   },
   {
     code: 'schema_not_allowed',

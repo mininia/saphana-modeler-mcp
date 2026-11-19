@@ -33,29 +33,27 @@ import {
   updateCalculationView,
 } from './view-write.service.js';
 
-/* ── 变更集（多对象事务）：SSD §6.1 第 2–4 步 + §6.3 补偿 + §6.4 报告 ────────
- * 单次调用内闭合的四步：① planChangeset 整体预检（形状非法 / 相交 / **破坏性未声明** ⇒ 整批拒绝零写入，
+/* ── 变更集（多对象事务）：预检 → 逐项执行 → 逆序补偿 → 报告 ────────────────
+ * 单次调用内闭合的四步：① 整体预检（形状非法 / 相交 / **破坏性未声明** ⇒ 整批拒绝零写入；
  * 破坏性判定见 precheckChangesetGates——在任何写之前）② 逐项执行（各自完成含激活）
  * ③ 失败 ⇒ 逆序补偿 ④ 组装报告（partial 与 notExecuted 显式枚举，绝不把部分完成包装成 success）。
  *
- * 【对 SSD §6.1「整批持有 keyed lock」的实测偏差】原文要求「逐个 withKeyedLock 并整批持有至批结束」——
- * 在本仓**不可实现且会自锁死**：withKeyedLock 不可重入，而三个写路径各自会取同一把对象锁
- * （createCalculationView 的临界区 / updateCalculationView 的整段判定与 PUT / deleteCalculationView →
- * deleteViaRest），批内先持锁再调用它们 = 排队等自己。本批的裁定：
+ * 【为什么批不整批持锁】整批持有 keyed lock 在本仓**不可实现且会自锁死**：withKeyedLock 不可重入，
+ * 而三个写路径各自会取同一把对象锁（create 的临界区 / update 的整段判定与 PUT / delete →
+ * deleteViaRest），批内先持锁再调用它们 = 排队等自己。故：
  *   - **逐项执行、各自取锁**：动作已按 (packageId, objectName) 字典序稳定排序（planChangeset），
  *     任意两批不会形成顺序相反的加锁环 ⇒ 不构成 ABBA 死锁；
- *   - 批的一致性由另两条既有保证兜住：批内**对象级相交检测**（§6.2，相交 ⇒ 零写入）与
- *     **每项自己的 If-Match 基线**（写前预读的 ETag 显式传给写路径 ⇒ 批外并发写以 412 暴露 ⇒
- *     `conflict_external`），而不是靠整批持锁的隔离；
+ *   - 批的一致性由另两条保证兜住：批内**对象级相交检测**（相交 ⇒ 零写入）与**每项自己的 If-Match
+ *     基线**（写前预读的 ETag 显式传给写路径 ⇒ 批外并发写以 412 暴露 ⇒ `conflict_external`）；
  *   - 代价如实说：批**不提供跨项快照隔离**——逐项提交，失败即逆序补偿，期间的批外读写对本批可见。
- * 该裁定同时写进回执（ChangesetReport.concurrencyNote），调用方不必读代码就知道这条偏差与理由。
+ * 该裁定同时写进回执（ChangesetReport.concurrencyNote），调用方不必读代码就知道。
  *
- * 依赖说明（I3）：读写集推导/排序/相交检测全部由 changeset.plan（其内部走 write-plan 的共享扫描件）
- * 承担，本文件**不出现第二份**扫描器；写路径一律复用既有服务函数，不另写一份。
+ * 依赖说明：读写集推导/排序/相交检测全部由 changeset.plan（内部走 write-plan 的共享扫描件）承担，
+ * 本文件**不出现第二份**扫描器；写路径一律复用既有服务函数，不另写一份。
  */
 
 /**
- * 变更集单项报告（SSD §6.4 形状）。
+ * 变更集单项报告。
  *
  * `index` 是**调用方原始顺序**的下标（不是执行序位置）：执行按 planChangeset 的字典序，
  * 但报告一律按调用方自己的顺序说话——否则「第 3 项失败」在报告里会指向另一个动作。
@@ -67,7 +65,7 @@ export interface ChangesetReportItem {
   action: string;
   status: 'ok' | 'failed' | 'compensated' | 'compensation_failed' | 'conflict_external';
   /**
-   * 该项**写成功后**回执里的新基线（= 该项的补偿基线，SSD §6.3）。
+   * 该项**写成功后**回执里的新基线（= 该项的补偿基线）。
    * 为什么不能用写前基线：本项自己的 PUT 已推进版本，拿写前基线做补偿的 If-Match 必得伪 412。
    * delete 项恒无此字段：删除后不存在可作基线的 ETag——它的补偿材料是原文（回写），不是 ETag。
    */
@@ -85,11 +83,9 @@ export interface ChangesetReportItem {
   /** 本项**自身**执行耗时 ms（写入前预读 + 写入/激活）；不含补偿耗时（补偿计入报告总 elapsedMs） */
   elapsedMs?: number;
   /**
-   * 该项写成功后服务端回报的**激活状态**（来源：update → UpdateCalculationViewResult.activated、
-   * create → CreateCalcViewResult.activated——均取自写响应的 SapBackPack.Activated 同刻读数）。
-   * SSD §6.1 第 3 步要求各项「各自完成（**含激活**）」：activated === false 的项按 `failed` 处理
-   * （触发停止 + 逆序补偿 + partial=true），activated === true 照旧 ok。
-   * delete 项没有激活概念，如实缺省（不产生该字段）。
+   * 该项写成功后服务端回报的**激活状态**（来源：update/create 回执的 SapBackPack.Activated 同刻读数）。
+   * 批要求各项「各自完成（**含激活**）」：activated === false 的项按 `failed` 处理（触发停止 +
+   * 逆序补偿 + partial=true）。delete 项没有激活概念，如实缺省。
    */
   activated?: boolean;
   /**
@@ -99,20 +95,19 @@ export interface ChangesetReportItem {
   activationErrors?: string;
   /**
    * 该项写成功回执里的诚实性警告（当前来源：create 通道的 CreateCalcViewResult.warnings——
-   * 自动取列命中上限的截断标注与显式列类型未解析）。批量通道不许把它静默丢弃：同一载荷走单对象
-   * 通道会看到警告、走批却看不到时，调用方会按「全列/类型齐全」的错误口径读回执。
-   * 无警告的项不产生该字段（不制造恒为空噪音）。
+   * 自动取列命中上限的截断标注与显式列类型未解析）。批量通道不许静默丢弃：同一载荷走单对象
+   * 通道会看到警告、走批却看不到时，调用方会按「全列/类型齐全」的错误口径读回执。无警告不产生该字段。
    */
   warnings?: string[];
 }
 
 /**
- * 未执行项（不变量 2：所有「部分成功」都要**显式枚举未完成项**，不许打包成 success，也不许让调用方
- * 靠 requested 与 applied 的差集自行推断）。两个来源：
- * - 批被**整体预检拒绝**（载荷形状非法 / 批内相交 / 破坏性未声明 ⇒ 整批拒绝、零写入）：全部动作都未执行，
- *   reason='batch_rejected'——此时没有报告可返回（调用以业务错误终止），同一形状的枚举随**三条拒绝路径**
- *   的载荷 errorDetail.notExecuted 带出（三条路径统一携带，机读方不会在其中任何一条落空）；
- * - 某项失败后**中止**（SSD §6.1：任一项失败即停止）：该项之后（执行序）的动作一件都不执行，
+ * 未执行项（不变量：所有「部分成功」都要**显式枚举未完成项**，不许打包成 success，也不许让调用方
+ * 靠 requested 与 applied 的差集推断）。两个来源：
+ * - 批被**整体预检拒绝**（载荷形状非法 / 批内相交 / 破坏性未声明 ⇒ 整批拒绝、零写入）：全部动作都
+ *   未执行，reason='batch_rejected'——此时没有报告可返回，同一形状的枚举随三条拒绝路径的载荷
+ *   errorDetail.notExecuted 带出（三条路径统一携带）；
+ * - 某项失败后**中止**（任一项失败即停止）：该项之后（执行序）的动作一件都不执行，
  *   reason='aborted_after_failure'。
  */
 export interface ChangesetNotExecutedItem {
@@ -127,7 +122,7 @@ export interface ChangesetNotExecutedItem {
 }
 
 /**
- * partial 报告 ⇒ 业务失败错误（I2：绝不把部分完成包装成 success）。
+ * partial 报告 ⇒ 业务失败错误（绝不把部分完成包装成 success）。
  *
  * **单点实现**：同步工具通道（hana_view_update 的 changeset 分支）与异步任务通道（async-task.service
  * 的终态结算）共用这一份——两处各写一遍文案与载荷必然漂移，而这是调用方据以判读批次结局的关键回执。
@@ -149,29 +144,25 @@ export function changesetPartialError(report: ChangesetReport): HanaBusinessErro
 }
 
 /**
- * 变更集报告（SSD §6.4；I2：部分成功显式枚举）。
+ * 变更集报告（部分成功显式枚举）。
  *
- * `applied` 只装**实际执行过**的动作：它可能少于 `requested`——差额就是「首次失败之后按其后未执行的动作」
- * （SSD §6.1：任一项失败即停止）。未执行项**不进 applied**（状态枚举里没有 skipped，宁可少报也不凭空标
- * ok/failed），整体信号由 partial 承担。
+ * `applied` 只装**实际执行过**的动作：可能少于 `requested`（差额 = 首次失败后未执行的动作，任一项
+ * 失败即停止）。未执行项**不进 applied**（状态枚举里没有 skipped，宁可少报也不凭空标 ok/failed），
+ * 整体信号由 partial 承担。
  *
- * `notExecuted` 是**必填**字段（对 SSD §6.4 形状的扩展，不变量 2）：未执行项显式枚举，别让调用方靠
- * applied 的差集推断（机读方容易漏）。全成功时为空数组（不制造噪音）。
- *
- * `uncertain` 只在非空时产生：planChangeset 的「解析不出对象级坐标」条目原样带入——相交检测对它们是
- * 「不判」而非「判过没有」，成功回执必须让两者可区分（没有引用 vs 解析不了而没判）。
- * 全成功且全部可解析时该字段缺省（不制造噪音）。
- *
- * `concurrencyNote` 是 always present 的**偏差声明**（见文件段落头注）：批不整批持锁，逐项执行各自取锁。
+ * `notExecuted` 是**必填**字段：未执行项显式枚举，别让调用方靠 applied 的差集推断（机读方容易漏）；
+ * 全成功时为空数组。`uncertain` 只在非空时产生：相交检测对 planChangeset 解析不出坐标的条目是
+ * 「不判」而非「判过没有」，回执必须让两者可区分。`concurrencyNote` 是 always present 的偏差声明
+ * （见文件段落头注）。
  */
 export interface ChangesetReport {
   requested: number;
   applied: ChangesetReportItem[];
-  /** 本次**没有执行**的动作（前项失败后中止；批被预检拒绝的情形见 ChangesetNotExecutedItem）：显式枚举（不变量 2） */
+  /** 本次**没有执行**的动作（前项失败后中止；批被预检拒绝的情形见 ChangesetNotExecutedItem）：显式枚举 */
   notExecuted: ChangesetNotExecutedItem[];
   /** 批内**未参与相交判定**的引用（解析不出对象级坐标；逐条含第几项与原因）：仅非空时产生 */
   uncertain?: string[];
-  /** 有任何非 ok ⇒ true。绝不允许把部分完成包装成 success（I2） */
+  /** 有任何非 ok ⇒ true。绝不允许把部分完成包装成 success */
   partial: boolean;
   /**
    * true = 因**取消请求**而停止（工具化任务 API 的 hana_task_cancel）——与失败中止走同一条
@@ -180,7 +171,7 @@ export interface ChangesetReport {
   cancelled?: boolean;
   /** 报告组装时刻（进程时区 ISO 秒级，与 impact().asOf 同一口径） */
   asOf: string;
-  /** 总耗时 ms（SSD §6.5：批时长如实给——每对象含 2–10s 激活） */
+  /** 总耗时 ms（如实给——每对象含 2–10s 激活） */
   elapsedMs: number;
   /** 并发裁定说明（always present）：为什么不整批持锁 + 防 ABBA 与正确性由什么兜住（见段落头注） */
   concurrencyNote: string;
@@ -191,12 +182,12 @@ export interface ChangesetReport {
  * always present：它不是「实测到的异常」，而是本批**恒定成立**的并发语义——调用方必须知道批不提供隔离。
  */
 const CHANGESET_LOCKING_NOTE =
-  '并发裁定（对 SSD §6.1「整批持有 keyed lock」的实测偏差）：本批逐项执行、各自取锁，不整批持锁——' +
+  '并发裁定：本批逐项执行、各自取锁，不整批持锁——' +
   'withKeyedLock 不可重入，而 create/update/delete 各写路径自身会取同一把对象锁，批内先持锁再调用它们等于自锁死。' +
   '防 ABBA 死锁由执行序保证（动作已按 (packageId, objectName) 字典序稳定排序，任意两批不会形成相反加锁环）；' +
-  '批的一致性由另两条兜住：批内对象级相交检测（§6.2，相交 ⇒ 整批拒绝零写入）与每项自己的 If-Match 基线' +
+  '批的一致性由另两条兜住：批内对象级相交检测（相交 ⇒ 整批拒绝零写入）与每项自己的 If-Match 基线' +
   '（批外并发写 ⇒ 该项 412 ⇒ conflict_external）。代价如实说：本批**不提供跨项快照隔离**——逐项提交，' +
-  '失败即逆序补偿（§6.3），期间的批外读写对本批可见。';
+  '失败即逆序补偿，期间的批外读写对本批可见。';
 
 /** 执行期的内部记录 = 报告项 + 补偿材料（原文 / 写成功后的新基线） */
 interface ChangesetRecord {
@@ -239,8 +230,8 @@ interface ChangesetActionOutcome {
  * 变更集项的**激活失败**（内部错误：只在 executeChangesetAction → applyChangeset 的 catch 之间流转）。
  * 为什么要有这个专用类型：写成功但激活未通过（HTTP 555，文件已写）必须按 failed 处理，而报告项要同时
  * 如实带出 activated=false 与 activationErrors 摘要——普通错误携带不了这两个读数，用 rawDetail 塞又
- * 会把它（若意外逃逸）当服务端原始载荷回显，语义不对。它 extends HanaBusinessError ⇒ 既有
- * changesetErrorOf（脱敏文本 + 机读码）与 changesetFailureStatus（非 412 ⇒ failed）路径零改动复用。
+ * 会把它（若意外逃逸）当服务端原始载荷回显，语义不对。它 extends HanaBusinessError ⇒ 既有的
+ * changesetErrorOf（脱敏文本 + 机读码）与 changesetFailureStatus（非 412 ⇒ failed）路径可直接复用。
  */
 class ChangesetActivationError extends HanaBusinessError {
   constructor(
@@ -266,7 +257,7 @@ type ChangesetCompensationOutcome =
     };
 
 /**
- * 执行一次变更集（SSD §6.1 的 1–4 步，单次调用内闭合）。
+ * 执行一次变更集（四步，单次调用内闭合）。
  *
  * 失败语义：**整批拒绝**发生在第 1 步（载荷形状非法 ⇒ changeset_invalid（形状校验在任何 I/O 之前）；
  * 批内相交 ⇒ changeset_conflict；**破坏性未声明 ⇒ migration_required**），三者都在任何写动作
@@ -305,7 +296,7 @@ export async function applyChangeset(
   // （逐项自建会话 = 每项固定多付 3 次登录往返 + 一个服务端 XS 会话）。
   // 懒建（三条纯函数拒绝路径仍在建 client 之前）：只在确有 I/O 之前创建，避免零写入拒绝也触发建连前置。
   const batchClient = client ?? new XsRestClient(config);
-  // 第 1.5 步（整体预检的判定面，SSD §6.1 第 1 步「任一被拦 ⇒ 整批拒绝、零写入」）：逐动作做破坏性
+  // 第 1.5 步（整体预检的判定面，「任一被拦 ⇒ 整批拒绝、零写入」）：逐动作做破坏性
   // 判定（**任何写之前**；判定本身只读，见 precheckChangesetGates）。任一被拦 ⇒ 整批拒绝、零写入。
   const rejected = await precheckChangesetGates(config, pool, plan, batchClient);
   if (rejected.length > 0) throw changesetMigrationRequiredError(actions, rejected);
@@ -353,7 +344,7 @@ export async function applyChangeset(
       executed.push({
         index: step.originalIndex,
         action: step.action,
-        // 失败项的状态判定（SSD §6.4）：错误码 412（写冲突）⇒ conflict_external；其它 ⇒ failed
+        // 失败项的状态判定：错误码 412（写冲突）⇒ conflict_external；其它 ⇒ failed
         status: changesetFailureStatus(e),
         elapsedMs: Date.now() - itemStartedAt,
         error: changesetErrorOf(e),
@@ -367,7 +358,7 @@ export async function applyChangeset(
             }
           : {}),
       });
-      // 不变量 2：失败项之后（执行序）的动作一件都不执行——**显式枚举**进 notExecuted，
+      // 不变量：失败项之后（执行序）的动作一件都不执行——**显式枚举**进 notExecuted，
       // 别让调用方拿 requested 与 applied 求差集推断（机读方容易漏）。
       for (const pending of plan.order.slice(i + 1)) {
         notExecuted.push({
@@ -407,7 +398,7 @@ export async function applyChangeset(
     }
   }
 
-  // 第 4 步：组装报告（按调用方原始下标升序；partial 与 notExecuted 显式枚举，I2）
+  // 第 4 步：组装报告（按调用方原始下标升序；partial 与 notExecuted 显式枚举）
   const applied: ChangesetReportItem[] = executed
     .map((r) => ({
       index: r.index,
@@ -498,14 +489,13 @@ function planChangesetOrThrow(actions: ChangesetAction[]): ChangesetPlanResult {
 
 /**
  * 第 1 步的**载荷形状校验**（纯函数、任何 I/O 之前）——逐 action 判「该动作的载荷能不能表达」。
- * 为什么必须前移：「update 既无 xml 也无 operations」「两者同给」这类**确定性**错误若拖到第 2 步执行到
- * 该项、由 updateCalculationView 抛错才失败，执行序上更早的动作已真实写入再被补偿，与「任一被拦 ⇒
- * 整批拒绝、零写入」的公开承诺相悖。
- * 只判形状，不判取值语义：create 的列/枚举等更深校验仍归 createCalculationView（同一处判定，不复制——
- * 与执行分支的既有注释同口径）；update 的「有 xml / 有 operations」与 updateCalculationView 同义
- * （空串/空数组不算有），判的就是要写的。
+ * 为什么必须前移：「update 既无 xml 也无 operations」这类**确定性**错误若拖到第 2 步才由
+ * updateCalculationView 抛错，执行序上更早的动作已真实写入再被补偿，与「任一被拦 ⇒ 整批拒绝、
+ * 零写入」相悖。只判形状，不判取值语义：create 的列/枚举等更深校验仍归 createCalculationView
+ * （同一处判定，不复制）；update 的「有 xml / 有 operations」与 updateCalculationView 同义
+ * （空串/空数组不算有）。
  * 「与自身无关的字段」一律拒绝而不是静默忽略（静默忽略比报错更难查）——例如 delete 带 xml、
- * create 带 operations、update 带 create 专用的 description/mode/source/scripted。
+ * create 带 operations、update 带 create 专用字段。
  */
 interface ChangesetPayloadError {
   /** 调用方原始下标（与报告口径一致） */
@@ -603,8 +593,8 @@ function changesetInvalidPayloadError(errors: ChangesetPayloadError[], actions: 
 }
 
 /**
- * 批内对象级相交 ⇒ 整批拒绝、零写入（SSD §6.2）。机读载荷 rawDetail.conflicts 带冲突对象与两个
- * **原始下标**（a<b，均指调用方传入顺序）；消息只陈述事实与冲突项对，不给补救指引（SSD §1.3）。
+ * 批内对象级相交 ⇒ 整批拒绝、零写入。机读载荷 rawDetail.conflicts 带冲突对象与两个
+ * **原始下标**（a<b，均指调用方传入顺序）；消息只陈述事实与冲突项对，不给补救指引。
  * rawDetail 同时带 notExecuted（覆盖全部动作，reason='batch_rejected'；相交的项多一句为什么）。
  */
 function changesetConflictError(conflicts: ChangesetConflict[], actions: ChangesetAction[]): HanaBusinessError {
@@ -619,7 +609,7 @@ function changesetConflictError(conflicts: ChangesetConflict[], actions: Changes
   }
   return HanaBusinessError.withRawDetail(
     `变更集被拒绝（整批拒绝、零写入）：批内 ${conflicts.length} 项对象级相交——${summary}。` +
-      '同一对象被两个动作以写-写或写-读方式触碰时，任何执行序都无法两全（SSD §6.2），故本批一件都不做。',
+      '同一对象被两个动作以写-写或写-读方式触碰时，任何执行序都无法两全，故本批一件都不做。',
     'changeset_conflict',
     {
       conflicts,
@@ -642,19 +632,17 @@ interface ChangesetRejectedAction {
 }
 
 /**
- * 第 1.5 步：**整体预检的破坏性判定**（SSD §6.1 第 1 步 + §6.6）。
- * 在任何写之前把「会被迁移闸门拒」的动作一次判完；任一被拦 ⇒ 由调用方整批拒绝、零写入。
- * 若判定只藏在逐项执行内部（跑到该项才失败、再逆序补偿），批内更早的对象已被写过、版本已推进——
- * 与「整批拒绝、零写入」相悖。
+ * 第 1.5 步：**整体预检的破坏性判定**。在任何写之前把「会被迁移闸门拒」的动作一次判完；
+ * 任一被拦 ⇒ 整批拒绝、零写入。若判定只藏在逐项执行内部（跑到该项才失败、再逆序补偿），
+ * 批内更早的对象已被写过、版本已推进——与「整批拒绝、零写入」相悖。
  *
- * 复用与代价（I3）：update 走 updateCalculationView 的只读 dryRun 预演，delete 走 assessDeletionGate
- * （与 deleteCalculationView 同一判定件）——判定只有这一份实现，不另写 diff/判定。代价如实说：
- * 每个 update 动作多一次「读 + 变换 + diff + 影响半径查询」、每个 delete 动作多一次影响半径查询；
- * 批次本就重（每对象含 2–10s 激活），这点只读开销可接受。
+ * 复用与代价：update 走 updateCalculationView 的只读 dryRun 预演，delete 走 assessDeletionGate
+ * （与 deleteCalculationView 同一判定件）——判定只有这一份实现。每个 update 多一次「读 + 变换 +
+ * diff + 影响半径查询」、每个 delete 多一次影响半径查询；批次本就重（每对象含 2–10s 激活），可接受。
  *
  * 「判不了」不等于「会被拒」：dryRun / 判定自身抛错（对象不存在、基线缺失、解析失败、查询故障）时
- * **不拦截**，只记一条 warn——该动作进执行阶段后仍会跑同一套判定与闸门（两层都在，防回归），
- * 失败语义维持既有行为（停止 + 逆序补偿）；把读故障升级成整批拒绝属于新失败面，不在本批口径内。
+ * **不拦截**，只记一条 warn——该动作进执行阶段后仍会跑同一套判定与闸门（两层都在），失败语义为
+ * 停止 + 逆序补偿；把读故障升级成整批拒绝属于另一条失败面，不在此做。
  */
 async function precheckChangesetGates(
   config: HanaConfig,
@@ -676,7 +664,7 @@ async function precheckChangesetGates(
           {
             dryRun: true,
             // 动作自己的声明原样进预演：声明的破坏性动作照常放行（accept 判定在报告里，
-            // 执行期它自己的闸门也会放行——两层都在，防回归）
+            // 执行期它自己的闸门也会放行——两层都在）
             ...(action.migration
               ? { migration: action.migration as { strategy: MigrationDeclaration; note?: string } }
               : {}),
@@ -721,10 +709,10 @@ async function precheckChangesetGates(
 }
 
 /**
- * 整批拒绝（破坏性未声明）的错误与机读载荷（SSD §6.1 第 1 步「任一被拦 ⇒ 整批拒绝、零写入」）。
- * - 消息只陈述事实（哪几项命中什么规则 + 由服务端在写入之前判定施加），**不给补救指引**（SSD §1.3）；
+ * 整批拒绝（破坏性未声明）的错误与机读载荷（「任一被拦 ⇒ 整批拒绝、零写入」）。
+ * - 消息只陈述事实（哪几项命中什么规则 + 由服务端在写入之前判定施加），**不给补救指引**；
  * - rawDetail.breaking 逐项给 { index（原始下标）, packageId, objectName, items }（既有 BreakingItem）；
- * - rawDetail.notExecuted 与 ChangesetReport.notExecuted 同形同义（对 SSD §6.4 形状的扩展，不变量 2）：
+ * - rawDetail.notExecuted 与 ChangesetReport.notExecuted 同形同义：
  *   批被拒时**没有报告可返回**，未执行项若不在这里显式枚举，调用方只能靠差集推断。
  */
 function changesetMigrationRequiredError(
@@ -771,9 +759,8 @@ function changesetUpdatePayload(action: ChangesetAction): { xml?: string; operat
  * 失败 ⇒ 进入补偿（期望行为——补偿侧再走低层路径绕开闸门，见 compensateChangesetItem）。
  *
  * 为什么**不在外面包 withKeyedLock**：withKeyedLock 不可重入，三个服务函数各自会取同一把对象锁
- * （create 的临界区 / update 的整段判定与 PUT / delete 的 deleteViaRest），批内先持锁再调用 = 自锁死。
- * 这就是 SSD §6.1「整批持有 keyed lock」在本仓不可实现的根因（完整裁定见本段落头注与
- * CHANGESET_LOCKING_NOTE）。
+ * （create 的临界区 / update 的整段判定与 PUT / delete 的 deleteViaRest），批内先持锁再调用 = 自锁死
+ * （完整裁定见本段落头注与 CHANGESET_LOCKING_NOTE）。
  */
 async function executeChangesetAction(
   config: HanaConfig,
@@ -784,14 +771,14 @@ async function executeChangesetAction(
   switch (action.action) {
     case 'update': {
       // 写入前**紧贴本项**预读（不批前一次性预取）：原文 = 补偿材料；ETag = 本项自己的冲突检测基线
-      // （SSD §6.1 第 2 步）——**不是**补偿基线：本项 PUT 会推进版本，拿写前基线补偿必得伪 412（§6.3）。
+      // ——**不是**补偿基线：本项 PUT 会推进版本，拿写前基线补偿必得伪 412。
       const { rest, file } = designTimeTarget(config, action.objectName, client);
       const meta = await rest.fileMeta(action.packageId, file);
       const originalXml = await rest.fileContent(action.packageId, file);
       const preEtag = meta.ETag?.trim() || undefined;
       if (preEtag === undefined) {
         // 与 delete 分支同口径的「退化不静默」：预读未返回 ETag 时本次更新退回锁内自取基线，
-        // 批外并发写入不再以 412 暴露——批报告没有承载它的字段，这条退化只能经日志可见。
+        // 批外并发写入不会以 412 暴露——批报告没有承载它的字段，这条退化只能经日志可见。
         logger.warn(
           { packageId: action.packageId, objectName: action.objectName },
           '变更集 update 项预读未返回 ETag：本次更新退回锁内自取基线，批外并发写入不再以 412 暴露',
@@ -820,7 +807,7 @@ async function executeChangesetAction(
         // 防御：本路径不传 dryRun，拿到预演回执说明调用出错——宁可失败也不能当写入结果消费
         throw new HanaBusinessError('内部错误：变更集的更新项不应返回 dryRun 预演回执');
       }
-      // 写成功但激活失败（HTTP 555，文件已写、激活未通过）**不算 ok**——SSD §6.1 第 3 步要求
+      // 写成功但激活失败（HTTP 555，文件已写、激活未通过）**不算 ok**——批要求
       // 各项「各自完成（含激活）」。按 failed 抛出 ⇒ 停止 + 逆序补偿 + partial=true，绝不把未激活当成功。
       if (result.activated === false) {
         throw changesetActivationFailureError(
@@ -840,7 +827,7 @@ async function executeChangesetAction(
       };
     }
     case 'create': {
-      // create 无原文可缓存（补偿=删除，见 §6.3），故不做预读；入参直接复用 hana_view_create 的形状。
+      // create 无原文可缓存（补偿=删除），故不做预读；入参直接复用 hana_view_create 的形状。
       // source/scripted 用断言收窄：ChangesetAction 把它们声明成宽松形状（measureMode: string /
       // columns: unknown[]），枚举与列形状的最终校验在 createCalculationView 内做（同一处判定，不复制）。
       const result = await createCalculationView(
@@ -880,16 +867,12 @@ async function executeChangesetAction(
     }
     case 'delete': {
       // 写入前紧贴本项预读：对象删除后设计时文件不再存在，原文是补偿（回写）的**唯一**材料。
-      // 预读到的 ETag 有两个用途：
-      //  ① **显式传给删除通道作 If-Match 基线**（deleteCalculationView 的 opts.ifMatch）——若丢弃它、
-      //     由 deleteViaRest 在锁内重取基线：「预读 → 删除」之间若有第三方写入，锁内重取的**新**基线
-      //     会让 DELETE 放行（无 412），随后补偿把预读原文写回 ⇒ 第三方的已提交版本被静默销毁、
-      //     报告还写 compensated。显式传入后该窗口内的第三方写入必得 412 ⇒ 该项 conflict_external、
-      //     对象不删、原文不回写，第三方版本零接触。
-      //  ② **不是补偿基线**：删除后不存在可作补偿基线的 ETag，删除项的补偿材料始终是原文（§6.3）。
-      // 预读未返回 ETag（服务器没给）时不传 ifMatch，退回锁内自取基线——这会让该项失去
-      // 「预读 → 删除」窗口的 412 保护，故日志留痕（批报告没有承载它的字段；与 update 分支
-      // 同一「退化不静默」原则，只是这条批内退化只能经日志可见）。
+      // 预读到的 ETag 只作**删除通道的 If-Match 基线**（不是补偿基线——删除后不存在可作基线的 ETag）：
+      // 若丢弃它、由 deleteViaRest 在锁内重取基线，「预读 → 删除」之间若有第三方写入，锁内重取的
+      // 新基线会让 DELETE 放行（无 412），随后补偿把预读原文写回 ⇒ 第三方的已提交版本被静默销毁。
+      // 显式传入后该窗口内的第三方写入必得 412 ⇒ 该项 conflict_external、对象不删、第三方版本零接触。
+      // 预读未返回 ETag 时不传 ifMatch，退回锁内自取基线——该项失去上述 412 保护，故日志留痕
+      // （与 update 分支同一「退化不静默」原则）。
       const { rest, file } = designTimeTarget(config, action.objectName, client);
       const meta = await rest.fileMeta(action.packageId, file);
       const preEtag = meta.ETag?.trim() || undefined;
@@ -923,10 +906,9 @@ async function executeChangesetAction(
 /**
  * 写成功但激活失败的**统一构造点**（update/create 两个分支共用，两处各写一份文案必然漂移）。
  * 返回 ChangesetActivationError ⇒ applyChangeset 按 failed 记录该项，并带出 activated=false +
- * activationErrors 摘要。error.text 给摘要与 activationDetail 线索（完整激活明细含 DDL 不随变更集报告
- * 透出——报告项形状只有一行摘要字段；对单个对象复核该明细仍走单对象通道）。
- * `activationErrors` 收 unknown：update 回执是 string，create 回执声明成 unknown（历史上是透传槽）——
- * 归一（非空 string 才收）只在这一处做，两个分支共用。
+ * activationErrors 摘要。完整激活明细（含 DDL）不随变更集报告透出；复核走单对象通道。
+ * `activationErrors` 收 unknown：update 回执是 string，create 回执声明成 unknown（透传槽）——
+ * 归一（非空 string 才收）只在这一处做。
  */
 function changesetActivationFailureError(
   actionLabel: string,
@@ -941,7 +923,7 @@ function changesetActivationFailureError(
       : '激活检查未通过（服务端未附明细）';
   return new ChangesetActivationError(
     `${actionLabel} ${packageId}/${objectName} 已写入设计时文件、但未通过激活（${summary}）：` +
-      '该项按 failed 处理（SSD §6.1 第 3 步要求各项「各自完成（含激活）」，未激活不算完成）。' +
+      '该项按 failed 处理（各项须各自完成含激活，未激活不算完成）。' +
       '完整激活明细（含 Type/Procedure DDL）不随变更集报告透出，可对被拒对象调用 hana_view_validate 复核',
     typeof activationErrors === 'string' && activationErrors.length > 0 ? activationErrors : undefined,
     errorCode,
@@ -949,18 +931,13 @@ function changesetActivationFailureError(
 }
 
 /**
- * 第 3 步：逆序补偿一项（SSD §6.3）。**必须绕开 migration 闸门**：直接用低层写路径
- * （updateViaRest / 裸 deleteFile），不经 updateCalculationView / deleteCalculationView 的
- * 「diff → 影响半径 → 破坏性判定」。
+ * 第 3 步：逆序补偿一项（错误统一收口成 compensation_failed，不向上抛）。
+ * **必须绕开 migration 闸门**：补偿是「回到批前状态」的内部动作，前进方向的破坏性**已由闸门判过**；
+ * 若补偿再走一遍闸门，声明过的破坏性变更在回退时反而会被拒（migration_required），补偿永久失败。
  *
- * 理由（写死）：补偿是「回到批前状态」的内部动作，前进方向的破坏性**已由闸门判过**；若补偿再走一遍
- * 闸门，一个声明过的破坏性变更在回退时反而会被拒（migration_required），补偿永久失败——
- * 批将永远停在半完成态。
- *
- * 锁：低层路径 updateViaRest/deleteFile 自身不取锁 ⇒ 本函数在 withKeyedLock(writeLockKey(...)) 内调用；
- * 需要 fileMeta + deleteFile 的序列（create 补偿）把「校验 → 删除」放在**同一临界区**（中途放锁会留下
- * 「校验通过 → 他人改写 → 删掉他人版本」的窗口）。锁不可重入 ⇒ 这里不调用任何自取锁的路径
- * （deleteViaRest 属于这类，故只用它的两个原语自己组合）。
+ * 锁：低层路径 updateViaRest/deleteFile 自身不取锁 ⇒ 各补偿函数在 withKeyedLock(writeLockKey(...))
+ * 内调用；「校验 → 删除」必须放在**同一临界区**（中途放锁会留下「校验通过 → 他人改写 → 删掉他人
+ * 版本」的窗口）。锁不可重入 ⇒ 这里不调用任何自取锁的路径（如 deleteViaRest）。
  */
 async function compensateChangesetItem(
   config: HanaConfig,
@@ -999,8 +976,7 @@ async function runChangesetCompensation(
 /**
  * 补偿写回 PUT 的激活失败证据：updateViaRest 对 555（文件已写、激活未通过）按**非致命**返回，
  * 补偿若丢掉返回值直接判 written/restored，回执会把「设计时已回写、激活版本未回退」的不一致态
- * 谎报成「已回到批前状态」（前进方向 executeChangesetAction 已把 activated=false 判 failed，
- * 补偿侧必须同口径）。
+ * 谎报成「已回到批前状态」（前进方向已把 activated=false 判 failed，补偿侧必须同口径）。
  * @returns undefined = 写回未暴露激活问题；否则为激活明细（含 HTTP 状态/错误码/摘要）
  */
 function compensationActivationFailure(
@@ -1068,23 +1044,18 @@ type UpdateCompensationVerdict =
   | { kind: 'written_not_activated'; detail: ActivationDetail };
 
 /**
- * update 的补偿：用缓存的原文写回（SSD §6.3 首行）。
- * **写回之前先探测核对版本**（探测与写回同一临界区，check-then-act 闭合）：
- * - 对象已存在且当前 ETag === 本项写成功回执的基线 ⇒ 仍是我们的版本 ⇒ 带 If-Match=该基线写回
- *   （If-Match 继续兜住「探测 → PUT」之间的跨进程写入 ⇒ 412 ⇒ compensation_failed + 结构化现场）；
- * - 对象已存在但当前 ETag 不同（被第三方改过/重建；或当前读数没带 ETag，无法证明是我们的版本）⇒
- *   **不写** + compensation_failed + 当前读数——与「直接 PUT + If-Match 靠服务端 412 拦下」结论
- *   相同，但连一次被拒的写都不发起，第三方版本零接触；
- * - 对象已不存在（第三方在本项写成功后删了它）⇒ 允许回写（批前状态就是「对象存在」，用 PUT 重建）。
- *   这里**刻意不带 If-Match**：「PUT + If-Match 对已删除对象返回 412 还是**重新创建**」在本仓没有实测
- *   （只实测过 DELETE 的三态：204/412/404）——补偿不依赖这条未实测行为，先探测再决定；
- *   探测到不存在 ⇒ PUT 必为重建（PUT 是 create-or-update，实测语义），带不带 If-Match 都不改变结果。
- * 已知窗口（如实记录）：进程内锁挡不住跨进程在「探测 → PUT」之间写入；带 If-Match 的分支由服务端 412
- * 兜底，重建分支（对象不存在）本就没有可依的基线——与 §4.1 的既有边界同类。
- * 基线缺失（写回执没带 ETag）时**不做**无 If-Match 的覆盖写：那会静默覆盖第三方的改动（与 create/delete
- * 补偿同一条「不静默覆盖」原则），如实报 compensation_failed。
- * 写回结果必须消费：本次 PUT 若返回 555（文件已写、激活未通过），文件层虽已回写、激活版本并未
- * 回退——按 compensation_failed 回报（compensationNotActivatedError），不许静默落成 compensated。
+ * update 的补偿：用缓存的原文写回。**写回之前先探测核对版本**（探测与写回同一临界区，
+ * check-then-act 闭合）：
+ * - 当前 ETag === 本项写成功回执的基线 ⇒ 带 If-Match=该基线写回（兜住「探测 → PUT」之间的跨进程
+ *   写入 ⇒ 412 ⇒ compensation_failed + 结构化现场）；
+ * - ETag 不同（被第三方改过/重建，或读数没带 ETag 无法证明归属）⇒ **不写** + compensation_failed
+ *   + 当前读数——第三方版本零接触；
+ * - 对象已不存在 ⇒ 允许回写（批前状态就是"对象存在"）。这里**刻意不带 If-Match**：「PUT + If-Match
+ *   对已删除对象返回 412 还是重新创建」未实测（只实测过 DELETE 的三态：204/412/404），不依赖未实测行为。
+ * 已知窗口：进程内锁挡不住跨进程在「探测 → PUT」之间写入；带 If-Match 的分支由服务端 412 兜底，
+ * 重建分支没有可依的基线——与其它跨进程并发窗口同类。基线缺失时**不做**无 If-Match 的覆盖写
+ * （会静默覆盖第三方改动）。写回结果必须消费：555（文件已写、激活未通过）时激活版本并未回退
+ * ——按 compensation_failed 回报，不许静默落成 compensated。
  */
 async function compensateUpdateAction(
   config: HanaConfig,
@@ -1172,7 +1143,7 @@ type CreateCompensationVerdict =
   { kind: 'deleted' } | { kind: 'absent' } | { kind: 'precondition_failed'; evidence: CompensationEvidence };
 
 /**
- * create 的补偿：删除新建对象——前置 = **post-create ETag 仍为当前值**（SSD §6.3 第二行）。
+ * create 的补偿：删除新建对象——前置 = **post-create ETag 仍为当前值**。
  * 为什么必须有前置：无前置的删除可能删掉他人同名新建对象（PUT 是 create-or-update，服务端没有 409）。
  * 「校验 → 删除」同一临界区完成（拆两段会留下「校验通过 → 他人改写 → 删掉他人版本」的窗口）。
  * 对象已不存在（**仅 404** 视为不存在）：批前状态（该对象不存在）已成立 ⇒ compensated；
@@ -1232,17 +1203,14 @@ type DeleteCompensationVerdict =
   | { kind: 'written_not_activated'; detail: ActivationDetail };
 
 /**
- * delete 的补偿：回写原文（SSD §6.3 末行）。
- * **先探测**：已存在（第三方重建同名对象）⇒ **不写** + compensation_failed——静默覆盖「第三方的重建」
- * 是不可接受的失败模式。探测**仅 404 视为不存在**，其它错误如实报（「查不到」与「确实没有」必须可区分）。
- * 探测到不存在才回写，且**刻意不带 If-Match**（与 update 补偿的重建分支同一理由）：
- * 对象已删除后没有可依的基线，而「PUT + If-Match 对已删除对象返回 412 还是**重新创建**」在本仓没有实测
- * （只实测过 DELETE 的三态：204/412/404）——补偿不依赖这条未实测行为，先探测再决定：不存在 ⇒ 裸 PUT
- * 重建（PUT 为 create-or-update，实测语义），确定且不再要求调用方去猜服务端行为。
- * 已知窗口（如实记录）：进程内锁挡不住跨进程在「探测 → PUT」之间重建；裸 PUT 无 If-Match 可依（没有
- * 可用的基线），跨进程真相在服务端——与 §4.1 的既有边界同类。
- * 回写结果必须消费：重建 PUT 若返回 555（文件已写、激活未通过）⇒ 批前状态（对象存在且激活）并未
- * 恢复，按 compensation_failed 回报，不许静默落成 restored。
+ * delete 的补偿：回写原文。
+ * **先探测**：已存在（第三方重建同名对象）⇒ **不写** + compensation_failed——静默覆盖「第三方的
+ * 重建」是不可接受的失败模式。探测**仅 404 视为不存在**，其它错误如实报（「查不到」与「确实没有」
+ * 必须可区分）。不存在才回写，且**刻意不带 If-Match**（与 update 补偿的重建分支同一理由：对象已删除
+ * 后没有可依的基线，而「PUT + If-Match 对已删除对象」的行为未实测）。裸 PUT 即重建
+ * （PUT 为 create-or-update，实测语义）。已知窗口：进程内锁挡不住跨进程在「探测 → PUT」之间重建，
+ * 跨进程真相在服务端。回写结果必须消费：555（文件已写、激活未通过）⇒ 批前状态并未恢复，
+ * 按 compensation_failed 回报，不许静默落成 restored。
  */
 async function compensateDeleteAction(
   config: HanaConfig,
@@ -1280,7 +1248,7 @@ async function compensateDeleteAction(
       error: {
         text:
           `补偿未执行：对象 ${packageId}/${objectName} 在本批删除之后已被（第三方）重建，` +
-          '按 §6.3 不写回原文——静默覆盖他人的重建不可接受',
+          '不写回原文——静默覆盖他人的重建不可接受',
       },
       ...verdict.evidence,
     };
@@ -1298,7 +1266,7 @@ async function compensateDeleteAction(
   return { status: 'compensated' };
 }
 
-/** 失败项的状态判定（SSD §6.4）：错误码 412（写冲突）⇒ conflict_external；其它 ⇒ failed */
+/** 失败项的状态判定：错误码 412（写冲突）⇒ conflict_external；其它 ⇒ failed */
 function changesetFailureStatus(e: unknown): 'failed' | 'conflict_external' {
   return e instanceof HanaBusinessError && e.code === '412' ? 'conflict_external' : 'failed';
 }

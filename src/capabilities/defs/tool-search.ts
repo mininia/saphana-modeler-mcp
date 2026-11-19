@@ -1,5 +1,5 @@
 /**
- * `hana_tool_search` 清单条目：Action Ontology v2.1 的**契约披露**入口。
+ * `hana_tool_search` 清单条目：**契约披露**入口。
  *
  * 它是两个常驻平台入口之一（另一个是执行入口 `hana_invoke`）；没有分类成员。
  * 三模式（互斥）：
@@ -13,7 +13,7 @@
 import { z } from 'zod';
 import { ALL_CAPABILITY_CATEGORIES, TOOL_KINDS, cap, type Capability } from '../types.js';
 
-/** 披露包的默认/硬上限（与 §6.6 对齐；预算参数只是护栏，Token 才是验收指标） */
+/** 披露包的默认/硬上限（预算参数只是护栏） */
 export const TOOL_SEARCH_LIMITS = {
   /** 单次 contract 的默认工具数 */
   maxToolsDefault: 12,
@@ -139,7 +139,7 @@ export const toolSearchCapabilities = {
       '披露不改变工具面、不做授权：回执里的 call.via 恒为 hana_invoke，每次调用仍过统一授权与预检。\n' +
       '不知道工具 id 时先 discover；已知工具集直接 contract；固定流程用 goal（权限诊断 goal=diagnose_preview_permission，不要先猜参数）。\n' +
       'goal 的 bindings 键=配方参数名（packageId/objectName，不是 viewName）；不知道 packageId 先 discover/search_objects。\n' +
-      '工具面只有两个入口：先用本工具选择，再用 hana_invoke 执行；没有分类门面，也没有平铺的具体工具。',
+      '工具面只有两个入口：先用本工具选择，再用 hana_invoke 执行；具体能力不注册为工具。',
     inputSchema: z.object({
       mode: z
         .enum(TOOL_SEARCH_MODES)

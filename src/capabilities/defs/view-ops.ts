@@ -8,7 +8,7 @@
  * 条目标 routeOnly: true：可发现、可授权，但永不注册为工具——调用方式：
  *   hana_invoke({ capability: "hana_view_update#add_join", args: { packageId, objectName, … } })
  * 与 hana_invoke({ capability: "hana_view_update", args: { …, operations: [{ op: "add_join", … }] } })
- * 完全等价（同一 handler、同一闸门）。
+ * 完全等价（同一 handler、同一闸门；审批按 op 的 destructive 声明）。
  */
 
 import { z } from 'zod';
@@ -111,7 +111,7 @@ export function buildViewOpCapabilities(parent: Capability): Record<string, Capa
           : '') +
         `经 hana_invoke 调用（本条目不注册为工具）：args = 父工具身份参数（packageId / objectName 必填；` +
         `ifMatch / dryRun / migration 可选）+ 本 op 参数。与 ` +
-        `hana_invoke({capability:"${parent.id}", args:{operations:[{op:"${decl.id}", …}]}}) 完全等价（同一 handler、同一闸门与破坏性判定）。`,
+        `hana_invoke({capability:"${parent.id}", args:{operations:[{op:"${decl.id}", …}]}}) 完全等价（同一 handler、同一闸门与破坏性判定；审批按本 op 的 destructive 声明）。`,
       // 身份字段复用父 schema 的同名字段（保留其 .default()/.optional() 语义）；载荷字段来自 union 成员
       inputSchema: z.object({ ...identity, ...payload }),
       // 注解从本条的 effects 派生（set_description 这类非破坏 op 的 destructiveHint 必须为 false）。

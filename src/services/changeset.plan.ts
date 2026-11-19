@@ -1,26 +1,26 @@
 import { dedupeRefs, objectRefsOfUpdate, sameObjectRef, type ObjectRef } from '../write-plan.js';
 
 /**
- * 变更集（多对象事务）的**规划与相交检测** —— SSD §6.1 第 1 步 + §6.2。纯函数、零 I/O。
+ * 变更集（多对象事务）的**规划与相交检测**。纯函数、零 I/O。
  *
- * 为什么需要它：批内动作可能互相依赖（一项写、另一项读同一个对象），无论怎么排执行序都有一方
- * 会踩到另一方（读方读到被覆盖前/后的版本，或写方按已过期的基线提交）。这类批必须**整批拒绝、
- * 零写入**。判定依据不能靠 agent 自报，必须从动作载荷里推导——本模块就是那次推导。
+ * 为什么需要它：批内动作可能互相依赖（一项写、另一项读同一个对象），无论怎么排执行序都有一方会
+ * 踩到另一方（读方读到被覆盖前/后的版本，或写方按已过期的基线提交）。这类批必须**整批拒绝、零写入**。
+ * 判定依据不能靠 agent 自报，必须从动作载荷里推导——本模块就是那次推导。
  *
- * 粒度为什么是**对象级**（SSD §6.2 评审修订）：包级相交会把「同包多对象」的正常批次全部误拒
- * （10 个同包对象 ⇒ writePackages 集合相同 ⇒ 全拒），不可用。这里只比 (packageId, objectName)。
+ * 粒度为什么是**对象级**：包级相交会把「同包多对象」的正常批次全部误拒（10 个同包对象 ⇒
+ * writePackages 集合相同 ⇒ 全拒）。这里只比 (packageId, objectName)。
  *
- * 依赖说明（I3）：读写集推导复用 write-plan.ts 的共享件（objectRefsOfUpdate，其内部走
- * scanXmlObjectRefs）；本文件**不**出现第二份 resourceUri / 表名扫描器。
+ * 依赖说明：读写集推导复用 write-plan.ts 的共享件（objectRefsOfUpdate，内部走 scanXmlObjectRefs）；
+ * 本文件**不**出现第二份 resourceUri / 表名扫描器。
  *
- * 降级口径（§6.2）：解析不出对象级的引用**不参与相交判定**（也不升级为拒绝），但逐条落
+ * 降级口径：解析不出对象级的引用**不参与相交判定**（也不升级为拒绝），但逐条落
  * `ChangesetPlanResult.uncertain`（含第几项与原因）——「不判」与「没有引用」必须可区分。
  */
 
 export type ChangesetActionKind = 'update' | 'create' | 'delete';
 
 /**
- * 批内一个动作。update/delete 按 SSD §6.1 的形状；create 无法只用一份 xml 表达
+ * 批内一个动作。update/delete 按变更集约定形状；create 无法只用一份 xml 表达
  * （xml 全量还原通道只对 update 成立），故**扩展**出 create 入参（description/mode/source/scripted），
  * 直接复用 hana_view_create 的入参名——扩展只加字段，不改变 update/delete 通道的语义。
  */
@@ -31,7 +31,7 @@ export interface ChangesetAction {
   /** update 专用（与 hana_view_update 的 xml/operations 同义，二选一） */
   xml?: string;
   operations?: unknown[];
-  /** update/delete 的破坏性声明位（P6 语义，原样透传；破坏性判定不在本模块做） */
+  /** update/delete 的破坏性声明位（原样透传；破坏性判定不在本模块做） */
   migration?: { strategy: string; note?: string };
   /** create 专用 */
   description?: string;
@@ -59,7 +59,7 @@ export interface ChangesetConflict {
 
 export interface ChangesetPlanResult {
   /**
-   * 按 (packageId, objectName) 字典序**稳定排序**后的执行序（SSD §6.1 的防 ABBA 死锁协议：
+   * 按 (packageId, objectName) 字典序**稳定排序**后的执行序（防 ABBA 死锁协议：
    * 批内动作统一按同一全局序取锁，任意两批不会形成顺序相反的加锁环）；
    * 元素带回 originalIndex，报告按 originalIndex 说话、执行按本数组的顺序。
    */
@@ -68,18 +68,17 @@ export interface ChangesetPlanResult {
   /** 每个动作的对象级读写集，**按原始顺序**排列（refs[k].originalIndex === k）；诊断用（回执出口是 uncertain） */
   refs: Array<{ originalIndex: number; reads: ObjectRef[]; writes: ObjectRef[] }>;
   /**
-   * §6.2 降级口径的**出口**：解析不出对象级的引用（join 源只给半个坐标、create 的 scripted 脚本内容、
-   * xml 里非「包路径…/视图目录段/对象名」形态的 resourceUri）**不参与相交判定**，但必须如实上报——
+   * 降级口径的**出口**：解析不出对象级的引用（join 源只给半个坐标、create 的 scripted 脚本内容、
+   * 非「包路径…/视图目录段/对象名」形态的 resourceUri）**不参与相交判定**，但必须如实上报——
    * 只有能区分「不判」与「没有引用」，调用方才敢按这份批次的相交结论行事。
-   * 逐条中文说明、含第几项（originalIndex，从 0 数）与解析不出的原因；
-   * 全部解析成功时为空数组（不制造噪音）。按 originalIndex 升序排列。
-   * 本模块只保证有出口，不替消费侧做判定：服务层在非空时把它原样带进变更集回执（ChangesetReport.uncertain）。
+   * 逐条中文说明、含第几项（originalIndex，从 0 数）与原因；按 originalIndex 升序，全部成功时为空数组。
+   * 本模块只保证有出口：服务层在非空时原样带进变更集回执（ChangesetReport.uncertain）。
    */
   uncertain: string[];
 }
 
 /**
- * 动作数上限（SSD §6.1 D3：与 operations 上限对齐）。超限抛 Error——服务层负责转成业务错误。
+ * 动作数上限（与 operations 上限对齐）。超限抛 Error——服务层负责转成业务错误。
  * 纯校验只做在这一处（单一实现）：服务层与回执都从这一次判定取材，避免两处各判一次而漂移。
  */
 export const CHANGESET_MAX_ACTIONS = 10;
@@ -94,7 +93,7 @@ export const CHANGESET_MAX_ACTIONS = 10;
 export function planChangeset(actions: ChangesetAction[]): ChangesetPlanResult {
   if (actions.length > CHANGESET_MAX_ACTIONS) {
     throw new Error(
-      `变更集动作数超上限：${actions.length} 项 > ${CHANGESET_MAX_ACTIONS}（SSD §6.1 D3，与 operations 上限对齐），请拆成多批`,
+      `变更集动作数超上限：${actions.length} 项 > ${CHANGESET_MAX_ACTIONS}（与 operations 上限对齐），请拆成多批`,
     );
   }
   const planned: PlannedAction[] = actions.map((action, originalIndex) => {
@@ -144,7 +143,7 @@ function isActionKind(value: unknown): value is ChangesetActionKind {
 
 /**
  * 单个动作的对象级读写集推导。update 走共享件；create/delete 的形状固定在各自分支里（含为什么）。
- * 第三项 `uncertain` 是 §6.2 的降级出口：推导中**解析不出对象级**的引用逐条落在这里（原因文案），
+ * 第三项 `uncertain` 是降级出口：推导中**解析不出对象级**的引用逐条落在这里（原因文案），
  * 由 planChangeset 补上「第几项」前缀后随结果返回——不猜，但也不静默。
  */
 function refsOfAction(action: ChangesetAction): { reads: ObjectRef[]; writes: ObjectRef[]; uncertain: string[] } {
@@ -167,11 +166,11 @@ function refsOfAction(action: ChangesetAction): { reads: ObjectRef[]; writes: Ob
       };
     }
     case 'create': {
-      // source 是 schema 下的物理表/视图，不是仓库对象 ⇒ 不进对象级读集（SSD §6.2 的粒度到此为止）；
+      // source 是 schema 下的物理表/视图，不是仓库对象 ⇒ 不进对象级读集（粒度到此为止）；
       // scripted.script **只有 mode='sql' 会被服务端消费**（mode 缺省=projection，projection 分支只读
       // source、从不读 scripted，见 createCalculationView）：该模式下不解析脚本——SQL 里的仓库对象引用
-      // 需要再写一份扫描器（I3 禁止），宁漏不猜，但**不静默**：脚本里可能藏着仓库对象引用，如实落
-      // uncertain（§6.2 降级口径把"不判"与"没有"区分开）。
+      // 需要再写一份扫描器（单一实现原则禁止），宁漏不猜，但**不静默**：脚本里可能藏着仓库对象引用，如实落
+      // uncertain（降级口径把"不判"与"没有"区分开）。
       // projection 下 scripted 是**不参与批次的载荷**，报「脚本不解析」会把调用方引向一个不存在的盲区；
       // 与规划器同口径（那里的 create/scripted 分支也只扫 mode='sql' 的载荷）。
       const script =
@@ -195,7 +194,7 @@ function refsOfAction(action: ChangesetAction): { reads: ObjectRef[]; writes: Ob
 }
 
 /**
- * 成对相交检测（SSD §6.2）：遍历所有 i<j 动作对，按对象求交——写∩写 与 写∩读（双向）。
+ * 成对相交检测：遍历所有 i<j 动作对，按对象求交——写∩写 与 写∩读（双向）。
  * 不短路、不只报第一对：报告要能一次看清整批的全部冲突项对。
  * 只做**跨动作**判定：同一动作内「自己读自己写」（如 add_join 源指向自身）不影响批的一致性，
  * 由单对象更新路径自身保证。

@@ -11,6 +11,7 @@ import type { McpServer } from '@modelcontextprotocol/server';
 import { CAP, findCapability } from '../capabilities/manifest.js';
 import type { Capability } from '../capabilities/types.js';
 import { discoverCapabilities } from '../capabilities/discovery.js';
+import { resourceRoleOf } from '../capabilities/resources.js';
 import {
   RECIPES,
   RECIPE_GOALS,
@@ -90,7 +91,7 @@ function respond(data: DisclosureData, maxResponseBytes: number, hintOnBudget: s
   return toToolResult(envelope);
 }
 
-/** 当前环境绑定（多环境才带 key/epoch；单环境返回 undefined，行为与旧版一致）。 */
+/** 当前环境绑定（多环境才带 key/epoch；单环境返回 undefined）。 */
 function disclosureEnvironment(ctx: ToolContext): { key: string; epoch: number } | undefined {
   const runtime = currentEnvironmentRuntime();
   if (ctx.manager?.multiEnv !== true || !runtime) return undefined;
@@ -114,6 +115,25 @@ function environmentField(ctx: ToolContext, ids: ReadonlySet<string>): Record<st
   };
 }
 
+/**
+ * canonicalCall 里的写包/读 schema 是否仍来自演示示例（bindings 未覆盖）：
+ * 这种参数不是调用方真实目标，据此做资源预判会给出假 blocked/ready。
+ * readPackage 只报告不拦截，不在此列。
+ */
+function hasUnboundResourceArgs(
+  cap: Capability,
+  args: Record<string, unknown>,
+  bindings: Record<string, unknown>,
+): boolean {
+  const shape = (cap.inputSchema as unknown as { shape?: Record<string, unknown> }).shape;
+  if (!shape) return false;
+  return Object.entries(shape).some(([name, field]) => {
+    const role = resourceRoleOf(field);
+    if (role !== 'writePackage' && role !== 'readSchema') return false;
+    return Object.hasOwn(args, name) && !Object.hasOwn(bindings, name);
+  });
+}
+
 /** 对一组「工具 + 预览参数」做 preview，汇总 policy.status 与 blockers。 */
 function previewPolicy(
   ctx: ToolContext,
@@ -124,6 +144,8 @@ function previewPolicy(
     stepId?: string;
     confidence?: 'full' | 'partial' | 'deferred';
     envAssertion?: { key?: string; epoch?: number };
+    /** 资源参数仍是演示值：资源维度的结论不可用（其余维度照常预判） */
+    resourceArgsUnbound?: boolean;
   }>,
 ): { status: PolicyStatus; blockers: Blocker[] } {
   const policy = policyFromConfig(ctx.config, toolFilterOf(ctx.config, ctx.toolFilter));
@@ -144,9 +166,19 @@ function previewPolicy(
       ...(runtime ? { runtime } : {}),
       ...(item.envAssertion ? { envAssertion: item.envAssertion } : {}),
     });
-    if (result.status === 'blocked') {
-      const code = result.codes[0] ?? 'blocked';
-      blockers.push({ toolId: item.cap.id, code, ...(item.stepId ? { stepId: item.stepId } : {}) });
+    // 演示资源值只能说明「这些演示包不在边界内」，不能作为该能力的结论；其余维度（能力/环境）照常。
+    const relevantBlocking = item.resourceArgsUnbound
+      ? result.verdict.blocking.filter((g) => g.dimension !== 'resource')
+      : result.verdict.blocking;
+    if (relevantBlocking.length > 0) {
+      blockers.push({
+        toolId: item.cap.id,
+        code: relevantBlocking[0]?.code ?? 'blocked',
+        ...(item.stepId ? { stepId: item.stepId } : {}),
+      });
+    } else if (item.resourceArgsUnbound) {
+      // 演示值不构成资源结论：即使恰好落在边界内，也不报 ready。
+      partial = true;
     }
   }
   return { status: blockers.length > 0 ? 'blocked' : partial ? 'partial' : 'ready', blockers };
@@ -172,7 +204,7 @@ function selfContractCard(): string {
   );
 }
 
-/** 集合 fail-closed：任一 id 未登记/是门面/不在 entitlement → 与未知能力逐字同形。 */
+/** 集合 fail-closed：任一 id 未登记/是平台入口/不在 entitlement → 与未知能力逐字同形。 */
 function resolveRequestedTools(
   ids: ReadonlySet<string>,
   requested: readonly string[],
@@ -318,6 +350,8 @@ export function registerToolSearchTools(server: McpServer, ctx: ToolContext): vo
           ...(tools[i].canonicalCall.envelope?.expectedEnvironment
             ? { envAssertion: tools[i].canonicalCall.envelope.expectedEnvironment }
             : {}),
+          // 资源参数仍是演示值 → 资源维度不可预判，其余维度照常（partial，不产出假 blocked）。
+          ...(hasUnboundResourceArgs(cap, tools[i].canonicalCall.args, bindings) ? { resourceArgsUnbound: true } : {}),
         })),
       );
       const toolIds = resolved.caps.map((c) => c.id);
@@ -403,7 +437,7 @@ export function registerToolSearchTools(server: McpServer, ctx: ToolContext): vo
       const refs = collectStepRefs(stepArgs);
       const needsFill = (step.fill ?? []).some((k) => stepArgs[k] === undefined);
       const confidence: 'full' | 'partial' | 'deferred' = refs.length > 0 ? 'deferred' : needsFill ? 'partial' : 'full';
-      // 绑定/字面参数完成后，必须重新过完整 schema + preflight（§10.1）；引用/待补步骤留给 AI，
+      // 绑定/字面参数完成后，必须重新过完整 schema + preflight；引用/待补步骤留给 AI，
       // 但一旦参数齐全就不允许把类型错误/空必填带进披露包。
       if (confidence === 'full') {
         const schema = capabilityInputSchema(cap, multiEnv, 'envelope');

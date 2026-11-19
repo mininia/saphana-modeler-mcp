@@ -1,13 +1,13 @@
 /**
  * 多环境运行时：每个环境一个独立 HanaPool / config / 缓存作用域。
  *
- * v2 模型：环境标识（envKey）直接取自 `HANA_<PARAM>_ENV_<XXXX>` 的 `<XXXX>`，
- * 大小写不敏感，内部规范化为大写。没有 LABEL / configKey 两层概念。
+ * 环境标识（envKey）直接取自 `HANA_<PARAM>_ENV_<XXXX>` 的 `<XXXX>`，
+ * 大小写不敏感，内部规范化为大写。
  *
  * 切换状态机：
  * - 切换前校验 allowlist / from / epoch / token / confirm / 在途调用 / 目标任务 / 目标连接；
  * - 校验与 active+epoch 更新在同步临界区内完成（中间无 await）；
- * - 旧环境有运行中任务 → task-draining（保留池）；否则 idle 并只关闭空闲连接；
+ * - 源环境有运行中任务 → task-draining（保留池）；否则 idle 并只关闭空闲连接；
  * - 池选项按环境从各自 config 派生（POOL_* / SQL_TIMEOUT_MS 可按环境不同）。
  */
 
@@ -33,7 +33,7 @@ export interface EnvironmentRuntime {
   callRefs: number;
   /** 运行中异步任务对池的租约 */
   taskRefs: number;
-  /** 是否多环境部署（单环境不产生环境字段，保持旧输出） */
+  /** 是否多环境部署（单环境不产生环境字段） */
   multiEnv: boolean;
 }
 
@@ -67,7 +67,11 @@ interface SwitchTokenRecord {
   expiresAt: number;
 }
 
-const SWITCH_TOKEN_TTL_MS = 60_000;
+/**
+ * 一次性切换 token 的有效期：与人工审批 TTL（5 分钟）对齐——否则确认稍慢就会拿到
+ * `env_switch_token_invalid`，而重新 list 会改变 args、又要重新审批。
+ */
+const SWITCH_TOKEN_TTL_MS = 5 * 60_000;
 const SWITCH_TOKEN_MAX = 64;
 
 /** 池工厂（测试注入用；生产默认 new HanaPool） */
@@ -90,7 +94,7 @@ export class EnvironmentManager {
     this.loaded = loaded;
     this.activeKey = loaded.startKey;
     for (const entry of loaded.entries) {
-      // 池选项按环境派生：POOL_* / SQL_TIMEOUT_MS 在 v2 属于策略层，可按环境不同。
+      // 池选项按环境派生：POOL_* / SQL_TIMEOUT_MS 属策略层，可按环境不同。
       const options: HanaPoolOptions = {
         ...poolOptions,
         max: entry.config.poolMax ?? poolOptions.max,

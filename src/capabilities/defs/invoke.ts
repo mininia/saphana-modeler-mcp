@@ -1,12 +1,9 @@
 /**
- * `hana_invoke` 清单条目：**唯一执行入口**。
- *
- * 2026-11-19 起工具面只有两个常驻平台工具：`hana_tool_search`（选择）与 `hana_invoke`（执行）。
- * 六个分类门面、`hana_sql_execute` 根工具、分类提升都已移除——它们都是“可以绕过本体层”的捷径。
+ * `hana_invoke` 清单条目：**唯一执行入口**（另一个常驻平台工具是 `hana_tool_search`）。
  *
  * 边界：
  * - 只执行**目标能力**；平台入口自身不可作为目标（防递归）；
- * - 授权、schema、预检、审批、审计全部按目标能力判定，与过去之门面路由同一套闸门；
+ * - 授权、schema、预检、审批、审计全部按目标能力判定；
  * - 不按分类扇出：`capability` 是全局 id，操作级别名（`<工具>#<op>`）也走这里；
  * - 未知与无权逐字同形，不泄漏存在性。
  */
@@ -14,7 +11,7 @@
 import { z } from 'zod';
 import { cap, type Capability } from '../types.js';
 
-/** 调用信封（P2）：环境断言与披露上下文从 `args` 移到执行入口的顶层。 */
+/** 调用信封：环境断言与披露上下文放在执行入口的顶层（不进 args）。 */
 export const CALL_ENVELOPE_SCHEMA = z.object({
   expectedEnvironment: z
     .object({
@@ -30,7 +27,7 @@ export const CALL_ENVELOPE_SCHEMA = z.object({
       manifestRev: z.string().max(128).optional(),
     })
     .optional()
-    .describe('旧披露上下文（兼容）'),
+    .describe('披露上下文（兼容字段；带 contextToken 时忽略）'),
 });
 
 /** `hana_invoke` 入参：能力 id + 该能力的 args（由服务端按目标 schema 校验） */
@@ -45,11 +42,7 @@ export const INVOKE_SCHEMA = z.object({
     .default({})
     .describe('目标能力的入参对象（按目标能力 schema 校验；省略 = 空对象）'),
   ...CALL_ENVELOPE_SCHEMA.shape,
-  /**
-   * 上下文令牌：`hana_tool_search` 回执签发，`hana_invoke` 执行时回传。
-   * 一个字段取代 expectedEnvironment/expectedEpoch/disclosure/disclosureId；
-   * 多环境所有调用必须带；旧字段保留一个版本兼容。
-   */
+  /** 上下文令牌：`hana_tool_search` 回执签发，`hana_invoke` 执行时回传；多环境所有调用必须带（旧字段仍兼容）。 */
   contextToken: z.string().min(1).max(4096).optional().describe('tool_search 回执的上下文令牌；多环境所有调用必填'),
   /** 兼容披露回执：调用方回传的披露 id（等价于 disclosure.id） */
   disclosureId: z.string().max(128).optional(),
@@ -82,7 +75,7 @@ export const invokeCapabilities = {
       returns: [
         '目标能力的原始回执（统一 envelope：{ success, data?, messages[], raw? }）',
         '未知/无权能力与不存在逐字同形',
-        '多环境所有调用需带 expectedEnvironment:{key,epoch}',
+        '多环境所有调用需带 contextToken（或 expectedEnvironment:{key,epoch}）',
       ],
     },
     title: '执行能力',

@@ -53,7 +53,8 @@ async function main(): Promise<void> {
   configureWritePackages(config.writePackages);
   // 进程级归因标签（MCP_AGENT_LABEL）：写进 envelope 与每条 capability-audit，未配置时不产生该字段
   setProcessAgentLabel(config.agentLabel);
-  // 解析工具可见性过滤（HANA_TOOL_GROUPS/HANA_TOOL_DENY；组名与能力 glob 同一列表）；非法分组名在此抛错
+  // 解析工具可见性过滤（HANA_TOOL_GROUPS/HANA_TOOL_DENY；组名与能力 id/glob 同一列表）；
+  // 拼错的分组/能力名不会阻断启动（会按 glob 匹配不到任何能力），由启动摘要告警提示。
   const toolFilter = buildToolFilter(config);
   // 安全要求：连接信息/用户名/密码不得以任何形式出现，不落日志
   logger.info('saphana-modeler-mcp 配置加载完成（连接信息与凭据不落日志）');
@@ -75,7 +76,12 @@ async function main(): Promise<void> {
   // 阻断级结论（如对外监听且无任何认证）直接拒绝启动——那种姿态下能力级与资源级全部形同虚设。
   // 注意：必须用**已加载的 config** 构造策略，不可用 { kind: 'env' } 重新解析 ——
   // 那会在 loadConfig 删除 HANA_PASSWORD 之后再读一次 .env（重新写回凭据），并让判定值与运行值分叉。
-  const verdict = describePolicy({ kind: 'resolved', policy: policyFromConfig(config, toolFilter) });
+  const verdict = describePolicy(
+    { kind: 'resolved', policy: policyFromConfig(config, toolFilter) },
+    loaded.multiEnv
+      ? { profileCapabilityFilters: [toolFilter, ...loaded.entries.map((entry) => buildToolFilter(entry.config))] }
+      : undefined,
+  );
   if (verdict.blocking.length > 0) {
     throw new Error(
       `权限策略自检未通过（${verdict.blocking.map((g) => g.code).join(', ')}），拒绝启动：\n${verdict.text}`,
@@ -90,6 +96,17 @@ async function main(): Promise<void> {
   // 池与超时参数按环境从各自 config 派生（见 EnvironmentManager 构造）；这里不再传全局选项。
   // 部署含义：max 是**每环境池大小**——N 个环境 × poolMax 是理论上限；连接仍懒建立，
   // 稳态通常只有 active 环境建连。多进程部署时 HANA 侧连接数按进程数线性放大，调大前先核对 DB 侧连接预算。
+  // 只读环境（写包为空）仍可由 HANA_SQL_ACCESS=readwrite 放开 SQL 写入：这是两条独立策略，
+  // 但组合容易超出运维预期，启动时显式提示一次。
+  for (const entry of loaded.entries) {
+    if (entry.access === 'readonly' && entry.config.sqlAccess === 'readwrite') {
+      logger.warn(
+        { envKey: entry.envKey },
+        '该环境写包为空（只读），但 HANA_SQL_ACCESS=readwrite：hana_sql_execute 仍允许 DML/DDL/管理类语句；' +
+          '如需禁止，设 HANA_SQL_ACCESS=select-only（或对应的 _ENV_ 覆盖）',
+      );
+    }
+  }
   const manager = new EnvironmentManager(loaded);
   // 调用期 pool/config 取“本次调用绑定的 runtime”；未进入上下文（启动期/测试直调）回退 active。
   const ctx: ToolContext = {
@@ -130,12 +147,11 @@ async function main(): Promise<void> {
   } else {
     // stdio：交给 serveStdio 做 **era 判定**——同一条 stdin/stdout 上
     // 2025-11-25 老客户端与 modern（2026-07-28）客户端都能被服务：
-    //   · 开场是 `initialize`（无 modern envelope claim）→ legacy 支路：行为与直连 StdioServerTransport 完全一致，
-    //     `legacy: 'serve'` 默认值显式写出以固化"既有握手语义不变"（本地实机验收脚本（不入库）与 smoke 零回归的前提）；
+    //   · 开场是 `initialize`（无 modern envelope claim）→ legacy 支路：行为与直连 StdioServerTransport 一致，
+    //     `legacy: 'serve'` 显式写出以固化既有握手语义；
     //   · 开场带 modern 声明（如 `server/discover`）→ modern 支路：SDK 在工厂产物上补装 modern-only handlers。
-    // 工厂返回的实例被**钉住整个连接**；两个平台入口注册到的正是这个实例——
-    // 各工具的 handler 闭包里捕获的就是自己注册时的那个 server（见 createServer 的装配顺序）。
-    // onerror 只做带外报告（绝不改变已写出的报文，SDK 原文）；用 logger 落一条告警便于排障。
+    // 工厂返回的实例被**钉住整个连接**；各工具 handler 闭包捕获自己注册时的 server（见 createServer 装配顺序）。
+    // onerror 只做带外报告（不改变已写出的报文）；用 logger 落告警便于排障。
     serveStdio(() => createServer(ctx), {
       legacy: 'serve',
       onerror: (error) => logger.warn({ err: error }, 'stdio 通道带外错误（不影响已写出的报文）'),
@@ -144,11 +160,11 @@ async function main(): Promise<void> {
   }
 
   // 进程收尾。两条路径能力不同，必须分开挂：
-  // ① SIGTERM/SIGINT（docker stop / k8s / IDE 停止按钮 / Ctrl+C）：信号默认处置直接结束进程，
-  //    **'exit' 事件不会触发**——异步清理（closeAll 的 pwd 擦除、HTTP handler.close 中止在途请求）
-  //    只能在信号处理器里 await 完成；带 SHUTDOWN_TIMEOUT_MS 超时兜底，清理卡住也能退出，重复信号不重复收尾。
-  // ② 'exit'（stdin EOF / 显式 process.exit / 崩溃兜底）：回调不可 await，只有各清理函数的**同步前缀**
-  //    会生效（如 httpClose 的 server.close/closeIdleConnections 立即停止接受新连接）；异步尾部依赖路径 ①。
+  // ① SIGTERM/SIGINT（docker stop / k8s / IDE 停止 / Ctrl+C）：信号默认处置直接结束进程，'exit' 不触发——
+  //    异步清理（closeAll 的 pwd 擦除、HTTP handler.close 中止在途请求）只能在信号处理器里 await；
+  //    带超时兜底，清理卡住也能退出，重复信号不重复收尾。
+  // ② 'exit'（stdin EOF / process.exit / 崩溃兜底）：回调不可 await，只有各清理函数的**同步前缀**生效
+  //   （如关闭 HTTP 监听、摘除空闲连接）；异步尾部依赖路径 ①。
   const closeResources = async (): Promise<void> => {
     const tasks: Promise<unknown>[] = [manager.closeAll()];
     if (httpClose) tasks.push(httpClose());

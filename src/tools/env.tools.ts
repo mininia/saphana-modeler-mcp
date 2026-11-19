@@ -1,5 +1,5 @@
 /**
- * 环境管理工具：hana_env_list（root，只读）+ hana_env_switch（route-only，admin）。
+ * 环境管理工具：hana_env_list（只读）+ hana_env_switch（route-only，admin）。
  *
  * 只在多环境部署注册：
  * - list：看当前环境标识、每个环境的 access/state/任务数、可切列表与一次性 token；
@@ -49,13 +49,13 @@ function listEnvelope(ctx: ToolContext): Envelope['data'] {
       runningTasks: countRunningTasksForEnvironment(rt.envKey),
       poolOpen: rt.pool.stats().inUse + rt.pool.stats().idle > 0,
     })),
-    next: '权限/预览诊断：先 hana_tool_search({ mode: "goal", goal: "diagnose_preview_permission", bindings: { packageId, objectName } })，再按 steps[] 用 hana_invoke 执行；多环境所有调用带 expectedEnvironment:{key,epoch}（或 contextToken）。',
+    next: '权限/预览诊断：先 hana_tool_search({ mode: "goal", goal: "diagnose_preview_permission", bindings: { packageId, objectName } })，再按 steps[] 用 hana_invoke 执行；多环境所有调用带 contextToken（或旧字段 expectedEnvironment:{key,epoch}）。',
     hint: httpMode
       ? 'HTTP 多客户端共享进程：不支持运行时切换；请一进程一环境或使用 Token→环境绑定。'
       : !switchEntitled
         ? '当前调用方没有 hana_env_switch 权限（admin 组/档案）：只能查看，不能切换。'
         : manager.switchable.length > 0
-          ? '切换用 hana_invoke({ capability: "hana_env_switch", args: { to, from: current, epoch, switchToken, confirm: to } })；token 一次性、60s 有效。'
+          ? '切换用 hana_invoke({ capability: "hana_env_switch", args: { to, from: current, epoch, switchToken, confirm: to }, contextToken })；token 一次性、5 分钟有效。'
           : '当前没有可切环境（HANA_ENV_SWITCHABLE 为空）：只能查看，不能切换。',
   };
 }

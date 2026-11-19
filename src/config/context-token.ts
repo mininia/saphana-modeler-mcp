@@ -1,19 +1,18 @@
 /**
  * 上下文令牌（`contextToken`）——把调用期的环境断言与披露上下文收成一个不可伪造的字符串。
  *
- * 现在客户端要在 `hana_invoke` 上传 `expectedEnvironment`、`expectedEpoch`、
- * `disclosure.{id,policyRev,manifestRev}`、`disclosureId`；服务端再用 registry 核对。
- * 令牌把这些字段打包签名：
- * - 服务端只验签与代际，不需要会话/registry；
+ * `hana_tool_search` 在回执中签发，`hana_invoke` 执行时回传；令牌绑定调用方、环境、epoch、
+ * 策略代际与清单代际：
+ * - 服务端只验签与比较代际，不需要会话/registry；
  * - 客户端无法伪造环境、epoch、policyRev、manifestRev；
  * - 令牌**不是授权凭证**：每次调用仍过 `authorizeCall`，它只证明「这份策略上下文还新鲜」。
  *
- * 进程内随机密钥：重启即失效（重新披露即可）；多副本 HTTP 若需要跨进程，后续引入共享密钥。
+ * 进程内随机密钥：重启即失效（重新获取即可）；多副本 HTTP 需共享密钥。
  */
 
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 
-/** 令牌默认有效期（与旧披露 registry 的 TTL 同口径） */
+/** 令牌默认有效期 */
 export const CONTEXT_TOKEN_TTL_MS = 10 * 60_000;
 
 export interface ContextTokenPayload {

@@ -1,11 +1,6 @@
 /**
  * `hana_invoke`：唯一执行入口。
  *
- * 与旧分类门面路由的区别：
- * - 没有分类扇出边界：`capability` 是全局 id（含操作级别名），但**平台入口自身不可作为目标**；
- * - 没有索引分支：选工具只由 `hana_tool_search` 负责；
- * - 其余不变：按目标能力授权、服务端 schema 校验、跨字段预检、审批与审计。
- *
  * 三条硬约束：
  * 1. 授权按目标能力判定（不是按入口名）；入口自身也先过一遍闸门；
  * 2. 参数在服务端按目标能力 schema 校验（客户端 schema 只是便利）；
@@ -34,7 +29,7 @@ import { UNKNOWN_CAPABILITY_TEXT } from './unknown.js';
 import { entitlementOf } from './surface.js';
 import { toolFilterOf } from './groups.js';
 
-/** 未知/无权能力的**同一句**回执（不变量 D；两者必须逐字相同） */
+/** 未知/无权能力的**同一句**回执（两者必须逐字相同） */
 export { UNKNOWN_CAPABILITY_TEXT };
 
 /**
@@ -76,7 +71,7 @@ function blockAuditPayload(
 
 /**
  * 参数校验失败时返回给模型的“参数卡”。
- * 错误回执即完整契约（I5）：模型不必再调一次 tool_search，也不会因为只看到
+ * 参数错误回执即完整契约：模型不必再调一次 tool_search，也不会因为只看到
  * “参数不符合 schema” 而继续换工具/猜参数名。
  */
 function schemaErrorHint(target: Capability, args: unknown, multiEnv: boolean): string {

@@ -48,7 +48,7 @@ export interface ToolContext {
   /**
    * 多环境管理器。存在时，每次工具调用入口绑定一次 runtime：
    * `ctx.pool` / `ctx.config` 的 getter 优先读绑定值，handler 内不再看全局 active。
-   * 省略 = 单环境测试/脚本直调，行为与旧版一致。
+   * 省略 = 单环境测试/脚本直调。
    */
   manager?: EnvironmentManager;
   /**
@@ -75,7 +75,7 @@ export function buildToolFilter(config: HanaConfig): ToolFilterConfig {
  * 与调用期闸门分工：这里管「这次部署注册不注册」，闸门管「这次调用成不成立」。
  */
 function registerVisibleTool(server: McpServer, ctx: ToolContext): McpServer['registerTool'] {
-  // 面已包含可见性过滤与提升结果，此处不再单独咨询 filter。
+  // 面已包含可见性过滤结果，此处不再单独咨询 filter。
   const effective = surfaceOf(ctx);
   return ((name: string, config: unknown, cb: unknown) => {
     // 工具级能力 id 恒等于注册名（操作级条目只经路由，不注册）
@@ -127,7 +127,7 @@ export interface CapabilityRegistrar {
 /**
  * 返回按能力清单注册的注册器：配置取自清单，handler 由统一调用期闸门（authorizeCall）包住。
  * 所有能力过同一个闸门，差别只在「有没有资源维度」（由 effects.plan 的有无表达）。
- * 注册期过滤算的是本次连接的面：具体能力默认只经门面路由调用，分类被提升后才进 tools/list。
+ * 注册期过滤算的是本次连接的面：具体能力不注册为工具，只登记 handler 供 hana_invoke 派发。
  */
 export function capabilityRegistrar(server: McpServer, ctx: ToolContext): CapabilityRegistrar {
   const register = registerVisibleTool(server, ctx);
@@ -167,7 +167,7 @@ function gatedHandler<S extends z.ZodType>(
   return (args, extra) => {
     const identity = currentIdentity();
     // 授权 → 执行 → 写能力终态审计：三个动作收在 dispatchAuthorized 一处，
-    // 门面路由与平铺直调共用同一个壳（P0-4）。
+    // 平台入口调用与 hana_invoke 派发共用同一个壳。
     const run = (): unknown =>
       dispatchAuthorized(
         cap,
@@ -257,6 +257,14 @@ export function logToolFilterSummary(filter: ToolFilterConfig, envKey?: string):
     },
     `${prefix}工具可见性过滤已启用（HANA_TOOL_GROUPS/HANA_TOOL_DENY）`,
   );
+  // 拼错的分组/能力名不会阻断启动：这里显式提示「未命中任何已登记能力」的 token。
+  const unmatched = filter.allowPatterns.filter((p) => !CAPABILITY_LIST.some((c) => matchGlob(c.id, [p])));
+  if (unmatched.length > 0) {
+    logger.warn(
+      { ...(envKey ? { envKey } : {}), unmatched },
+      `${prefix}HANA_TOOL_GROUPS 中这些 token 未命中任何已登记能力（拼写错误或已改名？）`,
+    );
+  }
   // 列出被关闭的能力名（帮助确认配置符合预期：它们在发现/执行两层都不可达）
   const allNames = CAPABILITY_LIST.filter((c) => c.routeOnly !== true && c.platform !== true).map((c) => c.id);
   const disabled = allNames.filter((name) => !shouldRegisterTool(name, filter));

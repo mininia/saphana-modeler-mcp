@@ -34,12 +34,11 @@ export interface WritePlan {
   readPackages: string[];
   /**
    * 本次将读取（引用）的仓库对象（对象级）。解析不出的引用落 uncertain，不在这里假装确定。
-   * 可选：未做对象级声明的规划器/调用方不填（既有调用方零改动）。
    * 未声明（undefined）与「已声明无」（`[]`）语义不同——前者表示对象级静态不可知，后者才表示确实没有；
-   * 拦截报告（formatWritePlan）按这一区别原样展示。
+   * 拦截报告按这一区别原样展示。
    *
-   * **不参与拦截判定**：包级判定只消费 writePackages/readSchemas（planToRequest）；批内相交检测由
-   * 执行侧（changeset.plan）用同一套推导（objectRefsOfUpdate）另行计算，不经本字段。
+   * **不参与拦截判定**：包级判定只消费 writePackages/readSchemas；批内相交检测由执行侧用同一套
+   * 推导（objectRefsOfUpdate）另行计算，不经本字段。
    */
   reads?: ObjectRef[];
   /** 本次将写入/创建/删除的仓库对象（对象级）。可选；语义与消费面同 reads（含"不参与拦截判定"）。 */
@@ -76,7 +75,7 @@ export function planToRequest(plan: WritePlan): PolicyRequest {
 
 /** 计划 → 人类可读多行文本（进拦截报告 / 执行前日志） */
 export function formatWritePlan(plan: WritePlan): string {
-  // 标题用「调用预规划」而非「写操作预规划」：P10-b 起读能力也有资源计划（planRead），
+  // 标题用「调用预规划」而非「写操作预规划」：读能力也有资源计划，
   // 同一份报告要同时服务"这次会写什么"与"这次会读什么"。
   const lines = [`调用预规划（${plan.tool}）：`];
   plan.steps.forEach((s, i) => lines.push(`  ${i + 1}. ${s}`));
@@ -106,11 +105,11 @@ export function formatWritePlan(plan: WritePlan): string {
  *
  * 两种 XML 方言形态必须都认（同一条正则的交替分支，**不是**第二份扫描器）：
  *   - **元素形态** `<resourceUri>/…</resourceUri>`：本仓生成/存储的 CV XML 就长这样
- *     （view-edit.ts 的 dataSourceBlock、view-xml.ts 的 parseDataSource 都按元素读，fixture-join-chain.xml 亦是）。
- *     只认属性形态时真实载荷里的跨对象读集**恒为空** ⇒ 批内 write∩read 冲突不判、不拒（评审实测）；
- *   - **属性形态** `resourceUri="/…"`：BW 导出样本/旧载荷的写法，既有用例保留。
+ *     （view-edit.ts 的 dataSourceBlock、view-xml.ts 的 parseDataSource 都按元素读）。
+ *     只认属性形态时真实载荷里的跨对象读集**恒为空** ⇒ 批内 write∩read 冲突不判、不拒；
+ *   - **属性形态** `resourceUri="/…"`：BW 导出样本的写法。
  * 元素形态允许标签与值之间存在空白（值 trim 后仍须以 / 开头，与属性形态同一口径）。
- * 对合法闭合的值与「只认属性形态」的旧实现逐字等价；截断/未闭合引号的畸形 XML 旧实现会误报，这里直接跳过（更严）。
+ * 截断/未闭合引号的畸形 XML 直接跳过（不误报）。
  */
 function scanXmlResourceUriValues(xml: string): string[] {
   const out: string[] = [];
@@ -127,10 +126,9 @@ function scanXmlResourceUriValues(xml: string): string[] {
  * 从 XML 里扫出跨包数据源引用（`/…/` 形态的 resourceUri，元素与属性两种写法都认，见扫描件头注）。
  * 尽力而为：扫不到不影响判定。
  *
- * 口径与既有实现一致：只取**首个路径段**（本服务生成的数据源 resourceUri 用点分包 id
- * `/ZDEMO.ZDEMO_MKC/calculationviews/X`，首段即完整包名）。斜杠分段的旧格式这里只报首段——
+ * 口径：只取**首个路径段**（本服务生成的数据源 resourceUri 用点分包 id
+ * `/ZDEMO.ZDEMO_MKC/calculationviews/X`，首段即完整包名）。斜杠分段的格式这里只报首段——
  * readPackages 是可见性信息、不参与拦截；精确到对象的解读归 `scanXmlObjectRefs`。
- * 对合法闭合的属性值与既有实现逐字等价；截断/未闭合引号的畸形 XML 旧实现会误报，这里直接跳过（更严）。
  */
 export function scanXmlPackageRefs(xml: string): string[] {
   const out = new Set<string>();
@@ -217,7 +215,7 @@ export function dedupeRefs(refs: ObjectRef[]): ObjectRef[] {
 /**
  * 从一次 update 载荷（xml 或 operations）推出对象级读/写集（writes=目标对象本身）。
  *
- * 为什么共享在本文件：规划器与 P7 服务侧都要用它（服务层逐 action 推读写集做相交检测），
+ * 为什么共享在本文件：规划器与服务侧（逐 action 推读写集做相交检测）都要用它，
  * 放这里双方都引它、又不产生环（本文件是运行期叶子，不 import services）。
  *
  * 口径：
@@ -225,7 +223,7 @@ export function dedupeRefs(refs: ObjectRef[]): ObjectRef[] {
  * - reads = xml 里 resourceUri 解析出的对象 + operations 里 add_join 的源对象；
  *   set_script 只替换自身脚本，不产生跨对象引用；
  * - 只有源包没有源对象名的 join 源**不猜**对象级引用（包级引用照旧由 readPackages 承担），
- *   但**不静默**：解析不出的引用逐条落 `uncertain`（§6.2 降级口径——"不判"与"没有引用"必须可区分）。
+ *   但**不静默**：解析不出的引用逐条落 `uncertain`（"不判"与"没有引用"必须可区分）。
  */
 export function objectRefsOfUpdate(input: {
   packageId: string;
@@ -362,7 +360,7 @@ export function splitSqlStatements(text: string): string[] {
 
 /**
  * 表名区里的**每一张表**都要看，不能只看紧邻锚点的那一个：
- * `SELECT * FROM SYS.DUMMY, MARA` 里 MARA 才是未限定的那张，只看第一个会漏（评审实测）——
+ * `SELECT * FROM SYS.DUMMY, MARA` 里 MARA 才是未限定的那张，只看第一个会漏——
  * 而漏判的后果是"默认 schema 不在允许范围内"这类越界读取直接放行。
  * 按**顶层逗号**分片（括号内的逗号属于函数调用参数，不分片），每片只看头一个标识符。
  * 以 `(` 开头的分片是**括号 join**（`FROM (MARA A JOIN …)`）或子查询：括号 join 的首表没有
@@ -500,19 +498,14 @@ function startsWithSubquery(inner: string): boolean {
  * 把**派生表/子查询**的括号内容抹成空白（保持偏移不变），并按括号内容区分其余括号：
  *
  * - **子查询**（内容以 SELECT/WITH 开头）：整段抹除。`SELECT V.A FROM (SELECT T.A FROM SYS.TAB T) V`
- *   里 `T.A` 的 `T` 是派生表的别名，不是 schema——不抹会被当成 schema 收集，而任何白名单都不可能有
- *   `T`，于是**合法语句被误拒**（实测：main 上返回 `['SYS']`，加括号扫描后变成 `['T','SYS']`）。
- *   派生表内部的表名不会因此漏掉：它自己的 `FROM` 会被锚点单独扫到（`SYS.TAB` 就在内层）。
- *   判定**以内容为先**，不看 `(` 前面是什么 token：`JOIN (SELECT …)`、`LATERAL (SELECT …)` 的
- *   `(` 前恰好是标识符字符（N/L），先前"`(` 前是标识符即函数调用"的判定会把子查询当函数参数
- *   留下，里面的别名限定列（`X.K`）被扫成 schema → 合法语句被 schema_not_allowed 硬拦（评审实测）。
- * - **非子查询括号**（表函数调用、括号 join）：**不整段抹**——表函数参数里可以有表名
- *   （`APPLY_FILTER("S"."T", …)`），括号 join 的首表更是没有别的锚点可见路径
- *   （`FROM (SECRET.T1 A JOIN ZEMP.T2 B ON …)`），抹掉等于整个表引用漏扫。
- *   改为**递归**进括号内容：表名继续参与扫描；里面若还有子查询照样按子查询抹除；
- *   并把括号 join 的 **join 条件（顶层 ON …）** 抹掉——`ON A.X=B.X` 里的限定名是列不是 schema
- *   （不抹会被当成 schema 收集，合法语句被误拒）。
- *   函数参数里的表名不会因此漏：递归同样保留它们，只有子查询与 join 条件被抹。
+ *   里 `T.A` 的 `T` 是派生表别名不是 schema——不抹会被当成 schema 收集（任何白名单都没有 `T`），
+ *   合法语句被误拒。内部的表名不漏：它自己的 `FROM` 会被锚点单独扫到。
+ *   判定**以内容为先**，不看 `(` 前的 token：`JOIN (SELECT …)`、`LATERAL (SELECT …)` 的 `(` 前是
+ *   标识符字符，按"前是标识符即函数调用"判会留下子查询，别名限定列（`X.K`）被扫成 schema。
+ * - **非子查询括号**（表函数、括号 join）：**不整段抹**——表函数参数里可以有表名
+ *   （`APPLY_FILTER("S"."T", …)`），括号 join 的首表也没有别的锚点可见（`FROM (ZDEMO_SEC.T1 A JOIN …)`），
+ *   抹掉等于整个表引用漏扫。改为**递归**：表名继续参与扫描，里面的子查询照抹；
+ *   并把括号 join 的顶层 `ON …` 条件抹掉——`ON A.X=B.X` 的限定名是列不是 schema。
  */
 function maskDerivedTables(region: string): string {
   let out = '';
@@ -585,24 +578,19 @@ function skipAlias(text: string, from: number): number {
 /**
  * 表名区 = FROM/JOIN 锚点之后，到**顶层**子句边界为止。
  *
- * 为什么要跟踪括号深度而不是见到 `(`/`)` 就切：表函数与派生表的表名都在括号里——
- * `APPLY_FILTER("SAPSR3"."MARA", $$X=1$$)`、`CE_COLUMN_TABLE("S"."T")`、`(SELECT * FROM C.T)`，
- * 早切会让它们整体逃过扫描（评审实测：这是读边界被绕过的一类写法）。顶层边界仍然是
- * ON/WHERE/GROUP/… 与语句结尾；顶层的 `=` 也切（旧行为，保留）；`AS` 只跳别名不截断（见 skipAlias）。
+ * 要跟踪括号深度而不是见 `(`/`)` 就切：表函数与派生表的表名都在括号里
+ * （`APPLY_FILTER("SAPDEMO"."MARA", $$X=1$$)`、`CE_COLUMN_TABLE("S"."T")`、`(SELECT * FROM C.T)`），
+ * 早切会让它们整体逃过扫描（读边界被绕过的一类写法）。顶层边界是 ON/WHERE/GROUP/… 与语句结尾；
+ * 顶层的 `=` 也切；`AS` 只跳别名不截断（见 skipAlias）。
  *
- * `ON` 不是**整段**表名区的终点：`JOIN … ON 条件, SECRET.T3` 里 ON 之后的顶层逗号列表仍可能有
- * 表引用（标准 SQL 的 FROM 逗号列表允许在 join 链之后再以逗号追加表），命中 ON 时越过条件表达式、
- * 在下一个顶层逗号处恢复扫描（条件本身不参与扫描——里面的 `A.X` 是列不是 schema）。
- * 引号标识符按 token 整体跳过：`FROM "ON"."T"` 的引号名里出现子句关键字不能截断表名区。
+ * `ON` 不是整段终点：`JOIN … ON 条件, SECRET.T3` 里 ON 之后的顶层逗号列表仍可能有表
+ * （FROM 逗号列表允许在 join 链后再追加表），故越过条件表达式、在下一个顶层逗号处恢复扫描
+ * （条件里的 `A.X` 是列不是 schema）。引号标识符按 token 整体跳过。
  *
- * **语句边界**：`;` 与语句起始关键字（STATEMENT_KEYWORD，如 BEGIN/END/SELECT）在顶层同样收住——
- * 表名区不得跨语句。多语句过程体（`BEGIN … ; … END`）里每条语句有自己的 FROM/JOIN 锚点，
- * 表名区越过边界后会把后续语句的列限定名/列名当成表引用（实测：合法脚本被闸门误拒）；
- * 后续语句自己的表引用由它自己的锚点扫到，在这里收住不会漏。
- *
- * WITH/FOR **不是**边界：它们是**表引用子句关键字**（`WITH HINT(…)` / `WITH PARAMETERS(…)` /
- * `FOR SYSTEM_TIME AS OF …`），出现在表名区里表示表级子句、不是新语句的起点，须继续扫其后的
- * 顶层逗号列表（`FROM SYS.T1 WITH HINT(NO_INLINE), SECRET.T2` 的 SECRET 不能漏；见 STATEMENT_KEYWORD 注）。
+ * **语句边界**：`;` 与语句起始关键字（STATEMENT_KEYWORD）在顶层同样收住——表名区不得跨语句；
+ * 越过边界会把后续语句的列限定名/列名当成表引用（实测合法脚本被误拒）。后续语句的表由它自己的
+ * 锚点扫到，收住不会漏。WITH/FOR **不是**边界：`WITH HINT(…)` / `FOR SYSTEM_TIME AS OF …` 是
+ * 表级子句，须继续扫其后的顶层逗号列表（否则 `… WITH HINT(NO_INLINE), SECRET.T2` 的 SECRET 漏扫）。
  */
 function tableNameRegion(text: string, start: number): string {
   let depth = 0;
@@ -652,19 +640,15 @@ const CLAUSE_KEYWORD = /\b(?:ON|WHERE|GROUP|ORDER|HAVING|UNION|EXCEPT|INTERSECT|
 /**
  * 语句起始关键字——表名区与 ON 恢复扫描的**语句边界**（与 `;` 同一口径，仅深度 0 生效）。
  *
- * 为什么需要：SQLScript 过程体 / SQL 模式视图 <definition> 是多语句脚本（语句以 `;` 分隔），
- * 每条语句有自己独立的 FROM/JOIN 锚点。表名区（或 ON 恢复扫描）越过语句边界后，会把后续语句里的
- * 列限定名（`X.COL`）、select 列表头当成表引用 —— 扫出假 schema / 假未限定表名，合法脚本被
- * 闸门误拒（多语句过程体实测）。字符串与注释已被剥离、引号标识符整 token 跳过，因此表位置上的
- * 这些词只可能是新语句的起点；本语句自己的表引用都在边界之前，收住不会漏扫。
- * `END` 例外（CASE 表达式的收尾）见 skipJoinCondition 的深度计数。
+ * 为什么需要：SQLScript 过程体 / SQL 模式视图 <definition> 是多语句脚本，每条语句有自己独立的
+ * FROM/JOIN 锚点。越过语句边界会把后续语句的列限定名（`X.COL`）、select 列表头当成表引用，
+ * 扫出假 schema/假未限定表名，合法脚本被误拒（多语句过程体实测）。字符串与注释已剥离、引号标识符
+ * 整 token 跳过，表位置上的这些词只可能是新语句的起点；本语句的表引用都在边界之前，收住不会漏。
+ * `END` 例外（CASE 收尾）见 skipJoinCondition。
  *
- * **WITH / FOR 故意不在此列**（独立复核 ①–④：把两者并进来手段过宽）：它们同时是**表引用子句关键字**
- * —— `WITH HINT(…)` / `WITH PARAMETERS(…)` / `FOR SYSTEM_TIME AS OF …`（以及 `FOR UPDATE`）跟在
- * FROM 表引用之后，是**表级子句**而不是新语句的起点。区分口径：本文件只在 FROM/JOIN 锚点**之后**的
- * 表名区里做关键字判定，而真正的语句起点前面必有 `;`（已单独收住，或就是扫描起点）——所以表名区里
- * 出现的 WITH/FOR 不可能是语句起点，遇到它们应**继续扫**其后的顶层逗号列表。当硬边界用的后果：
- * `… WITH HINT(NO_INLINE), SECRET.T2` 里逗号追加的 SECRET 整体漏扫，schema 白名单可再次被绕过。
+ * **WITH / FOR 故意不在此列**：它们同时是**表引用子句关键字**（`WITH HINT(…)` /
+ * `WITH PARAMETERS(…)` / `FOR SYSTEM_TIME AS OF …`），是表级子句而不是新语句起点——真正的语句起点
+ * 前面必有 `;`。当硬边界用的后果：`… WITH HINT(NO_INLINE), SECRET.T2` 里的 SECRET 整体漏扫。
  */
 const STATEMENT_KEYWORD =
   /\b(?:SELECT|INSERT|UPDATE|UPSERT|DELETE|MERGE|CREATE|DROP|ALTER|TRUNCATE|CALL|DO|BEGIN|END|IF|WHILE|LOOP|RETURN|DECLARE|EXPORT|IMPORT|GRANT|REVOKE|EXPLAIN|SET)\b/iy;
@@ -677,7 +661,7 @@ const STATEMENT_KEYWORD =
  * **语句边界**：`;` 与语句起始关键字（STATEMENT_KEYWORD）同样返回 -1 —— 恢复扫描不得跨语句
  * （跨过去会在后续语句里找到顶层逗号并恢复表名区扫描，后续语句的列名/列限定名被当成表引用，
  * 合法脚本被误拒）。`END` 例外：它可能是 ON 条件里 CASE 表达式的收尾（不是语句边界），
- * 用 CASE 深度计数区分——带 `CASE…END` 的条件之后，顶层逗号列表仍要恢复扫描（2.2 修复不退化）。
+ * 用 CASE 深度计数区分——带 `CASE…END` 的条件之后，顶层逗号列表仍要恢复扫描。
  * 表引用子句关键字是 WITH/FOR 时同样不收住（它们不在 STATEMENT_KEYWORD 里，见其注）：
  * 条件之后跟着表级子句时，继续找其后的顶层逗号列表。
  */
@@ -740,7 +724,7 @@ const SQL_NON_SCHEMA = new Set([
  * 去掉 SQL 字符串字面量与注释（避免把 'ABC.DEF' / `-- X.Y` 里的点当成 schema 限定）。
  *
  * 用**单遍状态机**而不是连续 replace：正则顺序敏感——先剥 `--` 行注释会把 `'a--b'` 里的
- * 字面量后半行一并吃掉（实测：`SELECT 'a--b' AS X ... FROM SAPSR3.T` 会扫不出 SAPSR3，
+ * 字面量后半行一并吃掉（实测：`SELECT 'a--b' AS X ... FROM SAPDEMO.T` 会扫不出 SAPDEMO，
  * 读边界因此静默放行）。状态机同时正确处理引号内的 `--`、注释里的引号与 `''` 转义。
  *
  * 导出给 SQL 分析工具复用：语句分类（首 token）与分号校验都必须跑在剥离后的文本上，
@@ -767,8 +751,8 @@ export function stripSqlLiteralsAndComments(sql: string): string {
     }
     // 双引号标识符必须**原样保留**（扫描器要读它），但它的内容要按标识符处理：
     // 里面的单引号 / $$ / -- 都不是字面量或注释的起始。缺这一段时
-    // `SELECT "a'b" AS X, B.* FROM "SAPSR3"."MARA" B` 会被那个孤立的单引号吞掉后半句，
-    // 两个扫描器都看不到 FROM，读边界静默放行（评审实测）。
+    // `SELECT "a'b" AS X, B.* FROM "SAPDEMO"."MARA" B` 会被那个孤立的单引号吞掉后半句，
+    // 两个扫描器都看不到 FROM，读边界静默放行。
     if (c === '"') {
       const start = i;
       i++;
@@ -785,7 +769,7 @@ export function stripSqlLiteralsAndComments(sql: string): string {
     }
     if (c === '-' && next === '-') {
       // 行注释终止于 LF 或 CR（只认 LF 时，CR 结尾的一行会把后续语句一起吞成"注释"，
-      // 多语句判定随之失效，但送去执行的是原文 —— 评审实测的洞）
+      // 多语句判定随之失效，但送去执行的是原文 —— 实测的洞）
       while (i < sql.length && sql[i] !== '\n' && sql[i] !== '\r') i++;
       out += ' ';
       continue;
@@ -813,18 +797,16 @@ export function stripSqlLiteralsAndComments(sql: string): string {
 /**
  * 从 SQL 脚本里扫出 schema 引用（`FROM SCHEMA."表"` / `JOIN "schema".t` / 逗号列表内的后续表）。
  *
- * 三条规则（每条都对应一类真实误判，松紧都必须在两个方向上都验）：
+ * 三条规则（每条都对应一类真实误判）：
  * 1. 先剥掉字符串字面量与注释——否则 `'ABC.DEF'`、`-- 参考 X.Y` 里的 token 会被当成 schema；
  * 2. 只认**表位置**（`FROM` / `JOIN` 之后到子句边界之间）的限定名：别名限定列（`SRC.COL`）与
  *    CTE 名（`WITH BASE AS … SELECT BASE.X`）不是 schema，误报会把合法调用硬拦在预检；
- * 3. 引号形式（`"SAPSR3"."MARA"`）与大小写写法都要识别（引号内保留原样、未加引号按 HANA 规则折成大写）：
- *    只认全大写未加引号会漏掉 `"SAPSR3"."MARA"` = 读边界被绕过。
+ * 3. 引号形式（`"SAPDEMO"."MARA"`）与大小写写法都要识别（引号内保留原样、未加引号按 HANA 规则折成大写）：
+ *    只认全大写未加引号会漏掉 `"SAPDEMO"."MARA"` = 读边界被绕过。
  *
- * 多语句脚本（SQLScript 过程体 `BEGIN … END`）**逐语句扫描**：表名区止于语句边界（`;` 与
- * 语句起始关键字，见 tableNameRegion），每条语句的表引用由它自己的 FROM/JOIN 锚点扫到——
- * 越过语句边界会把后续语句的列限定名（`X.COL`）扫成假 schema，合法脚本被闸门误拒。
- * `WITH HINT` / `WITH PARAMETERS` / `FOR SYSTEM_TIME AS OF` 这类**表引用子句关键字**不是语句边界：
- * 它们之后的顶层逗号列表（逗号追加的表）仍照扫（见 STATEMENT_KEYWORD 注）。
+ * 多语句脚本**逐语句扫描**：表名区止于语句边界（见 tableNameRegion）；越过边界会把后续语句的
+ * 列限定名扫成假 schema。`WITH HINT` / `WITH PARAMETERS` / `FOR SYSTEM_TIME AS OF` 不是语句边界，
+ * 其后的顶层逗号列表仍照扫（见 STATEMENT_KEYWORD）。
  *
  * 仍不覆盖（在计划里以「不确定」显式标注，不假装完整）：未限定 schema 的表名（服务端按当前用户默认
  * schema 解析）与动态 SQL。
@@ -872,11 +854,9 @@ function collectQualifiedRefs(region: string, out: Set<string>): void {
   // 否则会多扫出假 schema（如把列名当 schema），把合法调用挡在预检外。
   //
   // 两个判断都只看**紧邻的一个非空白字符**，所以用 prevNonSpace/nextNonSpace 前后扫，**不做切片**：
-  // 早先写成 `!/\.\s*$/.test(region.slice(0, pos))` 与 `/^\s*\./.test(region.slice(j))`，每个标识符
-  // 拷贝两次整段文本 → 整趟扫描是 O(标识符数 × 区域长度)。实测（本机）：限定名 1000/2000/4000/8000
-  // 个 → 6.9/20.2/76.1/329.0 ms（每翻倍约 4×），10 万字符的语句单次 303 ms，而 hana_sql_analyze
-  // 每次调用要跑两遍 → 约 0.6 s 的**同步**计算，HTTP 模式下会把整个进程的并发请求一起卡住。
-  // 表名区扫描范围扩大（函数参数、AS 之后的表）后这个平方项才变得显眼，故改为零分配的前后扫。
+  // 切片写法（`region.slice(0, pos)` / `region.slice(j)`）会让每个标识符拷贝两次整段文本，
+  // 整趟扫描成 O(标识符数 × 区域长度)——10 万字符的语句单次约 300 ms，hana_sql_analyze 每次
+  // 要跑两遍 ⇒ 约 0.6 s 的**同步**计算，HTTP 模式下会把整个进程的并发请求一起卡住。
   const isFirstSegment = (pos: number): boolean => prevNonSpace(region, pos) !== '.';
   while (i < region.length) {
     const ch = region[i];

@@ -4,11 +4,8 @@ import { VIEW_OPS } from '../services/view-ops.rules.js';
 /**
  * 视图操作集（operations 通道的 8 个 op）与异步任务规则。
  *
- * 来源（搬迁自，保留原文措辞）：
- * - src/capabilities/defs/modeling.ts 的 hana_view_update.description（operations 三方式与参数面一段）；
- * - src/services/view-ops.rules.ts 各 op 的 detail（方言/守卫口径的单一事实源，本规则**引用**它生成，
- *   不复制——op 增删时本规则自动跟随，避免第二份清单漂移）；
- * - src/services/async-task.service.ts 与 core/task-registry.ts 的头注（任务语义与诚实边界）。
+ * op 的方言/守卫口径以 src/services/view-ops.rules.ts 的 detail 为单一事实源——本规则**引用**它生成，
+ * 不复制（op 增删时本规则自动跟随，避免第二份清单漂移）。
  */
 
 /** 由 VIEW_OPS 声明生成 op 目录（每行：`op=id：summary（参数名）`）——单一事实源在 view-ops.rules.ts */
@@ -47,13 +44,13 @@ export const viewOpsRules: readonly RuleObject[] = [
       '立即返回 taskId。',
       '',
       '用法（变更集；单对象通道传 async 会被拒绝）：',
-      '- 提交：hana_view_update({changeset:{actions:[…]}, async:true}) ⇒ {taskId, status:"working", kind, label, hint}；',
-      '- 轮询：hana_task_get({taskId}) ⇒ {kind, status, progress, result?}；status ∈ working/completed/failed/cancelled；',
+      '- 提交：hana_invoke({capability:"hana_view_update", args:{changeset:{actions:[…]}, async:true}}) ⇒ {taskId, status:"working", kind, label, hint}；',
+      '- 轮询：hana_invoke({capability:"hana_task_get", args:{taskId}}) ⇒ {kind, status, progress, result?}；status ∈ working/completed/failed/cancelled；',
       '  终态 result 就是**与同步调用同形的回执信封**（success=true 时 data=报告；失败时 raw.errorDetail 带逐项明细）；',
-      '- 取消：hana_task_cancel({taskId}) ⇒ 协作式——**当前动作不打断**，本动作结束后停止后续项，',
+      '- 取消：hana_invoke({capability:"hana_task_cancel", args:{taskId}}) ⇒ 协作式——**当前动作不打断**，本动作结束后停止后续项，',
       '  并走与失败相同的**逆序补偿**（已执行项回到批前状态）；报告 raw.code=changeset_cancelled 带完整现场。',
       '',
-      '长 SQL 分析（同一任务 API）：hana_sql_analyze({sql, analyze:true, async:true}) ⇒ taskId；',
+      '长 SQL 分析（同一任务 API）：hana_invoke({capability:"hana_sql_analyze", args:{sql, analyze:true, async:true}}) ⇒ taskId；',
       '执行中的语句无法取消——取消请求会被受理但不会生效，分析跑完后 hint 会说明取消未生效（终态仍如实给分析结果）。',
       '',
       '语义与边界（诚实清单）：',
@@ -63,7 +60,7 @@ export const viewOpsRules: readonly RuleObject[] = [
       '- **进程内状态、服务重启即丢**：重启后 hana_task_get 对旧 taskId 回"未知任务"；多进程部署各自持任务，不共享；',
       '- 归属隔离：任务只对**本调用方**可见（HTTP = 已认证 clientId；stdio = 进程自身）。他人任务与不存在的任务',
       '  回同一句"未知任务"（不泄漏存在性）。**未配 Token 的 HTTP 部署**按单租户假设：所有调用方互相可见，',
-      '  与动态面提升表同一裁定；',
+      '  不做进一步隔离；',
       '- 取消到达太晚（批次/分析已执行完）不报错：终态 completed，hana_task_get 的 hint 如实说明"取消未生效"。',
     ].join('\n'),
     tools: ['hana_view_update', 'hana_sql_analyze', 'hana_task_get', 'hana_task_cancel'],

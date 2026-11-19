@@ -1,36 +1,24 @@
 /**
  * 调用方档案（CallerProfile）—— MCP_PROFILES 的权限载体。
  *
- * ## 它解决什么
- *
- * 所有能力都过同一个调用期闸门（见 config/authorize.ts 的 authorizeCall），但闸门只知道
- * **部署级策略**（进程的 `HANA_TOOL_GROUPS/ALLOW/DENY` + `HANA_WRITE_PACKAGES` + `HANA_READ_SCHEMA`）。
+ * 所有能力都过同一个调用期闸门（config/authorize.ts 的 authorizeCall），但闸门只知道
+ * **部署级策略**（进程的 HANA_TOOL_GROUPS/ALLOW/DENY + HANA_WRITE_PACKAGES + HANA_READ_SCHEMA）。
  * 多客户端共享一个进程时（HTTP），每个调用方需要**自己的**面：只读的数据分析师、
  * 能建模但只能碰自己包的开发者、完全只读的 CI 探针。
  *
- * **只能收紧，不能放宽**：档案是"在部署策略之内再砍一刀"，
- * 它永远不能把部署级 DENY 的能力变回可见，也不能扩大可写包/可读 schema 的范围。
- * 越界组合（档案声称允许 write 而部署只暴露 read）在**启动自检**里 block 拒绝启动——
- * 那不是安全漏洞（天花板仍在），而是"运维以为的权限"与"实际权限"分叉，必须显式暴露。
+ * **只能收紧，不能放宽**：档案是"在部署策略之内再砍一刀"，永远不能把部署级 DENY 的能力变回可见，
+ * 也不能扩大可写包/可读 schema 的范围。越界组合（档案声称允许 write 而部署只暴露 read）在**启动自检**
+ * 里 block 拒绝启动——那不是安全漏洞（天花板仍在），而是"运维以为的权限"与"实际权限"分叉。
  *
- * ## 文法
- *
- * ```
- * MCP_PROFILES = "name=kinds[:glob|glob][;name2=…]"
- *              kinds = read|write|admin|sql 用 + 连接
- *              glob  = 能力 id 的 * 通配（| 分隔），复用 matchGlob
- * ```
- * 例：`analyst=read;dev=read+write:hana_view_*|hana_metadata_*;ci=read`
+ * 文法：`MCP_PROFILES = "name=kinds[:glob|glob][;name2=…]"`，kinds = read|write|admin|sql 用 + 连接，
+ * glob = 能力 id 的 * 通配（| 分隔）。例：`analyst=read;dev=read+write:hana_view_*|hana_metadata_*;ci=read`
  *
  * 解析即校验（fail-fast）：名字非法/重复、kind 未知、条目格式错误、glob 为空——一律抛错。
- * 错误消息**不含凭据**（档案里没有凭据），但也不回显整条 env（保持与其它解析器一致的口径）。
+ * 错误消息**不含凭据**（档案里没有凭据），但也不回显整条 env。
  *
- * ## 未配置时的行为
- *
- * `MCP_PROFILES` 为空 ⇒ 只有**隐式 default 档案**（允许全部 kind、不限能力）——
- * 即"面 == 部署策略"：未启用档案机制的部署行为不变（向后兼容）。
- * 一旦配置了 `MCP_PROFILES`，就必须**同时定义 `default`**：HTTP 里没带第三段的 Token
- * 与 stdio 进程都要落到它，否则"没有档案"会被误读成"没有限制"。
+ * 未配置时：`MCP_PROFILES` 为空 ⇒ 只有**隐式 default 档案**（允许全部 kind、不限能力）——
+ * 即"面 == 部署策略"，不额外收紧。一旦配置了 `MCP_PROFILES`，就必须**同时定义 `default`**：
+ * HTTP 里没带第三段的 Token 与 stdio 进程都要落到它，否则"没有档案"会被误读成"没有限制"。
  */
 
 import { ALL_TOOL_GROUPS, matchGlob } from '../tools/groups.js';
@@ -58,9 +46,8 @@ export interface CallerProfile {
    * 资源范围收紧（可选）：写包 / 读 schema 的**子集**。
    * 两个方向同口径：**声明了但为空数组 = 什么都不允许**（子集语义，fail-closed）——
    * 声明 `writePackages: []` 的档案在部署白名单内也一个包都写不了（不是"不收紧"）。
-   * 当前 env 文法**不表达**它（文法只定义 kinds 与 glob 两段）——
-   * 保留字段是为了让调用方（测试、未来的文法扩展、编程式构造）能直接设置，
-   * 判定逻辑（config/authorize.ts 的 checkProfile）一次实现，不必等文法。
+   * 当前 env 文法**不表达**它（文法只定义 kinds 与 glob 两段）；保留字段供编程式构造直接设置，
+   * 判定逻辑统一在 authorizeCall 的 checkProfile。
    */
   resourceScopes?: {
     writePackages?: string[];
@@ -147,8 +134,8 @@ export function resolveProfile(
   profiles: ReadonlyMap<string, CallerProfile> | undefined,
   profileId: string | undefined,
 ): CallerProfile | undefined {
-  // 缺表 = 未启用档案机制（等价于空表）：务实处理——测试/脚本会构造"最小 config"，
-  // 那里没有档案字段；把它当致命错误会让一次工具调用崩在"内部错误"上，而不是给出策略结论。
+  // 缺表 = 未启用档案机制（等价于空表）：测试/脚本会构造无档案字段的最小 config，
+  // 把它当致命错误会让工具调用崩在"内部错误"上，而不是给出策略结论。
   if (!profiles || profiles.size === 0) return IMPLICIT_DEFAULT_PROFILE;
   if (profileId === undefined) return undefined;
   return profiles.get(profileId);
@@ -157,8 +144,8 @@ export function resolveProfile(
 /**
  * 本次调用的**生效档案**：身份自带的档案优先（HTTP Token 第三段），否则落进程默认（`MCP_PROFILE`）。
  *
- * 回退规则只此一处：注册面（tools/surface.ts 的 entitlement）、调用期闸门（tools/index.ts 的
- * gatedHandler）与门面路由（tools/capability.tools.ts）都经它取值——档案是权限收窄的唯一载体，
+ * 回退规则只此一处：注册面（tools/surface.ts 的 entitlement）与调用期闸门（tools/index.ts 的
+ * gatedHandler）都经它取值——档案是权限收窄的唯一载体，
  * 任一处手抄这条回退都会让权限口径静默分裂。
  */
 export function activeProfile(

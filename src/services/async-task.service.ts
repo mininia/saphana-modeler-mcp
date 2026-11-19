@@ -3,24 +3,22 @@
  *
  * ## 为什么是它（而不是协议原生 tasks）
  *
- * 见 core/task-registry.ts 头注：SDK 2.3.1 的 Tasks 无运行期，2026-era 上 tasks/result|list 恒不可服务，
+ * 见 core/task-registry.ts 头注：SDK 2.3.1 的 Tasks 无运行期，tasks/result|list 恒不可服务，
  * 协议原生路线要替换 SDK 的 tools/call 处理器——本仓取工具化路线：`hana_view_update(async=true)`
  * 提交任务，`hana_task_get` 轮询、`hana_task_cancel` 取消，两个 era 行为一致、零 SDK 侵入。
  *
- * ## 语义（与注册表头注配套，别只读一处）
+ * ## 语义
  *
- * - 提交即返回：`hana_view_update(async=true)` 只做**形状/策略**校验（工具层已做），把变更集的
- *   **全部 HANA 交互**（整体预检 → 逐项执行 → 补偿）放进后台执行——预检仍在任何写入之前（在任务内），
- *   「整体预检不通过 ⇒ 整批拒绝、零写入」的语义不变。
- * - 终态载荷 = **与同步通道同形的信封**（三条终态路径都由 withErrorEnvelope 构造，恒带 messages 与身份
- *   字段）：成功 ⇒ `{success:true,data:<报告>}`；部分成功 ⇒ `changeset_partial`（共用
- *   `changesetPartialError`）；按取消停止 ⇒ `changeset_cancelled`（报告进 rawDetail.report）。
- *   轮询方拿到的读法与同步调用的读取代码完全一致。
+ * - 提交即返回：工具层只做**形状/策略**校验，把变更集的**全部 HANA 交互**（整体预检 → 逐项执行 →
+ *   补偿）放进后台执行——「整体预检不通过 ⇒ 整批拒绝、零写入」的语义不变。
+ * - 终态载荷 = **与同步通道同形的信封**（三条终态路径都由 withErrorEnvelope 构造，恒带 messages 与
+ *   身份字段）：成功 ⇒ `{success:true,data:<报告>}`；部分成功 ⇒ `changeset_partial`；按取消停止 ⇒
+ *   `changeset_cancelled`（报告进 rawDetail.report）。轮询方拿到的读法与同步调用完全一致。
  * - **不新开写路径**：任务体就是 `applyChangeset` 本体（同一实现、同一锁、同一信号量、同一补偿）。
  * - 归属：owner = 已认证 clientId / '(stdio)'；`hana_task_get|cancel` 对他人任务与不存在任务
- *   **逐字同形**（不泄漏存在性，与"未知能力"同一条原则）。
+ *   **逐字同形**（不泄漏存在性）。
  * - 诚实边界：进程内、重启即丢；未配 Token 的 HTTP 部署按单租户假设（所有调用方 anonymous，
- *   互相可见任务——与提升表同一裁定，写进 README）。
+ *   互相可见任务）。
  */
 
 import type { HanaConfig } from '../config/config.js';
@@ -50,7 +48,7 @@ import type { ChangesetAction } from './changeset.plan.js';
 export const UNKNOWN_TASK_TEXT = '未知任务：该任务不存在，或不属于当前调用方。';
 
 /**
- * 异步任务执行侧终态审计（P0-4）：提交记 deferred:true 的 completed；真正的写入结局在这里记
+ * 异步任务执行侧终态审计：提交记 deferred:true 的 completed；真正的写入结局在这里记
  * completed/failed。取消按 failed + failureDetail=changeset_cancelled 记。
  * 前提：当前 async 能力都是 persistent；新增 transient/none 的 async 能力需重新判定。
  */
@@ -184,7 +182,7 @@ export interface BackgroundTaskSpec {
 }
 
 /**
- * 提交一个通用后台任务（P：sql_analyze 长语句走这里）。
+ * 提交一个通用后台任务（sql_analyze 长语句走这里）。
  * 与 changeset 共用同一个注册表、归属、TTL 与终态审计；差别只在任务体由调用方提供。
  */
 export function submitBackgroundTask(owner: string, spec: BackgroundTaskSpec): TaskSubmission {
@@ -269,8 +267,8 @@ async function runChangesetTask(
     });
     if (report.cancelled) {
       // 取消停止：与失败同路径（已执行项已逆序补偿回批前状态）；报告进 rawDetail.report 供判读。
-      // 文案**从 report.applied 逐项 status 派生**（评审 #1108/#1109）：补偿失败时不得宣称"已回滚"——
-      // 把部分回滚说成全部回滚正是 I2 禁止的「把部分完成包装成成功」。
+      // 文案**从 report.applied 逐项 status 派生**：补偿失败时不得宣称"已回滚"——
+      // 把部分回滚说成全部回滚正是「把部分完成包装成成功」。
       const compensated = report.applied.filter((x) => x.status === 'compensated').length;
       const compFailed = report.applied.filter((x) => x.status === 'compensation_failed').length;
       const compUnresolved = report.applied.length - compensated - compFailed;
@@ -337,7 +335,7 @@ async function runChangesetTask(
 }
 
 /**
- * 失败终态的统一落点（评审 #1106/#1107/#1110）：**无论什么异常都落成 failed 终态，本函数自身不 throw**。
+ * 失败终态的统一落点：**无论什么异常都落成 failed 终态，本函数自身不 throw**。
  *
  * 为什么不能直接 `await withErrorEnvelope(async () => { throw e; })`：withErrorEnvelope 对非
  * HanaBusinessError（ProtocolError/SdkError/未知异常）的既定语义是**重新抛出**（core/errors.ts），

@@ -17,11 +17,18 @@ export interface RuleCatalogEntry {
 export interface RuleQueryResult {
   /** 'catalog' = 未指定 rules（只给目录）；'full' = 命中了 all/规则 id（给出全文） */
   mode: 'catalog' | 'full';
+  /** 调用语法：规则正文里的 `hana_x(...)` 都是能力调用简写 */
+  note: string;
   /** 规则目录：mode='catalog' 时的内容（id + title，省 token） */
   catalog?: RuleCatalogEntry[];
   /** 命中规则的全文（id/title/detail/errorCodes/tools）：mode='full' 时的内容，不重复列目录 */
   items?: RuleObject[];
 }
+
+/** 规则正文的调用语法提示（每条规则都按此解释简写，避免模型把能力 id 当工具名直接调） */
+const RULE_CALL_NOTE =
+  '规则里的 hana_x(...) 是能力调用简写：实际一律经 hana_invoke({capability:"hana_x", args:{...}}) 执行；' +
+  '只有 hana_tool_search 与 hana_invoke 注册为工具。';
 
 /**
  * getSystemInfo 的可选项（工具层的 params 透传；**字段必须同时声明在工具 inputSchema 里**，
@@ -87,12 +94,16 @@ function rulesValueHint(): string {
  */
 function resolveRules(raw?: string): RuleQueryResult {
   if (raw === undefined) {
-    return { mode: 'catalog', catalog: RULES.map((r) => ({ id: r.id, title: r.title })) };
+    return {
+      mode: 'catalog',
+      note: RULE_CALL_NOTE,
+      catalog: RULES.map((r) => ({ id: r.id, title: r.title })),
+    };
   }
   const ids = splitList(raw);
   if (ids.length === 0) throw new HanaBusinessError(`rules 参数为空。${rulesValueHint()}`);
-  if (ids.includes('all')) return { mode: 'full', items: getRules() };
-  return { mode: 'full', items: getRules(ids) };
+  if (ids.includes('all')) return { mode: 'full', note: RULE_CALL_NOTE, items: getRules() };
+  return { mode: 'full', note: RULE_CALL_NOTE, items: getRules(ids) };
 }
 
 /** hana_check_privileges 返回的权限报告 */
@@ -213,11 +224,10 @@ export async function getPrivileges(pool: HanaPool): Promise<PrivilegeReport> {
     repoPrivileges,
     summary: {
       canReadRepository: schemaSelect.some((s) => up(s) === '_SYS_REPO'),
-      // 判定口径与 README 的写路径授权说明对齐：仓库写/激活权限是 EDIT/ACTIVATE_NATIVE_OBJECTS；
-      // MODIFY_* 是变更会话（workspace）操作——但实机记录显示，被测账号只有 MODIFY_* + CREATE ANY
-      // 也能走完 XS Classic REST 写链路，故两者**并列 OR**，
-      // 谁为真都算具备。反向收紧：不再拿"任意一条 REPO.*"当证据（REPO.READ /
-      // WORK_IN_FOREIGN_WORKSPACE 既不能写也不能激活，旧口径会把"只能读仓库"报成"可激活"）
+      // 仓库写/激活权限是 EDIT/ACTIVATE_NATIVE_OBJECTS；MODIFY_* 是变更会话（workspace）操作——
+      // 但实机记录显示，只有 MODIFY_* + CREATE ANY 的账号也能走完 XS Classic REST 写链路，
+      // 故两者**并列 OR**，谁为真都算具备。不拿"任意一条 REPO.*"当证据（REPO.READ /
+      // WORK_IN_FOREIGN_WORKSPACE 既不能写也不能激活，会把"只能读仓库"报成"可激活"）
       canWriteRepository: hasRepo('REPO.EDIT_NATIVE_OBJECTS') || hasRepo('REPO.MODIFY_CHANGE'),
       canActivate:
         sysHas('CREATE ANY') &&

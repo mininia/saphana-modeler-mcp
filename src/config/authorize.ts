@@ -1,41 +1,23 @@
 /**
  * 调用期授权闸门（**唯一入口**）：所有能力调用的授权判定都收敛到 `authorizeCall`。
  *
- * ## 为什么需要它
+ * 为什么不能靠注册期过滤：可见性只在注册时咨询一次（见 tools/surface.ts），而工具面按连接/调用方
+ * 计算；同一进程可能有多个调用方（HTTP 多客户端 + 调用方档案）；且存在不经 `tools/list` 的入口
+ * （经 `hana_invoke` 派发的具体能力）。所以必须有**与入口无关**的判定函数，任何入口都调它。
  *
- * 「能不能调用」不能靠注册期过滤替代：
- * - 可见性只在注册时被咨询一次（见 tools/surface.ts），而工具面按连接/调用方计算，
- *   "注册时判过"不等于"调用时仍成立"；
- * - 同一进程可能有多个调用方（HTTP 多客户端 + 调用方档案），各自的收紧维度不同；
- * - 存在不经 `tools/list` 的入口（门面路由），注册期判定根本到不了那里。
- * 所以必须有一个**与入口无关**的判定函数，任何入口都调它。
+ * 判定内容（**复用同一个判定器与报告**）：清单的 `effects.plan` 规划出「这次会触碰什么」，
+ * 交给**同一个** `runPreflight`（checkCapability + checkResource + checkDeployment），只额外附一行
+ * 资源计划进报告。能力级（HANA_TOOL_GROUPS/HANA_TOOL_DENY）、资源级（HANA_WRITE_PACKAGES /
+ * HANA_READ_SCHEMA）、部署级（姿态项，只出警告）判据因此一致。规则粒度由清单决定：读能力不声明
+ * `effects.plan` 就没有资源结论（planFor 对读能力绝不套用写兜底）。
  *
- * ## 判定内容（**复用同一个判定器与报告**，不另写规则）
+ * 位置（为什么在 src/config/）：依赖方向决定——`capabilities/` 是声明层，只允许 import 叶子模块；
+ * 本模块要 import 策略层（preflight.ts），而策略层经 tools/groups.ts → manifest.ts 依赖清单，
+ * 把闸门塞进 capabilities/ 会让两层互相依赖（作废"清单不许依赖策略"这条规矩）。
  *
- * 一次 `authorizeCall` = ①「这次调用会触碰什么」由清单的 `effects.plan` 规划出来（`planFor`）；
- * ② 交给**同一个** `runPreflight`（它组合 `checkCapability` + `checkResource` + `checkDeployment`），
- * 只额外附一行"本次调用的资源计划"进报告。因此两个入口（写预检 / 统一闸门）：
- * - 能力级（`HANA_TOOL_GROUPS/ALLOW/DENY`）：工具是否对客户端暴露；
- * - 资源级：`HANA_WRITE_PACKAGES`（写包，来自计划 `writePackages`）与
- *   `HANA_READ_SCHEMA`（读 schema，来自计划 `readSchemas`）；
- * - 部署级：与具体请求无关的姿态项（明文连接等，只出警告）。
- *
- * **规则粒度由清单决定**：能力声明了 `effects.plan` 才有资源维度；读能力不声明就没有资源结论
- * （`planFor` 对读能力绝不套用写兜底，见其文档）。
- *
- * ## 位置（为什么在 src/config/ 而不是 capabilities/）
- *
- * 依赖方向决定：`capabilities/` 是**声明层**，只允许 import 叶子模块（见 types.ts 头注）；
- * 而本模块要 import 策略层（preflight.ts）。策略层反过来又经 `tools/groups.ts` →
- * `capabilities/manifest.ts` 依赖清单，把闸门塞进 capabilities/ 会让两层互相依赖
- * （等于把"清单不许依赖策略"这条规矩作废）。
- * 放这里还有一个语义理由：本文件紧挨 `check*` 与 `runPreflight`，符合该层"权限判定的唯一入口"自述。
- *
- * ## 归因（每次调用都记一条审计，无论放行与否）
- *
- * 每次调用产出一条 `capability-audit`：`{clientId, transport, capabilityId, verdict, resources, codes}`。
- * 放行记 `info`、拦截记 `warn`。`agentLabel`（`MCP_AGENT_LABEL`）取当前进程级标签（未配置时不产生
- * 该字段）——不提前编造一个恒为空的占位。
+ * 归因：每次调用产出一条 `capability-audit`：`{clientId, transport, capabilityId, verdict, resources,
+ * codes}`；放行记 info、拦截记 warn。审批等待由 approval 事件记录，确认后补放行/终态记录。
+ * `agentLabel`（MCP_AGENT_LABEL）取进程级标签（未配置时不产生该字段）。
  */
 
 import type { InputRequiredResult } from '@modelcontextprotocol/server';
@@ -68,23 +50,27 @@ export interface AuthorizationContext {
   /** 生效的部署级策略（`policyFromConfig` / `resolvePolicy`） */
   policy: Policy;
   /**
-   * 调用方档案。**未配档案的部署由 `resolveProfile` 返回隐式 default**（不额外收紧）；
-   * 这里的 undefined 只代表"配了档案表却解析不到对应条目" = 空档案 → **全拒**（fail-closed，
-   * 见 `resolveProfile` 与 `checkProfile` 的说明）。
+   * 调用方档案。未配档案的部署由 `resolveProfile` 返回隐式 default（不额外收紧）；
+   * 这里的 undefined 只代表"配了档案表却解析不到对应条目" = 空档案 → **全拒**（fail-closed）。
    */
   profile?: CallerProfile;
   /** 调用方身份（省略 = 取当前请求上下文；stdio 下为 undefined） */
   caller?: CallerIdentity;
   /** 进程级归因标签（`MCP_AGENT_LABEL`），随审计事件落地 */
   agentLabel?: string;
-  /** 归因入口（门面路由时 = 门面 id；平铺直调缺省）——只进审计，不参与判定 */
+  /** 归因入口（经 `hana_invoke` 派发时 = "hana_invoke"；平台入口自身缺省）——只进审计，不参与判定 */
   via?: string;
-  /** 调用信封里的环境断言（P2）；省略时回退 args.expectedEnvironment/expectedEpoch */
+  /** 调用信封里的环境断言；省略时回退 args.expectedEnvironment/expectedEpoch */
   envAssertion?: EnvironmentAssertion;
   /** 调用信封里的披露上下文（只做一致性检查，不是授权凭证） */
   disclosure?: { id?: string; policyRev?: string; manifestRev?: string };
   /** rev 补充输入（readonlySql/approvalPolicy） */
   policyRevExtras?: { readonlySql?: string; approvalPolicy?: string };
+  /**
+   * true = 由 dispatchAuthorized 统一记「放行后」的审计：审批确认前不记 allowed，
+   * 避免被拒/待确认的破坏性调用在日志里呈现为已放行。
+   */
+  deferAllowAudit?: boolean;
 }
 
 /** 一次调用的授权结论 */
@@ -97,12 +83,12 @@ export interface AuthorizationResult {
   verdict: Verdict;
   /** 四层检查态（能力/资源/环境/审批；与 hana_tool_search 的 preview 同源） */
   checks?: EvaluationResult['checks'];
-  /** 审计事件载荷（每次调用都记，无论放行与否；字段固定，不随入口变化） */
+  /** 审计事件载荷（放行/拦截至少一条；审批等待由 approval 事件记录） */
   audit: CapabilityAuditEvent;
 }
 
 /**
- * 审计终态（P0-4）：
+ * 审计终态：
  * - none/transient：`allowed | denied`（授权即终态，无持久副作用）；
  * - persistent：`denied | completed | failed`——每次尝试恰好一条终态记录。
  */
@@ -121,13 +107,13 @@ export interface AuditTarget {
 
 /** `capability-audit` 事件载荷（字段固定：审计链路不随入口变化） */
 export interface CapabilityAuditEvent {
-  /** 本次调用的执行上下文 id（P2；入口绑定，贯穿审计） */
+  /** 本次调用的执行上下文 id（入口绑定，贯穿审计） */
   requestId?: string;
   capabilityId: string;
-  /** 终态（P0-4）：读 = allowed|denied；写 = denied|completed|failed */
+  /** 终态：读 = allowed|denied；写 = denied|completed|failed */
   result: AuditResult;
   /**
-   * `allow|block` 投影（兼容旧日志读取方）。
+   * `allow|block` 投影（保留给既有日志读取方）。
    * `completed`/`failed` 都投影为 `allow`：它们是在**已授权**之后发生的执行结局。
    */
   verdict: 'allow' | 'block';
@@ -145,7 +131,7 @@ export interface CapabilityAuditEvent {
   calledFromEnvironment?: string;
   /** 进程级归因标签（MCP_AGENT_LABEL；未配置时不产生该字段） */
   agentLabel?: string;
-  /** 归因入口（门面路由时 = 门面 id） */
+  /** 归因入口（经 `hana_invoke` 派发时 = "hana_invoke"） */
   via?: string;
   /** 非敏感目标（包/对象/op） */
   target?: AuditTarget;
@@ -158,6 +144,8 @@ export interface CapabilityAuditEvent {
   failureDetail?: string;
   /** true = 本次调用只是把工作交给异步任务（终态在执行侧另记一条，带 taskId） */
   deferred?: boolean;
+  /** true = dryRun 零写入预演成功（result=allowed，不记 completed） */
+  dryRun?: boolean;
 }
 
 /**
@@ -183,10 +171,7 @@ export function auditTargetOf(args: Record<string, unknown>): AuditTarget | unde
   return Object.keys(target).length > 0 ? target : undefined;
 }
 
-/**
- * 调用方身份（clientId/transport/profileId，取自请求上下文 ALS；stdio 无身份时为空对象）。
- * authorizeCall 在调用方未显式传身份时用它兜底。
- */
+/** 当前请求上下文的调用方身份（clientId/transport/profileId；stdio 无身份时为空对象）。 */
 function currentCaller(): CallerIdentity {
   const id = currentIdentity();
   return {
@@ -213,7 +198,7 @@ export function authorizeCall(
   const agentLabel = ctx.agentLabel ?? currentAgentLabel();
   const runtime = currentEnvironmentRuntime();
   const execution = currentExecutionContext();
-  // 单环境不产生环境字段，保持旧输出逐字兼容。
+  // 单环境不产生环境字段（保持输出形状兼容）。
   const envAudit = runtime?.multiEnv
     ? {
         environment: runtime.envKey,
@@ -260,7 +245,6 @@ export function authorizeCall(
   }
 
   // 统一判定入口：preview（hana_tool_search）与 enforce（本函数）共用同一个 evaluate。
-  // 语义与 P1 之前逐项不变：planFor + runPreflight + profile/environment 维度。
   const evaluated = evaluate({
     policy,
     ...(profile ? { profile } : {}),
@@ -296,10 +280,12 @@ export function authorizeCall(
     codes: verdict.blocking.length > 0 ? verdict.blocking.map((g) => g.code) : verdict.warnings.map((g) => g.code),
     ...(verdict.allowed ? {} : { denyReason: verdict.blocking[0]?.code ?? 'blocked' }),
   };
-  // P0-4：非持久写入授权即终态；persistent 放行时不记，由执行侧记 completed/failed。
-  // 平台入口本身不执行 HANA：放行不写 capability-audit（计划 §8.5），拦截仍记。
+  // 非持久写入授权即终态；persistent 放行时不记，由执行侧记 completed/failed。
+  // 审批等待由 approval 事件记录；dispatchAuthorized 在审批通过后补 allowed（deferAllowAudit）。
+  // 平台入口本身不执行 HANA：放行不写 capability-audit，拦截仍记；
   // 目标能力的审计由 hana_invoke 的内层 dispatchAuthorized 负责。
-  const auditOnAllow = isPersistentMutation(capability) === false && capability.platform !== true;
+  const auditOnAllow =
+    ctx.deferAllowAudit !== true && isPersistentMutation(capability) === false && capability.platform !== true;
   if (!verdict.allowed) logger.warn({ ...audit }, 'capability-audit');
   else if (auditOnAllow) logger.info({ ...audit }, 'capability-audit');
 
@@ -307,7 +293,7 @@ export function authorizeCall(
 }
 
 /**
- * 执行侧终态审计（P0-4）：写能力在本次执行结束后记 `completed` 或 `failed`。
+ * 执行侧终态审计：写能力在本次执行结束后记 `completed` 或 `failed`。
  * 读能力不记（它们的终态在 authorizeCall 已记 allowed|denied）。
  *
  * @param auth authorizeCall 的返回值（沿用身份、资源计划与规则码，不另算一份）
@@ -355,10 +341,10 @@ function failureCodeOf(value: unknown): { failed: boolean; detail?: string; defe
 }
 
 /**
- * 已授权调用的统一执行壳（P0-4）：授权 → 执行 → 写能力记终态。
- * 门面路由与平铺直调共用它，保证两条入口的审计字段与终态口径一致。
+ * 已授权调用的统一执行壳：授权 → 执行 → 写能力记终态。
+ * 平台入口包装与 `hana_invoke` 派发共用它，保证审计字段与终态口径一致。
  *
- * @param onBlocked 拦截回执的构造器（两处形状不同：直调回 blockedCallResult，路由回同样的硬错误）
+ * @param onBlocked 拦截回执的构造器
  */
 export async function dispatchAuthorized<T>(
   capability: Capability,
@@ -366,15 +352,26 @@ export async function dispatchAuthorized<T>(
   ctx: AuthorizationContext,
   dispatch: () => T | Promise<T>,
   onBlocked: (result: AuthorizationResult) => T,
-  /** P3 审批：策略放行后、派发前调用；返回 input_required 则本次不执行 */
+  /** 审批：策略放行后、派发前调用；返回 input_required 则本次不执行 */
   approval?: () => InputRequiredResult | undefined,
 ): Promise<T> {
-  const auth = authorizeCall(capability, args, ctx);
+  const auth = authorizeCall(capability, args, { ...ctx, deferAllowAudit: true });
   if (!auth.allowed) return onBlocked(auth);
   const gate = approval?.();
   if (gate) return gate as T;
+  // 审批已通过（或不需要）：非持久能力在这里补放行记录，确认前不记 allowed。
+  const dryRun = args['dryRun'] === true;
+  const dryRunField = dryRun ? { dryRun: true } : {};
+  if (!isPersistentMutation(capability) && capability.platform !== true) {
+    logger.info({ ...auth.audit, ...dryRunField }, 'capability-audit');
+  }
   try {
     const value = await dispatch();
+    // dryRun 是零写入预演：成功也不能记 completed（会被读成真的写了持久变更）。
+    if (dryRun && isPersistentMutation(capability)) {
+      logger.info({ ...auth.audit, result: 'allowed', verdict: 'allow', ...dryRunField }, 'capability-audit');
+      return value;
+    }
     const outcome = failureCodeOf(value);
     auditTerminal(capability, auth, outcome.failed ? 'failed' : 'completed', outcome.detail, outcome.deferred);
     return value;

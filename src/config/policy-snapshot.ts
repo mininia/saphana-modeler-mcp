@@ -1,8 +1,7 @@
 /**
  * 策略快照（PolicySnapshot）——把「能力面 / 资源范围 / 环境」在**调用入口**编译成一个不可变形状。
  *
- * P1 只要求「预览与执行同一判定函数」；本文件先落地快照的**形状与编译**（P2 完整编译的骨架），
- * 让 `hana_tool_search` 的 `policy` 与 `authorizeCall` 能引用同一份 entitlement/scope/rev，
+ * 目的：让 `hana_tool_search` 的 `policy` 与 `authorizeCall` 引用同一份 entitlement/scope/rev，
  * 而不是在披露侧再写一套四参数交叉。
  *
  * 三条边界：
@@ -28,7 +27,7 @@ export type ReadScopeMode = 'unconfigured' | 'system-only' | 'allowlist';
 export interface PolicySnapshot {
   /** 策略代际（sha256 前 16 位；不含 epoch） */
   rev: string;
-  /** 可见能力（含门面/操作级别名/根工具）；空 = 全拒 */
+  /** 可见能力（含操作级别名/平台入口）；空 = 全拒 */
   entitlement: ReadonlySet<string>;
   scope: {
     write: {

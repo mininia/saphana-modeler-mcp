@@ -4,18 +4,18 @@
  * ## 为什么是"工具化"而不是协议原生 tasks
  *
  * SDK 2.3.1 的 Tasks（SEP-2663）只有线协议词汇、没有运行期，且 2026-07-28 era 上
- * `tasks/result` / `tasks/list` 恒被 -32601（era gate 无解）——协议原生路线在 modern 客户端上残缺，
- * 要接它还得替换 SDK 的 tools/call 处理器（自行复刻参数/输出校验与投影）。本仓选择**工具化任务 API**：
+ * `tasks/result` / `tasks/list` 恒被 -32601（era gate 无解）——要接它还得替换 SDK 的
+ * tools/call 处理器（自行复刻参数/输出校验与投影）。故用**工具化任务 API**：
  * `hana_view_update(async=true)` 立即返回 taskId，`hana_task_get` / `hana_task_cancel` 轮询与取消——
- * 两个 era 行为一致、零 SDK 侵入。代价如实说：模型主动轮询，而不是客户端按协议自动轮询。
+ * 两个 era 行为一致、零 SDK 侵入。代价：模型主动轮询，而不是客户端按协议自动轮询。
  *
- * ## 语义边界（逐条写死，别让下一个人重新推演）
+ * ## 语义边界
  *
- * - **进程内状态、重启即丢**：任务不落盘、不跨进程共享（多进程拓扑下没有可信的共享存储，
- *   与提升表同一裁定）。重启后 `hana_task_get` 对旧 id 一律回"未知任务"。
+ * - **进程内状态、重启即丢**：任务不落盘、不跨进程共享（多进程拓扑下没有可信的共享存储）。
+ *   重启后 `hana_task_get` 对旧 id 一律回"未知任务"。
  * - **归属隔离**：每条记录记 `owner`（HTTP = 已认证 clientId；stdio = `(stdio)`）。查询/取消只对
  *   记录者可见——**他人任务与不存在的任务逐字同形**（与"未知能力"同一条不泄漏原则）。
- *   未配 Token 的 HTTP 部署里所有调用方都是 anonymous：与提升一致按单租户假设处理，写进 README。
+ *   未配 Token 的 HTTP 部署里所有调用方都是 anonymous：按单租户假设处理。
  * - **取消是协作式**：置位 `cancelRequested`，执行侧在每个动作**开始前**检查并停下
  *   （当前动作不打断），随后走与失败相同的逆序补偿路径——不会留下半批状态。
  * - **容量与保留**：同时运行上限 `TASK_MAX_RUNNING_DEFAULT`（超出提交即拒）；
@@ -50,11 +50,11 @@ export interface TaskRecord {
   kind: TaskKind;
   /** 提交时的环境标识；任务体在提交时捕获的 runtime 下执行 */
   environment: string;
-  /** 提交时的环境 epoch（用于回执/审计还原；P1/P2 恒为当前值） */
+  /** 提交时的环境 epoch（用于回执/审计还原） */
   envEpoch: number;
   /** 提交时环境的只读/可写策略（审计回执用） */
   envAccess: 'readwrite' | 'readonly';
-  /** 是否为多环境部署（单环境不产生环境字段，保持旧输出） */
+  /** 是否为多环境部署（单环境不产生环境字段） */
   multiEnv: boolean;
   /** 一句话说明（如 `changeset PKG/CV_A +2`），给轮询方认领用 */
   label: string;

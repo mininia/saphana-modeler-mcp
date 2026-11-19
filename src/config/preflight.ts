@@ -26,34 +26,20 @@ import { describeProfiles, matchedCapabilities, type CallerProfile } from './pro
 /**
  * 权限策略层 —— 能力级 + 资源级两类权限的唯一判定入口。
  *
- * ## 两个权限级功能
+ * | 维度 | 管什么 | 配置项 |
+ * |---|---|---|
+ * | **能力级** | 哪些工具对外暴露 | HANA_TOOL_GROUPS / HANA_TOOL_DENY |
+ * | **资源级** | 能操作哪些资源 | HANA_WRITE_PACKAGES（可写包）/ HANA_READ_SCHEMA（可读 schema） |
+ * | （部署级） | 连接侧约束，非任务级 | HANA_TLS / MCP_HTTP_* |
  *
- * | 维度 | 管什么 | 配置项 | 参考 |
- * |---|---|---|---|
- * | **能力级** | 哪些工具对外暴露 | HANA_TOOL_GROUPS / ALLOW / DENY | tableau 的 INCLUDE/EXCLUDE_TOOLS（组展开）；dataworks 的 TOOL_CATEGORIES/NAMES |
- * | **资源级** | 能操作哪些资源 | HANA_WRITE_PACKAGES（可写包）/ HANA_READ_SCHEMA（可读 schema） | tableau 的 BoundedContext；dataworks 交给平台 |
- * | （部署级） | 连接侧约束，非任务级 | HANA_TLS / MCP_HTTP_* | —— 两家的 Config 构造期 fail-closed |
+ * 每个维度一个纯函数判定器（统一签名 `(policy, 请求) → Grant[]`，互不知道对方存在），由入口组合：
+ * `resolvePolicy(source)` 从 env / mcp.json / 已加载 config 取出生效值 →
+ * `checkCapability` / `checkResource` / `checkDeployment` → `runPreflight` / `describePolicy` → Verdict。
+ * 新增一个权限维度 = 加一个 `check*`，不动其它维度。
  *
- * ## 结构
- *
- * ```
- *   规则叶子（纯函数，零 I/O）          本层                            调用方
- *   ─────────────────────────         ──────────────────────          ──────────────
- *   write-boundary.ts  写包规则   ┐
- *   sql.ts             schema规则 ├─→ checkResource()   ┐
- *   groups.ts          工具规则   ──→ checkCapability() ├─→ runPreflight()  → Verdict
- *   deployment.ts      姿态规则   ──→ checkDeployment() ┘   describePolicy()
- *                                                         ↑
- *                             resolvePolicy(source) ───────┘
- *                             （从 env / mcp.json / 已加载 config 取出生效值）
- * ```
- *
- * 判定器统一签名 `(policy, 请求) → Grant[]`：每个维度一个纯函数，互不知道对方存在，
- * 由入口组合。新增一个权限维度 = 加一个 `check*`，不动其它维度。
- *
- * 为什么必须收成一层的核心原因：生效值取决于**启动来源**，同一台机器上三处配置
- * （客户端 mcp.json 的 env / 仓库 .env / 进程环境变量）可能给出三个不同答案，且凭据三件套
- * 齐备时服务器会整个跳过 .env。「从哪读」和「怎么判定」散在各调用方，就会各判各的、谁都拦不住。
+ * 为什么必须收成一层：生效值取决于**启动来源**，同一台机器上三处配置（客户端 mcp.json 的 env /
+ * 仓库 .env / 进程环境变量）可能给出三个不同答案，且凭据三件套齐备时服务器会整个跳过 .env。
+ * 「从哪读」和「怎么判定」散在各调用方，就会各判各的、谁都拦不住。
  */
 
 // ── 一、策略模型 ──────────────────────────────────────────────
@@ -66,7 +52,7 @@ export interface Policy {
   resource: {
     /**
      * 可写包前缀（大写；空数组 = 写边界未启用——声明写包的写请求会被闸门以 boundary_off 拒绝，
-     * 只有服务层 assertWritePackageAllowed 那一层是 fail-open，见 checkResource）
+     * 见 checkResource）
      */
     writePackages: string[];
     /** 可读 schema 的追加项（系统 schema 恒可读，不在此列） */
@@ -84,10 +70,8 @@ export interface Policy {
 }
 
 /** 缺省部署姿态：stdio、仅本机、加密且校验证书（即无任何部署级风险）。
- *  三个安全默认值取自 deployment.ts 的常量（与 config 的 zod 默认值同一份，
- *  保证"判定用的默认值 = 运行用的默认值"）。
- *  例外：xsPlaintext 是 XS 写通道的事实默认（缺省明文，仅 HANA_XS_TLS=true 才切 https，见
- *  core/xs-rest.ts），不属"安全默认值"，须持续告警直到部署方显式加密该通道。 */
+ *  安全默认值取自 deployment.ts 的常量（与 config 的 zod 默认值同一份，保证"判定用的默认值 = 运行用的默认值"）。
+ *  例外：xsPlaintext 是 XS 写通道的事实默认（缺省明文，仅 HANA_XS_TLS=true 才切 https），须持续告警。 */
 export const SAFE_DEPLOYMENT_POSTURE: DeploymentPosture = {
   httpPort: undefined,
   httpHost: DEFAULT_HTTP_HOST,
@@ -155,22 +139,15 @@ export interface Verdict {
 
 // ── 二、来源解析 ──────────────────────────────────────────────
 
-/**
- * 拆分写包白名单（大写）。
- * 三条来源路径都经此归一，避免"resolved 不做空串过滤、env/file 做"这类不一致。
- */
+/** 拆分写包白名单（大写）：三条来源路径都经此归一，避免"resolved 不做空串过滤、env/file 做"这类不一致。 */
 function splitPackages(raw: unknown): string[] {
   return splitList(raw).map((s) => s.toUpperCase());
 }
 
 /**
- * 从一组原始 env 值构造部署姿态（与能力/资源同源，保证判定与运行期一致）。
- *
- * 与 config.ts 的 boolSchema 共用同一套**真值集合**（ENV_TRUE_VALUES + isEnvTrue），
- * 但强度不同，且这里的强度**刻意更低**：boolSchema 走 zod 枚举，取值既非真值也非假值时
- * 启动即失败；本函数读的是 mcp.json / 原生 env 的原始值（拿不到 zod 校验），非真值一律按假处理
- * （不在此处报错，也不静默当成真）。两边共享同一常量，保证真值口径不分叉；
- * 默认值同样取自 deployment.ts 的单一常量。
+ * 从一组原始 env 值构造部署姿态。与 config.ts 的 boolSchema 共用同一套**真值集合**，但这里读的是
+ * mcp.json / 原生 env 的原始值（拿不到 zod），非真值一律按假处理——刻意比 boolSchema 的启动即失败更低强度。
+ * 默认值取自 deployment.ts 的单一常量。
  */
 function deploymentFromEnvValues(env: Record<string, unknown>): DeploymentPosture {
   const port = env.MCP_HTTP_PORT;
@@ -191,8 +168,8 @@ function deploymentFromEnvValues(env: Record<string, unknown>): DeploymentPostur
 
 /** 从一组原始 env 值构造策略（三条来源路径共用） */
 function policyFromEnvValues(env: Record<string, unknown>, source: string): Policy {
-  // 无别名层（2026-10-14）：直接按正名读取。旧名/已删名在这里**取不到值**（等价于未配置），
-  // 与 loadConfig 的硬切换同口径——不静默拿旧名当新名用
+  // 无别名层：只按正名读取。其它名称在这里取不到值（等价于未配置），
+  // 与 loadConfig 同口径——不静默拿别名当正名用
   return {
     capability: parseToolFilter(String(env.HANA_TOOL_GROUPS ?? ''), String(env.HANA_TOOL_DENY ?? '')),
     resource: {
@@ -266,9 +243,8 @@ function resolveFromFile(path: string, server?: string): Policy {
  * 进程环境变量 + .env 兜底（与服务器 tryLoadDotEnv 同源），并给出「值实际来自哪里」的归因。
  *
  * ⚠️ **只允许给独立进程用**（CLI、实机验证脚本）。**绝不可在服务进程内 `loadConfig()` 之后调用**：
- * 那时 `HANA_PASSWORD` 已被 loadConfig 从环境中删除，三件套不再齐备，本函数会认为"外部未提供凭据"
- * 而真的去读 .env —— 既把密码重新写回 `process.env`，又让判定值与 `config` 里的运行值分叉。
- * 服务进程内请用 {@link policyFromConfig}。
+ * 那时 `HANA_PASSWORD` 已被删除，本函数会认为"外部未提供凭据"而真的去读 .env——既把密码重新写回
+ * `process.env`，又让判定值与 `config` 里的运行值分叉。服务进程内请用 {@link policyFromConfig}。
  */
 function resolveFromEnv(env: NodeJS.ProcessEnv = process.env): Policy {
   const preexisting = env.HANA_WRITE_PACKAGES;
@@ -303,14 +279,11 @@ export function resolvePolicy(source: PolicySource): Policy {
 /**
  * 从**已加载的配置**构造策略（服务进程内的唯一正确做法）。
  *
- * 为什么不复用 resolveFromEnv：那是给**独立进程**（CLI / 实机脚本）用的，它会调
- * `tryLoadDotEnv` 去读 .env。服务进程内 `loadConfig()` 已经解析过配置，并且在解析后
- * **删除了 `process.env.HANA_PASSWORD`**（凭据生命周期控制，见 config.ts）。此时三件套不再齐备，
- * `tryLoadDotEnv` 会认为"外部未提供凭据"而**真的去读 .env**，后果有两个：
+ * 不要复用 resolveFromEnv：它会给独立进程调 `tryLoadDotEnv` 读 .env。服务进程内 `loadConfig()`
+ * 解析后已**删除 `process.env.HANA_PASSWORD`**（凭据生命周期控制，见 config.ts），
+ * 此时三件套不再齐备，`tryLoadDotEnv` 会认为"外部未提供凭据"而**真的去读 .env**，后果两个：
  *   1. 把已删除的密码重新写回 `process.env`，常驻整个服务生命周期 —— 直接推翻那条控制；
- *   2. 判定看到的 token/端口等来自 .env，而 `config` 里是另一套值 —— 出现
- *      「判定用的值 ≠ 运行用的值」，启动自检会放过实际不设防的部署。
- * 所以服务进程内一律走本函数，不要走 resolveFromEnv。
+ *   2. 判定看到的 token/端口等来自 .env，而 `config` 里是另一套值 —— 「判定用的值 ≠ 运行用的值」。
  */
 export function policyFromConfig(config: HanaConfig, capability: ToolFilterConfig): Policy {
   return {
@@ -340,7 +313,7 @@ export function policyFromConfig(config: HanaConfig, capability: ToolFilterConfi
 /**
  * 写语义探测参数：只为让清单声明的写语义显形——两个顶层写包形参名（`zWritePackageId` 的用法）
  * 与对象名各给一个值；`hana_view_validate` 一类的规划器写分支（design 模式）据此进入写路径。
- * 与 capability-manifest.test.ts 的探测调用同口径；探测无副作用（规划器是纯函数，入参 → WritePlan）。
+ * 探测无副作用（规划器是纯函数，入参 → WritePlan）。
  */
 const WRITE_PROBE_ARGS: Record<string, unknown> = {
   packageId: 'PROBE.PKG',
@@ -352,12 +325,11 @@ const WRITE_PROBE_ARGS: Record<string, unknown> = {
  * 能力的**实际写语义**：资源计划（`planFor`——清单声明的唯一投影）在探测调用下是否声明写包。
  *
  * 判据必须是计划而不是组名（kind）：write/admin 组里混着**行为只读**的成员
- * （`hana_sql_analyze`、`hana_view_check_actions`、`hana_task_cancel`，以及 admin 档的
- * `hana_repo_export` / `hana_repo_changelist` / health 四件套），按组名判会让
- * 「read,admin 分组 + deny 掉唯一写包能力（`hana_repo_import`）」这类**实际无写能力**的部署
- * 也报 boundary_off，运维文案与事实不符。`planFor` 同时覆盖两个声明源：
- * 参数声明（如 `hana_repo_import.targetPackageId` 的打标写包形参）与规划器写分支
- * （如 `hana_view_validate` 的 design 模式写 _CHKTMP 临时对象）。
+ * （`hana_sql_analyze`、`hana_view_check_actions`、`hana_task_cancel`、`hana_repo_export`、
+ * `hana_repo_changelist`、health 四件套），按组名判会让「read,admin 分组 + deny 掉唯一写包能力
+ * （`hana_repo_import`）」这类**实际无写能力**的部署也报 boundary_off，运维文案与事实不符。
+ * `planFor` 同时覆盖两个声明源：参数声明（如 `hana_repo_import.targetPackageId`）
+ * 与规划器写分支（如 `hana_view_validate` 的 design 模式写 _CHKTMP 临时对象）。
  */
 function writesRepositoryPackages(name: string): boolean {
   const cap = findCapability(name);
@@ -367,12 +339,10 @@ function writesRepositoryPackages(name: string): boolean {
 /**
  * 「可能写仓库包」的能力是否真的对客户端可达：无此类能力的部署下，写边界不影响实际行为
  * （不产生误导性告警）。判据 = 暴露面里存在**实际写语义**的能力（见 writesRepositoryPackages），
- * **不按组名**——真阳性场景不漏：`hana_repo_import` 是 admin 档的写能力，「只暴露 admin 组 +
- * 空白名单」的部署仍会报 boundary_off。
+ * **不按组名**——`hana_repo_import` 是 admin 档的写能力，「只暴露 admin 组 + 空白名单」仍会报 boundary_off。
  *
- * 只看**具体能力**（`CONCRETE_CAPABILITY_IDS`），不看门面：门面的 kind 是成员摘要，
- * 业务域（如 modeling）是 admin 却也含 write 档成员——拿它当"写能力可达"的证据会给每一次
- * describePolicy 都刷出假的 boundary_off。
+ * 只看**具体能力**（`CONCRETE_CAPABILITY_IDS`）：kind 是能力档位，"写能力可达"必须按能力自身的
+ * 规划判定；拿档位当证据会给每一次 describePolicy 都刷出假的 boundary_off。
  */
 function writeCapableExposed(policy: Policy): boolean {
   return CONCRETE_CAPABILITY_IDS.some(
@@ -381,8 +351,7 @@ function writeCapableExposed(policy: Policy): boolean {
 }
 
 /**
- * 能力级判定：要调用的工具是否会被注册。
- * 未注册的工具调用即 tool not found —— 典型「跑到最后才发现」。
+ * 能力级判定：要调用的工具是否会被注册。未注册的工具调用即 tool not found——典型「跑到最后才发现」。
  */
 function checkCapability(policy: Policy, tools: readonly string[]): Grant[] {
   const out: Grant[] = [];
@@ -402,20 +371,16 @@ function checkCapability(policy: Policy, tools: readonly string[]): Grant[] {
 
 /**
  * 资源级判定：要写入的包 / 要读取的 schema 是否在授权范围内。
- *
- * 写包门禁只对「本次确实要写包」的请求生效——只读请求不该被空写白名单的 boundary_off 拦住，
- * 否则读操作在未配置写边界的部署上寸步难行。
+ * 写包门禁只对「本次确实要写包」的请求生效——只读请求不该被空写白名单的 boundary_off 拦住。
  */
 function checkResource(policy: Policy, request: PolicyRequest): Grant[] {
   const out: Grant[] = [];
   const targets = request.writePackages ?? [];
 
   if (targets.length > 0) {
-    // 边界为空 = 写边界未启用（服务层 assertWritePackageAllowed 那层是 fail-open，但本闸门必须拦）：
-    // 依赖边界生效的写请求在此不成立，放行等于给出错误的安全保证。
-    // **不附加"存在已暴露的写能力"条件**：本分支只在请求确实声明了写包时进入（只读请求不在此），
-    // 而声明写包的能力不限于 kind==='write'——admin 档的 hana_repo_import 同样写仓库包，附加该条件
-    // 会让这类调用在空白名单部署里 fail-open（与 checkPolicySelf 的 writeCapableExposed 同口径）。
+    // 边界为空 = 写边界未启用（服务层那层是 fail-open，但本闸门必须拦）：放行等于给出错误的安全保证。
+    // **不附加"存在已暴露的写能力"条件**：本分支只在请求确实声明了写包时进入，而声明写包的能力不限于
+    // kind==='write'——admin 档的 hana_repo_import 同样写仓库包，附加该条件会让这类调用在空白名单部署里 fail-open。
     if (policy.resource.writePackages.length === 0) {
       out.push({
         dimension: 'resource',
@@ -470,19 +435,13 @@ function checkResource(policy: Policy, request: PolicyRequest): Grant[] {
 }
 
 /**
- * 部署不变量里归**启动告警**的一类：只进运维自检 `describePolicy`，不进任务闸门（runPreflight）
- * 与调用审计（authorizeCall 放行时把全部 warnings 映射为 audit.codes）。
- *
- * 为什么 xs_plaintext 必须分流：它是 XS 写通道的**缺省事实**——未显式置 HANA_XS_TLS=true 的部署
- * （默认部署）恒命中，与"这次调用触碰了什么"无关。若随每次调用结论下发，每条放行审计的 codes
- * 都会被它**无条件**塞满，审计码不再表达本次调用；而按运维要求它仍须在启动自检里持续可见
- * （部署方据此加密通道或做网络侧隔离）。
+ * 部署不变量里归**启动告警**的一类：只进运维自检 `describePolicy`，不进任务闸门与调用审计。
+ * 为什么 xs_plaintext 必须分流：它是 XS 写通道的**缺省事实**（默认部署恒命中，与本次调用无关）；
+ * 若随每次调用下发，会把每条放行审计的 codes **无条件**塞满，而它仍须在启动自检里持续可见。
  */
 const STARTUP_ONLY_DEPLOYMENT_CODES: ReadonlySet<DeploymentInvariant['code']> = new Set(['xs_plaintext']);
 
-/** 部署不变量 → 判定结论（唯一映射处）：只取 message（事实陈述）。补救指引与豁免开关是运维向
- *  信息，仅在 describePolicy 里追加，不随 Grant 进入请求响应——`checkDeployment` 的结论也会
- *  出现在给调用方的拦截消息中。 */
+/** 部署不变量 → 判定结论（唯一映射处）：只取 message（事实陈述）；补救指引与豁免开关仅在 describePolicy 追加。 */
 function deploymentGrants(invariants: readonly DeploymentInvariant[]): Grant[] {
   return invariants.map((inv) => ({
     dimension: 'deployment' as const,
@@ -515,9 +474,8 @@ function checkDeploymentStartup(policy: Policy): Grant[] {
 
 /** 策略自检：与具体请求无关的、关于"这份策略本身"的结论 */
 function checkPolicySelf(policy: Policy): Grant[] {
-  // 可能写仓库包的能力可达但写边界未启用 —— 这是策略级事实，不需要有写请求就该被告知。
-  // 口径必须与 checkResource 一致：空白名单不是「不限制」，而是「声明写包的写请求会被硬拦」——
-  // 写能力已暴露时等于写不可用（只有服务层 assertWritePackageAllowed 那层是 fail-open）。
+  // 可能写仓库包的能力可达但写边界未启用：策略级事实，不需要有写请求就该被告知。
+  // 口径与 checkResource 一致：空白名单不是「不限制」，写能力已暴露时就等于写不可用。
   if (writeCapableExposed(policy) && policy.resource.writePackages.length === 0) {
     return [
       {
@@ -567,7 +525,7 @@ function formatCapability(c: ToolFilterConfig): string {
     c.allowPatterns.length === 0 &&
     c.denyPatterns.length === 0 &&
     c.groupsExplicit !== true;
-  // 空配置不再等于「全部」：sql 组默认关闭（hana_sql_execute 必须显式启用）
+  // 空配置不等于「全部」：sql 组默认关闭（hana_sql_execute 必须显式启用）
   if (legacyEmpty) return '未过滤（read/write/admin 启用；sql 组默认关闭）';
   const parts: string[] = [];
   if (c.enabledGroups.size > 0) parts.push(`启用分组 ${[...c.enabledGroups].join('/')}`);
@@ -638,28 +596,25 @@ export function runPreflight(opts: {
 
 /**
  * 档案自检：**档案只能收紧，不能放宽**。
+ * - **block**：档案声明允许某个 kind，而该 kind 在部署面上**一个能力都不可见**——"运维以为的权限"
+ *   与"实际权限"的直接矛盾，必须显式纠偏（天花板仍在，不是漏洞）。
+ * - **warn**：档案的能力 glob 有部分落在部署已隐藏的面上（宽 glob 几乎必然如此，一律 block 会让档案无法使用）。
  *
- * 判定口径（两条，方向不同、严重度不同）：
- * - **block**：档案声明允许某个 kind，而该 kind 在部署面上**一个能力都不可见**
- *   （分组未启用、或被 deny 全关掉）。这是"运维以为的权限"与"实际权限"的直接矛盾——
- *   天花板仍在（不是漏洞），但必须显式纠偏，否则运维会按错误的认知排查问题。
- * - **warn**：档案的能力 glob 有部分落在部署已隐藏的面上（或与自身 allowKinds 不匹配）。
- *   宽 glob（如 `hana_*`）几乎必然命中一些被隐藏的能力，若一律 block 会让档案无法使用；
- *   实际效果仍由天花板决定，故只提示。
- *
- * 只在**配置自检**路径（describePolicy）里跑，不进 runPreflight——
- * 它是"关于配置本身"的结论，与具体请求无关，每调用一次都重算是噪音。
+ * 只在**配置自检**路径（describePolicy）里跑：它是"关于配置本身"的结论，每调用一次都重算是噪音。
  */
-export function checkProfiles(policy: Policy): Grant[] {
+export function checkProfiles(
+  policy: Policy,
+  capabilityFilters: readonly ToolFilterConfig[] = [policy.capability],
+): Grant[] {
   const profiles = policy.profiles;
   if (!profiles || profiles.size === 0) return [];
   const out: Grant[] = [];
   const capabilityIds = Object.keys(TOOL_GROUPS);
   // 各 kind 在部署面上是否还有可见能力（把 deny / 分组 / 未登记 一并算进去）。
-  // **只数具体能力**：门面的 kind 是成员摘要，把它算进来会让"只读部署 + dev 档案声称允许 write"
-  // 这类真矛盾漏报（门面可见 ≠ 其成员全部可触达）。
+  // **只数具体能力**：kind 是能力档位而非成员摘要；多环境按所有环境的并集判定（见 describePolicy 的调用方）。
+  const visibleUnder = (name: string): boolean => capabilityFilters.some((f) => shouldRegisterTool(name, f));
   const exposedKinds = ALL_TOOL_GROUPS.filter((k) =>
-    CONCRETE_CAPABILITY_IDS.some((name) => TOOL_GROUPS[name] === k && shouldRegisterTool(name, policy.capability)),
+    CONCRETE_CAPABILITY_IDS.some((name) => TOOL_GROUPS[name] === k && visibleUnder(name)),
   );
   for (const profile of profiles.values()) {
     const kindsOutside = profile.allowKinds.filter((k) => !exposedKinds.includes(k));
@@ -686,7 +641,7 @@ export function checkProfiles(policy: Policy): Grant[] {
           message: `档案 "${profile.id}" 的能力 glob（${profile.allowCapabilities.join('|')}）没有命中任何已登记能力（拼写错误？）`,
         });
       } else {
-        const hidden = hit.filter((id) => !shouldRegisterTool(id, policy.capability));
+        const hidden = hit.filter((id) => !visibleUnder(id));
         if (hidden.length > 0) {
           out.push({
             dimension: 'profile',
@@ -711,7 +666,10 @@ export function checkProfiles(policy: Policy): Grant[] {
  * 这是**运维向**入口：只有这里会追加补救指引与豁免开关（那是运维需要的信息），
  * 请求响应路径（runPreflight）不会带这些。
  */
-export function describePolicy(source: PolicySource): Verdict {
+export function describePolicy(
+  source: PolicySource,
+  opts?: { profileCapabilityFilters?: readonly ToolFilterConfig[] },
+): Verdict {
   const policy = resolvePolicy(source);
   const verdict = assemble(
     policy,
@@ -720,7 +678,7 @@ export function describePolicy(source: PolicySource): Verdict {
       ...checkDeployment(policy),
       // 启动告警类部署结论（xs_plaintext 等）：只在运维自检里可见，不进任务闸门/调用审计
       ...checkDeploymentStartup(policy),
-      ...checkProfiles(policy),
+      ...checkProfiles(policy, opts?.profileCapabilityFilters ?? [policy.capability]),
     ],
     [
       `部署姿态：${policy.deployment.httpPort == null ? 'stdio（不对外监听）' : `HTTP :${policy.deployment.httpPort} @ ${policy.deployment.httpHost}`}` +

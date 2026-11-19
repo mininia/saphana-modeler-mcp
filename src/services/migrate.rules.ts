@@ -4,46 +4,39 @@
  *
  * 三条刻意为之的语义，改代码前先读这里：
  *
- * 1. **分级门槛 = 下游是否引用**：同样变更，下游没人引用就是非破坏，有人引用才破坏。
- *    因此 items 只在「下游非空」时产生——调用方拿到的每一条都是真的会断下游的破坏项，
- *    不存在"列出来但其实不算数"的条目（判定表逐行实现，见各 collect* 的注释）。
+ * 1. **分级门槛 = 下游是否引用**：同样变更，下游没人引用就是非破坏。因此 items 只在「下游非空」时
+ *    产生——调用方拿到的每一条都是真的会断下游的破坏项，不存在"列出来但其实不算数"的条目。
  *
  * 2. **描述 / 显示名 / 隐藏标志的变更永不破坏**（即便有下游）——下游消费的是字段与取数口径，
- *    不依赖 description / order / hidden / key 这类展示属性。这是刻意的，不要"顺手"升级为破坏。
+ *    不依赖 description / order / hidden / key 这类展示属性。不要"顺手"升级为破坏。
  *
  * 3. **requiresStrategy 只对「可迁移的字段级变更」给出策略**：删字段 / 改类型 / 改名 →
  *    cast / preserve_column / move；视图删除、接线变更、数据源变更都没有可自动化的策略，如实给空数组。
- *    是否放行由调用层按 D2 闸门语义决定（声明 + 回执记录），本模块只判定、不阻断。
+ *    是否放行由调用层按闸门语义决定（声明 + 回执记录），本模块只判定、不阻断。
  *
  * 明确**不在表内**的（不产生条目，别顺手加）：新增输出字段、节点增删、变量增删、仅新增数据源、
  * `diff.output.changed` 单独，以及 outputs.changed 的展示类字段位（description / hidden / key / order）。
  * 判定表是白名单：扩一条规则 = 先在本文件（文件头与对应 collect* 的头注）把新口径写清，再加实现。
  *
  * 三条**口径面规则**——编辑能力（节点过滤器 / 属性过滤器 / 变量默认值）会改变下游取到的数据，
- * 不能从闸门旁边走过去：
- *   - `node_filter_changed`：节点过滤器表达式变更（view-diff 的 nodes.changed fields 含 'filter'）；
- *   - `attribute_filter_changed`：属性级值过滤器变更（fields 含 'attributeFilters'）；
- *   - `variable_changed`：输入参数的**语义字段**（parameter/datatype/length/defaultValue/mandatory）
- *     变更——description-only 的变更不产生条目（与第 2 条「描述永不破坏」同口径）；
- *     变量**增删**仍在表外：新增参数不改变既有取数，删除参数的影响面属"参数不再被接受"，
- *     交调用方按 xml 通道自行承担。
+ * 不能从闸门旁边走过去：`node_filter_changed`（fields 含 'filter'）、`attribute_filter_changed`
+ * （fields 含 'attributeFilters'）、`variable_changed`（语义字段 parameter/datatype/length/
+ * defaultValue/mandatory 变更；description-only 不产生条目；变量**增删**仍在表外——新增参数不改变
+ * 既有取数，删除参数的影响面交调用方按 xml 通道承担）。
  *
- * 四条附加信号面（「补洞」性质，唯一收紧是重挂豁免要证据）：
+ * 四条附加信号面（重挂豁免须有证据）：
  *   - 节点级类型声明（attributeTypes）变更按节点成条（列级关联为何不可达见该函数头注）；
  *   - 输入接线变化（fields 'inputs'——输入换人/增减，映射逐字同名也含）独立成 node_input_changed 条；
  *   - SQL 模式视图的脚本变更进判定（改基表最隐蔽）：保守口径、不解析 SQL，见 collectScriptChanges；
- *   - 机械重挂豁免必须带「恒等直通」证据（output.passThrough：透明节点 + 直通边映射非空且全恒等），
- *     见 collectOutputNodeRewiring 第 2 条。
- * level 的类型扩出 'unknown'：本模块不产生它——留给服务层在「基线不可用、判定未执行」时如实标注。
+ *   - 机械重挂豁免必须带「恒等直通」证据（output.passThrough：透明节点 + 直通边映射非空且全恒等）。
+ * level 的类型含 'unknown'：本模块不产生它——留给服务层在「基线不可用、判定未执行」时如实标注。
  *
  * 「改输出节点接线」「改输入数据源 / 基表」的判据统一为"**既有输出字段的取数解析变没变**"，
  * 而不是"节点 / 数据源有没有变动"（判据来源是实机 op=add_join 的变换结果：数据源仅新增 + 输出节点
- * 换人 + 既有字段 sourceObject 机械重挂，详见 collectOutputNodeRewiring / collectDataSourceChanges
- * 的头注与 tests/unit/migrate.rules.test.ts 的实证用例）——这些形态必须判非破坏，否则闸门会拦下
- * 良性的加 join。改各 collect* 前先读它们的头注，别改成按现象粗判。
+ * 换人 + 既有字段 sourceObject 机械重挂，详见各 collect* 的头注与单测实证用例）——这些形态必须判
+ * 非破坏，否则闸门会拦下良性的加 join。
  *
- * diff 的字段名 / 分类以 view-diff.ts 的契约为准；本模块不做任何再归一化，
- * 也绝不读 raw / XML 文本。
+ * diff 的字段名 / 分类以 view-diff.ts 的契约为准；本模块不做任何再归一化，也绝不读 raw / XML 文本。
  */
 
 import { OUTPUT_FIELD_CATEGORY, type OutputFieldCategory, type ViewDiff } from '../model/view-diff.js';
@@ -193,21 +186,17 @@ function collectOutputFieldTypeChanges(diff: ViewDiff, items: BreakingItem[]): v
 }
 
 /**
- * 规则：节点级类型声明变更（attributeTypes）——SQL 模式视图（本服务 view-builder
- * 就这么写）与部分 BW/Studio 方言把列类型写在**节点**的 viewAttribute 上；logicalModel 输出字段不带
- * datatype ⇒ 输出侧（outputs.changed）完全看不到类型变化，只判 outputs.changed 会漏成 none。
+ * 规则：节点级类型声明变更（attributeTypes）——SQL 模式视图（本服务 view-builder 就这么写）与部分
+ * BW/Studio 方言把列类型写在**节点**的 viewAttribute 上；logicalModel 输出字段不带 datatype ⇒
+ * 输出侧完全看不到类型变化，只判 outputs.changed 会漏成 none。
  *
- * 为什么按**节点**成条、而不是「按 keyMapping 关联到输出字段」：判定输入只有 diff + impact，
- * 而 diff 里节点侧只带变化的**字段名**（不含列级新旧值、不含节点列清单），输出侧条目只带
- * {list,id,fields}（不含 sourceObject/sourceColumn）——「哪个节点列变了、哪些输出字段指它」两个关联键
- * 在结构 diff 里都不存在。列级关联要么改 diff 形状、要么把 after 侧定义塞进判定输入，两者都动既有契约，
- * 故取节点级近似：一个变更节点一条、target=节点 id，detail 如实说明关联不可达。
+ * 为什么按**节点**成条、而不是关联到输出字段：判定输入只有 diff + impact，而 diff 里节点侧只带
+ * 变化的字段名（不含列级新旧值/列清单），输出侧条目只带 {list,id,fields}——「哪个节点列变了、哪些
+ * 输出字段指它」的两个关联键在结构 diff 里都不存在；列级关联要么改 diff 形状、要么塞 after 侧定义，
+ * 都动既有契约。故取节点级近似：一个变更节点一条、target=节点 id，detail 如实说明关联不可达。
  *
- * 「关联不到的节点列不产生破坏项」的取舍：列级信息本就没有，也不回退为按节点列逐个冒充 target（那要先
- * 知道列清单，同样拿不到）；节点内未被任何输出字段引用的列会随节点整体成条——保守方向（类型声明变更
- * 意味着该节点取数口径有变化，下游有引用时宁过不漏），不要「顺手」改成按列猜。
- *
- * requiresStrategy 与输出字段类型规则同口径（改类型可 cast / 保列新建 / move）。
+ * 「关联不到的节点列」随节点整体成条——保守方向（类型声明变更意味着取数口径变化，下游有引用时
+ * 宁过不漏），不要改成按列猜。requiresStrategy 与输出字段类型规则同口径。
  */
 function collectNodeAttributeTypeChanges(diff: ViewDiff, items: BreakingItem[]): void {
   for (const node of diff.nodes.changed) {
@@ -234,28 +223,21 @@ function fieldCategory(field: string): OutputFieldCategory | undefined {
 }
 
 /**
- * 规则：改输出节点接线——判据是**既有输出字段的解析变没变**
- * （diff.outputs.changed 的 fields 含解析类字段位任一），不是"节点 / 数据源有没有变动"。
- * 改这个函数前先读下面三条（否则下一个人容易改成现象级粗判）：
+ * 规则：改输出节点接线——判据是**既有输出字段的解析变没变**（diff.outputs.changed 的 fields
+ * 含解析类字段位任一），不是"节点 / 数据源有没有变动"。
  *
- * 1. `diff.output.changed`（最终输出节点换人）**单独不构成破坏**：字段解析不变 = 下游 keyMapping
- *    不会断（判定表给这行写的判据就是"下游 keyMapping 会断"）。
- * 2. 输出节点换人伴随的 sourceObject 机械重挂**不计入破坏——但要证据**，且证据必须闭到「恒等直通」：
- *    add_join 等变换会把 logicalModel 的 keyMapping/measureMapping 的 columnObjectName 从旧输出节点
- *    **整体**改指新输出节点。实机变换（tests/fixtures 的 join 链 + op=add_join）产出的 diff 实证：
- *    既有字段 fields=['sourceObject']、sourceColumn（列名）不变，且 diff.output.passThrough=true——
- *    after 定义里新输出节点 to 确有一条输入直指旧输出节点 from（机械重挂的一手证据）。列名未变、值沿
- *    新节点直通 ⇒ 解析没有变；不看这条豁免，良性的加 join 会被判破坏（该豁免防的正是这个假阳性）。
- *    证据为什么必须闭到「透明直通」：直通边只证明「有边」，证明不了「值沿新节点直通」——
- *    把直通输入写成非恒等映射（target=KEY_A source=AMT）时列名未变而值已换，静默语义漂移。
+ * 1. `diff.output.changed`（最终输出节点换人）**单独不构成破坏**：字段解析不变 = 下游 keyMapping 不断。
+ * 2. 输出节点换人伴随的 sourceObject 机械重挂**不计入破坏——但要证据**，且证据须闭到「恒等直通」：
+ *    add_join 等变换把 keyMapping/measureMapping 的 columnObjectName 整体改指新输出节点（实测 diff：
+ *    fields=['sourceObject']、列名不变、diff.output.passThrough=true）。不看这条豁免，良性的加 join
+ *    会被判破坏。证据必须闭到「透明直通」：直通边只证明「有边」，证明不了「值沿新节点直通」——把直通
+ *    输入写成非恒等映射（target=KEY_A source=AMT）时列名未变而值已换，静默语义漂移。
  *    passThrough 的判定（view-diff.isPassThrough）：to 类型 ∈ {Projection, Join}（Join 须 joinType =
- *    leftOuter——过滤型 join（inner/rightOuter/fullOuter，含缺省 inner）会改行集合）、自身无聚合/
- *    过滤器/Rank/脚本，且 to→from 那条边的映射非空且**全部恒等**（target === source）。
- *    纯形态匹配（"换人 + 仅 sourceObject 变化"）不够：真实世界里破坏性的重接线同样长这样，只是
- *    新输出节点与旧节点毫无直通关系——证据不成立（passThrough=false/缺省）时必须照判破坏。
- *    字段若还伴随其他解析位变化，仍照常判破坏（见下面循环）。
- * 3. 节点输入映射重指向（mappings.retargeted 非空）**保留原判**：同一列改从另一个上游取数，列值会变
- *    （语义漂移）；它不产生 add_join 的假阳性（实机 add_join 的 nodes.changed 为空），故逐条照判、不合并。
+ *    leftOuter——过滤型 join 会改行集合）、自身无聚合/过滤器/Rank/脚本，且 to→from 那条边的映射非空
+ *    且**全部恒等**。真实世界里破坏性的重接线同样长这样（新输出节点与旧节点毫无直通关系），
+ *    证据不成立时照判破坏；字段若还伴随其他解析位变化也照判。
+ * 3. 节点输入映射重指向（mappings.retargeted 非空）**保留原判**：同一列改从另一个上游取数，列值会变；
+ *    add_join 不产生这种条目（实机 nodes.changed 为空），故逐条照判、不合并。
  *
  * 下游有引用 → 破坏；无可用迁移策略（接线断没有"cast 一下"的修法）。
  */
@@ -263,13 +245,8 @@ function collectOutputNodeRewiring(diff: ViewDiff, items: BreakingItem[]): void 
   for (const field of diff.outputs.changed) {
     const resolutionFields = field.fields.filter((f) => fieldCategory(f) === 'resolution');
     if (resolutionFields.length === 0) continue;
-    // 第 2 条豁免：输出节点换人 + 仅 sourceObject 这一位变化（机械重挂形态），**且证据成立**。
-    // 证据是 view-diff 算好的 passThrough，语义 =「透明直通」：to 类型 ∈ {Projection, Join}（Join 须
-    // joinType = leftOuter——过滤型 join 会改行集合）、自身无聚合/过滤器/Rank/脚本，
-    // 且 **to→from 那条边的映射非空且全部恒等**（target === source）。
-    // 直通边只证明「有边」，证明不了「值沿新节点直通」：映射把该字段的列改写成别的来源
-    // （target=KEY_A source=AMT——列名未变而值已换）时 passThrough=false ⇒ 照判破坏。
-    // 证据不成立时不豁免，按解析变化照判。
+    // 第 2 条豁免：输出节点换人 + 仅 sourceObject 变化（机械重挂形态），且 view-diff 的 passThrough
+    // 证据成立（透明直通，判定口径见函数头注）；证据不成立时按解析变化照判破坏。
     const onlyRehosted =
       diff.output.changed &&
       diff.output.passThrough === true &&
@@ -298,15 +275,14 @@ function collectOutputNodeRewiring(diff: ViewDiff, items: BreakingItem[]): void 
 }
 
 /**
- * 规则：节点输入接线变更（node_input_changed）——view-diff 的输入绑定比较
- * 命中时在 nodes.changed[].fields 记 'inputs'（输入换人 / 输入增减 / 映射重指向都命中；Union 输入集合
- * 增删同样命中，重排不命中——文档序无语义，别在这边自行再加归一）。
+ * 规则：节点输入接线变更（node_input_changed）——view-diff 命中时在 nodes.changed[].fields 记
+ * 'inputs'（输入换人 / 输入增减 / 映射重指向都命中；Union 输入集合增删同样命中，重排不命中——
+ * 文档序无语义）。
  *
- * 为什么必须独立一条：输入换人但映射**逐字同名**（如 Join 左输入 #Proj_A → #Proj_B，两者暴露同名同列）
- * 时逐映射差量为空、dataSources 也无变化，'inputs' 是唯一信号；但下游按原列名取到的值已经变了（语义
- * 漂移，最隐蔽）。命中即破坏的并集语义：与逐映射的 output_node_rewired 条目**不合并、都不丢**
- * （同一次变更里两类条目各说各的事实——模块文件头第 1 条：调用方拿到的每条都是真的）。
- * 判定表「改输出节点接线」判据的延伸：下游有引用 ⇒ 破坏；接线断没有字段级修法，策略如实给空。
+ * 为什么必须独立一条：输入换人但映射**逐字同名**（如 Join 左输入 #Proj_A → #Proj_B，两者暴露同名
+ * 同列）时逐映射差量为空、dataSources 也无变化，'inputs' 是唯一信号；但下游按原列名取到的值已经变了。
+ * 与逐映射的 output_node_rewired 条目**不合并、都不丢**（两类条目各说各的事实）。
+ * 下游有引用 ⇒ 破坏；接线断没有字段级修法，策略如实给空。
  */
 function collectNodeInputChanges(diff: ViewDiff, items: BreakingItem[]): void {
   for (const node of diff.nodes.changed) {
@@ -321,14 +297,12 @@ function collectNodeInputChanges(diff: ViewDiff, items: BreakingItem[]): void {
 }
 
 /**
- * 规则：改 / 删输入数据源 / 基表——**仅新增不构成破坏**（判据同样是"既有取数语义变没变"）。
- *   - removed 非空：既有源被移除，视图取数口径变化（语义漂移，最隐蔽）⇒ 下游有引用时破坏；
- *   - changed 非空（契约保证 fields 非空，⊂ [type, resourceUri, schemaName, columnObjectName]，
- *     全是取数口径类字段）：既有源的口径变更 ⇒ 同判；
- *   - 仅 added（removed / changed 为空）：**不判破坏**——新增源若被接进既有输出字段，该字段的解析位
- *     变化会由 collectOutputNodeRewiring 捕获（"sourceObject 变化会捕获"那条就是为这个场景留的）；
- *     没接进既有字段的新增源（如 add_join 的新源只喂新增输出字段）不改变任何既有语义。
- *     把 added 也算破坏会拦下良性的 add join，这正是该分支不存在的理由。
+ * 规则：改 / 删输入数据源 / 基表——**仅新增不构成破坏**（判据同样是"既有取数语义变没变"）：
+ *   - removed：既有源被移除 ⇒ 下游有引用时破坏；
+ *   - changed（fields ⊂ [type, resourceUri, schemaName, columnObjectName]，全是取数口径类字段）⇒ 同判；
+ *   - 仅 added：**不判破坏**——新增源若被接进既有输出字段，其解析位变化由 collectOutputNodeRewiring
+ *     捕获；没接进既有字段的新增源（如 add_join 的新源只喂新增输出字段）不改变任何既有语义。
+ *     把 added 也算破坏会拦下良性的 add join。
  * 无可用迁移策略（口径漂移不是字段级 cast 能兜的，交给编排层按 impact 处理）。
  */
 function collectDataSourceChanges(diff: ViewDiff, items: BreakingItem[]): void {
@@ -354,19 +328,15 @@ function collectDataSourceChanges(diff: ViewDiff, items: BreakingItem[]): void {
  * 规则：SQLScript 脚本变更（script_changed）——**保守口径**：
  * 脚本文本变化 + 下游有引用 ⇒ 破坏；不解析 SQL（不做「脚本引用的源集合」比较）。
  *
- * 为什么不复用现有扫描件：本仓可复用的 SQL 扫描件只有 write-plan 的
- * scanSqlSchemaRefs / hasUnqualifiedTableRef（read-scope.service 的 assertSqlReadScopes 族依赖注入式
- * 异步读取、且是校验不是抽取）。前者虽是纯函数，但只抽 **schema**、抽不出被引用的对象；而实测的漂移
- * 形态常是**同 schema 换表**（`FROM ZTEST_SIGN.HEADER` → `FROM ZTEST_SIGN.ITEM` 实测 schema 集合不变；
- * 实测语料（ZDEMO 族）的脚本也全走 _SYS_BIC）——只比 schema 集合等于把这行漂移继续放行；逐对象抽取器不
- * 存在，现写一份 = 第二份表名扫描器（write-plan 是单点实现，注释明确「不要再写第二份剥离/扫描实现」）。
- * 故不解析 SQL：任何脚本文本变化都按语义漂移要求显式声明（fail-closed——宁过不漏），WHERE/格式类
- * 良性变更也会命中，这是保守口径的明示代价。
+ * 为什么不复用现有扫描件：write-plan 的 scanSqlSchemaRefs 只抽 **schema**、抽不出被引用的对象，
+ * 而实测的漂移形态常是**同 schema 换表**（`FROM ZDEMO_SIGN.HEADER` → `FROM ZDEMO_SIGN.ITEM`
+ * 实测 schema 集合不变）——只比 schema 集合等于把这行漂移继续放行；逐对象抽取器现写一份 = 第二份
+ * 表名扫描器（write-plan 是单点实现）。故不解析 SQL：任何脚本文本变化都按语义漂移要求显式声明
+ * （fail-closed——宁过不漏），WHERE/格式类良性变更也会命中，这是保守口径的明示代价。
  *
- * 「源集合未变时只给 warning」的分支无法在**本模块**落地：判定出口没有 warnings 通道（在服务层组装
- * DryRunReport 时才有），且「源集合未变」用现有扫描件根本证不出来（对象级不可见）——不要为了凑这个
- * 分支塞半份扫描器。requiresStrategy：语义漂移没有可自动化的字段级动作（同 data_source_changed 口径），
- * 如实给空数组；放行与否由调用层按 D2 闸门（显式声明）决定。
+ * 「源集合未变时只给 warning」的分支无法在**本模块**落地：判定出口没有 warnings 通道（在服务层
+ * 组装 DryRunReport 时才有），且「源集合未变」用现有扫描件根本证不出来——不要为了凑这个分支
+ * 塞半份扫描器。requiresStrategy：语义漂移没有可自动化的字段级动作，如实给空数组。
  */
 function collectScriptChanges(diff: ViewDiff, items: BreakingItem[]): void {
   for (const node of diff.nodes.changed) {
@@ -381,13 +351,11 @@ function collectScriptChanges(diff: ViewDiff, items: BreakingItem[]): void {
 }
 
 /**
- * 规则：取数口径面变更——节点过滤器（fields 含 'filter'）与属性级值过滤器（fields 含 'attributeFilters'）。
- *
- * 为什么进表：两者都不动输出字段与接线，但改变**行集合**——下游按原字段名取到的数据变了。
- * 这与 data_source_changed 判的是同一件事（"既有取数语义变没变"），故同判：
- * 下游有引用 ⇒ 破坏；无字段级迁移动作（口径漂移不是 cast 能兜的），requiresStrategy 如实给空。
- * 判定覆盖两个方向：**加**过滤器（如新排除删除标记）与**改/删**过滤器都会改变行集合，一律成条——
- * 不存在"仅新增不构成破坏"的豁免（那条豁免针对的是"新增源没接进既有字段"，这里不存在对应形态）。
+ * 规则：取数口径面变更——节点过滤器（fields 含 'filter'）与属性级值过滤器（fields 含
+ * 'attributeFilters'）。两者都不动输出字段与接线，但改变**行集合**——下游按原字段名取到的数据变了，
+ * 与 data_source_changed 判的是同一件事，故同判：下游有引用 ⇒ 破坏；无字段级迁移动作。
+ * **加**过滤器与**改/删**过滤器一律成条——没有"仅新增不构成破坏"的豁免（那条豁免针对
+ * "新增源没接进既有字段"，这里不存在对应形态）。
  */
 function collectDataFilterChanges(diff: ViewDiff, items: BreakingItem[]): void {
   for (const node of diff.nodes.changed) {
@@ -413,12 +381,10 @@ function collectDataFilterChanges(diff: ViewDiff, items: BreakingItem[]): void {
 /**
  * 规则：输入参数（变量）**语义字段**变更（defaultValue / mandatory / datatype / length / parameter）。
  *
- * 为什么进表：改默认值影响**所有未显式传参的下游调用**——同一句 SELECT 取到的值变了，
- * 属口径漂移；类型/长度/parameter 标志同理。判定与 collectDataFilterChanges 同口径（下游有引用 ⇒ 破坏，
- * 无字段级策略）。
- *
- * **description-only 的变更不产生条目**：描述是展示属性，与第 2 条「描述 / 显示名永不破坏」同口径——
- * 这里用「除 description 外还有语义字段命中」表达，字段混改（描述 + 默认值）时正常成条。
+ * 改默认值影响**所有未显式传参的下游调用**——同一句 SELECT 取到的值变了，属口径漂移；类型/长度/
+ * parameter 标志同理。判定与 collectDataFilterChanges 同口径（下游有引用 ⇒ 破坏，无字段级策略）。
+ * **description-only 的变更不产生条目**（描述是展示属性，与「描述 / 显示名永不破坏」同口径）；
+ * 字段混改（描述 + 默认值）时正常成条。
  */
 function collectVariableChanges(diff: ViewDiff, items: BreakingItem[]): void {
   for (const variable of diff.variables.changed) {
@@ -436,7 +402,7 @@ function collectVariableChanges(diff: ViewDiff, items: BreakingItem[]): void {
 /**
  * 判定表独立入口：删除整个视图（调用方在 hana_view_delete 前用；判定表最后一行）。
  * 下游无引用 → 非破坏；有引用 → 破坏，且**没有迁移策略**——
- * 是否放行由调用层按 D2（先解除依赖或调用方显式承担）决定，本模块只如实判定。
+ * 是否放行由调用层按闸门（先解除依赖或调用方显式承担）决定，本模块只如实判定。
  */
 export function assessViewDeletion(
   target: { packageId: string; objectName: string },
