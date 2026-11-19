@@ -38,19 +38,19 @@
  * 该字段）——不提前编造一个恒为空的占位。
  */
 
-import { assembleVerdict, checkDeployment, runPreflight, type Grant, type Policy, type Verdict } from './preflight.js';
-import { environmentGrants, environmentMutationScope } from './environment-policy.js';
-import { profileAllows, type CallerProfile } from './profiles.js';
-import { isPackageAllowed } from './write-boundary.js';
-import { planFor } from '../capabilities/manifest.js';
+import type { InputRequiredResult } from '@modelcontextprotocol/server';
+import { assembleVerdict, checkDeployment, type Policy, type Verdict } from './preflight.js';
+import { evaluate, type EvaluationResult } from './evaluate.js';
+import { environmentMutationScope, type EnvironmentAssertion } from './environment-policy.js';
+import type { CallerProfile } from './profiles.js';
 import { planReadless } from '../capabilities/planners.js';
 import type { Capability } from '../capabilities/types.js';
-import { isSchemaAllowedWith } from '../core/sql.js';
 import { BLOCKED_PREFIX, mcpErrorText } from '../core/errors.js';
 import { currentAgentLabel, currentIdentity } from '../core/request-context.js';
 import { currentEnvironmentRuntime } from '../core/environment-context.js';
+import { currentExecutionContext } from '../core/execution-context.js';
 import { logger } from '../core/logger.js';
-import { formatWritePlan, planToRequest, type WritePlan } from '../write-plan.js';
+import { formatWritePlan, type WritePlan } from '../write-plan.js';
 import { sqlFingerprint } from '../services/sql-execute.rules.js';
 
 /** 调用方身份（HTTP = 认证后的 clientId；stdio = 进程内单客户端，无身份上下文） */
@@ -79,6 +79,12 @@ export interface AuthorizationContext {
   agentLabel?: string;
   /** 归因入口（门面路由时 = 门面 id；平铺直调缺省）——只进审计，不参与判定 */
   via?: string;
+  /** 调用信封里的环境断言（P2）；省略时回退 args.expectedEnvironment/expectedEpoch */
+  envAssertion?: EnvironmentAssertion;
+  /** 调用信封里的披露上下文（只做一致性检查，不是授权凭证） */
+  disclosure?: { id?: string; policyRev?: string; manifestRev?: string };
+  /** rev 补充输入（readonlySql/approvalPolicy） */
+  policyRevExtras?: { readonlySql?: string; approvalPolicy?: string };
 }
 
 /** 一次调用的授权结论 */
@@ -89,6 +95,8 @@ export interface AuthorizationResult {
   plan: WritePlan;
   /** 策略判定总结果（含 blocking/warnings/text/policy） */
   verdict: Verdict;
+  /** 四层检查态（能力/资源/环境/审批；与 hana_tool_search 的 preview 同源） */
+  checks?: EvaluationResult['checks'];
   /** 审计事件载荷（每次调用都记，无论放行与否；字段固定，不随入口变化） */
   audit: CapabilityAuditEvent;
 }
@@ -113,6 +121,8 @@ export interface AuditTarget {
 
 /** `capability-audit` 事件载荷（字段固定：审计链路不随入口变化） */
 export interface CapabilityAuditEvent {
+  /** 本次调用的执行上下文 id（P2；入口绑定，贯穿审计） */
+  requestId?: string;
   capabilityId: string;
   /** 终态（P0-4）：读 = allowed|denied；写 = denied|completed|failed */
   result: AuditResult;
@@ -152,7 +162,7 @@ export interface CapabilityAuditEvent {
 
 /**
  * 审计终态口径：只有 persistent 记 completed/failed；none/transient 同读能力记 allowed。
- * 与 HANA_ACCESS 闸门同源（environmentMutationScope），不按 kind 推断。
+ * 与写包推导的只读态同源（environmentMutationScope），不按 kind 推断。
  */
 export function isPersistentMutation(capability: Capability): boolean {
   return environmentMutationScope(capability) === 'persistent';
@@ -202,6 +212,7 @@ export function authorizeCall(
   const identity = ctx.caller ?? currentCaller();
   const agentLabel = ctx.agentLabel ?? currentAgentLabel();
   const runtime = currentEnvironmentRuntime();
+  const execution = currentExecutionContext();
   // 单环境不产生环境字段，保持旧输出逐字兼容。
   const envAudit = runtime?.multiEnv
     ? {
@@ -229,6 +240,7 @@ export function authorizeCall(
     const verdict = assembleVerdict(policy, grants, ['本次调用：能力 (未登记)——拒绝']);
     const unknownTarget = auditTargetOf(args);
     const audit: CapabilityAuditEvent = {
+      ...(execution ? { requestId: execution.requestId } : {}),
       capabilityId: '(未登记能力)',
       result: 'denied',
       verdict: 'block',
@@ -247,25 +259,25 @@ export function authorizeCall(
     return { allowed: false, plan: planReadless('(未登记能力)'), verdict, audit };
   }
 
-  const plan = planFor(capability, args);
-  // 档案维度（只能收紧）作为**附加维度**并入同一次判定：
-  // 与各 check* 的结论一起分类/成文，报告构造仍只有 assemble 一处。
-  const verdict = runPreflight({
-    source: { kind: 'resolved', policy },
-    request: planToRequest(plan),
-    extraLines: [
-      `本次调用：能力 ${capability.id}` +
-        `；读 schema ${plan.readSchemas.length ? plan.readSchemas.join(', ') : '(无)'}` +
-        `；跨包只读引用 ${plan.readPackages.length ? plan.readPackages.join(', ') : '(无)'}`,
-    ],
-    extraGrants: [
-      ...checkProfile(capability, plan, profile, (policy.profiles?.size ?? 0) > 0),
-      ...environmentGrants(capability, args, runtime),
-    ],
+  // 统一判定入口：preview（hana_tool_search）与 enforce（本函数）共用同一个 evaluate。
+  // 语义与 P1 之前逐项不变：planFor + runPreflight + profile/environment 维度。
+  const evaluated = evaluate({
+    policy,
+    ...(profile ? { profile } : {}),
+    capability,
+    args,
+    mode: 'enforce',
+    ...(runtime ? { runtime } : {}),
+    ...(ctx.envAssertion ? { envAssertion: ctx.envAssertion } : {}),
+    ...(ctx.disclosure ? { disclosure: ctx.disclosure } : {}),
+    ...(ctx.policyRevExtras ? { policyRevExtras: ctx.policyRevExtras } : {}),
   });
+  const plan = evaluated.plan;
+  const verdict = evaluated.verdict;
 
   const target = auditTargetOf(args);
   const audit: CapabilityAuditEvent = {
+    ...(execution ? { requestId: execution.requestId } : {}),
     capabilityId: capability.id,
     result: verdict.allowed ? 'allowed' : 'denied',
     verdict: verdict.allowed ? 'allow' : 'block',
@@ -285,10 +297,13 @@ export function authorizeCall(
     ...(verdict.allowed ? {} : { denyReason: verdict.blocking[0]?.code ?? 'blocked' }),
   };
   // P0-4：非持久写入授权即终态；persistent 放行时不记，由执行侧记 completed/failed。
+  // 平台入口本身不执行 HANA：放行不写 capability-audit（计划 §8.5），拦截仍记。
+  // 目标能力的审计由 hana_invoke 的内层 dispatchAuthorized 负责。
+  const auditOnAllow = isPersistentMutation(capability) === false && capability.platform !== true;
   if (!verdict.allowed) logger.warn({ ...audit }, 'capability-audit');
-  else if (!isPersistentMutation(capability)) logger.info({ ...audit }, 'capability-audit');
+  else if (auditOnAllow) logger.info({ ...audit }, 'capability-audit');
 
-  return { allowed: verdict.allowed, plan, verdict, audit };
+  return { allowed: verdict.allowed, plan, verdict, checks: evaluated.checks, audit };
 }
 
 /**
@@ -351,9 +366,13 @@ export async function dispatchAuthorized<T>(
   ctx: AuthorizationContext,
   dispatch: () => T | Promise<T>,
   onBlocked: (result: AuthorizationResult) => T,
+  /** P3 审批：策略放行后、派发前调用；返回 input_required 则本次不执行 */
+  approval?: () => InputRequiredResult | undefined,
 ): Promise<T> {
   const auth = authorizeCall(capability, args, ctx);
   if (!auth.allowed) return onBlocked(auth);
+  const gate = approval?.();
+  if (gate) return gate as T;
   try {
     const value = await dispatch();
     const outcome = failureCodeOf(value);
@@ -370,95 +389,6 @@ export async function dispatchAuthorized<T>(
     auditTerminal(capability, auth, 'failed', detail);
     throw e;
   }
-}
-
-/**
- * 档案维度的判定（只能收紧，不能放宽）。
- *
- * 三项：
- * 1. **能力在档案面内**：档案声明的能力 glob 未命中 → 拒（`capability_not_in_profile`）；
- * 2. **kind 被档案允许**：如只读档案调用写能力 → 拒（`kind_not_allowed_by_profile`）；
- * 3. **资源收紧**：档案若声明了 `resourceScopes`，写包/读 schema 必须是它的**子集**
- *    （两个方向同口径：声明了但为空 = 什么都不允许；env 文法暂不表达该项，但机制在此一次实现）。
- *
- * `profile === undefined` 的两种情形**分开处理**（fail-closed）：
- * - 部署没启用档案机制（`profilesEnabled=false`，策略里没有档案表）：跳过全部三项（向后兼容）；
- * - 部署配了档案表却解析不到条目（空档案）：产出一条 `profile_unknown` block，**全拒**——
- *   `resolveProfile` 对"未配档案"返回隐式 default，undefined 只代表这一种情形，
- *   与 profiles.ts / tools/surface.ts 声明的"空档案 = 全拒"同口径。
- */
-function checkProfile(
-  capability: Capability,
-  plan: WritePlan,
-  profile: CallerProfile | undefined,
-  profilesEnabled: boolean,
-): Grant[] {
-  if (!profile) {
-    if (!profilesEnabled) return [];
-    return [
-      {
-        dimension: 'profile',
-        subject: '(空档案)',
-        code: 'profile_unknown',
-        severity: 'block',
-        message: `${BLOCKED_PREFIX}：本进程未解析到可用的调用方档案（已启用档案机制，但本次调用解析不到对应条目）。`,
-      },
-    ];
-  }
-  const out: Grant[] = [];
-  // 规则：权限只有一层（能力层）——门面是**入口**，不参与档案判定；档案的 kind/glob
-  // 管的是"哪些能力可用"，门面常驻（见 tools/surface.ts 的「门面常驻」）。越界由目标能力自己的
-  // 判定拦下——门面 handler 派发前会对目标能力再跑一次同一个闸门。
-  if (capability.facadeOf === undefined) {
-    const allowedByProfile = profileAllows(profile, capability.id, capability.kind);
-    if (!allowedByProfile.ok) {
-      const code = allowedByProfile.code ?? 'capability_not_in_profile';
-      // profile_unknown 在此不可达：本函数已先对 undefined 档案产出 block（见上），
-      // 走到这里 profile 必有值——profileAllows 对该情形只返回这两条码
-      const detail =
-        code === 'kind_not_allowed_by_profile'
-          ? `档案 "${profile.id}" 不允许 ${capability.kind} 类能力（允许：${profile.allowKinds.join('/') || '(无)'}）`
-          : `能力 "${capability.id}" 不在档案 "${profile.id}" 允许的能力范围内`;
-      out.push({
-        dimension: 'profile',
-        subject: profile.id,
-        code,
-        severity: 'block',
-        message: `${BLOCKED_PREFIX}：${detail}。`,
-      });
-    }
-  }
-  const scopes = profile.resourceScopes;
-  if (scopes?.writePackages) {
-    for (const pkg of plan.writePackages) {
-      // 子集语义（与 readSchemas 分支同一读法）：**声明了但为空 = 一个包都不许写**。
-      // 不能直接复用 isPackageAllowed 对空白名单的口径——那是"本判定层不限制"（见 write-boundary.ts），
-      // 与本字段"写包子集"的定义相反：想让档案只读却写成 [] 的档案会悄悄变成"可写部署白名单内的任意包"。
-      if (scopes.writePackages.length === 0 || !isPackageAllowed(pkg, scopes.writePackages)) {
-        out.push({
-          dimension: 'profile',
-          subject: pkg,
-          code: 'write_package_outside_profile',
-          severity: 'block',
-          message: `${BLOCKED_PREFIX}：目标包 "${pkg}" 不在档案 "${profile.id}" 的可写范围内。`,
-        });
-      }
-    }
-  }
-  if (scopes?.readSchemas) {
-    for (const schema of plan.readSchemas) {
-      if (!isSchemaAllowedWith(schema, scopes.readSchemas)) {
-        out.push({
-          dimension: 'profile',
-          subject: schema,
-          code: 'schema_outside_profile',
-          severity: 'block',
-          message: `${BLOCKED_PREFIX}：schema "${schema}" 不在档案 "${profile.id}" 可读的范围内。`,
-        });
-      }
-    }
-  }
-  return out;
 }
 
 /**

@@ -94,10 +94,10 @@ types ← core ← model ← services ← tools ← server ← index
 
 ## 注册期 / 调用期分层（不要合并）
 
-- **注册期**（`tools/surface.ts` 的 `computeSurface`）只决定**呈现**：哪些工具进 `tools/list`、门面索引列什么、哪些可路由。它**不做授权结论**，也不产生"已授权"状态。
-- **调用期**（`config/authorize.ts` 的 `authorizeCall`）决定**调用成不成立**：能力级（分组/deny/档案）+ 资源级（写包/读 schema）+ 部署级。门面路由、提升后平铺直调、直接工具调用**三条入口必须都经过它**（由 `dispatchAuthorized` 统一执行）。
+- **注册期**（`tools/surface.ts` 的 `computeSurface`）只决定**呈现**：哪些工具进 `tools/list`（固定为 `hana_tool_search` + `hana_invoke`）。它**不做授权结论**，也不产生"已授权"状态。
+- **调用期**（`config/authorize.ts` 的 `authorizeCall`）决定**调用成不成立**：能力级（分组/deny/档案）+ 资源级（写包/读 schema）+ 部署级。唯一执行入口 `hana_invoke` 的目标派发**必须经过它**（由 `dispatchAuthorized` 统一执行）；`hana_tool_search` 的 `policy` 只是同一个 `evaluate` 的 preview，不构成授权。
 - 典型反例：把"写包不在 `HANA_WRITE_PACKAGES`"塞进 `computeSurface`。那样能力会从工具面消失，模型只能看到"没有这个工具"，而拿不到资源边界的拦截报告；且 HTTP 每请求重建面后，同一配置下不同请求的"工具存不存在"会漂移。**资源判定永远在调用期**。
-- 防退化测试：`tests/unit/contract-layers.test.ts`（面内但越界仍被拒、三条入口同文案、deny 不出现在索引、注册面恒为六个门面）。
+- 防退化测试：`tests/unit/contract-layers.test.ts`（面内但越界仍被拒、未知/平台入口/档案外同文案、deny 不出现在发现、注册面恒为两个平台入口）。
 
 ## 文档的分层（单一事实源）
 
@@ -135,7 +135,7 @@ types ← core ← model ← services ← tools ← server ← index
 
 ## 新增一个能力时（三件"税"）
 
-1. **清单**：在 `src/capabilities/defs/<分类>.ts` 加一条（`id` / `category` / `kind` / `effects` / `title` / `description` / `inputSchema` / `annotations`；`facadeOf` 只给六个分类门面）。
+1. **清单**：在 `src/capabilities/defs/<分类>.ts` 加一条（`id` / `category` / `kind` / `effects` / `title` / `description` / `inputSchema` / `annotations`）。不要加 `facadeOf`/`rootTool`：具体能力一律经 `hana_tool_search` 选择、`hana_invoke` 执行。
    **资源形参要用带角色的构造器**：写目标包 `zWritePackageId(...)`、只读引用的包 `zReadPackageId(...)`、
    只读 schema `tagResource(z.string()…, 'readSchema')`（**必须包在最外层**——`.optional()`/`.describe()` 会换掉对象）。
    资源维度由此**自动成立**；`effects.plan` 只用来补参数声明表达不了的东西：分支叙述、`uncertain`、嵌套结构（`operations[]`）

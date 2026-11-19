@@ -102,7 +102,7 @@ export const ERROR_CODES: readonly ErrorCodeSpec[] = [
   {
     code: 'env_assertion_missing',
     category: 'environment',
-    summary: '多环境非纯读调用缺少 expectedEnvironment',
+    summary: '多环境调用缺少 expectedEnvironment',
     remediation: '传入当前环境标识（与 hana_env_list 的 current 一致，大小写不敏感）。',
   },
   {
@@ -225,7 +225,7 @@ export const ERROR_CODES: readonly ErrorCodeSpec[] = [
     code: 'tool_not_exposed',
     category: 'authorization',
     summary: '能力未对当前调用方暴露',
-    remediation: '检查 HANA_TOOL_GROUPS / HANA_TOOL_ALLOW / HANA_TOOL_DENY 与档案。',
+    remediation: '检查 HANA_TOOL_GROUPS / HANA_TOOL_DENY 与档案。',
   },
   {
     code: 'unknown_capability',

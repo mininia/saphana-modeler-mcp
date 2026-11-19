@@ -27,6 +27,33 @@ import {
 } from './environment-config.js';
 import { interceptionError } from './error-codes.js';
 import { IMPLICIT_DEFAULT_PROFILE_ID, parseProfiles, type CallerProfile } from './profiles.js';
+
+/**
+ * 权限参数收口（2026-11）：只保留 4 个 env——
+ * `HANA_TOOL_GROUPS` / `HANA_WRITE_PACKAGES` / `HANA_READ_SCHEMA` / `HANA_TOOL_DENY`。
+ * 已移除的旧变量**忽略（不生效）**，只记一次 warn：升级时残留变量不应阻断启动。
+ */
+const REMOVED_PERMISSION_ENV = [
+  'HANA_ACCESS',
+  'HANA_READONLY_SQL',
+  'HANA_APPROVAL',
+  'HANA_TOOL_ALLOW',
+  'MCP_POLICY',
+] as const;
+
+function warnRemovedPermissionEnv(env: NodeJS.ProcessEnv): void {
+  const scoped = /^HANA_(ACCESS|READONLY_SQL)_ENV_/;
+  const found = [
+    ...REMOVED_PERMISSION_ENV.filter((key) => Object.hasOwn(env, key)),
+    ...Object.keys(env).filter((key) => scoped.test(key)),
+  ];
+  if (found.length === 0) return;
+  logger.warn(
+    { ignored: found },
+    '以下权限变量已移除，已忽略（不生效）：只读由 HANA_WRITE_PACKAGES 是否为空推导；' +
+      'SQL 由是否启用 sql 组控制；破坏性操作固定需要审批',
+  );
+}
 import { DEFAULT_HTTP_HOST, DEFAULT_SSL_VALIDATE, DEFAULT_TLS } from './deployment.js';
 
 /** 默认 Locale（仅本文件使用）。2026-10-14 起由 zh_CN 改为 zh（不带国家码） */
@@ -116,9 +143,6 @@ const trimmedOrUnset = (v: unknown): unknown => {
 const intEnvSchema = (defaultValue: number, min: number, max: number) =>
   z.preprocess(emptyAsUnset, z.coerce.number().int().min(min).max(max).default(defaultValue));
 
-/** 提升预算默认值（zod default 与 parseSurfaceMax 的错误消息共用，防两处字面量漂移） */
-const SURFACE_MAX_DEFAULT = 50;
-
 const envSchema = z.object({
   // 安全要求：连接信息（主机/端口/库名/用户名/密码）一律只允许来自环境变量 / mcp.json，
   // 禁止默认值或硬编码真实环境值。
@@ -147,11 +171,6 @@ const envSchema = z.object({
   /** 租户数据库名（MDC 指定租户时填写，如 SYSTEMDB / 业务租户名；非 MDC 可省略） */
   HANA_DB_NAME: z.string().min(1).optional(),
   /**
-   * 环境的只读/可写策略（多环境）。扁平值 = 所有环境共享；命名环境用
-   * HANA_ACCESS_ENV_<XXXX> 覆盖。只读闸门只看它，不按环境名推断。
-   */
-  HANA_ACCESS: z.enum(['readwrite', 'readonly']).default('readwrite'),
-  /**
    * 环境模式（可选）：single / multi。
    * 不设置时自动判断：出现任意 `_ENV_` 变量 = multi。显式值与实际不一致时启动失败。
    */
@@ -173,27 +192,18 @@ const envSchema = z.object({
   HANA_SSL_VALIDATE: boolSchema(DEFAULT_SSL_VALIDATE),
   HANA_TIMEZONE: timeZoneSchema,
   /**
-   * 启用的工具功能分组（逗号分隔：read/write/admin）。
-   * 空/未填 = 不限制（全部分组启用，向后兼容默认）。
-   * 例：HANA_TOOL_GROUPS="read" → 仅暴露数据读取，关闭全部写工具（含校验）。
-   * 合法值校验在 src/tools/groups.ts 的 parseToolFilter 完成（启动即失败）。
-   *
-   * 名称：HANA_ 前缀——与 HANA_WRITE_PACKAGES / HANA_READ_SCHEMA 同类，都是「这个 HANA 面
-   * 向客户端暴露/放行多少」的部署级范围声明（2026-10-14 复核回退：曾于 2026-10-08 改名
-   * MCP_TOOL_*，现改回 HANA_ 前缀并与其余两个范围声明对齐）。**无别名层**：MCP_TOOL_* 不再识别，
-   * 仍写旧名会被当作未设置（按需拉取，不扫描/告警无关变量）。
+   * 启用的工具分组或能力（逗号分隔）：
+   * - 组名 `read/write/admin/sql` → 启用整组；
+   * - 能力 id 或 glob（如 `hana_view_*`）→ 单独放行；
+   * 两者可混写。空/未填 = 默认 read/write/admin（**sql 关闭**）。
+   * 例：HANA_TOOL_GROUPS="read" → 仅数据读取；"read,hana_sql_analyze" → 读取 + 单个分析能力。
    */
   HANA_TOOL_GROUPS: z
     .string()
     .default('')
     .transform((s) => s.trim()),
   /**
-   * 强制启用的工具名 glob（逗号分隔，支持 * 通配；即便其分组未启用也注册）。
-   * 用于在分组开关之外单独放行个别工具。例：HANA_TOOL_ALLOW="hana_some_tool"
-   */
-  HANA_TOOL_ALLOW: z.string().default('').transform(splitList),
-  /**
-   * 强制禁用的工具名 glob（逗号分隔，支持 * 通配；优先级最高，覆盖 allow 与分组）。
+   * 强制禁用的工具名 glob（逗号分隔，支持 * 通配；优先级最高，覆盖 enable 与分组）。
    * 例：HANA_TOOL_DENY="hana_data_preview_*" 关闭所有预览工具。
    */
   HANA_TOOL_DENY: z.string().default('').transform(splitList),
@@ -201,7 +211,6 @@ const envSchema = z.object({
    * 工具面省略说明的调试开关（P1-7）：默认关闭，只说明"哪些类别被收窄/加载失败"，**不点名**被隐藏的能力。
    * 置 `names` 才在说明里输出被隐藏/失败的能力名（排障用；会泄漏能力存在性，不要常开）。
    */
-  HANA_EXPLAIN_SURFACE: z.preprocess(emptyAsUnset, z.enum(['names']).optional()),
   /**
    * 调用方档案定义：`name=kinds[:glob|glob][;name2=…]`，kinds 用 + 连接。
    * 例：MCP_PROFILES="analyst=read;dev=read+write:hana_view_*|hana_metadata_*;default=read"
@@ -228,18 +237,6 @@ const envSchema = z.object({
     .string()
     .default('')
     .transform((s) => s.trim()),
-  /**
-   * 单调用方的**提升预算**：按**工具数**算（只数能注册为工具的成员，操作级条目不注册也不计），
-   * 超出时**最旧的那个分类**整体淘汰（FIFO）。与 hana-cli 的 `MAX_DYNAMIC_TOOLS` 同值同义。
-   * 上限的意义是能力增长时不静默失控；空串按未设置处理（与其余数字旋钮同口径）。
-   */
-  MCP_CAPABILITY_SURFACE_MAX: z.preprocess(
-    emptyAsUnset,
-    z
-      .string()
-      .default(String(SURFACE_MAX_DEFAULT))
-      .transform((s) => s.trim()),
-  ),
   /** 额外允许的 SQL 查询 schema（逗号分隔，追加到 core/sql.ts 白名单；默认仅系统 schema）。
    *  多环境下扁平值 = 所有环境共享；HANA_READ_SCHEMA_ENV_<XXXX> 覆盖单个环境。
    *  2026-10-14 由 HANA_SCHEMA_ALLOW 改名而来（原名只说明「allow」，看不出 allow 什么）；
@@ -303,8 +300,12 @@ const envSchema = z.object({
     .transform((s) => s.trim()),
   /** 可切换环境标识列表（逗号分隔；大小写不敏感）；默认空 = 不可切 */
   HANA_ENV_SWITCHABLE: z.string().default('').transform(splitList),
-  /** 只读环境的 SQL 策略：select-only（默认）/ deny；仍受 sql 工具组控制 */
-  HANA_READONLY_SQL: z.enum(['select-only', 'deny']).default('select-only'),
+  /**
+   * 是否启用 hana_tool_search 的 goal 模式（配方）。默认 on。
+   * off 时只保留 discover/contract，适合验证“不走配方”的选择路径；
+   * 不改变工具面，也不影响 hana_invoke。
+   */
+  HANA_TOOL_SEARCH_GOAL: z.enum(['on', 'off']).default('on'),
   /* ── 并发与超时旋钮：池、SQL/XS 超时、激活并发 ──
    * 全部为 intEnvSchema（数字型、可留空、留空 = 默认值；非法值启动即失败）；
    * 前缀 HANA_ 的理由：这些都是与 HANA 连接侧资源相关的运行参数（与 HANA_XS_PORT/HANA_READ_SCHEMA 同类），
@@ -317,8 +318,15 @@ const envSchema = z.object({
   HANA_POOL_MAX_WAITERS: intEnvSchema(POOL_MAX_WAITERS_DEFAULT, 1, 100_000),
   /** 写路径语句超时 ms HANA_SQL_TIMEOUT_MS：防一条挂死的写语句占住池位直到进程重启（只给写路径，不加全局默认，理由见 core/limits.js） */
   HANA_SQL_TIMEOUT_MS: intEnvSchema(SQL_TIMEOUT_MS_DEFAULT, 1, 3_600_000),
+  /**
+   * SQL 直接执行（hana_sql_execute）的访问模式：
+   * - select-only（默认）：只允许 SELECT 类；
+   * - readwrite：允许 DML/DDL/管理类（仍受规则层与 HANA 账号权限约束）。
+   * 与全局写包无关；对象级 schema/对象访问由数据库账号决定。多环境可用 `_ENV_` 覆盖。
+   */
+  HANA_SQL_ACCESS: z.enum(['select-only', 'readwrite']).default('select-only'),
   /* ── hana_sql_execute（直接执行 HANA SQL）：默认关闭分组的多语句开关与结果硬上限 ──
-   * 工具本身还须 HANA_TOOL_GROUPS=sql 或 HANA_TOOL_ALLOW=hana_sql_execute 才会暴露
+   * 工具本身还须 HANA_TOOL_GROUPS 含 sql 组（或 hana_sql_execute）才会暴露
    * （sql 组默认关闭，见 tools/groups.ts）。maxRows / timeoutMs 是**工具参数**，不在这里配置；
    * 这里只保留“多语句解锁”与两个服务端结果上限（默认值取自 core/limits.js）。 */
   /** 同时解锁“多物理行”与“多语句”；默认 false（单条 + 单行） */
@@ -568,6 +576,8 @@ export interface HanaConfig {
   timezone: string;
   /** 额外允许的查询 schema（来自 HANA_READ_SCHEMA，追加到 sql.ts 白名单） */
   schemaAllow: string[];
+  /** true = 读 schema 范围由策略文档**显式**声明（含空数组 = system-only） */
+  schemaAllowExplicit?: boolean;
   /**
    * 允许写操作的仓库包前缀（大写）。非空=仅允许这些包及其下级子包；**空数组=本判定层不限制**，
    * 但端到端不是「所有包可写」——声明写包的调用会被运行期闸门以 boundary_off 拒绝（见同名字段在
@@ -575,17 +585,17 @@ export interface HanaConfig {
    * 来自 mcp.json/.env 的 HANA_WRITE_PACKAGES（逗号分隔）。运行时由 configureWritePackages 接线。
    */
   writePackages: string[];
+  /** true = 写包范围由策略文档**显式**声明（含空数组 = deny-all；区别于未配置） */
+  writePackagesExplicit?: boolean;
   /**
-   * 启用的工具功能分组（原始逗号分隔字符串，保留原样供 groups.ts 解析）。
-   * 空=不限制（全部分组启用）；非空=仅启用指定分组（read/write/admin）。
+   * 启用的工具分组或能力（原始逗号分隔字符串，保留原样供 groups.ts 解析）。
+   * 空=默认 read/write/admin（sql 关闭）；非空=组名与能力 id/glob 的显式列表。
    */
   toolGroups: string;
-  /** 强制启用的工具名 glob 列表（覆盖分组开关；来自 HANA_TOOL_ALLOW） */
-  toolAllow: string[];
   /** 强制禁用的工具名 glob 列表（最高优先级；来自 HANA_TOOL_DENY） */
   toolDeny: string[];
-  /** 工具面省略说明的调试开关（来自 HANA_EXPLAIN_SURFACE=names）；未配置 = 不点名被隐藏的能力 */
-  explainSurface?: 'names';
+  /** 是否启用 hana_tool_search 的 goal 模式（来自 HANA_TOOL_SEARCH_GOAL，默认 true） */
+  toolSearchGoalEnabled: boolean;
   /**
    * 调用方档案表（来自 MCP_PROFILES；空表 = 只有隐式 default 档案，不额外收紧）。
    * 档案只作用于**调用期授权**（config/authorize.ts），不改变注册期可见性。
@@ -595,8 +605,6 @@ export interface HanaConfig {
   profileId: string;
   /** 进程级归因标签（来自 MCP_AGENT_LABEL；空 = 不产生该字段） */
   agentLabel: string;
-  /** 单调用方的提升预算（来自 MCP_CAPABILITY_SURFACE_MAX；按工具数、最旧分类整体淘汰） */
-  surfaceMax: number;
   logLevel: string;
   /** Streamable HTTP 端口。undefined = stdio 传输（默认）；设置 = HTTP 模式监听（0 = 随机端口） */
   httpPort?: number;
@@ -614,9 +622,13 @@ export interface HanaConfig {
   httpAllowAnonymous: boolean;
   /** 环境标识（规范化为大写）；单环境为 DEFAULT */
   envKey?: string;
-  /** 只读/可写策略（HANA_ACCESS / HANA_ACCESS_ENV_<XXXX>） */
+  /** 只读/可写策略：由写包是否为空推导（空 = readonly） */
   access?: 'readwrite' | 'readonly';
-  /** 只读环境 SQL 策略（HANA_READONLY_SQL） */
+  /** SQL 直接执行的访问模式（HANA_SQL_ACCESS；默认 select-only） */
+  sqlAccess?: 'select-only' | 'readwrite';
+  /** 破坏性操作审批策略：固定为 destructive（不再可配） */
+  approvalPolicy: 'off' | 'destructive';
+  /** 只读环境 SQL 策略：固定 select-only（要完全关闭 SQL 请不启用 sql 组） */
   readonlySql?: 'select-only' | 'deny';
   /** XS 写通道是否走 HTTPS；undefined = 回退进程级 HANA_XS_TLS */
   xsTls?: boolean;
@@ -817,21 +829,6 @@ function assertProfileConfig(
 }
 
 /**
- * 解析提升预算（MCP_CAPABILITY_SURFACE_MAX）：1..1000 的整数，缺省 {@link SURFACE_MAX_DEFAULT}
- * （与 hana-cli 的 `MAX_DYNAMIC_TOOLS` 同值）。越界一律启动失败——配错却静默取默认，表现为
- * "面突然被提前淘汰"，是很难查的。
- */
-function parseSurfaceMax(raw: string): number {
-  const n = Number(raw);
-  if (!Number.isInteger(n) || n < 1 || n > 1000) {
-    throw new Error(
-      `MCP_CAPABILITY_SURFACE_MAX 非法：应为 1..1000 的整数（当前 "${raw}"，默认 ${SURFACE_MAX_DEFAULT}）`,
-    );
-  }
-  return n;
-}
-
-/**
  * 加载并校验配置。HANA_HOST/HANA_PORT/HANA_USER/HANA_PASSWORD 必填（无默认值），
  * 缺失或非法抛 zod 校验错误（服务启动即失败，不给半配置运行的机会）。
  *
@@ -892,15 +889,15 @@ function loadInternal(env: NodeJS.ProcessEnv): LoadedEnvironments {
     sslValidate: parsed.HANA_SSL_VALIDATE,
     timezone: parsed.HANA_TIMEZONE,
     schemaAllow: parsed.HANA_READ_SCHEMA,
+    ...(Object.hasOwn(env, 'HANA_READ_SCHEMA') ? { schemaAllowExplicit: true } : {}),
     writePackages: parsed.HANA_WRITE_PACKAGES,
+    ...(Object.hasOwn(env, 'HANA_WRITE_PACKAGES') ? { writePackagesExplicit: true } : {}),
     toolGroups: parsed.HANA_TOOL_GROUPS,
-    toolAllow: parsed.HANA_TOOL_ALLOW,
     toolDeny: parsed.HANA_TOOL_DENY,
-    explainSurface: parsed.HANA_EXPLAIN_SURFACE,
+    toolSearchGoalEnabled: parsed.HANA_TOOL_SEARCH_GOAL !== 'off',
     profiles,
     profileId: parsed.MCP_PROFILE,
     agentLabel: parsed.MCP_AGENT_LABEL,
-    surfaceMax: parseSurfaceMax(parsed.MCP_CAPABILITY_SURFACE_MAX),
     logLevel: parsed.LOG_LEVEL,
     xsPort,
     xsBasePath: parsed.HANA_XS_BASE_PATH,
@@ -909,6 +906,7 @@ function loadInternal(env: NodeJS.ProcessEnv): LoadedEnvironments {
     poolWaitMs: parsed.HANA_POOL_WAIT_MS,
     poolMaxWaiters: parsed.HANA_POOL_MAX_WAITERS,
     sqlTimeoutMs: parsed.HANA_SQL_TIMEOUT_MS,
+    sqlAccess: parsed.HANA_SQL_ACCESS,
     // hana_sql_execute 的多语句开关与结果上限（maxRows/timeoutMs 是工具参数，不在这里）
     sqlAllowMultiStatement: parsed.HANA_SQL_ALLOW_MULTI_STATEMENT,
     sqlMaxResultBytes: parsed.HANA_SQL_MAX_RESULT_BYTES,
@@ -926,9 +924,10 @@ function loadInternal(env: NodeJS.ProcessEnv): LoadedEnvironments {
     httpAllowAnonymous: parsed.MCP_HTTP_ALLOW_ANONYMOUS,
     connectionSources: dotenv.sources,
     connectionSourceMixed,
-    // 环境维度：单环境在 buildEnvironments 里填 DEFAULT；多环境填各自 _ENV_ 标识
-    access: parsed.HANA_ACCESS,
-    readonlySql: parsed.HANA_READONLY_SQL,
+    // 环境维度：只读由写包推导；审批固定为破坏性操作需确认；SQL 只读态固定 select-only。
+    access: (parsed.HANA_WRITE_PACKAGES?.length ?? 0) > 0 ? 'readwrite' : 'readonly',
+    approvalPolicy: 'destructive',
+    readonlySql: 'select-only',
     xsTls: parsed.HANA_XS_TLS,
   };
 
@@ -940,6 +939,9 @@ function loadInternal(env: NodeJS.ProcessEnv): LoadedEnvironments {
       '本版仅支持 strict；legacy 兼容层未实现，请按 scripts/migrate-env-config.mjs 的报告迁移。',
     );
   }
+
+  // 授权参数收口：旧变量必须移除（静默忽略会让“以为生效、实际没生效”）。
+  warnRemovedPermissionEnv(env);
 
   const loaded = buildEnvironments(env, baseConfig, {
     start: parsed.HANA_ENV_START,

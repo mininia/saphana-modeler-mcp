@@ -116,25 +116,11 @@ export const PARAM_REGISTRY: readonly ParamSpec[] = [
 
   // ── 策略/授权参数：扁平 = 所有环境共享；_ENV_ = 覆盖单个环境 ──
   {
-    name: 'ACCESS',
-    envVar: 'HANA_ACCESS',
-    scope: 'policy',
-    defaultValue: 'readwrite',
-    description: '环境只读/可写策略（readwrite / readonly）',
-  },
-  {
-    name: 'READONLY_SQL',
-    envVar: 'HANA_READONLY_SQL',
-    scope: 'policy',
-    defaultValue: 'select-only',
-    description: '只读环境的 SQL 策略（select-only / deny）',
-  },
-  {
     name: 'WRITE_PACKAGES',
     envVar: 'HANA_WRITE_PACKAGES',
     scope: 'policy',
     defaultValue: '',
-    description: '允许写操作的仓库包前缀；空 = 无写包',
+    description: '允许写操作的仓库包前缀；空 = 无写包（只读）',
   },
   {
     name: 'READ_SCHEMA',
@@ -149,6 +135,27 @@ export const PARAM_REGISTRY: readonly ParamSpec[] = [
     scope: 'policy',
     defaultValue: '60000',
     description: '写路径 SQL 语句超时（ms）',
+  },
+  {
+    name: 'SQL_ACCESS',
+    envVar: 'HANA_SQL_ACCESS',
+    scope: 'policy',
+    defaultValue: 'select-only',
+    description: 'SQL 直接执行的访问模式（select-only / readwrite）',
+  },
+  {
+    name: 'TOOL_GROUPS',
+    envVar: 'HANA_TOOL_GROUPS',
+    scope: 'policy',
+    defaultValue: '',
+    description: '启用的工具分组或能力（组名 / 能力 glob，逗号分隔）；扁平 = 所有环境共享',
+  },
+  {
+    name: 'TOOL_DENY',
+    envVar: 'HANA_TOOL_DENY',
+    scope: 'policy',
+    defaultValue: '',
+    description: '强制禁用的工具名/组名 glob；扁平 = 所有环境共享',
   },
   {
     name: 'SQL_ALLOW_MULTI_STATEMENT',
@@ -209,39 +216,11 @@ export const PARAM_REGISTRY: readonly ParamSpec[] = [
 
   // ── 进程级 · 能力面 ──
   {
-    name: 'TOOL_GROUPS',
-    envVar: 'HANA_TOOL_GROUPS',
+    name: 'TOOL_SEARCH_GOAL',
+    envVar: 'HANA_TOOL_SEARCH_GOAL',
     scope: 'process',
     processGroup: 'capability',
-    description: '启用的工具功能分组',
-  },
-  {
-    name: 'TOOL_ALLOW',
-    envVar: 'HANA_TOOL_ALLOW',
-    scope: 'process',
-    processGroup: 'capability',
-    description: '强制启用的工具名/组名 glob',
-  },
-  {
-    name: 'TOOL_DENY',
-    envVar: 'HANA_TOOL_DENY',
-    scope: 'process',
-    processGroup: 'capability',
-    description: '强制禁用的工具名/组名 glob',
-  },
-  {
-    name: 'EXPLAIN_SURFACE',
-    envVar: 'HANA_EXPLAIN_SURFACE',
-    scope: 'process',
-    processGroup: 'capability',
-    description: '工具面省略说明的调试开关',
-  },
-  {
-    name: 'CAPABILITY_SURFACE_MAX',
-    envVar: 'MCP_CAPABILITY_SURFACE_MAX',
-    scope: 'process',
-    processGroup: 'capability',
-    description: '单调用方提升预算（按工具数）',
+    description: 'enables hana_tool_search goal mode (on/off)',
   },
   {
     name: 'PROFILES',

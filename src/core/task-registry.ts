@@ -26,6 +26,7 @@
 import { randomUUID } from 'node:crypto';
 import { HanaBusinessError } from './errors.js';
 import { currentEnvironmentKey, currentEnvironmentRuntime, reclaimDrainingEnvironment } from './environment-context.js';
+import { bindExecutionContextTask, currentExecutionContext } from './execution-context.js';
 import { TASK_MAX_RETAINED_DEFAULT, TASK_MAX_RUNNING_DEFAULT, TASK_TTL_MS_DEFAULT } from './limits.js';
 
 export type TaskStatus = 'working' | 'completed' | 'failed' | 'cancelled';
@@ -133,7 +134,7 @@ export function createTask(owner: string, label: string, total: number, kind: Ta
     owner,
     kind,
     // 提交时捕获环境：任务体之后即使切换 active，也不会跑到新环境上
-    environment: runtime?.envKey ?? currentEnvironmentKey(),
+    environment: runtime?.envKey ?? currentExecutionContext()?.envKey ?? currentEnvironmentKey(),
     envEpoch: runtime?.epoch ?? 1,
     envAccess: runtime?.access ?? 'readwrite',
     multiEnv: runtime?.multiEnv ?? false,
@@ -145,6 +146,8 @@ export function createTask(owner: string, label: string, total: number, kind: Ta
     progress: { total, done: 0 },
   };
   tasks.set(record.id, record);
+  // 把任务 id/环境/代际绑进本次调用上下文（审计/后续回执可读）；无上下文时静默跳过。
+  bindExecutionContextTask({ taskId: record.id, environment: record.environment, epoch: record.envEpoch });
   return record;
 }
 

@@ -1,24 +1,20 @@
 import type { McpServer, ServerContext, CallToolResult, InputRequiredResult } from '@modelcontextprotocol/server';
 import { z } from 'zod';
-import { parseToolFilter, shouldRegisterTool, matchGlob, type ToolFilterConfig, ALL_TOOL_GROUPS } from './groups.js';
+import { shouldRegisterTool, matchGlob, toolFilterOf, type ToolFilterConfig, ALL_TOOL_GROUPS } from './groups.js';
 import { logger } from '../core/logger.js';
 import { currentIdentity } from '../core/request-context.js';
 import { activeProfile } from '../config/profiles.js';
 import { policyFromConfig } from '../config/preflight.js';
+import { approvalGate } from '../config/approval.js';
 import { blockedCallResult, dispatchAuthorized } from '../config/authorize.js';
 import { capabilityInputSchema } from '../config/environment-policy.js';
 import { registeredNameOf, type Capability } from '../capabilities/types.js';
-import { CAPABILITY_LIST, membersOfCategory } from '../capabilities/manifest.js';
-import { facadeDescription } from '../capabilities/facades.js';
+import { CAPABILITY_LIST, manifestRev } from '../capabilities/manifest.js';
 import { computeSurface, type CallerSurface } from './surface.js';
-import {
-  getRawHandler,
-  hasDynamicHandle,
-  recordDynamicHandle,
-  recordRawHandler,
-  removeDynamicHandle,
-} from './handler-registry.js';
-import { registerCapabilityTools } from './capability.tools.js';
+import { policyRevOf } from './contracts.js';
+import { recordRawHandler } from './handler-registry.js';
+import { registerToolSearchTools } from './tool-search.tools.js';
+import { registerInvokeTools } from './invoke.tools.js';
 import { registerSystemTools } from './system.tools.js';
 import { registerEnvironmentTools } from './env.tools.js';
 import { registerPackageTools } from './package.tools.js';
@@ -37,6 +33,7 @@ import {
   reclaimDrainingEnvironment,
   runWithEnvironment,
 } from '../core/environment-context.js';
+import { createExecutionContext, runWithExecutionContext } from '../core/execution-context.js';
 
 export interface ToolContext {
   /** HANA 连接池（懒连接，工具经池访问 HANA） */
@@ -44,8 +41,8 @@ export interface ToolContext {
   /** 已校验配置（含脱敏摘要供 ping 类工具展示） */
   config: HanaConfig;
   /**
-   * 工具可见性过滤配置（由 HANA_TOOL_GROUPS/HANA_TOOL_ALLOW/HANA_TOOL_DENY 解析而来）。
-   * 未进面的能力不出现在 tools/list，但仍可经门面路由调用（判定走同一套闸门）。
+   * 工具可见性过滤配置（由 HANA_TOOL_GROUPS/HANA_TOOL_DENY 解析而来）。
+   * 未进 entitlement 的能力不可发现、也不可执行（判定走同一套闸门）。
    */
   toolFilter: ToolFilterConfig;
   /**
@@ -55,8 +52,8 @@ export interface ToolContext {
    */
   manager?: EnvironmentManager;
   /**
-   * 本次 server 构建使用的**面**：`(门面 ∪ 已提升分类的成员) ∩ 部署策略 ∩ 档案`。
-   * HTTP 按请求构建（于是每个身份看到自己的面）；stdio 单实例。省略 = 由 `surfaceOf` 现算。
+   * 本次 server 构建使用的**面**：两个平台入口（`hana_tool_search` / `hana_invoke`）∩ 部署策略 ∩ 档案。
+   * HTTP 按请求构建（于是每个身份看到自己的面）；stdio 单实例。省略 = 由 computeSurface 现算。
    */
   surface?: CallerSurface;
 }
@@ -68,9 +65,9 @@ function surfaceOf(ctx: ToolContext): CallerSurface {
   return ctx.surface ?? computeSurface(ctx, currentIdentity());
 }
 
-/** 由 mcp.json/.env 配置解析得到 ToolFilterConfig；无效分组名在此抛错（fail-closed：启动即失败） */
+/** 由 mcp.json/.env 配置解析得到 ToolFilterConfig；多环境下应按当前环境 config 调用 */
 export function buildToolFilter(config: HanaConfig): ToolFilterConfig {
-  return parseToolFilter(config.toolGroups, config.toolAllow.join(','), config.toolDeny.join(','));
+  return toolFilterOf(config);
 }
 
 /**
@@ -89,17 +86,23 @@ function registerVisibleTool(server: McpServer, ctx: ToolContext): McpServer['re
 
 /**
  * 能力清单条目 → SDK 的 registerTool 配置：title / inputSchema / annotations 全部取自清单。
- * 门面描述按 surface 重建，文本随 deny / 分组 / 档案的收窄而收窄。
+ * 具体能力默认不注册；只有平台入口会进入工具面。
  */
-function registrationOf<S extends z.ZodType>(cap: Capability<S>, surface: CallerSurface, multiEnv: boolean) {
+function registrationOf<S extends z.ZodType>(
+  cap: Capability<S>,
+  _surface: CallerSurface,
+  multiEnv: boolean,
+  goalEnabled = true,
+) {
   const description =
-    cap.facadeOf !== undefined
-      ? facadeDescription(cap.facadeOf, membersOfCategory(cap.facadeOf), (m) => surface.entitlementIds.has(m.id))
+    cap.id === 'hana_tool_search' && !goalEnabled
+      ? `${cap.description}
+（本部署已关闭 goal 模式：只用 discover/contract。）`
       : cap.description;
   return {
     title: cap.title,
     description,
-    // 多环境下非纯读能力（mutates != none，含临时对象）要求 expectedEnvironment；纯读/单环境原样返回
+    // 多环境下所有具体能力都要求 expectedEnvironment；平台入口/单环境原样返回
     inputSchema: capabilityInputSchema(cap, multiEnv),
     annotations: cap.annotations,
   };
@@ -133,12 +136,12 @@ export function capabilityRegistrar(server: McpServer, ctx: ToolContext): Capabi
     cap: Capability<S>,
     handler: CapabilityHandler<S>,
   ): void {
-    // ① 原始 handler 先入表：门面按目标能力授权后直接派发，不再过一遍闸门
+    // ① 原始 handler 先入表：hana_invoke 按目标能力授权后直接派发，不再过一遍闸门
     recordRawHandler(server, cap.id, handler);
-    // ② 可见则注册（配置来自清单）
+    // ② 只有平台入口会进面；具体能力仅登记原始 handler，供 hana_invoke 派发
     (register as (n: string, c: unknown, f: unknown) => unknown)(
       registeredNameOf(cap),
-      registrationOf(cap, surface, ctx.manager?.multiEnv === true),
+      registrationOf(cap, surface, ctx.manager?.multiEnv === true, ctx.config.toolSearchGoalEnabled !== false),
       gatedHandler(ctx, cap, handler),
     );
   } as CapabilityRegistrar;
@@ -153,8 +156,8 @@ export function capabilityRegistrar(server: McpServer, ctx: ToolContext): Capabi
 }
 
 /**
- * 给 handler 套上统一调用期闸门（注册路径与动态注册共用）。
- * 策略来自已加载的 config（不重新解析 env）；档案：身份里带就用它，否则落进程默认。
+ * 给 handler 套上统一调用期闸门（平台入口注册路径使用）。
+ * 具体能力的派发由 hana_invoke 里的 dispatchAuthorized 负责；两条路径共用同一判定壳。
  */
 function gatedHandler<S extends z.ZodType>(
   ctx: ToolContext,
@@ -170,163 +173,115 @@ function gatedHandler<S extends z.ZodType>(
         cap,
         args,
         {
-          policy: policyFromConfig(ctx.config, ctx.toolFilter),
+          policy: policyFromConfig(ctx.config, toolFilterOf(ctx.config, ctx.toolFilter)),
           profile: activeProfile(ctx.config, identity),
           agentLabel: ctx.config.agentLabel,
+          policyRevExtras: {
+            readonlySql: ctx.config.readonlySql ?? 'select-only',
+            approvalPolicy: ctx.config.approvalPolicy,
+          },
         },
         () => (handler as (a: unknown, e: unknown) => unknown)(args, extra),
         (auth) => blockedCallResult(auth) as never,
+        () => approvalGate(cap, args, ctx.config.approvalPolicy, extra as ServerContext, identity?.clientId),
       );
     // 多环境：入口取一次 runtime 并绑定到本次调用（含异步续体）。捕获发生在任何 await 之前，
     // 因此之后切换 active 不会影响这次调用；policyFromConfig(ctx.config) 也读绑定值。
     const manager = ctx.manager;
-    if (!manager) return run();
     // HTTP 请求入口可能已按 Token 绑定 runtime；有绑定就用它，stdio/未绑定才用进程 active。
-    const runtime = currentEnvironmentRuntime() ?? manager.current();
-    runtime.callRefs += 1;
-    manager.beginCall();
-    return runWithEnvironment(runtime, async () => {
-      try {
-        return await run();
-      } finally {
-        runtime.callRefs = Math.max(0, runtime.callRefs - 1);
-        manager.endCall();
-        // 切走后进入 task-draining 的环境：最后一个在途调用结束（且无任务）时回 idle/关空闲池。
-        reclaimDrainingEnvironment(runtime);
-      }
+    const runtime = manager ? (currentEnvironmentRuntime() ?? manager.current()) : undefined;
+    const profile = activeProfile(ctx.config, identity);
+    const execution = createExecutionContext({
+      ...(identity ? { identity } : {}),
+      ...(runtime ? { runtime } : {}),
+      policyRev: policyRevOf(ctx.config, ctx.toolFilter, profile, runtime),
+      manifestRev: manifestRev(),
     });
+    const invoke = (): unknown => {
+      if (!manager || !runtime) return run();
+      runtime.callRefs += 1;
+      manager.beginCall();
+      return runWithEnvironment(runtime, async () => {
+        try {
+          return await run();
+        } finally {
+          runtime.callRefs = Math.max(0, runtime.callRefs - 1);
+          manager.endCall();
+          // 切走后进入 task-draining 的环境：最后一个在途调用结束（且无任务）时回 idle/关空闲池。
+          reclaimDrainingEnvironment(runtime);
+        }
+      });
+    };
+    return runWithExecutionContext(execution, invoke);
   };
-}
-
-/**
- * 动态提升的注册结果（P1-6）：成功清单 + 可重试的失败清单。
- * `failures` 是**瞬时/编程**失败（handler 未登记、注册器抛错），重试门面调用可能补齐；
- * 策略性省略（deny/档案）在面计算阶段就被排除，不会走到这里。
- */
-export interface DynamicRegistrationResult {
-  registered: string[];
-  failures: { capabilityId: string; reason: string }[];
-}
-
-/**
- * 把已提升的能力挂到当前已连接的实例上（stdio 路径）。
- * HTTP 无会话、每请求新建 server，下一个请求自然带上新能力，不需要它。
- * 闸门照旧包上——动态注册与静态注册走同一条判定。
- */
-export function registerCapabilitiesDynamically(
-  server: McpServer,
-  ctx: ToolContext,
-  caps: readonly Capability[],
-): DynamicRegistrationResult {
-  const registered: string[] = [];
-  const failures: { capabilityId: string; reason: string }[] = [];
-  // SDK 的 registerTool 每注册一个工具就发一次 notifications/tools/list_changed。
-  // 一次提升 N 个工具会产生 N 次通知；宿主（如 DSH）收到后会做整代替换，多次替换会把
-  // 当前步的 toolSet 打失效（表现为整步 UNKNOWN_TOOL）。批量注册期间静默，结束后只发一次。
-  // 测试里的 duck-typed server 可能没有该方法：有则批量，没有则跳过（真实 McpServer 恒有）。
-  const originalNotify = typeof server.sendToolListChanged === 'function' ? server.sendToolListChanged : undefined;
-  if (originalNotify) server.sendToolListChanged = () => {};
-  try {
-    for (const cap of caps) {
-      const name = registeredNameOf(cap);
-      if (hasDynamicHandle(server, name)) continue; // 幂等：重复提升同一分类不重复挂
-      // 根工具（hana_sql_execute）在 entitled 时已由注册器**静态**注册；提升时再挂一次会撞名。
-      // 它本来就是常驻的（rootTool 语义），不需要也不应该经“分类提升”进入工具面。
-      if (cap.rootTool === true) continue;
-      const raw = getRawHandler(server, cap.id);
-      if (!raw) {
-        // 面内但本进程没有 handler：编程错误，响亮记录而非静默跳过
-        logger.error({ capabilityId: cap.id }, '提升：目标能力的 handler 未注册（清单与注册不同步），本次跳过');
-        failures.push({ capabilityId: cap.id, reason: 'handler_missing' });
-        continue;
-      }
-      try {
-        const handle = server.registerTool(
-          name,
-          registrationOf(cap, surfaceOf(ctx), ctx.manager?.multiEnv === true),
-          gatedHandler(ctx, cap, raw as CapabilityHandler<typeof cap.inputSchema>) as never,
-        ) as unknown as { remove(): void };
-        recordDynamicHandle(server, name, handle);
-        registered.push(name);
-      } catch (e) {
-        // 单个注册失败不拖垮整类：记 warning，交由调用方回报 partial（可重试）
-        logger.error({ capabilityId: cap.id, err: e }, '提升：能力注册失败（本次跳过，重试门面调用可补齐）');
-        failures.push({ capabilityId: cap.id, reason: 'register_failed' });
-      }
-    }
-  } finally {
-    if (originalNotify) server.sendToolListChanged = originalNotify;
-  }
-  if (registered.length > 0 && originalNotify) server.sendToolListChanged();
-  return { registered, failures };
-}
-
-/**
- * 把已淘汰的能力从当前已连接的实例上摘下来（stdio 路径；静态门面不参与淘汰）。
- * HTTP 不需要它：下一个请求重建 server 时面里自然不再包含被淘汰的分类。
- *
- * @returns 真正被摘下的工具名
- */
-export function unregisterCapabilities(server: McpServer, toolNames: readonly string[]): string[] {
-  const removed: string[] = [];
-  for (const name of toolNames) {
-    if (removeDynamicHandle(server, name)) removed.push(name);
-  }
-  return removed;
 }
 
 /**
  * 启动时打印工具可见性摘要（仅配置了过滤变量时输出），便于排查「为何某工具没注册」。
  * 操作级别名不是工具，不列入。
  */
-export function logToolFilterSummary(filter: ToolFilterConfig): void {
+export function logToolFilterSummary(filter: ToolFilterConfig, envKey?: string): void {
+  const prefix = envKey ? `[${envKey}] ` : '';
   // sql 组是**默认关闭**的独立分组：空配置不等于“全部启用”。只在既未启用、也未被显式 deny 时
   // 提示一次（启动期唯一一次；指数级 HTTP 每请求构建不会再刷）。
   const sqlEnabled = filter.enabledGroups.has('sql') || matchGlob('hana_sql_execute', filter.allowPatterns);
   const sqlDenied = matchGlob('hana_sql_execute', filter.denyPatterns);
   if (!sqlEnabled && !sqlDenied) {
     logger.info(
-      'sql 组默认关闭：hana_sql_execute 不注册、不出现在 tools/list 与门面索引；' +
-        '需显式 HANA_TOOL_GROUPS=sql 或 HANA_TOOL_ALLOW=hana_sql_execute 才启用',
+      `${prefix}sql 组默认关闭：hana_sql_execute 不可发现、不可执行（也不在 tools/list）；` +
+        '需显式 HANA_TOOL_GROUPS=sql（或 hana_sql_execute）才启用',
     );
   }
-  if (filter.enabledGroups.size === 0 && filter.allowPatterns.length === 0 && filter.denyPatterns.length === 0) {
+  if (
+    filter.enabledGroups.size === 0 &&
+    filter.allowPatterns.length === 0 &&
+    filter.denyPatterns.length === 0 &&
+    filter.groupsExplicit !== true
+  ) {
     return; // 全空 = 不过滤 read/write/admin（sql 除外），不打扰日志
   }
   // 空配置下 read/write/admin 默认启用，sql 默认关闭——摘要如实反映，不写成“全部启用”
   const groupSummary = Array.from(ALL_TOOL_GROUPS)
-    .map(
-      (g) =>
-        `${g}${filter.enabledGroups.size === 0 ? (g === 'sql' ? '✗' : '✓') : filter.enabledGroups.has(g) ? '✓' : '✗'}`,
-    )
+    .map((g) => {
+      const on =
+        filter.enabledGroups.size === 0 ? filter.groupsExplicit !== true && g !== 'sql' : filter.enabledGroups.has(g);
+      return `${g}${on ? '✓' : '✗'}`;
+    })
     .join(' ');
   logger.info(
-    { enabledGroups: groupSummary, allow: filter.allowPatterns, deny: filter.denyPatterns },
-    '工具可见性过滤已启用（HANA_TOOL_GROUPS/HANA_TOOL_ALLOW/HANA_TOOL_DENY）',
+    {
+      ...(envKey ? { envKey } : {}),
+      enabledGroups: groupSummary,
+      allow: filter.allowPatterns,
+      deny: filter.denyPatterns,
+    },
+    `${prefix}工具可见性过滤已启用（HANA_TOOL_GROUPS/HANA_TOOL_DENY）`,
   );
-  // 列出被关闭的工具名（帮助确认配置符合预期）
-  const allNames = CAPABILITY_LIST.filter((c) => c.routeOnly !== true).map((c) => c.id);
+  // 列出被关闭的能力名（帮助确认配置符合预期：它们在发现/执行两层都不可达）
+  const allNames = CAPABILITY_LIST.filter((c) => c.routeOnly !== true && c.platform !== true).map((c) => c.id);
   const disabled = allNames.filter((name) => !shouldRegisterTool(name, filter));
   if (disabled.length > 0) {
     logger.info(
-      { disabledCount: disabled.length, disabled: disabled.join(', ') },
-      '以下工具被配置关闭（不出现在 tools/list）',
+      { ...(envKey ? { envKey } : {}), disabledCount: disabled.length, disabled: disabled.join(', ') },
+      `${prefix}以下能力被配置关闭（不可发现、不可执行）`,
     );
   }
 }
 
 /**
- * 注册全部工具。可见性 = 本次构建的面（见 surface.ts）；零可见时什么都不注册。
+ * 注册全部工具。工具面 = 两个平台入口（见 surface.ts）；具体能力只登记 handler，
+ * 供 `hana_invoke` 在内层按目标能力授权后派发。零可见时什么都不注册。
  * 实测（SDK 2.3.1）：零注册时服务端不声明 tools，客户端 tools/list 得到 -32601，
  * 由下方 warn 与 npm run preflight 兜底。
  */
 export function registerAllTools(server: McpServer, ctx: ToolContext): void {
   // 面算一次、贯穿本次构建
   const effective = surfaceOf(ctx);
-  // 门面最先注册（入口排最前）；stdio 的动态注册也是 append 到末尾，两种传输顺序一致。
-  registerCapabilityTools(server, ctx);
+  // 两个平台入口最先注册（选择 → 执行）；其余模块只登记原始 handler。
+  registerToolSearchTools(server, ctx);
+  registerInvokeTools(server, ctx);
   registerSystemTools(server, ctx);
-  // 环境管理紧随 system：多环境才注册 hana_env_list / hana_env_switch（route-only）
+  // 环境管理紧随 system：多环境才让 hana_env_list / hana_env_switch 可达（均经本体层选择）
   registerEnvironmentTools(server, ctx);
   registerPackageTools(server, ctx);
   registerMetadataTools(server, ctx);
@@ -345,7 +300,7 @@ export function registerAllTools(server: McpServer, ctx: ToolContext): void {
   if (!anyVisible) {
     logger.warn(
       '当前配置未启用任何工具：SDK 不会声明 tools 能力，客户端调 tools/list 将得到 -32601。' +
-        '请检查 HANA_TOOL_GROUPS/HANA_TOOL_ALLOW/HANA_TOOL_DENY（空=read/write/admin 启用，sql 默认关闭）。',
+        '请检查 HANA_TOOL_GROUPS/HANA_TOOL_DENY（空=read/write/admin 启用，sql 默认关闭）。',
     );
   }
 }

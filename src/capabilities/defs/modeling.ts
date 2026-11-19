@@ -349,6 +349,11 @@ const baseModelingCapabilities = {
       notFor: ['只是预览数据用 hana_data_preview'],
       priority: 'primary',
       exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV008', target: 'design' },
+      returns: [
+        'CheckResult 编译明细（成功/失败与具体错误）',
+        'design 模式临时副本写后即删；清理失败回执 tempResidue',
+        'runtime 模式校验已激活视图一致性',
+      ],
     },
     title: '校验计算视图一致性',
     description:
@@ -416,6 +421,11 @@ const baseModelingCapabilities = {
       priority: 'primary',
       requires: '目标包在 HANA_WRITE_PACKAGES 可写范围内',
       exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV008' },
+      returns: [
+        '激活结果 + 编译错误明细（失败不误报成功）',
+        '412 并发冲突按机读回执返回',
+        '激活后运行时视图在 _SYS_BIC',
+      ],
     },
     title: '激活 Calculation View（设计时对象）',
     description:
@@ -439,7 +449,16 @@ const baseModelingCapabilities = {
       notFor: ['新建用 hana_view_create；不要 delete+重建'],
       priority: 'primary',
       requires: '目标包在 HANA_WRITE_PACKAGES 可写范围内',
-      exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV008', operations: [] },
+      exampleArgs: {
+        packageId: 'ZDEMO.ZDEMO_MGF',
+        objectName: 'ZDEMO02_CV008',
+        operations: [{ op: 'set_description', description: '示例描述' }],
+      },
+      returns: [
+        'operations 模式：每条操作的应用明细 + 实测激活状态',
+        'dryRun=true：mode=dryRun + 结构 diff/影响半径/breaking，零写入',
+        '412 冲突：raw.conflict 带当前 ETag/版本；changeset 逐项 report',
+      ],
     },
     title: '更新 Calculation View（声明式 operations / 全量 XML / 变更集）',
     // 硬保留（验收脚本断言）：三方式互斥、关键参数名、migration 合法值、机读码全集、回执字段名、零写入语义。

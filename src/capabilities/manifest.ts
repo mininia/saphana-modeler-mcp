@@ -9,10 +9,10 @@
  * ② tools/<模块>.tools.ts 用 regCap(CAP.<id>, handler) 注册；③ manifest 完整性测试会核对。
  */
 
-import type { z } from 'zod';
-import type { Capability, CapabilityCategory, ToolKind } from './types.js';
+import { createHash } from 'node:crypto';
+import { z } from 'zod';
+import { isPlatformToolId, type Capability, type CapabilityCategory, type ToolKind } from './types.js';
 import { planFallback, planReadless } from './planners.js';
-import { buildFacades } from './facades.js';
 import { deriveResourcesFromParams, mergeDeclaredIntoPlan } from './resources.js';
 import type { WritePlan } from '../write-plan.js';
 import { systemCapabilities } from './defs/system.js';
@@ -22,11 +22,13 @@ import { previewCapabilities } from './defs/preview.js';
 import { modelingCapabilities } from './defs/modeling.js';
 import { sqlAnalyzeCapabilities } from './defs/sql-analyze.js';
 import { sqlExecuteCapabilities } from './defs/sql-execute.js';
+import { toolSearchCapabilities } from './defs/tool-search.js';
+import { invokeCapabilities } from './defs/invoke.js';
 import { healthCapabilities } from './defs/health.js';
 
 /**
- * 基础能力表（不含门面）。表内顺序 = 模块注册顺序，也是门面描述里成员的排列顺序。
- * 注册面 = 六个门面：具体能力只经门面路由调用；分类提升后才动态进 tools/list。
+ * 全量能力表。表内顺序 = 模块注册顺序，也是发现排序的稳定次序。
+ * 工具面只有两个平台入口（`hana_tool_search` / `hana_invoke`）；其余条目只经本体层选择后执行。
  * 保持每个条目的精确 schema 类型（satisfies 只约束、不拓宽），handler 参数推断依赖它。
  */
 const BASE_CAPABILITIES = {
@@ -36,21 +38,16 @@ const BASE_CAPABILITIES = {
   ...previewCapabilities,
   ...modelingCapabilities,
   ...sqlAnalyzeCapabilities,
-  // SQL 直接执行（kind=sql，默认关闭的独立分组；rootTool 常驻但受 entitlement 约束）
+  // SQL 直接执行（kind=sql，默认关闭的独立分组；不是常驻工具）
   ...sqlExecuteCapabilities,
+  // 动作本体：选择入口 + 执行入口（平台工具，常驻 tools/list）
+  ...toolSearchCapabilities,
+  ...invokeCapabilities,
   ...healthCapabilities,
 } satisfies Record<string, Capability<z.ZodType>>;
 
-/**
- * 六个分类门面（从基础表派生）。单独导出是为了让注册点拿到精确键类型，门面 handler 的参数才有推断。
- */
-export const FACADES = buildFacades(Object.values(BASE_CAPABILITIES));
-
-/** 全量能力表 = 基础能力 + 六个门面（表内门面在后；注册最先，见 tools/index.ts） */
-export const CAPABILITIES = {
-  ...BASE_CAPABILITIES,
-  ...FACADES,
-} satisfies Record<string, Capability<z.ZodType>>;
+/** 全量能力表（平台入口也在内；表内顺序 = 声明顺序） */
+export const CAPABILITIES = BASE_CAPABILITIES satisfies Record<string, Capability<z.ZodType>>;
 
 /** 清单的简写别名（工具模块里写作 `CAP.hana_view_create`） */
 export const CAP = CAPABILITIES;
@@ -73,22 +70,22 @@ export function isRegisteredCapability(id: string): boolean {
 }
 
 /**
- * 某分类的成员能力（排除门面自己）。按分类过滤时若不排除门面会自指，结论随门面 kind 漂移。
+ * 某分类的成员能力。平台入口不参与业务分类成员遍历（`tool_search` 分类自身除外）。
  */
 export function membersOfCategory(category: CapabilityCategory): Capability[] {
-  return CAPABILITY_LIST.filter((c) => c.category === category && c.facadeOf === undefined);
+  return CAPABILITY_LIST.filter((c) => c.category === category && c.platform !== true);
 }
 
-/** 某可见性归属下的能力 id 列表（**含门面**：门面的 kind 是成员摘要；测试按它断言三档都还有能力） */
+/** 某可见性归属下的能力 id 列表（**不含平台入口**：平台入口没有业务 kind） */
 export function capabilitiesOfKind(kind: ToolKind): string[] {
-  return CAPABILITY_LIST.filter((c) => c.kind === kind).map((c) => c.id);
+  return CAPABILITY_LIST.filter((c) => c.kind === kind && c.platform !== true).map((c) => c.id);
 }
 
 /**
- * 具体能力（非门面）的 id 清单。判断「某个 kind 是否可达」必须用它：
- * 门面的 kind 是成员摘要，拿它判会得出「只读部署里还存在写能力」的假结论。
+ * 具体能力（非平台入口）的 id 清单。判断「某个 kind 是否可达」必须用它：
+ * 平台入口的 kind 只是注册占位，拿它判会得出「只读部署里还存在写能力」的假结论。
  */
-export const CONCRETE_CAPABILITY_IDS: readonly string[] = CAPABILITY_LIST.filter((c) => c.facadeOf === undefined).map(
+export const CONCRETE_CAPABILITY_IDS: readonly string[] = CAPABILITY_LIST.filter((c) => !isPlatformToolId(c.id)).map(
   (c) => c.id,
 );
 
@@ -111,4 +108,36 @@ export function planFor(capability: Capability | undefined, args: Record<string,
 /** 已声明专用规划器的能力 id（测试据此断言「非 read 档能力都登记了规划器」） */
 export function plannedCapabilityIds(): string[] {
   return CAPABILITY_LIST.filter((c) => c.effects.plan !== undefined).map((c) => c.id);
+}
+
+/** 16 位十六进制摘要（sha256 前 16 位；展示/关联足够，不作为安全边界） */
+function digest(value: unknown): string {
+  return createHash('sha256').update(JSON.stringify(value)).digest('hex').slice(0, 16);
+}
+
+let manifestRevCache: string | undefined;
+
+/**
+ * 能力清单代际：id/title/description/routing/inputSchema 的稳定投影。
+ * 清单变化 → manifestRev 变化 → 旧 disclosureId/披露上下文失效（只作一致性检查，不是授权凭证）。
+ */
+export function manifestRev(): string {
+  if (manifestRevCache !== undefined) return manifestRevCache;
+  const material = [...CAPABILITY_LIST]
+    .map((c) => ({
+      id: c.id,
+      title: c.title,
+      description: c.description,
+      kind: c.kind,
+      category: c.category,
+      platform: c.platform === true,
+      routeOnly: c.routeOnly === true,
+      control: c.control === true,
+      effects: { mutates: c.effects.mutates, destructive: c.effects.destructive, idempotent: c.effects.idempotent },
+      routing: c.routing ?? null,
+      schema: z.toJSONSchema(c.inputSchema, { io: 'input' }),
+    }))
+    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  manifestRevCache = `sha256:${digest(material)}`;
+  return manifestRevCache;
 }

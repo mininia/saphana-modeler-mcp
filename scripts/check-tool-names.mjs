@@ -11,7 +11,7 @@
  * - 提取 `hana_*` token（字母/数字/下划线），**token 级**匹配：`hana_view_update#add_join`
  *   会被切成 `hana_view_update`，不会误判为未知能力；
  * - 以下 token 是占位/通配，不参与断言：`hana_`、以 `_` 结尾的 `hana_xxx_*` 家族写法；
- * - 合法集合 = 清单里登记的 id（从 defs 的 `id: '...'` 与分类目录派生的六个门面）
+ * - 合法集合 = 清单里登记的 id（从 defs 的 `id: '...'` 派生，含两个平台入口）
  *   ∪ 显式 REMOVED_TOOL_NAMES（改名/删除留档，附说明）；
  * - 扫描 0 个文件 = 失败（防止路径写错后"全绿"）。
  *
@@ -37,7 +37,7 @@ const SCAN_TARGETS = [
   { path: 'src/tools', kind: 'dir', match: /\.ts$/ },
 ];
 
-/** 读取清单里登记的工具 id（defs 的 `id: 'hana_...'`）+ 六个门面 */
+/** 读取清单里登记的工具 id（defs 的 `id: 'hana_...'`，含 `hana_tool_search` / `hana_invoke`） */
 function registeredNames() {
   const names = new Set();
   const defsDir = join(ROOT, 'src/capabilities/defs');
@@ -46,14 +46,6 @@ function registeredNames() {
     const text = readFileSync(join(defsDir, file), 'utf8');
     for (const m of text.matchAll(/\bid:\s*'((?:hana_)[a-z0-9_]+)'/g)) names.add(m[1]);
   }
-  // 门面 id 由分类目录派生（src/capabilities/types.ts 的 FACADE_CATEGORIES）
-  const types = readFileSync(join(ROOT, 'src/capabilities/types.ts'), 'utf8');
-  const block = types.match(/export const FACADE_CATEGORIES\s*=\s*\[([\s\S]*?)\]/);
-  if (!block) {
-    console.error('工具名守卫中止：读不到 FACADE_CATEGORIES（派生门面名的唯一来源）');
-    process.exit(2);
-  }
-  for (const m of block[1].matchAll(/'([a-z]+)'/g)) names.add(`hana_${m[1]}`);
   return names;
 }
 

@@ -53,12 +53,17 @@ async function main(): Promise<void> {
   configureWritePackages(config.writePackages);
   // 进程级归因标签（MCP_AGENT_LABEL）：写进 envelope 与每条 capability-audit，未配置时不产生该字段
   setProcessAgentLabel(config.agentLabel);
-  // 解析工具可见性过滤（HANA_TOOL_GROUPS/HANA_TOOL_ALLOW/HANA_TOOL_DENY，旧名 HANA_TOOL_* 仍生效）；无效分组名在此抛错
+  // 解析工具可见性过滤（HANA_TOOL_GROUPS/HANA_TOOL_DENY；组名与能力 glob 同一列表）；非法分组名在此抛错
   const toolFilter = buildToolFilter(config);
   // 安全要求：连接信息/用户名/密码不得以任何形式出现，不落日志
   logger.info('saphana-modeler-mcp 配置加载完成（连接信息与凭据不落日志）');
   // 一次性启动摘要：stdio 构建一次即用；HTTP 模式 server 按请求经工厂构建，摘要不能进工厂
-  logToolFilterSummary(toolFilter);
+  // 多环境下 tool groups 可逐环境覆盖：按环境分别打印，避免摘要与 entitlement 不一致。
+  if (loaded.multiEnv) {
+    for (const entry of loaded.entries) logToolFilterSummary(buildToolFilter(entry.config), entry.envKey);
+  } else {
+    logToolFilterSummary(toolFilter);
+  }
   // 调用方档案摘要（MCP_PROFILES/MCP_PROFILE）：配了才打印；「档案 ⊆ 部署策略」的越界结论在下面的自检里（block 即拒绝启动）
   if (config.profiles.size > 0) {
     logger.info(
@@ -128,7 +133,7 @@ async function main(): Promise<void> {
     //   · 开场是 `initialize`（无 modern envelope claim）→ legacy 支路：行为与直连 StdioServerTransport 完全一致，
     //     `legacy: 'serve'` 默认值显式写出以固化"既有握手语义不变"（本地实机验收脚本（不入库）与 smoke 零回归的前提）；
     //   · 开场带 modern 声明（如 `server/discover`）→ modern 支路：SDK 在工厂产物上补装 modern-only handlers。
-    // 工厂返回的实例被**钉住整个连接**；门面动态提升（capability.tools.ts）挂的正是这个实例——
+    // 工厂返回的实例被**钉住整个连接**；两个平台入口注册到的正是这个实例——
     // 各工具的 handler 闭包里捕获的就是自己注册时的那个 server（见 createServer 的装配顺序）。
     // onerror 只做带外报告（绝不改变已写出的报文，SDK 原文）；用 logger 落一条告警便于排障。
     serveStdio(() => createServer(ctx), {

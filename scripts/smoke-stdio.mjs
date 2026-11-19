@@ -1,33 +1,30 @@
 /**
- * stdio 冒烟测试：真实启动 dist/index.js，走完整 MCP JSON-RPC 握手，
- * 验证 tools/list 注册、annotations 透出，以及**门面索引**、**路由护栏**与**提升（list_changed）**（黑盒协议层）。
+ * stdio 冒烟测试：真实启动 dist/index.js，走完整 MCP JSON-RPC 握手。
  *
- * 只调用**不触库**的路径：门面不带参数调用 = 只读清单；路由到未知/跨类能力 = 入口即拒。
- * 真实的业务调用会触数据库，留在本地 test-verification/（不入库）。
+ * 2026-11-19 单一入口契约：
+ *   - 常驻工具面**只有两个**：hana_tool_search（选择）+ hana_invoke（执行）；
+ *   - 六个分类门面、hana_sql_execute、所有具体能力均不在 tools/list；
+ *   - 具体能力经 tool_search 发现/披露，经 hana_invoke 执行；平台入口自身不可作为目标。
+ *
+ * 只调用**不触库**的路径：discover/contract/goal 只读清单；invoke 的未知能力在入口即拒，
+ * schema 错误在派发前拒绝。真实业务调用留在本地 test-verification/（不入库）。
  *
  * 用法：node scripts/smoke-stdio.mjs（package.json 的 smoke 脚本已含 build）
- *
- * 三个用例（分类门面制）：
- *   A. **注册面**：tools/list 应恰好是六个分类门面（顺序固定），占位工具不出现；annotations 透出。
- *   B. **门面行为 + 可见性过滤自检**：每个门面的索引条数与可见成员数一致、不含门面自己；
- *      未知能力与跨类路由回**同一句**未知能力；若另配了 HANA_TOOL_GROUPS / HANA_TOOL_ALLOW /
- *      HANA_TOOL_DENY（旧名 HANA_TOOL_* 同义），额外校验**能力层**收窄结果（门面层不做限制，
- *      六个入口恒在；索引可能为空——入口在、里面没有你可用的能力）：
- *        HANA_TOOL_GROUPS=read node scripts/smoke-stdio.mjs   # 只读部署：六门面恒在；modeling 索引只剩 hana_task_get（read 档），diagnostics 索引为空
- *   C. **提升**：调门面 → 该分类能力进入 tools/list（带完整 schema、可平铺直调）+ list_changed 通知。
  */
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { createInterface } from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
 import { LATEST_PROTOCOL_VERSION } from '@modelcontextprotocol/server';
-import { DUMMY_HANA_ENV, FACADE_ORDER, assertSameUnknownRefusal, requireEnvelope } from './smoke-shared.mjs';
+import {
+  DEFAULT_SURFACE_ORDER,
+  DUMMY_HANA_ENV,
+  INVOKE_TOOL,
+  TOOL_SEARCH_TOOL,
+  assertSameUnknownRefusal,
+  requireEnvelope,
+} from './smoke-shared.mjs';
 
-/**
- * 仓库根与 server 入口按**脚本自身位置**解析（与调用方 cwd 无关）：下面的 dist 存在性断言与
- * spawn 共用同一路径。dist 缺失/半成品是首跑常见场景（本脚本自己不做构建），先在入口给明确报错——
- * 不检测的话子进程的 MODULE_NOT_FOUND 会被 60s 全局兜底吞成"冒烟测试超时（60s）"，排障方向错位。
- */
 const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 const SERVER_ENTRY = fileURLToPath(new URL('../dist/index.js', import.meta.url));
 if (!existsSync(SERVER_ENTRY)) {
@@ -35,7 +32,7 @@ if (!existsSync(SERVER_ENTRY)) {
   process.exit(1);
 }
 
-/** 面相关环境变量：用例 A 剥离（保证断言与调用方 shell 环境无关），用例 B 读调用方配置做自检 */
+/** 面相关环境变量：用例 A/C 剥离（保证断言与调用方 shell 环境无关），用例 B 读调用方配置做自检 */
 const SURFACE_ENV_KEYS = [
   'HANA_TOOL_GROUPS',
   'HANA_TOOL_ALLOW',
@@ -47,20 +44,8 @@ const SURFACE_ENV_KEYS = [
   'MCP_PROFILE',
 ];
 
-/** dummy 配置（来自共享模块）：仅用于让 config 校验通过，本脚本不调用任何触库工具 */
 const BASE_ENV = { ...process.env, ...DUMMY_HANA_ENV };
 
-/**
- * 镜像表**全部从被测构建（dist）的清单派生**，不手写副本：手写副本会随清单演进漂移
- * （漏登新能力或 routeOnly 操作级别名），用例 B 便拿**错的期望**判服务端，输出
- * "索引应含 N 项，实际 M"这类假失败，把排查指向并不存在的服务端索引缺陷。派生后期望与被测
- * 服务端恒为同一份清单（子进程跑 dist/index.js，镜像取自 dist/capabilities/manifest.js——
- * 同一次构建），新增能力只登记清单、本文件零改动。
- *
- * 清单（单一事实源）：src/capabilities/defs/*.ts → dist/capabilities/manifest.js。
- * 用 try 包住：该模块链在**加载期**就会读环境变量（如 LOG_LEVEL 建 logger），构建产物或环境变量
- * 有问题时给它一句明确的报错，而不是把 pino/zod 的原始栈抛给调用方。
- */
 let CAPABILITY_LIST;
 try {
   ({ CAPABILITY_LIST } = await import('../dist/capabilities/manifest.js'));
@@ -72,24 +57,11 @@ try {
   process.exit(1);
 }
 
-/**
- * 门面 → 成员能力 id（含 routeOnly 操作级别名）。与 manifest.membersOfCategory 同口径：
- * 成员 = 非门面条目（`facadeOf === undefined`）且分类匹配；门面条目自身的 facadeOf 就是它的分类，
- * 不排除会把门面列进自己的成员表。门面 id = `hana_<分类>`（facadeIdOf），故按 id 反查。
- */
-const FACADE_MEMBERS = Object.fromEntries(
-  FACADE_ORDER.map((facadeId) => [
-    facadeId,
-    CAPABILITY_LIST.filter((c) => c.facadeOf === undefined && `hana_${c.category}` === facadeId).map((c) => c.id),
-  ]),
-);
-
-/** 能力 id → 分组 kind（含门面与 routeOnly 别名；与 tools/groups.ts 的 TOOL_GROUPS 同口径） */
-const GROUP_OF = new Map(CAPABILITY_LIST.map((c) => [c.id, c.kind]));
-
-/** 组名 → 该组全部 id（与 groups.ts 的 toolsOfGroup 同语义，供 allow/deny 的组名展开） */
+/** 具体能力（非平台入口）：发现/执行的候选全集 */
+const CONCRETE = CAPABILITY_LIST.filter((c) => c.platform !== true);
+const GROUP_OF = new Map(CONCRETE.map((c) => [c.id, c.kind]));
 const IDS_BY_GROUP = new Map(
-  ['read', 'write', 'admin'].map((group) => [group, CAPABILITY_LIST.filter((c) => c.kind === group).map((c) => c.id)]),
+  ['read', 'write', 'admin'].map((group) => [group, CONCRETE.filter((c) => c.kind === group).map((c) => c.id)]),
 );
 
 const timeout = setTimeout(() => {
@@ -97,12 +69,7 @@ const timeout = setTimeout(() => {
   process.exit(1);
 }, 60_000);
 
-/**
- * 启动一个 stdio server，跑完 fn 后关闭。
- * fn 收到 { request, initialize, call, notifications } 四个助手（initialize 必须最先调用）。
- */
 async function withServer(env, fn) {
-  // 入口用脚本位置解析出的绝对路径、cwd 固定仓库根：从任意目录直跑脚本都落到同一个 dist
   const child = spawn(process.execPath, [SERVER_ENTRY], {
     cwd: REPO_ROOT,
     stdio: ['pipe', 'pipe', 'inherit'],
@@ -110,14 +77,8 @@ async function withServer(env, fn) {
   });
   const rl = createInterface({ input: child.stdout });
   const pending = new Map();
-  /** 服务端主动发的通知（id == null），如 notifications/tools/list_changed */
   const notifications = [];
   let nextId = 1;
-  /**
-   * 子进程提前退出（dist 半成品 / 从旧 cwd 启动失败 / 启动自检拒绝等）时**立刻 reject** 全部挂起请求——
-   * 不检测就只剩 60s 全局兜底，会把"服务没起来"误报成"冒烟测试超时（60s）"，排障方向错位。
-   * 正常收尾（finally 里 child.kill()）时 pending 已空，这里只是空转一跳。
-   */
   const rejectPending = (message) => {
     for (const p of pending.values()) p.reject(new Error(message));
     pending.clear();
@@ -129,7 +90,7 @@ async function withServer(env, fn) {
     try {
       msg = JSON.parse(line);
     } catch {
-      return; // 忽略非 JSON 行（如 pino 意外输出，理论上不应出现）
+      return;
     }
     if (msg.id == null) {
       notifications.push(msg);
@@ -157,16 +118,10 @@ async function withServer(env, fn) {
       clientInfo: { name: clientName, version: '0.0.1' },
     });
     console.log(`[handshake] ${clientName} negotiated protocol:`, init.protocolVersion);
-    // instructions 应在 initialize 结果中（SEP 增强）；仅提示不硬断言
     if (init.instructions) console.log('[instructions] 已下发（' + init.instructions.length + ' 字符）');
     send({ jsonrpc: '2.0', method: 'notifications/initialized' });
     return init;
   };
-  /**
-   * 调一个工具并返回 { isError, text, error }。
-   * 未注册的工具名走**协议层错误**（JSON-RPC error，没有 result）——`error` 非空即"不可达"，
-   * 与"注册了但被闸门拦下"（isError=true 且有文案）是两种形态，别混。
-   */
   const call = async (name, args) => {
     try {
       const r = await request('tools/call', { name, arguments: args });
@@ -183,21 +138,9 @@ async function withServer(env, fn) {
   }
 }
 
-/** 断言 annotations 透出（从面上任取一个带 annotations 的工具） */
-function assertAnnotations(tools, preferred) {
-  const sample =
-    tools.find((t) => t.name === preferred) ??
-    tools.find((t) => t.annotations?.readOnlyHint) ??
-    tools.find((t) => t.annotations);
-  console.log('[annotations]', JSON.stringify(sample?.annotations ?? '(未透出)'));
-  if (!sample?.annotations) {
-    throw new Error('annotations 未按约定透出（tools/list 里没有任何工具带 annotations）');
-  }
-}
-
-/** 用例 A：注册面 = 六个分类门面（具体能力不进 tools/list） */
+/** 用例 A：工具面 = 两个平台入口 */
 async function caseRegisteredSurface() {
-  console.log('\n[case A] 注册面 = 六个分类门面');
+  console.log('\n[case A] 工具面 = hana_tool_search + hana_invoke');
   const env = { ...BASE_ENV };
   for (const k of SURFACE_ENV_KEYS) delete env[k];
   await withServer(env, async ({ request, initialize }) => {
@@ -205,36 +148,38 @@ async function caseRegisteredSurface() {
     const tools = (await request('tools/list')).tools;
     const names = tools.map((t) => t.name);
     console.log('[tools/list]', names.join(', '));
-    if (JSON.stringify(names) !== JSON.stringify(FACADE_ORDER)) {
-      throw new Error(`注册面应为六个门面（顺序固定 ${FACADE_ORDER.join(', ')}），实际：${names.join(', ') || '(空)'}`);
+    if (JSON.stringify(names) !== JSON.stringify(DEFAULT_SURFACE_ORDER)) {
+      throw new Error(`工具面应为 ${DEFAULT_SURFACE_ORDER.join(', ')}，实际：${names.join(', ') || '(空)'}`);
     }
-    // 具体能力一个都不该直接注册（否则等于退回"全常驻"）
-    for (const members of Object.values(FACADE_MEMBERS)) {
-      for (const id of members) {
-        if (names.includes(id)) throw new Error(`${id} 不应直接注册——具体能力恒为动态调用`);
+    // 具体能力一个都不该直接注册（否则等于留下绕过本体层的捷径）
+    for (const cap of CONCRETE) {
+      if (names.includes(cap.id)) throw new Error(`${cap.id} 不应直接注册——具体能力只能经本体层选择`);
+    }
+    const search = tools.find((t) => t.name === TOOL_SEARCH_TOOL);
+    const invoke = tools.find((t) => t.name === INVOKE_TOOL);
+    if (!search?.annotations?.readOnlyHint) throw new Error('hana_tool_search 应声明 readOnlyHint=true');
+    if (invoke?.annotations?.readOnlyHint !== false) throw new Error('hana_invoke 应声明 readOnlyHint=false');
+    const invokeProps = Object.keys(invoke.inputSchema?.properties ?? {});
+    if (JSON.stringify(invokeProps.slice(0, 2)) !== JSON.stringify(['capability', 'args'])) {
+      throw new Error(`hana_invoke 入参应以 capability/args 开头，实际：${invokeProps.join(', ')}`);
+    }
+    for (const p of invokeProps.slice(2)) {
+      if (!['expectedEnvironment', 'disclosure', 'disclosureId', 'contextToken'].includes(p)) {
+        throw new Error(`hana_invoke 出现未知信封字段：${p}`);
       }
     }
-    // 门面入参必须是 { capability?, args? }
-    for (const t of tools) {
-      const props = Object.keys(t.inputSchema?.properties ?? {});
-      if (JSON.stringify(props) !== JSON.stringify(['capability', 'args'])) {
-        throw new Error(`${t.name} 的入参应为 capability/args，实际：${props.join(', ') || '(空)'}`);
-      }
-    }
-    assertAnnotations(tools, 'hana_modeling');
-    console.log('[case A] PASS —— 注册面只有六个分类门面，具体能力按需索引与路由');
+    console.log('[case A] PASS —— 工具面只有选择与执行两个平台入口');
   });
 }
 
-/** 用例 B：门面索引 + 路由护栏 +（可选）可见性过滤自检 */
-async function caseFacadeBehaviour() {
-  console.log('\n[case B] 门面索引 / 路由护栏 / 可见性过滤自检');
+/** 用例 B：可见性过滤自检 + 路由护栏 */
+async function caseVisibilityAndGuard() {
+  console.log('\n[case B] 可见性过滤 / 路由护栏');
   const env = { ...BASE_ENV };
   for (const k of SURFACE_ENV_KEYS) delete env[k];
-  // 保留调用方 shell 里的过滤配置（本用例据此做自检）
-  const groups = (process.env.HANA_TOOL_GROUPS ?? process.env.HANA_TOOL_GROUPS ?? '').trim();
-  const allow = (process.env.HANA_TOOL_ALLOW ?? process.env.HANA_TOOL_ALLOW ?? '').trim();
-  const deny = (process.env.HANA_TOOL_DENY ?? process.env.HANA_TOOL_DENY ?? '').trim();
+  const groups = (process.env.HANA_TOOL_GROUPS ?? '').trim();
+  const allow = (process.env.HANA_TOOL_ALLOW ?? '').trim();
+  const deny = (process.env.HANA_TOOL_DENY ?? '').trim();
   if (groups) env.HANA_TOOL_GROUPS = groups;
   if (allow) env.HANA_TOOL_ALLOW = allow;
   if (deny) env.HANA_TOOL_DENY = deny;
@@ -245,7 +190,6 @@ async function caseFacadeBehaviour() {
         ? new RegExp('^' + p.replace(/[.+^${}()|[\]\\?]/g, '\\$&').replace(/\*/g, '.*') + '$').test(name)
         : p === name,
     );
-  // 组名展开成该组全部成员（大小写不敏感，与 groups.ts 的 expandGroupTokens / parseToolFilter 同语义）
   const expandTokens = (raw) =>
     raw
       .split(',')
@@ -260,143 +204,132 @@ async function caseFacadeBehaviour() {
         .map((g) => g.trim().toLowerCase())
         .filter(Boolean)
     : [];
-  /** deny 命中：与 src/tools/groups.ts 的 deniedByPatterns 同语义——操作级别名（`父#op`）跟随父工具 id */
   const capDenied = (id) => {
     if (matchGlob(id, denyPatterns)) return true;
     const parent = id.includes('#') ? id.split('#')[0] : undefined;
     return parent !== undefined && matchGlob(parent, denyPatterns);
   };
-  /** 单个具体能力是否可见（deny > allow > 分组；空分组 = 不限制） */
-  /** 环境控制能力只在多环境（至少一个 _ENV_ 覆盖）进面；单环境索引不列它们 */
+  // 单环境冒烟：hana_env_list / hana_env_switch 不可达（多环境才有）
   const ENV_CONTROL_IDS = new Set(['hana_env_list', 'hana_env_switch']);
-  const hasEnvOverrides = Object.keys(env).some((k) => /^HANA_[A-Z0-9_]+_ENV_[A-Z0-9_]+$/.test(k));
-  const envControlVisible = (id) => hasEnvOverrides || !ENV_CONTROL_IDS.has(id);
   const capVisible = (id) => {
-    if (!envControlVisible(id)) return false;
+    if (ENV_CONTROL_IDS.has(id)) return false;
     if (capDenied(id)) return false;
     if (matchGlob(id, allowPatterns)) return true;
-    if (enabledGroups.length === 0) return true;
+    if (enabledGroups.length === 0) {
+      const group = GROUP_OF.get(id);
+      return group !== undefined && group !== 'sql';
+    }
     const group = GROUP_OF.get(id);
-    // 未知 id 直接抛错：清单再变更时当场暴露，而不是落"admin 兜底"把期望算错后误报服务端
-    if (group === undefined) throw new Error(`能力清单里没有 ${id}——镜像表与清单脱节，请检查派生逻辑`);
+    if (group === undefined) throw new Error(`能力清单里没有 ${id}——镜像表与清单脱节`);
     return enabledGroups.includes(group);
   };
-  /** 门面是否注册：**门面层不做限制**——恒在；只有显式 deny（命中门面 id，或全部成员被 deny）才消失 */
-  const facadeVisible = (facade) =>
-    !capDenied(facade) && FACADE_MEMBERS[facade].some((id) => !capDenied(id) && envControlVisible(id));
+  const anyConcrete = CONCRETE.some((c) => capVisible(c.id));
+  const expectedSurface = DEFAULT_SURFACE_ORDER.filter((id) => anyConcrete && !capDenied(id));
 
   await withServer(env, async ({ request, initialize, call }) => {
-    await initialize('smoke-stdio-facade');
-    const tools = (await request('tools/list')).tools;
-    const names = tools.map((t) => t.name);
-    console.log('[tools/list]', names.join(', '));
-
-    // ① 可见性过滤自检：注册面应恰好是"该可见的门面"
-    const expectedFacades = FACADE_ORDER.filter(facadeVisible);
-    if (JSON.stringify(names) !== JSON.stringify(expectedFacades)) {
-      throw new Error(
-        `门面可见性与过滤配置不符：期望 ${expectedFacades.join(', ') || '(空)'}，实际 ${names.join(', ') || '(空)'}`,
-      );
+    await initialize('smoke-stdio-guard');
+    const names = (await request('tools/list')).tools.map((t) => t.name);
+    console.log('[tools/list]', names.join(', ') || '(空)');
+    if (JSON.stringify(names) !== JSON.stringify(expectedSurface)) {
+      throw new Error(`可见面应为 ${expectedSurface.join(', ') || '(空)'}，实际 ${names.join(', ') || '(空)'}`);
     }
-    if (enabledGroups.length > 0 || denyPatterns.length > 0) {
-      console.log(
-        `[tool-filter] 分组 ${enabledGroups.join(',') || '(不限)'} → 可见门面 ${names.join(', ') || '(空)'}，符合预期`,
-      );
+    if (!anyConcrete) {
+      console.log('[case B] PASS —— 没有可达的具体能力，平台入口一并消失');
+      return;
     }
 
-    // ② 门面索引：条数 = 可见成员数，且不含门面自己
-    for (const facade of expectedFacades) {
-      const members = FACADE_MEMBERS[facade].filter(capVisible);
-      const idx = requireEnvelope((await call(facade, {})).text, `${facade} 索引回执`);
-      if (idx.success !== true)
-        throw new Error(`${facade} 索引调用应成功，实际：${(await call(facade, {})).text.slice(0, 200)}`);
-      const ids = idx.data.items.map((i) => i.id);
-      if (ids.length !== members.length) {
-        throw new Error(`${facade} 索引应含 ${members.length} 项，实际 ${ids.length}：${ids.join(', ')}`);
-      }
-      if (ids.includes(facade)) throw new Error(`${facade} 的索引里不应有门面自己`);
-      for (const item of idx.data.items) {
-        if (!item.summary || item.summary.length > 120) throw new Error(`${facade} 索引项 ${item.id} 的摘要缺失或过长`);
-        if (!Array.isArray(item.params)) throw new Error(`${facade} 索引项 ${item.id} 缺 params（挑选依据）`);
-      }
+    // discover 只返回 entitlement 内的候选
+    const discover = requireEnvelope(
+      (await call(TOOL_SEARCH_TOOL, { mode: 'discover', query: 'hana', limit: 50 })).text,
+      'discover 回执',
+    );
+    if (discover.success !== true || discover.data.mode !== 'discover') {
+      throw new Error(`discover 应成功，实际：${JSON.stringify(discover).slice(0, 200)}`);
     }
-    const sample = expectedFacades.length
-      ? requireEnvelope((await call(expectedFacades[0], {})).text, `${expectedFacades[0]} 索引回执`).data.items.map(
-          (i) => i.id,
-        )
-      : [];
-    if (sample.length) console.log(`[index] ${expectedFacades[0]} →`, sample.join(', '));
-
-    // ③ 路由护栏：未知能力 / 跨类 / 路由到门面 —— 三者同一句文案，且都不触库
-    if (expectedFacades.length >= 2) {
-      const [a, b] = expectedFacades;
-      const unknown = await call(a, { capability: 'hana_does_not_exist' });
-      const cross = await call(a, { capability: FACADE_MEMBERS[b][0] });
-      const toFacade = await call(a, { capability: b });
-      if (!unknown.isError || !cross.isError || !toFacade.isError) {
-        throw new Error('未知/跨类/路由到门面的调用都必须是硬错误');
-      }
-      assertSameUnknownRefusal([unknown.text, cross.text, toFacade.text]);
-      console.log('[route-guard] 未知 / 跨类 / 路由到门面 → 同一句拒绝文案');
+    for (const card of discover.data.candidates) {
+      if (card.inputSchema !== undefined) throw new Error('候选卡不得含完整 inputSchema');
+      if (!capVisible(card.id)) throw new Error(`候选 ${card.id} 不在当前可见范围内`);
     }
 
-    assertAnnotations(tools, 'hana_modeling');
+    // 路由护栏：未知能力 / 平台入口自身 → 同一句拒绝文案
+    const unknown = await call(INVOKE_TOOL, { capability: 'hana_does_not_exist' });
+    const toPlatform = await call(INVOKE_TOOL, { capability: TOOL_SEARCH_TOOL });
+    if (!unknown.isError || !toPlatform.isError) throw new Error('未知/平台入口目标必须是硬错误');
+    assertSameUnknownRefusal([unknown.text, toPlatform.text]);
+
+    // 具体能力在协议层不可直调
+    const direct = await call('hana_data_preview', {});
+    if (direct.error === undefined) {
+      throw new Error(`具体能力不应可直调，实际拿到了 result：${direct.text.slice(0, 120)}`);
+    }
     console.log('[case B] PASS');
   });
 }
 
-/**
- * 用例 C：**提升**（对齐 hana-cli 的 Dynamic Tool Promotion）。
- *
- * 调门面 → 该分类的能力进入 tools/list（带完整 schema、可平铺直调）+ `list_changed` 通知。
- * 全流程不触库：只调门面（索引）与一次"未注册工具名"的协议层探测。
- */
-async function casePromotion() {
-  console.log('\n[case C] 提升：调门面 → 该类能力进 tools/list + list_changed');
+/** 用例 C：披露零面变更 + 契约路由到 hana_invoke */
+async function caseDisclosure() {
+  console.log('[case C] 契约披露：零面变更 + call.via=hana_invoke');
   const env = { ...BASE_ENV };
   for (const k of SURFACE_ENV_KEYS) delete env[k];
   await withServer(env, async ({ request, initialize, call, notifications }) => {
-    await initialize('smoke-stdio-promotion');
+    await initialize('smoke-stdio-disclosure');
     const before = (await request('tools/list')).tools.map((t) => t.name);
-    if (JSON.stringify(before) !== JSON.stringify(FACADE_ORDER)) {
-      throw new Error(`前提失败：注册面应为六个门面，实际 ${before.join(', ')}`);
-    }
-    // 提升前：具体能力名在协议层不可达（JSON-RPC error，而不是"注册了但被闸门拦"）
-    const preCall = await call('hana_data_preview', {});
-    if (preCall.error === undefined) {
-      throw new Error(`提升前 hana_data_preview 不应可直调，实际拿到了 result：${preCall.text.slice(0, 120)}`);
+    if (JSON.stringify(before) !== JSON.stringify(DEFAULT_SURFACE_ORDER)) {
+      throw new Error(`前提失败：工具面应为 ${DEFAULT_SURFACE_ORDER.join(', ')}，实际 ${before.join(', ')}`);
     }
 
-    // 调门面（不带参数）→ 提升 data 类
-    const idx = requireEnvelope((await call('hana_data', {})).text, 'hana_data 索引回执');
-    if (idx.data.promoted !== true) {
-      throw new Error(`调门面应触发提升，实际 promoted=${JSON.stringify(idx.data.promoted)}`);
+    const contract = requireEnvelope(
+      (
+        await call(TOOL_SEARCH_TOOL, {
+          mode: 'contract',
+          tools: ['hana_metadata_get_view', 'hana_data_preview_diagnose'],
+        })
+      ).text,
+      'contract 回执',
+    );
+    if (contract.success !== true || contract.data.mode !== 'contract' || contract.data.tools.length !== 2) {
+      throw new Error(`contract 应返回两个完整契约，实际：${JSON.stringify(contract).slice(0, 300)}`);
     }
-    await sleep(400);
+    for (const t of contract.data.tools) {
+      if (!t.inputSchema?.properties || !Array.isArray(t.required)) {
+        throw new Error(`${t.id} 的契约缺 inputSchema/required`);
+      }
+      if (t.call?.via !== INVOKE_TOOL || t.canonicalCall?.via !== INVOKE_TOOL) {
+        throw new Error(`${t.id} 的 call.via/canonicalCall.via 应为 ${INVOKE_TOOL}，实际 ${t.call?.via}`);
+      }
+    }
 
+    const goal = requireEnvelope(
+      (
+        await call(TOOL_SEARCH_TOOL, {
+          mode: 'goal',
+          goal: 'diagnose_preview_permission',
+          bindings: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV008' },
+        })
+      ).text,
+      'goal 回执',
+    );
+    if (goal.success !== true || goal.data.mode !== 'goal' || !goal.data.steps.length) {
+      throw new Error(`goal 应返回配方步骤，实际：${JSON.stringify(goal).slice(0, 300)}`);
+    }
+    for (const step of goal.data.steps) {
+      if (step.via !== INVOKE_TOOL) throw new Error(`配方步骤 ${step.id} 的 via 应为 ${INVOKE_TOOL}`);
+    }
+
+    // invoke 的 schema 错误在派发前拒绝（不触库）
+    const bad = await call(INVOKE_TOOL, { capability: 'hana_metadata_get_view', args: {} });
+    if (!bad.isError || !/参数不符合/.test(bad.text)) {
+      throw new Error(`invoke 非法参数应被拒绝，实际：${bad.text.slice(0, 200)}`);
+    }
+
+    await sleep(200);
     const after = (await request('tools/list')).tools.map((t) => t.name);
-    console.log('[tools/list after]', after.join(', '));
-    for (const id of FACADE_MEMBERS.hana_data) {
-      if (!after.includes(id)) throw new Error(`提升后 ${id} 应出现在 tools/list 里`);
+    if (JSON.stringify(after) !== JSON.stringify(before)) {
+      throw new Error(`披露/执行不得改变工具面：前 ${before.join(', ')}；后 ${after.join(', ')}`);
     }
-    if (after.length !== FACADE_ORDER.length + FACADE_MEMBERS.hana_data.length) {
-      throw new Error(`只应多出 data 类的 ${FACADE_MEMBERS.hana_data.length} 个工具，实际：${after.join(', ')}`);
-    }
-    // 提升后的工具带完整 inputSchema（这是提升相对索引的唯一收益）
-    const promoted = (await request('tools/list')).tools.find((t) => t.name === 'hana_data_preview');
-    if (!promoted?.inputSchema?.properties || Object.keys(promoted.inputSchema.properties).length === 0) {
-      throw new Error('提升后的工具必须带完整 inputSchema（否则提升没有意义）');
-    }
-    // 批量注册只应发一次 list_changed（SDK 默认每个 registerTool 各发一次；
-    // 多次通知会让宿主做多次整代替换，把当前步的 toolSet 打失效）。
     const listChangedCount = notifications.filter((n) => n.method === 'notifications/tools/list_changed').length;
-    if (listChangedCount !== 1) {
-      throw new Error(
-        `提升 2 个工具应只发 1 次 notifications/tools/list_changed（批量通知），实际 ${listChangedCount} 次：` +
-          JSON.stringify(notifications.map((n) => n.method)),
-      );
-    }
-    console.log('[case C] PASS —— 提升把该类能力挂成平铺工具并通知客户端刷新');
+    if (listChangedCount !== 0) throw new Error(`不应发 tools/list_changed，实际 ${listChangedCount} 次`);
+    console.log('[case C] PASS —— 披露零面变更，执行统一经 hana_invoke');
   });
 }
 
@@ -404,8 +337,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 try {
   await caseRegisteredSurface();
-  await caseFacadeBehaviour();
-  await casePromotion();
+  await caseVisibilityAndGuard();
+  await caseDisclosure();
   console.log('\n[smoke] PASS');
 } catch (e) {
   console.error('[smoke] FAIL:', e.message);

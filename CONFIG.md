@@ -57,11 +57,10 @@
 | `HANA_XS_PORT` | XS Classic 设计时 REST 端口（非默认实例/租户需覆盖，不按实例号推导） | 8010 | `8000` | 连接 | 生效（可选） | 忽略（不生效） | 可选 |
 | `HANA_XS_TLS` | XS 写通道走 HTTPS（默认明文 http://，须网络侧隔离） | false | `true` | 连接 | 生效（可选） | 忽略（不生效） | 可选 |
 | `HANA_XS_BASE_PATH` | XS 设计时 REST 基础路径 | /sap/hana/xs/dt/base | — | 连接 | 生效（可选） | 忽略（不生效） | 可选 |
-| `HANA_ACCESS` | 环境只读/可写策略（readwrite / readonly）；只读仅拒绝持久写入，临时对象与纯读放行 | readwrite | `readonly` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
-| `HANA_READONLY_SQL` | 只读环境的 SQL 策略（select-only / deny）；仍受 sql 工具组控制 | select-only | `deny` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
-| `HANA_WRITE_PACKAGES` | 允许写操作的仓库包前缀；空 = 未启用写边界（`boundary_off`）；`_ENV_` 显式空 = 该环境无写包 | 空 | `ZDEMO1,ZDEMO2.ZDEMO_SD` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
-| `HANA_READ_SCHEMA` | 追加允许按名读取的 schema | 空 | `SAPABAP1,OTHER_SCHEMA` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
+| `HANA_WRITE_PACKAGES` | 允许写操作的仓库包前缀；**非空 = readwrite，空 = readonly**；`_ENV_` 显式空 = 该环境只读 | 空 | `ZDEMO1,ZDEMO2.ZDEMO_SD` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
+| `HANA_READ_SCHEMA` | 追加允许按名读取的 schema；空 = 仅系统 schema | 空 | `SAPABAP1,OTHER_SCHEMA` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
 | `HANA_SQL_TIMEOUT_MS` | 写路径 SQL 语句超时（ms） | 60000 | `120000` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
+| `HANA_SQL_ACCESS` | `hana_sql_execute` 的访问模式：`select-only`（默认）/ `readwrite`；对象级 schema/对象访问由 HANA 账号决定 | select-only | `readwrite` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
 | `HANA_SQL_ALLOW_MULTI_STATEMENT` | hana_sql_execute 多行/多语句开关（有写时自动事务） | false | `true` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
 | `HANA_SQL_MAX_RESULT_BYTES` | 单次 SQL 结果字节上限（1024..52428800） | 1000000 | `2000000` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
 | `HANA_SQL_MAX_STATEMENTS` | 单次调用 SQL 语句条数上限（最大 100） | 20 | `50` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
@@ -70,11 +69,9 @@
 | `HANA_POOL_MAX` | 每环境连接池上限 | 4 | `8` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
 | `HANA_POOL_WAIT_MS` | 池排队等待超时（ms） | 30000 | `60000` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
 | `HANA_POOL_MAX_WAITERS` | 池排队上限 | 64 | `128` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
-| `HANA_TOOL_GROUPS` | 启用的工具功能分组；空 = read/write/admin，sql 默认关闭 | — | `read` / `read,sql` | 进程级·能力面 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
-| `HANA_TOOL_ALLOW` | 强制启用的工具名/组名 glob（支持 `*`） | — | `hana_view_validate` / `write` | 进程级·能力面 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
-| `HANA_TOOL_DENY` | 强制禁用的工具名/组名 glob（优先级最高） | — | `hana_data_preview*` | 进程级·能力面 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
-| `HANA_EXPLAIN_SURFACE` | 工具面省略说明的调试开关 | — | `names` | 进程级·能力面 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
-| `MCP_CAPABILITY_SURFACE_MAX` | 单调用方提升预算（按工具数，默认 50） | — | `100` | 进程级·能力面 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
+| `HANA_TOOL_GROUPS` | 启用的工具**组名或能力 glob**（同一列表）；空 = read/write/admin，sql 默认关闭 | — | `read` / `read,hana_sql_execute` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
+| `HANA_TOOL_DENY` | 强制禁用的工具名/组名 glob（优先级最高） | — | `hana_data_preview*` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
+| `HANA_TOOL_SEARCH_GOAL` | 是否启用 `hana_tool_search` 的 goal 模式（配方） | on | `off` | 进程级·能力面 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
 | `MCP_PROFILES` | 调用方档案表（只能收紧部署策略；配了必须定义 default） | — | `analyst=read;dev=read+write:hana_view_*;default=read` | 进程级·能力面 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
 | `MCP_PROFILE` | stdio / 无档案身份的默认档案名 | — | `default` | 进程级·能力面 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
 | `LOG_LEVEL` | 进程日志级别（默认 info） | — | `debug` | 进程级·运行时 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
@@ -111,11 +108,11 @@
   `expectedEnvironment` 都用它；回执与审计显示大写形式。
 - **环境集合** = 所有已识别参数的 `_ENV_` 键的 `<XXXX>`；`HANA_ENV_START` 必须是其中之一（只有一个环境时可省略）；
   `HANA_ENV_SWITCHABLE` 只接受环境标识，仅大小写不同的重复项失败。
-- **只读环境**（`ACCESS=readonly`）：只拒绝持久写入（清单 `effects.mutates='persistent'`）；临时对象（节点预览
-  中间视图、`_CHKTMP`）与纯读放行；`hana_sql_execute` 由 `HANA_READONLY_SQL` 控制（`select-only` 下只允许
-  SELECT，拒绝 `FOR UPDATE` / `FOR SHARE` / `NEXTVAL`）。**单环境同样生效**。
-- **expectedEnvironment**：多环境下所有非纯读调用（`effects.mutates != none`，含临时对象）必须带当前环境标识；
-  门面索引的 `params` 已包含该字段。
+- **只读环境**（`HANA_WRITE_PACKAGES` 为空）：只拒绝持久写入（清单 `effects.mutates='persistent'`）；临时对象（节点预览
+  中间视图、`_CHKTMP`）与纯读放行。启用 `sql` 组时只允许 SELECT 类（拒绝 `FOR UPDATE` / `FOR SHARE` /
+  `NEXTVAL`）；要完全关闭 SQL，不把 `sql` 写进 `HANA_TOOL_GROUPS`。**单环境同样生效**。
+- **expectedEnvironment + expectedEpoch（调用信封）**：多环境下**所有**调用都必须带当前环境标识**与代际**；统一写成 `hana_invoke({ capability, args, expectedEnvironment: { key, epoch } })`（或回传 `contextToken`）。旧调用把 `expectedEnvironment`/`expectedEpoch` 放在 `args` 里仍兼容（入口会剥出）。只有环境名挡不住 DEV 4 → PRD 5 → DEV 6 的旧披露。
+  披露上下文 `disclosure: { id?, policyRev?, manifestRev? }` 只做一致性检查；`policyRev`/`manifestRev` 不匹配 → `policy_stale`/`manifest_stale`。
 - **切换**：`hana_env_list` 发放一次性 `switchToken`（仅 stdio 且 switch 可达）；`hana_env_switch` 是 route-only、
   HTTP 拒绝且不进索引；只影响之后的调用，已提交任务与在途调用仍绑定原环境；旧环境有运行中任务时进入
   `task-draining`，任务/调用结束后回 `idle`；切换前会预检目标连接，目标有运行中任务时需
@@ -145,12 +142,14 @@ HANA_PORT_ENV_PROD=30015
 HANA_USER_ENV_PROD=PROD_USER
 HANA_PASSWORD_ENV_PROD=***
 
-# 策略/授权：扁平 = 所有环境共享；只给 DEV 写包
-HANA_ACCESS=readonly
-HANA_ACCESS_ENV_DEV=readwrite
+# 策略/授权：扁平 = 所有环境共享；_ENV_ 覆盖单个环境
+# 能力面可以按环境不同（多环境 = 多个单环境）
+HANA_TOOL_GROUPS_ENV_DEV=read,write
+HANA_TOOL_GROUPS_ENV_PROD=read
+HANA_TOOL_DENY_ENV_PROD=hana_view_delete
+# 写包非空 = readwrite，空 = readonly
 HANA_WRITE_PACKAGES_ENV_DEV=ZDEMO
 HANA_READ_SCHEMA=SHARED_SCHEMA
-HANA_READONLY_SQL=select-only
 
 # 启动/可切列表用环境标识（大小写不敏感）
 HANA_ENV_START=DEV
@@ -180,72 +179,75 @@ HANA_ENV_SWITCHABLE=DEV,UAT,PROD
 
 - 多环境配置可以完全写在 `.env` 里；此时进程环境没有 `_ENV_` 键，`.env` 是唯一来源。
 - 进程环境已有 `_ENV_` 键时，`.env` 整个被跳过；即使 `.env` 里还有其它环境键也不会补进来。
-- 进程环境只有扁平策略键（如 `HANA_ACCESS`）而没有 `_ENV_` 键时，`.env` 仍会加载，可能出现“策略来自进程环境、连接来自 `.env`”的混源；多环境建议把连接与策略放在同一来源。
+- 进程环境只有扁平策略键（如 `HANA_WRITE_PACKAGES`）而没有 `_ENV_` 键时，`.env` 仍会加载，可能出现“策略来自进程环境、连接来自 `.env`”的混源；多环境建议把连接与策略放在同一来源。
 - 多环境从 `.env` 加载且三件套始终不齐时，会继续尝试项目根 `.env`；两个文件的键按“先加载者优先”合并，建议只保留一个多环境 `.env`。
 
 ## 工具分组与可见性控制
 
-业务能力按功能划分为四个业务组；另有独立的 `sql` 组。**注册面上恒有六个分类门面**——具体能力经门面索引 + 路由调用（见 README「工具面」）。`hana_sql_execute` 是**独立的第七个根工具**：显式启用 `sql` 组后与门面同级常驻 `tools/list`，不属于任何业务分类、不进任何门面索引/描述；关闭时对模型完全不可见。可见性配置管的是**可触达上限**（哪些能力存在且有权用），不等于注册面。
+业务能力按功能划分为四个业务组；另有独立的 `sql` 组。**注册面上恒有两个平台入口**：`hana_tool_search`（选择）与 `hana_invoke`（执行）——具体能力经本体层发现/披露后执行（见 README「工具面」）。`hana_sql_execute` 不再是常驻工具：显式启用 `sql` 组后经 `hana_tool_search` 发现、由 `hana_invoke` 执行；关闭时对模型完全不可见。可见性配置管的是**可触达上限**（哪些能力可被发现、可被执行）。
 
 | 分组 | 说明 | 能力 |
 | --- | --- | --- |
 | **read** 数据读取 | 访问 HANA 数据/元数据/系统信息与异步任务状态，不改动仓库 | `hana_system_get_info`、`hana_check_privileges`、`hana_package_list`、`hana_package_list_objects`、`hana_metadata_get_view`、`hana_metadata_search_objects`、`hana_metadata_list_fields`、`hana_metadata_get_field_logic`、`hana_metadata_where_used`、`hana_table_list`、`hana_table_columns`、`hana_data_preview`、`hana_data_preview_diagnose`、`hana_task_get`（多环境另含 `hana_env_list`） |
 | **write** 写操作 | 改动仓库设计时对象/包、接受任意 SQL 的分析、取消异步任务 | `hana_package_create`、`hana_view_create`、`hana_view_activate`、`hana_view_update`、`hana_view_delete`、`hana_view_validate`、`hana_view_check_actions`、`hana_sql_analyze`、`hana_task_cancel` |
 | **admin** 管理操作 | Transfer / Change-Tracking API 与系统监视面 | `hana_repo_export`、`hana_repo_import`、`hana_repo_changelist`、`hana_system_health`、`hana_system_activity`、`hana_table_storage`、`hana_system_trend`（多环境另含 route-only `hana_env_switch`） |
-| **sql** 直接执行（**默认关闭**） | 独立第七根工具：在 HANA 上直接执行任意 SQL（读/写/管理类）。**空 `HANA_TOOL_GROUPS` 不会启用它**；须显式 `HANA_TOOL_GROUPS=sql` 或 `HANA_TOOL_ALLOW=hana_sql_execute`。未启用时它不进 `tools/list`、不进任何门面描述/索引，提示里也不提及 | `hana_sql_execute` |
+| **sql** 直接执行（**默认关闭**） | 在 HANA 上直接执行任意 SQL（读/写/管理类）。**空 `HANA_TOOL_GROUPS` 不会启用它**；须显式把 `sql`（或 `hana_sql_execute`）写进 `HANA_TOOL_GROUPS`。未启用时它不可发现、不可披露、不可执行 | `hana_sql_execute` |
 
 > 分组（kind）是**权限层级**而非"行为画像"：稳定性诊断四件套、`hana_repo_changelist` 行为只读但归 admin；`hana_sql_analyze` 接受任意 SQL 但归 write。客户端注解（`readOnlyHint`）描述行为，两者不互相推导。**环境副作用另由清单的 `effects.mutates` 表达**（`none` / `transient` / `persistent`），不按 kind 推断。
 > `hana_view_validate` design 模式会短暂写入 `_CHKTMP` 临时对象，故整工具归 write；其环境口径是 `transient`（只读环境放行）。
-> **门面层不做限制**：六个门面在任何分组配置下都常驻 `tools/list`（只有显式 `HANA_TOOL_DENY` 命中门面 id、或 deny 掉它全部成员才会消失）。分组开关只决定**能力层**；索引/路由/提升/调用一律按**目标能力**的 kind 判。
-》
+> **只有一个权限层——能力层**：两个平台入口在任何分组配置下都常驻 `tools/list`，但只能发现/执行当前 entitlement 内的能力。分组开关决定的是**可发现/可执行的集合**；`hana_invoke` 的授权、schema 与预检一律按**目标能力**判。
 
-### 权限维度分工（三层正交）
+### 权限参数（4 个 + SQL 模式）
 
-| 维度 | 配置 | 管什么 | 作用域 |
-| --- | --- | --- | --- |
-| **能力面** | `HANA_TOOL_GROUPS` / `HANA_TOOL_ALLOW` / `HANA_TOOL_DENY` + `MCP_PROFILES` | 哪些能力可见、可被调用（存在性/暴露面） | 进程 |
-| **环境副作用** | `HANA_ACCESS`（+ `HANA_READONLY_SQL`） | 当前环境允许哪些**持久写入**；只读环境只拦 `persistent` | 环境（多环境按环境标识） |
-| **资源范围** | `HANA_WRITE_PACKAGES` / `HANA_READ_SCHEMA` | 能写哪些仓库包、能按名读哪些 schema | 进程 |
+| 参数 | 管什么 | 缺省/空值 |
+| --- | --- | --- |
+| `HANA_TOOL_GROUPS` | 能力可见性：组名（`read`/`write`/`admin`/`sql`）或能力 id/glob，逗号分隔；两者可混写 | 空 = read/write/admin（**sql 关闭**） |
+| `HANA_TOOL_DENY` | 强制禁用能力/组（优先级最高） | 空 = 不禁用 |
+| `HANA_WRITE_PACKAGES` | 可写仓库包前缀；**非空 = readwrite，空 = readonly** | 空 = 只读 |
+| `HANA_READ_SCHEMA` | 按名可读 schema（系统 schema 恒可读） | 空 = 仅系统 schema |
+| `HANA_SQL_ACCESS` | SQL 直接执行的访问模式：`select-only`（默认）/ `readwrite`；`sql` 组只管可见性 | select-only |
 
-三层互不推导：分组收窄不会改变环境副作用判定，`ACCESS=readonly` 也不会隐藏工具。选型：**全局只读部署**用 `HANA_TOOL_GROUPS=read`（写工具不可见）；**同一进程里按环境只读**用 `HANA_ACCESS_ENV_<XXXX>=readonly`（写工具仍可见，调用时被 `env_readonly` 拒绝）。
+**作用域**：以上 5 个参数都支持 `_ENV_<KEY>` 覆盖（扁平 = 所有环境共享）。多环境下 entitlement（`hana_tool_search` 的候选/契约与 `hana_invoke` 的执行判定）按**当前绑定环境**编译，等价于“多环境 = 多个单环境”。
 
-配置变量优先级：`HANA_TOOL_DENY` > `HANA_TOOL_ALLOW` > `HANA_TOOL_GROUPS`。
+**推导项与固定项**：
 
-- `HANA_TOOL_GROUPS`：启用的分组（逗号分隔）；空 = read/write/admin 启用（**sql 默认关闭**，须显式写 `sql`）。
-- `HANA_TOOL_ALLOW`：强制启用（即便分组未启用），支持组名与工具名 glob。
-- `HANA_TOOL_DENY`：强制禁用（优先级最高），支持组名与 glob。
+- **只读/可写（非 SQL 能力）**：由 `HANA_WRITE_PACKAGES` 是否为空推导。空 = 只拦 `persistent`，`transient` 与纯读放行。
+- **SQL 模式**：由 `HANA_SQL_ACCESS` 独立决定，**与全局写包无关**。`select-only` 只允许 SELECT 类；`readwrite` 才允许 DML/DDL/管理类。对象级 schema/对象访问由 HANA 账号权限决定。
+- **审批**：`effects.destructive=true` 的能力在策略放行后**固定**走一次人工确认（`input_required`），不再可配。
+- **档案**：`MCP_PROFILES` / `MCP_PROFILE` 仍是可选高级项；档案只能在上述参数范围内收紧。
 
-> **没有别名层**：`MCP_TOOL_*` 不再识别。服务**按需读取**已知变量：无关的 `HANA_*` / `MCP_*` / `LOG_*`
-> 变量不会被扫描或告警；拼错的键不会生效，但也不会阻断启动。
->
-> 组名可直接用于 allow/deny（`read` / `write` / `admin` / `sql`），展开为该组全部工具名。例：`HANA_TOOL_GROUPS=read,write` + `HANA_TOOL_DENY=write` ⇒ 等价只读部署。
+**已移除、忽略（不生效）**：`HANA_ACCESS`、`HANA_READONLY_SQL`、`HANA_APPROVAL`、`HANA_TOOL_ALLOW`、`MCP_POLICY`（含策略类 `_ENV_` 变体）。出现时只记一条启动 warn，不阻断启动。
+
+配置优先级：`HANA_TOOL_DENY` > `HANA_TOOL_GROUPS`（显式列出的组/能力）> 默认 read/write/admin。
+`HANA_TOOL_GROUPS` 里的非组名 token 按**能力 id/glob** 处理；拼错只会匹配不到能力，不会阻断启动。
 
 ### 典型部署
 
-- **只读分析师**：`HANA_TOOL_GROUPS=read` —— 可触达上限收窄到 read 档能力；`hana_diagnostics` 索引为空，
-  `hana_modeling` 只剩 `hana_task_get`。
-- **建模开发者**：`HANA_TOOL_GROUPS=read,write` —— admin 档不可达。
-- **需要直接执行 SQL**：`HANA_TOOL_GROUPS=read,write,admin,sql`（或 `HANA_TOOL_ALLOW=hana_sql_execute`）；
-  按需打开 `HANA_SQL_ALLOW_MULTI_STATEMENT`；`maxRows` / `timeoutMs` 在调用时传。
-- **关闭特定能力**：`HANA_TOOL_DENY=hana_view_delete` —— 索引、路由、提升都够不着。
-
-未知分组名（如 `HANA_TOOL_GROUPS=read,bogus`）启动即失败（fail-closed）。
+- **只读分析师**：`HANA_TOOL_GROUPS=read`，不设 `HANA_WRITE_PACKAGES`（或显式空）。
+- **建模开发者**：`HANA_TOOL_GROUPS=read,write` + `HANA_WRITE_PACKAGES=ZDEMO`。
+- **需要直接执行 SQL**：`HANA_TOOL_GROUPS=read,write,admin,sql`（或直接写 `hana_sql_execute`）；
+  **默认 `HANA_SQL_ACCESS=select-only`（只允许 SELECT 类）**；需要 SQL 写时显式设 `HANA_SQL_ACCESS=readwrite`
+  （对象级仍由 HANA 账号权限约束）。
+- **关闭特定能力**：`HANA_TOOL_DENY=hana_view_delete` —— 发现、契约与执行都够不着。
+- **只读但保留校验/分析**：`HANA_TOOL_GROUPS=read,write` + 空写包；`hana_view_validate`（transient）与
+  `hana_sql_analyze`（mutates=none）仍可用，`hana_view_update/delete` 等 persistent 被拒。
+- **平台入口**：`hana_tool_search` / `hana_invoke` 不绑 read 分组；未显式 deny ∧ 至少一个具体能力可见时即常驻。
 
 ### 直接执行 HANA SQL（hana_sql_execute）
 
 `sql` 组默认关闭：未显式启用时该工具对模型**完全不可见**（不注册、不进索引/描述）。启用方式：
-`HANA_TOOL_GROUPS` 加 `sql`（如 `read,write,admin,sql`），或 `HANA_TOOL_ALLOW=hana_sql_execute`；
-`HANA_TOOL_DENY` 优先级最高。它是独立的第七个根工具（`category=sql`，不属于任何门面），启用后直接出现在
-`tools/list`，不需要先调门面提升。
+`HANA_TOOL_GROUPS` 加 `sql`（如 `read,write,admin,sql`），或直接写 `hana_sql_execute`；
+`HANA_TOOL_DENY` 优先级最高。它是独立分类 `sql` 的能力，启用后经 `hana_tool_search` 发现、由
+`hana_invoke` 执行，**不直接出现在 `tools/list`**。
 
 **语句分类与权限**
 
 | 类别 | 典型语句 | 默认行为 | 权限/控制 |
 |---|---|---|---|
-| 查询 `read` | `SELECT`、`WITH ... SELECT` | 允许 | 只读环境：`select-only` 允许，但 `FOR UPDATE` / `FOR SHARE` / `NEXTVAL` 拒绝；`deny` 全部拒绝。对象权限由 HANA 账号决定 |
-| 写数据 `dml` | `INSERT` / `UPDATE` / `DELETE` / `UPSERT` / `MERGE` | 允许 | 数据库账号权限；只读环境（`ACCESS=readonly`）拒绝 |
-| DDL | `CREATE` / `ALTER` / `DROP` / `TRUNCATE` / `RENAME` / `COMMENT`（非 USER/REMOTE/SYSTEM） | 允许 | 数据库账号权限；只读环境拒绝；DDL 可能隐式提交 |
-| 管理/调用 | `CALL` / `GRANT` / `REVOKE` / `ALTER SYSTEM` / `RECONFIGURE` / `IMPORT` / `EXPORT` / `EXECUTE`、`CREATE/ALTER/DROP USER、REMOTE、SYSTEM` | 允许 | 数据库账号权限；只读环境拒绝 |
+| 查询 `read` | `SELECT`、`WITH ... SELECT` | 允许 | 始终允许 SELECT 类；`FOR UPDATE` / `FOR SHARE` / `NEXTVAL` 拒绝。对象权限由 HANA 账号决定 |
+| 写数据 `dml` | `INSERT` / `UPDATE` / `DELETE` / `UPSERT` / `MERGE` | 拒绝 | 仅 `HANA_SQL_ACCESS=readwrite` 允许；数据库账号权限 |
+| DDL | `CREATE` / `ALTER` / `DROP` / `TRUNCATE` / `RENAME` / `COMMENT`（非 USER/REMOTE/SYSTEM） | 拒绝 | 仅 `HANA_SQL_ACCESS=readwrite` 允许；DDL 可能隐式提交 |
+| 管理/调用 | `CALL` / `GRANT` / `REVOKE` / `ALTER SYSTEM` / `RECONFIGURE` / `IMPORT` / `EXPORT` / `EXECUTE`、`CREATE/ALTER/DROP USER、REMOTE、SYSTEM` | 拒绝 | 仅 `HANA_SQL_ACCESS=readwrite` 允许；数据库账号权限 |
 | 事务控制 | `BEGIN` / `COMMIT` / `ROLLBACK` / `SAVEPOINT` / `RELEASE` / `SET TRANSACTION` | 拒绝 | 规则层硬拒绝：连接池跨调用无法保证事务原子性 |
 | 会话状态 | `SET ...`（非 `SET TRANSACTION`） | 拒绝 | 规则层硬拒绝：会污染连接池后续调用 |
 | 执行计划 | `EXPLAIN ...` | 拒绝 | 改用 `hana_sql_analyze` |
@@ -277,6 +279,22 @@ HANA_ENV_SWITCHABLE=DEV,UAT,PROD
 
 仅在用户明确要求执行 SQL 时调用；不用于探测、验证或替代专用工具。该约束写在工具说明里，服务端无法读取
 用户原始消息，属模型侧软约束；需要硬拦截请在客户端把该工具设为需人工确认。
+
+### 策略文档已移除
+
+`MCP_POLICY` 不再是权限入口：已移除并忽略（v1/v2 都不再读取）。权限只由 4 个 env 表达：
+`HANA_TOOL_GROUPS` / `HANA_TOOL_DENY` / `HANA_WRITE_PACKAGES` / `HANA_READ_SCHEMA`。
+多调用方需要再收紧时，用可选的 `MCP_PROFILES`（档案只能在上述范围内收紧）。
+
+### 调用上下文（contextToken）
+
+`hana_tool_search` 的 `discover` / `contract` / `goal` 回执都带 `contextToken`（HMAC 签名，10 分钟有效）。
+执行时把它传给 `hana_invoke({ capability, args, contextToken })`：
+
+- 多环境**所有**调用必须带（读调用也不例外）；
+- token 绑定 profile/client/env/epoch/policyRev/manifestRev；切环境、改策略、换清单后旧 token 失效（`context_stale`），重新调 `hana_tool_search` 即可；
+- 旧字段 `expectedEnvironment` / `disclosure` / `disclosureId` 仍兼容一个版本，但新调用只需 `contextToken`；
+- token **不是授权凭证**：每次 `hana_invoke` 仍按目标能力重新授权与预检。
 
 ### 调用方档案（MCP_PROFILES）
 
@@ -415,8 +433,12 @@ MCP_HTTP_PORT=3000 MCP_HTTP_TOKENS='shared:your-long-random-token' node dist/ind
 | `env_start_required` | 多环境未指定启动环境 | 设置 HANA_ENV_START=<环境标识>；只有一个环境时可省略。 |
 | `env_switchable_in_single` | 单环境部署却配置了可切换列表 | 删除 HANA_ENV_SWITCHABLE，或补充 _ENV_ 变量进入多环境模式。 |
 | `env_readonly` | 只读环境拒绝了持久写入能力 | 切到 ACCESS=readwrite 的环境，或为该环境使用只读账号；临时对象与纯读不受影响。 |
-| `env_assertion_missing` | 多环境非纯读调用缺少 expectedEnvironment | 传入当前环境标识（与 hana_env_list 的 current 一致，大小写不敏感）。 |
+| `env_assertion_missing` | 多环境调用缺少 expectedEnvironment | 传入当前环境标识（与 hana_env_list 的 current 一致，大小写不敏感）。 |
 | `env_assertion_mismatch` | expectedEnvironment 与当前环境不一致 | 先确认是否忘了切回；用 hana_env_list 查看当前环境后重试。 |
+| `env_epoch_missing` | 多环境调用缺少 expectedEpoch | 传入 hana_env_list 返回的 epoch（或重新披露取当前代际）。 |
+| `env_epoch_stale` | expectedEpoch 已过期（如 DEV 4 → PRD 5 → DEV 6） | 重新调用 hana_env_list / hana_tool_search 取当前代际后重试；旧披露不可复用。 |
+| `policy_stale` | 调用方回传的披露 `policyRev` 与当前策略不一致 | 重新调用 hana_tool_search 披露（策略/档案/环境已变化）。 |
+| `manifest_stale` | 调用方回传的披露 `manifestRev` 与当前能力清单不一致 | 重新披露；服务端可能已升级。 |
 | `env_switch_disabled` | 环境切换未启用 | 需要多环境部署且 HANA_ENV_SWITCHABLE 非空。 |
 | `env_switch_http_unsupported` | HTTP 模式不支持进程级环境切换 | 改用一进程一环境，或配置 MCP_HTTP_CLIENT_ENVS 做 Token→环境绑定。 |
 | `env_switch_target_not_allowed` | 目标环境不在 HANA_ENV_SWITCHABLE 中 | 把目标环境标识加入 HANA_ENV_SWITCHABLE 后重启。 |
@@ -435,8 +457,8 @@ MCP_HTTP_PORT=3000 MCP_HTTP_TOKENS='shared:your-long-random-token' node dist/ind
 | `capability_not_in_profile` | 能力不在档案允许的 glob 范围内 | 调整 MCP_PROFILES 的 glob，或换用其它档案。 |
 | `write_package_outside_profile` | 目标包不在档案的写包范围内 | 调整档案的 resourceScopes（若已启用），或换用允许该包的档案。 |
 | `schema_outside_profile` | schema 不在档案允许的读取范围内 | 调整档案的 resourceScopes（若已启用），或换用允许该 schema 的档案。 |
-| `tool_not_exposed` | 能力未对当前调用方暴露 | 检查 HANA_TOOL_GROUPS / HANA_TOOL_ALLOW / HANA_TOOL_DENY 与档案。 |
-| `unknown_capability` | 能力 id 不存在 | 通过门面索引获取可用能力 id。 |
+| `tool_not_exposed` | 能力未对当前调用方暴露 | 检查 HANA_TOOL_GROUPS / HANA_TOOL_DENY 与档案。 |
+| `unknown_capability` | 能力 id 不存在或未授权 | 先 `hana_tool_search({mode:"discover"})` 获取可用能力 id。 |
 | `schema_not_allowed` | schema 不在读取白名单内 | 把 schema 加入 HANA_READ_SCHEMA（或对应的 _ENV_ 覆盖）。 |
 | `tls_plaintext` | SQL 连接未启用 TLS | 设置 HANA_TLS=true（或对应环境的 HANA_TLS_ENV_<XXXX>=true）。 |
 | `hana_client_pipe_unavailable` | @sap/hana-client 的内部 IPC 管道（hdbpipe）不可用 | 重启 MCP server；若持续出现，检查 SAP HANA client 运行环境（杀毒软件/临时目录/残留的 HANA 客户端进程）。 |

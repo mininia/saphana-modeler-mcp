@@ -3,7 +3,7 @@
  *
  * 只在多环境部署注册：
  * - list：看当前环境标识、每个环境的 access/state/任务数、可切列表与一次性 token；
- * - switch：必须经 hana_system 门面路由，校验 allowlist/from/epoch/token/confirm/在途调用/目标任务/目标连接。
+ * - switch：必须经 hana_invoke 路由，校验 allowlist/from/epoch/token/confirm/在途调用/目标任务/目标连接。
  *
  * 两个 handler 都不碰 HANA（list 只读内存；switch 的预检由 manager 负责），
  * 因此当前环境不可用时仍能查看/切换。
@@ -49,17 +49,18 @@ function listEnvelope(ctx: ToolContext): Envelope['data'] {
       runningTasks: countRunningTasksForEnvironment(rt.envKey),
       poolOpen: rt.pool.stats().inUse + rt.pool.stats().idle > 0,
     })),
+    next: '权限/预览诊断：先 hana_tool_search({ mode: "goal", goal: "diagnose_preview_permission", bindings: { packageId, objectName } })，再按 steps[] 用 hana_invoke 执行；多环境所有调用带 expectedEnvironment:{key,epoch}（或 contextToken）。',
     hint: httpMode
       ? 'HTTP 多客户端共享进程：不支持运行时切换；请一进程一环境或使用 Token→环境绑定。'
       : !switchEntitled
         ? '当前调用方没有 hana_env_switch 权限（admin 组/档案）：只能查看，不能切换。'
         : manager.switchable.length > 0
-          ? '切换用 hana_system({ capability: "hana_env_switch", args: { to, from: current, epoch, switchToken, confirm: to } })；token 一次性、60s 有效。'
+          ? '切换用 hana_invoke({ capability: "hana_env_switch", args: { to, from: current, epoch, switchToken, confirm: to } })；token 一次性、60s 有效。'
           : '当前没有可切环境（HANA_ENV_SWITCHABLE 为空）：只能查看，不能切换。',
   };
 }
 
-/** 注册环境管理工具。handler 恒登记（门面路由表完整），是否可见由 surface 按 multiEnv/switchable 决定 */
+/** 注册环境管理能力。handler 恒登记（供 hana_invoke 派发），是否可发现/执行由 entitlement 决定 */
 export function registerEnvironmentTools(server: McpServer, ctx: ToolContext): void {
   const regCap = capabilityRegistrar(server, ctx);
 

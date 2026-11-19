@@ -745,22 +745,6 @@ export function planTaskCancel(args: Record<string, unknown>): WritePlan {
   ]);
 }
 
-export function planFacade(facadeId: string): CapabilityPlanner {
-  return (args) => {
-    const target = asStr(args.capability);
-    const p = emptyPlan(facadeId);
-    p.steps.push(
-      target
-        ? `门面路由：本次调用的是 ${target}（读写范围由目标能力自身的计划判定）`
-        : '读取本类能力索引：只读清单，不触碰任何 HANA 资源',
-    );
-    if (target) {
-      p.uncertain.push('门面自身不声明资源；目标能力会独立跑一次同一个闸门，资源结论以那一次为准');
-    }
-    return p;
-  };
-}
-
 /** hana_table_list：列出某 schema 的表。schema 省略时按当前用户默认 schema 解析（服务端查 CURRENT_SCHEMA） */
 export function planTableList(args: Record<string, unknown>): WritePlan {
   const schema = asStr(args.schema);

@@ -4,6 +4,18 @@
 >
 > 约定：每次提交前把变化补到对应版本条目下；每条 1–3 行，只写对外可见变化。
 
+## 1.6.0 - 2026-11-19
+
+- **破坏性变更（单一入口）**：`tools/list` 只保留 `hana_tool_search`（选择）与 `hana_invoke`（执行）；删除六个分类门面、`hana_sql_execute` 根工具与所有分类/集合提升。
+- 具体能力（含 SQL、环境切换、`hana_view_update#<op>` 操作级别名）一律经本体层发现/披露后由 `hana_invoke({capability,args})` 执行；契约 `call.via` 恒为 `hana_invoke`。
+- 删除 `MCP_CAPABILITY_SURFACE_MAX`；多环境写/临时对象的环境断言统一放在 `hana_invoke` 顶层 `expectedEnvironment:{key,epoch}`，旧 `args` 写法仍兼容。
+
+## 1.5.0 - 2026-11-18
+
+- 新增 `hana_tool_search`：discover/contract/goal 三模式 + 预算；取消门面自动提升，`tools/list` 稳定为六门面 + 平台入口；门面 schema 错误回执升级为完整契约参数卡。
+- P2：`expectedEnvironment:{key,epoch}` 调用信封、`disclosure` 一致性检查（policy_stale/manifest_stale）、单一策略文档 `MCP_POLICY`、执行上下文与审计 requestId、Token 预算校准。
+- P3：`promote:true` 集合级提升（按工具 FIFO、恰好一次 list_changed）、`HANA_APPROVAL=destructive` 的 input_required 人工确认（绑定 args/principal/5 分钟过期）；多环境写调用逾期披露按 epoch 失效。
+
 ## 1.4.5 - 2026-11-16
 
 - 修复多环境参数配置无法按预期生效：连接参数严格按 `HANA_<PARAM>_ENV_<XXXX>` 解析，扁平连接键忽略；策略/授权参数支持扁平共享 + `_ENV_` 按环境覆盖。

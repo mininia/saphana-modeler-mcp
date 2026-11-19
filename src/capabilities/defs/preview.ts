@@ -44,6 +44,11 @@ export const previewCapabilities = {
         '权限/可达性验证用 diagnose；不要用本工具逐个预览上游（SELECT * 投影全部列，宽视图即使 limit=1 也可能很慢）',
       ],
       exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV008', limit: 5 },
+      returns: [
+        '视图预览：data.columns + data.rows（默认前 10/100 行）',
+        '基表勘察：逐列画像，统计只基于采样行',
+        '权限类失败自动附 raw.diagnosis',
+      ],
     },
     preflight: (args) => {
       const target = resolvePreviewTarget(args as Parameters<typeof resolvePreviewTarget>[0]);
@@ -122,6 +127,7 @@ export const previewCapabilities = {
       intent: '回答某个视图/对象为什么不能预览/没权限（258/2950）',
       whenToUse: [
         '已激活视图预览报 258/2950',
+        '固定流程优先：hana_tool_search({mode:"goal", goal:"diagnose_preview_permission"})',
         '判断是经典分析权限、SQL 结构化权限、上游不可达还是运行时权限',
         '逐个确认上游对象是否可访问（根对象与上游都用本工具）',
       ],
@@ -132,6 +138,11 @@ export const previewCapabilities = {
       ],
       priority: 'primary',
       exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV008', channel: 'derived' },
+      returns: [
+        'data.brief：结论/上游不可达/分析权限/结构化权限',
+        'verbose=true 才返回完整 checks/privileges 明细',
+        '只做 SELECT 1 实测，不返回业务数据',
+      ],
       constraints: [
         '根对象与上游逐个确认都用本工具；内部 SELECT 1 LIMIT 1，不返回业务数据',
         '不要用 hana_data_preview 取数验证权限（宽视图按 SELECT * 投影会慢）',

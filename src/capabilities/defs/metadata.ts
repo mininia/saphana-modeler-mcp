@@ -94,6 +94,11 @@ export const metadataCapabilities = {
       notFor: ['只看字段清单用 hana_metadata_list_fields', '权限/预览失败用 hana_data_preview_diagnose'],
       priority: 'primary',
       exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV008' },
+      returns: [
+        'data.view 为结构化定义（数据源/节点/字段/变量）',
+        'data.xml 为仓库原始设计时 XML',
+        '不分页；超大对象可能截断',
+      ],
     },
     title: '读取视图完整定义',
     description:
@@ -124,6 +129,7 @@ export const metadataCapabilities = {
       notFor: ['已知 packageId+objectName 时直接 get_view/list_fields'],
       priority: 'primary',
       exampleArgs: { pattern: 'ZDEMO02_CV', by: 'name', category: 'model' },
+      returns: ['model=objects；目录类别=items；all=groups+counts', 'limit 为每类上限（默认 20）'],
     },
     preflight: (args) => {
       const rule = validateSearchObjectsArgs(args as Parameters<typeof validateSearchObjectsArgs>[0]);
@@ -179,6 +185,7 @@ export const metadataCapabilities = {
       notFor: ['看单字段计算逻辑用 hana_metadata_get_field_logic'],
       priority: 'primary',
       exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV008' },
+      returns: ['data.fields[] 字段 ID/描述/类型/聚合/来源/是否带逻辑', '不分页；字段数受对象定义限制'],
     },
     preflight: (args) => {
       const v = args as { exact?: boolean; pattern?: string };
@@ -218,6 +225,11 @@ export const metadataCapabilities = {
       notFor: ['视图级依赖用 hana_metadata_where_used', '字段 ID 不确定先用 hana_metadata_list_fields'],
       priority: 'primary',
       exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV008', fieldId: 'MATERIAL' },
+      returns: [
+        'data.logic：公式原文/源字段/节点溯源/字段元数据',
+        'includeUsage=true 时附字段级下游血缘（受 usageMaxViews 约束）',
+        '单字段聚焦；不返回整视图定义',
+      ],
     },
     title: '获取单字段计算逻辑',
     description:
@@ -263,6 +275,10 @@ export const metadataCapabilities = {
       notFor: ['字段级逻辑用 hana_metadata_get_field_logic'],
       priority: 'primary',
       exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV008', direction: 'both' },
+      returns: [
+        'data.upstream[]/downstream[]：packageId/objectName/objectSuffix/refType/isRuntime',
+        'depth>1 时 closure 带跳数口径；truncated 表示达到上限',
+      ],
     },
     title: '血缘/依赖关系搜索',
     description:

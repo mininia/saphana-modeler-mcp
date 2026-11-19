@@ -82,7 +82,7 @@ node scripts/smoke-stdio.mjs   # 冒烟：握手 + 工具注册（无需真实 H
 }
 ```
 
-**多 HANA 环境（可选）**：用 `HANA_<PARAM>_ENV_<XXXX>` 定义多个环境。连接参数按环境写（扁平 `HANA_HOST` 等会被忽略），`HOST/PORT/USER/PASSWORD` 每个环境必填；`HANA_ACCESS` 等策略参数扁平写 = 共享，`_ENV_` 覆盖单个环境。环境标识就是 `<XXXX>`（大小写不敏感），用 `hana_env_list` / `hana_env_switch` 切换；HTTP 用 `MCP_HTTP_CLIENT_ENVS` 绑定 Token。完整规则见 [CONFIG.md 的「多 HANA 环境」](CONFIG.md#多-hana-环境单进程单-active)。
+**多 HANA 环境（可选）**：用 `HANA_<PARAM>_ENV_<XXXX>` 定义多个环境。连接参数按环境写（扁平 `HANA_HOST` 等会被忽略），`HOST/PORT/USER/PASSWORD` 每个环境必填；`HANA_TOOL_GROUPS` / `HANA_TOOL_DENY` / `HANA_WRITE_PACKAGES` / `HANA_READ_SCHEMA` / `HANA_SQL_ACCESS` 扁平写 = 共享，`_ENV_` 覆盖单个环境。**多环境的 entitlement（search + invoke）按当前环境编译，等价于多个单环境**。环境标识就是 `<XXXX>`（大小写不敏感），用 `hana_env_list` / `hana_env_switch` 切换；HTTP 用 `MCP_HTTP_CLIENT_ENVS` 绑定 Token。完整规则见 [CONFIG.md 的「多 HANA 环境」](CONFIG.md#多-hana-环境单进程单-active)。
 
 多环境 `mcp.json` 示例（npx 启动，三个环境）：
 
@@ -108,8 +108,6 @@ node scripts/smoke-stdio.mjs   # 冒烟：握手 + 工具注册（无需真实 H
         "HANA_USER_ENV_PROD": "PROD_USER",
         "HANA_PASSWORD_ENV_PROD": "***",
 
-        "HANA_ACCESS": "readonly",
-        "HANA_ACCESS_ENV_DEV": "readwrite",
         "HANA_WRITE_PACKAGES_ENV_DEV": "ZDEMO",
 
         "HANA_ENV_START": "DEV",
@@ -123,8 +121,7 @@ node scripts/smoke-stdio.mjs   # 冒烟：握手 + 工具注册（无需真实 H
 > 说明：
 > 多环境下扁平的连接参数(`HANA_HOST`等)，此类配置会被忽略。
 > 每个环境必须显式提供 `HANA_HOST_ENV_*` / `HANA_PORT_ENV_*` / `HANA_USER_ENV_*` / `HANA_PASSWORD_ENV_*`。
-> `HANA_ACCESS` 为所有环境共享的策略值，`HANA_ACCESS_ENV_DEV` 仅覆盖 DEV；
-> `HANA_WRITE_PACKAGES_ENV_DEV` 仅为 DEV 启用写边界，UAT 与 PROD 不启用。
+> `HANA_WRITE_PACKAGES_ENV_DEV` 仅为 DEV 启用写边界（DEV=readwrite）；UAT 与 PROD 没有写包（只读）。
 > 非默认 XS 端口通过`HANA_XS_PORT_ENV_<XXXX>` 配置；HTTP 模式下使用 `MCP_HTTP_CLIENT_ENVS` 将 Token 绑定到环境。
 
 > **stdio 下的环境切换是进程级的**：只影响之后的调用，已提交任务与在途调用仍绑定原环境；并发 agent 共享同一 active 环境，建议一进程一环境。
@@ -136,24 +133,47 @@ node scripts/smoke-stdio.mjs   # 冒烟：握手 + 工具注册（无需真实 H
   对外暴露需配置 `MCP_HTTP_HOST` / `MCP_HTTP_ALLOWED_HOSTS` / `MCP_HTTP_TOKENS`；无 Token 的非回环监听默认拒绝启动。
   详见 [CONFIG.md](CONFIG.md) 的「传输方式」。
 
-## 工具面：六个分类门面 + 独立 SQL 工具
+## 工具面：本体层选择 + 唯一执行入口
 
-`tools/list` 常驻 6 个分类门面；显式启用 `sql` 组后，`hana_sql_execute` 与门面同级常驻（默认不可见）。具体能力默认隐藏，经门面索引 + 路由调用，调门面时按分类提升进工具面。
+`tools/list` 常驻且**只有两个**平台工具：
 
-| 工具 | 方向 | 成员数 |
+| 工具 | 职责 |
+| --- | --- |
+| `hana_tool_search` | 本体层：`discover` 找候选、`contract` 一次取完整契约、`goal` 取预设配方；**不执行、不授权、不改工具面** |
+| `hana_invoke` | 唯一执行入口：`{ capability, args }`，按目标能力重新过授权、schema、预检与审批 |
+
+具体能力（含 `hana_sql_execute`、环境切换、`hana_view_update#<op>` 操作级别名）**永不注册为工具**。
+没有分类门面，也没有平铺的具体工具：想调用任何能力，都必须先经 `hana_tool_search` 选择，再用
+`hana_invoke` 执行。这两个入口本身都不会改变工具面（无 `list_changed`）。
+
+### 三阶段
+
+| 阶段 | 调用 | 返回 |
 | --- | --- | --- |
-| `hana_system` | 连接与环境：当前连接是谁、连到哪；多环境时含环境列表与切换 | 3 |
-| `hana_discovery` | 浏览与查找：找包/对象/表，读定义与字段结构 | 7 |
-| `hana_data` | 取数预览：看已激活视图/基表的数据 | 2 |
-| `hana_insights` | 结构与血缘分析：影响面、字段级计算逻辑 | 2 |
-| `hana_modeling` | 建模与仓库变更：创建/修改/校验/激活/删除、导入导出 | 11 |
-| `hana_diagnostics` | 运维与性能：健康/会话/存储/趋势、SQL 分析、变更审计 | 6 |
-| `hana_sql_execute` | 执行 HANA SQL | — |
+| 发现 | `hana_tool_search({ mode: "discover", query: "权限 诊断", category: "data" })` | 候选卡（id/标题/用途/授权类别），不含完整 schema |
+| 披露 | `hana_tool_search({ mode: "contract", tools: ["hana_metadata_get_view", "hana_data_preview_diagnose"] })` | 完整输入 JSON Schema、required、exampleArgs、constraints、effects、access、returns、`call.via` |
+| 执行 | `hana_invoke({ capability: "hana_metadata_get_view", args: { packageId, objectName } })` | 目标能力的原始 envelope |
 
-- 权限模型见 [CONFIG.md 的「权限维度分工（三层正交）」](CONFIG.md#权限维度分工三层正交)。
-- 多环境部署时 `hana_system` 额外包含 `hana_env_list` / `hana_env_switch`；单环境不出现。
-- 拒绝不泄漏存在性：未知能力、无权能力、跨类路由**逐字同形**。
-- 工具分组与动态面规则见 [CONFIG.md 的「工具分组与可见性控制」](CONFIG.md#工具分组与可见性控制)；调用方档案见 [「调用方档案（MCP_PROFILES）」](CONFIG.md#调用方档案mcp_profiles)。
+固定流程用 `goal`：
+
+```jsonc
+hana_tool_search({ "mode": "goal", "goal": "diagnose_preview_permission",
+                   "bindings": { "packageId": "ZDEMO", "objectName": "ZDEMO_CV_SDR008" } })
+```
+
+- 契约里的 `call.via` 恒为 `hana_invoke`；配方步骤的 `steps[].via` 同样如此。
+- **权限/预览失败（258/2950）**：先取 `diagnose_preview_permission` 配方（根对象 derived、上游逐个 direct），再按步骤执行；不要先猜参数或用 `hana_data_preview` 取数验证。
+- 集合内任一 id 未知/无权 → **整包拒绝**，与未知能力逐字同形。
+- 多环境下的**所有**调用需带 `contextToken`（`hana_tool_search` 回执签发；旧 `expectedEnvironment:{key,epoch}` 仍兼容一个版本）；切环境后旧 token 失效（`context_stale`）。
+- 预算护栏：`maxTools`（默认 12 / 硬上限 20）、`maxSchemaBytes`（默认 32KB/工具）、`maxResponseBytes`（默认 256KB）；超限给 `budget_exceeded`，不静默丢契约。
+- **可显式关闭 goal 模式**：`HANA_TOOL_SEARCH_GOAL=off` 时只保留 `discover`/`contract`，`mode=goal` 返回可恢复错误；工具面与 `hana_invoke` 不变，用于验证不走配方的选择路径。
+- **调用上下文**：推荐 `hana_invoke({ capability, args, contextToken })`；`expectedEnvironment` / `disclosure` 是兼容字段。
+- **审批固定启用**：`effects.destructive=true` 的能力在策略放行后返回 `input_required`，确认绑定 args/调用方/5 分钟过期；不再有 `HANA_APPROVAL` 开关。
+- **SQL 访问模式**：`HANA_SQL_ACCESS=select-only`（默认）只允许 SELECT 类；`readwrite` 才允许 SQL 写；对象级 schema/对象访问由 HANA 账号权限决定。
+- 权限模型见 [CONFIG.md 的「权限参数（4 个 + SQL 模式）」](CONFIG.md#权限参数4-个--sql-模式)。
+- 多环境部署时 `hana_env_list` / `hana_env_switch` 经本体层发现与执行；单环境不可见。
+- 拒绝不泄漏存在性：未知能力、无权能力、平台入口自身目标**逐字同形**。
+- 工具分组与可见性规则见 [CONFIG.md 的「工具分组与可见性控制」](CONFIG.md#工具分组与可见性控制)；调用方档案见 [「调用方档案（MCP_PROFILES）」](CONFIG.md#调用方档案mcp_profiles)。
 
 ## 数据预览
 
@@ -192,7 +212,7 @@ src/
   config/                          环境变量校验、权限策略与调用期闸门
   core/                            连接池、SQL 白名单、错误 envelope、日志脱敏、锁与信号量、XS REST
   model/                           视图类型、XML 解析/构造
-  capabilities/                    能力清单（kind/effects/schema）+ 分类门面
+  capabilities/                    能力清单（kind/effects/schema/本体契约）+ 平台入口
   rules/                           规则正文目录（按 id 查询）
   services/                        元数据/预览/仓库写/SQL 分析/稳定性诊断
   tools/                           MCP 工具薄壳

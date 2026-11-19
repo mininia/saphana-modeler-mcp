@@ -1,26 +1,30 @@
 /**
- * 调用方面（surface）、可触达上限（entitlement）与提升。
+ * 调用方面（surface）与可触达上限（entitlement）。
  *
- * - entitlement = 部署静态面 ∩ 调用方档案，是天花板：门面索引、路由与提升都按它判定，
- *   面外能力在三处都表现得与不存在完全一样（不变量 D）。
- * - promoted = 该调用方调用过的分类；提升把该分类的具体能力搬进 surface，此后可按工具名平铺直调。
- * - surface = (门面 ∪ 已提升分类的成员) ∩ entitlement，是本次连接实际注册的工具集。
- * 关系：surface ⊆ entitlement ⊆ 部署策略（不变量 A）。
+ * 2026-11-19（单一入口）起工具面固定为**两个平台入口**：
+ * - `hana_tool_search`：本体层（发现 / 契约 / 配方），不改工具面、不执行；
+ * - `hana_invoke`：唯一执行入口，按目标能力统一授权后派发。
  *
- * 提升按分类（粒度对齐 hana-cli 的 Dynamic Tool Promotion）：淘汰单位与提升单位一致，
- * 上限 MCP_CAPABILITY_SURFACE_MAX 按工具数算（routeOnly 不注册也不计），超出时最旧分类整体淘汰。
+ * 具体能力（含 `hana_sql_execute`、环境切换、操作级别名）**永不注册**为工具；
+ * entitlement 仍是“可发现 + 可执行”的天花板（部署策略 ∩ 档案）。
  *
- * 状态在进程内、重启即退回只有门面（不变量 F：面是呈现设施，不是正确性设施）：
- * HTTP 键 = 已认证 clientId；stdio 键 = (stdio)。未配 Token 的 HTTP 部署提升整体关闭（单租户假设）。
+ * 关系：surfaceIds ⊆ entitlementIds ⊆ 部署策略（不变量 A）。面是呈现设施，不是授权设施：
+ * 每次调用仍过 `authorizeCall`（见 config/authorize.ts）。
  */
 
-import { CAPABILITY_LIST, findCapability, membersOfCategory } from '../capabilities/manifest.js';
-import { CAPABILITY_CATALOG, type Capability, type FacadeCategory } from '../capabilities/types.js';
+import { CAPABILITY_LIST, findCapability } from '../capabilities/manifest.js';
+import {
+  CAPABILITY_CATALOG,
+  PLATFORM_TOOL_IDS,
+  type BusinessCategory,
+  type Capability,
+} from '../capabilities/types.js';
 import { activeProfile, profileAllows, type CallerProfile } from '../config/profiles.js';
-import type { HanaConfig } from '../config/config.js';
+import { compilePolicySnapshot } from '../config/policy-snapshot.js';
 import { capabilityInputSchema } from '../config/environment-policy.js';
-import { ANONYMOUS_CLIENT_ID, currentIdentity } from '../core/request-context.js';
-import { matchGlob, shouldRegisterTool, type ToolFilterConfig } from './groups.js';
+import type { HanaConfig } from '../config/config.js';
+import { currentIdentity } from '../core/request-context.js';
+import { matchGlob, shouldRegisterTool, toolFilterOf, type ToolFilterConfig } from './groups.js';
 
 /**
  * 面的计算只需要「策略 + 配置」。刻意不 import ./index.js 的 ToolContext（会成环）；
@@ -29,145 +33,61 @@ import { matchGlob, shouldRegisterTool, type ToolFilterConfig } from './groups.j
 export interface SurfaceContext {
   config: HanaConfig;
   toolFilter: ToolFilterConfig;
-  /** 多环境管理器（可选；测试/单环境可省略）：环境管理能力按 multiEnv/switchable 条件可见 */
+  /** 多环境管理器（可选；测试/单环境可省略） */
   manager?: {
     multiEnv: boolean;
     switchable: readonly string[];
   };
 }
 
-/** stdio 进程（单客户端）的提升键 */
+/** stdio 进程（单客户端）的归属键（异步任务归属用） */
 const STDIO_SURFACE_KEY = '(stdio)';
 
-/** 提升注册表：调用方键 → 已提升的分类（按提升顺序，FIFO 淘汰用最旧在前） */
-const promotedByCaller = new Map<string, FacadeCategory[]>();
-
-/** 重置全部提升状态（测试隔离用） */
-export function resetPromotedSurfaces(): void {
-  promotedByCaller.clear();
-}
-
-/** 某调用方已提升的分类（FIFO 顺序，最旧在前） */
-export function promotedCategoriesFor(key: string): readonly FacadeCategory[] {
-  return promotedByCaller.get(key) ?? [];
-}
-
-/** 该调用方是否启用提升（未配 Token 的 HTTP 部署关闭） */
-export function canPromote(identity: { clientId?: string } | undefined): boolean {
-  // 无身份上下文 = stdio（单客户端，无串扰面）→ 允许
-  if (identity === undefined) return true;
-  // HTTP 未配 Token 时所有调用方都是 anonymous → 关闭（单租户假设，见头注）
-  return identity.clientId !== ANONYMOUS_CLIENT_ID;
-}
-
-/** 调用方键（提升注册表的键） */
+/** 调用方键（异步任务归属用） */
 function surfaceKeyOf(identity: { clientId?: string } | undefined): string {
   return identity?.clientId ?? STDIO_SURFACE_KEY;
 }
 
-/**
- * 当前调用方的归属键（提升注册表与异步任务归属共用）：HTTP 用 clientId，stdio 用 (stdio)。
- * 两处必须同源——各自现算会让「自己提交的任务查不到」且没有任何报错。
- */
+/** 当前调用方的归属键（异步任务归属等共用）：HTTP 用 clientId，stdio 用 (stdio)。 */
 export function currentSurfaceKey(): string {
   return surfaceKeyOf(currentIdentity());
 }
 
 /**
- * 一批分类覆盖的工具数（提升预算按它算）。与 computeSurface 同口径：只数可注册成员，
- * routeOnly 别名不计入（计入会让「面从未超上限」的部署被提前淘汰）。
- */
-function toolCountOf(categories: readonly FacadeCategory[]): number {
-  return categories.reduce((sum, c) => sum + membersOfCategory(c).filter((m) => m.routeOnly !== true).length, 0);
-}
-
-/**
- * 把一批分类提升到某调用方的面。返回本次实际新增与被 FIFO 淘汰的分类。
- * - 已提升的分类不重复计入，也不刷新顺序；
- * - 超出 max 时从最旧的一端整体淘汰，本次刚提升的分类不参与淘汰（否则会立刻淘汰自己）；
- * - 不做授权判定：调用方已按 entitlement 过滤。
- */
-export function promoteCategories(
-  key: string,
-  categories: readonly FacadeCategory[],
-  max: number,
-): { added: FacadeCategory[]; evicted: FacadeCategory[] } {
-  const current = [...(promotedByCaller.get(key) ?? [])];
-  const added: FacadeCategory[] = [];
-  for (const c of categories) {
-    if (!current.includes(c)) {
-      current.push(c);
-      added.push(c);
-    }
-  }
-  const newlyAdded = new Set(added);
-  const evicted: FacadeCategory[] = [];
-  while (toolCountOf(current) > max) {
-    // 从最旧的一端找第一个"不是本次刚加进来的"分类淘汰
-    const idx = current.findIndex((c) => !newlyAdded.has(c));
-    if (idx < 0) break; // 只剩本次新增的（单个分类就超上限）：保面可用，不再淘汰
-    evicted.push(...current.splice(idx, 1));
-  }
-  promotedByCaller.set(key, current);
-  return { added, evicted };
-}
-
-/**
- * 调用方的可触达能力（entitlement）：部署静态面 ∩ 档案，包含门面与非门面两类条目。
- * 门面常驻：入口不参与能力层判定，否则按 glob 收紧的档案会把门面全拒、一个工具都注册不出来。
+ * 调用方的可触达能力（entitlement）：部署静态面 ∩ 档案。
+ *
+ * 编译委托给 `config/policy-snapshot.ts`（P2 快照）：平台入口按「未显式 deny ∧
+ * 至少一个具体能力 entitled」出现；它们不单独受分组/档案 kind 限制。
  */
 export function entitlementOf(
   ctx: SurfaceContext,
   identity: { clientId?: string; profileId?: string } | undefined,
-): {
-  ids: string[];
-  profile: CallerProfile | undefined;
-} {
+): { ids: string[]; profile: CallerProfile | undefined } {
   const profile = activeProfile(ctx.config, identity);
-  // 切换必须能拿到 hana_env_list 发放的一次性 token：list 自身不可达（read 组关闭/档案拒绝）时
-  // switch 也必然不可用，不能把它列进索引。HTTP 下进程级切换不受支持，同样不列。
-  const envListCapability = findCapability('hana_env_list');
-  const envListVisible =
-    ctx.manager?.multiEnv === true &&
-    envListCapability !== undefined &&
-    shouldRegisterTool(envListCapability.id, ctx.toolFilter) &&
-    profileAllows(profile, envListCapability.id, envListCapability.kind).ok;
-  /** 环境管理能力只在多环境注册；switch 还要求 list 可达、switchable 非空且非 HTTP */
-  const envCapabilityVisible = (c: Capability): boolean => {
-    if (c.id === 'hana_env_list') return ctx.manager?.multiEnv === true;
-    if (c.id === 'hana_env_switch') {
-      return envListVisible && (ctx.manager?.switchable?.length ?? 0) > 0 && ctx.config.httpPort == null;
-    }
-    return true;
-  };
-  /** 单个能力的可触达判定：可见性配置 + 档案（门面只过 deny 那一关，见上） */
-  const entitled = (c: Capability): boolean => {
-    if (!envCapabilityVisible(c)) return false;
-    if (!shouldRegisterTool(c.id, ctx.toolFilter)) return false;
-    if (c.facadeOf !== undefined) return true; // 门面：入口不参与能力层判定（分组/档案都不拦它）
-    // 档案维度与调用期闸门共用 profileAllows（单点实现）：undefined 档案 → profile_unknown → false
-    return profileAllows(profile, c.id, c.kind).ok;
-  };
-  const ids = CAPABILITY_LIST.filter(entitled).map((c) => c.id);
-  return { ids, profile };
+  const snapshot = compilePolicySnapshot({
+    config: ctx.config,
+    // 多环境：toolGroups/toolDeny 可由 _ENV_ 覆盖；entitlement 按当前绑定环境编译。
+    toolFilter: toolFilterOf(ctx.config, ctx.toolFilter),
+    ...(profile ? { profile } : {}),
+    multiEnv: ctx.manager?.multiEnv === true,
+    switchable: ctx.manager?.switchable ?? [],
+    ...(ctx.config.httpPort != null ? { httpPort: ctx.config.httpPort } : {}),
+  });
+  return { ids: [...snapshot.entitlement], profile };
 }
 
 /** 一次 server 构建使用的面（HTTP 每请求一份；stdio 单实例一份） */
 export interface CallerSurface {
-  /** 提升注册表的键（clientId / '(stdio)'） */
+  /** 归属键（clientId / '(stdio)'） */
   key: string;
-  /** 该调用方是否启用提升（未配 Token 的 HTTP 部署为 false） */
-  canPromote: boolean;
-  /** 可触达上限（部署静态面 ∩ 档案）——门面索引、路由与提升的判定依据 */
+  /** 可触达上限（部署静态面 ∩ 档案）——发现、契约与执行的判定依据 */
   entitlementIds: Set<string>;
-  /** 实际注册出去的工具集 = `(门面 ∪ 已提升分类的成员) ∩ entitlement` */
+  /** 实际注册出去的工具集 = entitlement 里的平台入口 */
   surfaceIds: Set<string>;
-  /** 已提升的分类（FIFO 顺序） */
-  promoted: readonly FacadeCategory[];
 }
 
 /**
- * 计算这次连接的面。
+ * 计算这次连接的面：只有两个平台入口。
  *
  * @param ctx 工具上下文（策略 / 配置）
  * @param identity 调用方身份（HTTP 请求内取；stdio 为 undefined）
@@ -178,30 +98,11 @@ export function computeSurface(
 ): CallerSurface {
   const { ids } = entitlementOf(ctx, identity);
   const entitlementIds = new Set(ids);
-  const key = surfaceKeyOf(identity);
-  const allowed = canPromote(identity);
-  const promoted = allowed ? promotedCategoriesFor(key) : [];
-  // routeOnly 别名不进 surface：它们没有自己的注册名（注册即撞父工具名），只经门面路由可用。
-  const promotedMembers = new Set(
-    promoted.flatMap((c) =>
-      membersOfCategory(c)
-        .filter((m) => m.routeOnly !== true)
-        .map((m) => m.id),
-    ),
-  );
-
   const surfaceIds = new Set<string>();
-  for (const c of CAPABILITY_LIST) {
-    if (!entitlementIds.has(c.id)) continue;
-    // 门面：常驻（它们是入口，提升不改变这一点）
-    if (c.facadeOf !== undefined) surfaceIds.add(c.id);
-    // 根工具（hana_sql_execute）：entitled 时常驻，与门面同级；不需要先调门面提升。
-    // 它的可见性仍由 shouldRegisterTool（sql 组默认关闭）与档案决定，见 entitlementOf。
-    else if (c.rootTool === true) surfaceIds.add(c.id);
-    // 其它具体能力：只有其分类被提升过才进面
-    else if (promotedMembers.has(c.id)) surfaceIds.add(c.id);
+  for (const id of PLATFORM_TOOL_IDS) {
+    if (entitlementIds.has(id)) surfaceIds.add(id);
   }
-  return { key, canPromote: allowed, entitlementIds, surfaceIds, promoted };
+  return { key: surfaceKeyOf(identity), entitlementIds, surfaceIds };
 }
 
 /** 面内的能力条目（按 id 排序：确定性顺序，跨传输/跨调用方比对列表时顺序稳定） */
@@ -268,12 +169,16 @@ function zodDescription(field: unknown): string | undefined {
 }
 
 /**
- * 能力的参数面（门面索引）：名字 + 必填 + 粗类型 + 参数说明。
- * 不返回完整 schema（那是提升后平铺工具的收益）；但索引必须自足到“按它填参数不会 schema 失败”：
- * 多环境下非纯读能力（mutates != none）会被追加必填 expectedEnvironment（见 capabilityInputSchema）。
+ * 能力的参数面（发现/契约辅助）：名字 + 必填 + 粗类型 + 参数说明。
+ * 不返回完整 schema（那是 `hana_tool_search(mode=contract)` 的收益）。
  */
-export function paramDetailsOf(cap: Capability, multiEnv = false): ParamDetail[] {
-  const schema = capabilityInputSchema(cap, multiEnv);
+export function paramDetailsOf(
+  cap: Capability,
+  multiEnv = false,
+  mode: 'args' | 'envelope' = 'envelope',
+): ParamDetail[] {
+  // 契约默认走信封（P2）：expectedEnvironment/expectedEpoch 不在 args 里。
+  const schema = capabilityInputSchema(cap, multiEnv, mode);
   const shape = (schema as unknown as { shape?: Record<string, unknown> }).shape;
   if (!shape) return [];
   return Object.entries(shape).map(([name, field]) => {
@@ -289,9 +194,9 @@ export function paramDetailsOf(cap: Capability, multiEnv = false): ParamDetail[]
   });
 }
 
-/** 必填参数名（门面索引的 required 快捷字段；与 paramDetailsOf 同源） */
-export function requiredParamsOf(cap: Capability, multiEnv = false): string[] {
-  return paramDetailsOf(cap, multiEnv)
+/** 必填参数名（契约的 required 快捷字段；与 paramDetailsOf 同源） */
+export function requiredParamsOf(cap: Capability, multiEnv = false, mode: 'args' | 'envelope' = 'envelope'): string[] {
+  return paramDetailsOf(cap, multiEnv, mode)
     .filter((p) => p.required)
     .map((p) => p.name);
 }
@@ -302,26 +207,25 @@ export function resolveCapability(id: string): Capability | undefined {
 }
 
 /**
- * 工具面省略说明（P1-7）：让模型知道「为什么有些能力不在」，同时**默认不泄漏**被隐藏的能力名。
+ * 能力面省略说明：让调用方知道「为什么有些能力不可达」，同时**默认不泄漏**被隐藏的能力名。
  *
- * 三类口径（与清单/计划一致）：
+ * 三类口径：
  * - 部署策略 / deny：说明句 + 涉及**类别**，默认不点名能力，不提示重试；
  * - 分组 / allow 过滤：只列本次启用的类别；
  * - 档案收紧：说明句 + 涉及类别（同样不点名）。
- * 瞬时注册失败不在本函数（它发生在提升时，见 tools/capability.tools.ts 的 warnings）。
  *
  * 全量面返回 `{ status: 'full' }`——正常部署**不追加任何噪音**。
- * `names=true` 是 `HANA_EXPLAIN_SURFACE=names` 的调试口径，才会输出被隐藏的能力 id。
+ * `names=true` 是调试口径，才会输出被隐藏的能力 id。
  */
 export interface SurfaceExplanation {
   status: 'full' | 'restricted';
   /** 本次部署启用的类别（有成员可见的类别） */
-  enabledCategories?: FacadeCategory[];
+  enabledCategories?: BusinessCategory[];
   /** 一个可见成员都没有的类别 */
-  omittedCategories?: FacadeCategory[];
+  omittedCategories?: BusinessCategory[];
   /** 可读说明（不含能力名，除非调试开关） */
   notes?: string[];
-  /** 被隐藏的能力 id（仅调试开关 `HANA_EXPLAIN_SURFACE=names`） */
+  /** 被隐藏的能力 id（仅调试口径 names=true） */
   omittedNames?: string[];
 }
 
@@ -331,24 +235,25 @@ export function explainSurface(
   opts: { names?: boolean } = {},
 ): SurfaceExplanation {
   const profile = activeProfile(ctx.config, identity);
-  // `sql` 组是**默认关闭**的敏感能力：未显式启用时对 AI 完全不可见——不参与 hidden 统计、
-  // 也不参与类别可用性推导（否则每次全量部署都会多出一条「有类别被收窄」的假说明）。
-  // 显式启用（shouldRegisterTool=true）后才进入正常的能力面说明；被 deny 时同样完全不提。
+  const filter = toolFilterOf(ctx.config, ctx.toolFilter);
+  // `sql` 组是**默认关闭**的敏感能力；`tool_search` 是平台入口，不参与业务类别说明。
   const concrete = CAPABILITY_LIST.filter(
-    (c) => c.facadeOf === undefined && (c.kind !== 'sql' || shouldRegisterTool(c.id, ctx.toolFilter)),
+    (c) =>
+      c.platform !== true && c.category !== 'tool_search' && (c.kind !== 'sql' || shouldRegisterTool(c.id, filter)),
   );
   const denied: Capability[] = [];
   const groupHidden: Capability[] = [];
   const profileHidden: Capability[] = [];
 
   for (const cap of concrete) {
-    if (!shouldRegisterTool(cap.id, ctx.toolFilter)) {
-      // deny 与分组/allow 过滤分开归因：前者是部署策略，后者是"本次启用了哪些类别"
+    if (!shouldRegisterTool(cap.id, filter)) {
       const deniedById =
-        matchGlob(cap.id, ctx.toolFilter.denyPatterns) ||
-        (cap.routeOnly === true && matchGlob(cap.module, ctx.toolFilter.denyPatterns));
+        matchGlob(cap.id, filter.denyPatterns) ||
+        (cap.routeOnly === true && matchGlob(cap.module, filter.denyPatterns));
       (deniedById ? denied : groupHidden).push(cap);
-    } else if (!profileAllows(profile, cap.id, cap.kind).ok) {
+    } else if (profileAllows(profile, cap.id, cap.kind).ok) {
+      // 允许
+    } else {
       profileHidden.push(cap);
     }
   }
@@ -358,9 +263,8 @@ export function explainSurface(
 
   const categoriesOf = (caps: readonly Capability[]): string[] => {
     const set = new Set(caps.map((c) => c.category));
-    // 业务类别走门面目录；sql 是独立分类（无门面），单独给一个人可读标签。
-    const facades: string[] = CAPABILITY_CATALOG.map((e) => e.id).filter((id) => set.has(id));
-    return [...facades, ...(set.has('sql') ? ['SQL 执行'] : [])];
+    const categories: string[] = CAPABILITY_CATALOG.map((e) => e.id).filter((id) => set.has(id));
+    return [...categories, ...(set.has('sql') ? ['SQL 执行'] : [])];
   };
   const hiddenIds = new Set(hidden.map((c) => c.id));
   const enabledCategories = CAPABILITY_CATALOG.map((e) => e.id).filter((cat) =>

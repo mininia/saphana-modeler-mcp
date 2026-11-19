@@ -39,10 +39,8 @@ export interface SqlExecutePolicy {
   allowMultiStatement: boolean;
   /** 单次调用允许的语句条数（默认 HANA_SQL_MAX_STATEMENTS 默认值） */
   maxStatements?: number;
-  /** 只读环境（ACCESS=readonly + HANA_READONLY_SQL=select-only）：只允许 read 类语句 */
+  /** 只读模式（HANA_SQL_ACCESS=select-only）：只允许 read 类语句 */
   readOnly?: boolean;
-  /** 只读环境 + HANA_READONLY_SQL=deny：整体拒绝 hana_sql_execute */
-  readonlySqlDeny?: boolean;
 }
 
 /** 单条已分类语句 */
@@ -276,16 +274,6 @@ export function parseSqlScript(raw: string, opts: SqlExecutePolicy): ParsedSqlSc
     problems.push(problem('sql_nul', 'SQL 含 NUL 字符', '请去掉文本中的不可见 NUL 字节后重试'));
     return result;
   }
-  if (opts.readonlySqlDeny === true) {
-    problems.push(
-      problem(
-        'sql_readonly_denied',
-        '当前环境为只读，且 HANA_READONLY_SQL=deny：hana_sql_execute 整体不可用',
-        '如需只读查询，请由部署方设置 HANA_READONLY_SQL=select-only；写操作请切换到 ACCESS=readwrite 的环境',
-      ),
-    );
-    return result;
-  }
   const strippedAll = stripSqlLiteralsAndComments(sql);
   const maskedAll = maskQuotedIdentifiers(strippedAll);
   if (maskedAll.includes('?') || NAMED_PARAM_RE.test(maskedAll)) {
@@ -348,8 +336,8 @@ export function parseSqlScript(raw: string, opts: SqlExecutePolicy): ParsedSqlSc
         problems.push(
           problem(
             'sql_readonly_violation',
-            `只读环境只允许 SELECT 类语句（第 ${index + 1} 条被判定为 ${kind}）`,
-            '当前环境 ACCESS=readonly；写操作请切换到可写环境，或由部署方设置 HANA_READONLY_SQL=deny 完全关闭',
+            `SQL 访问模式为 select-only，只允许 SELECT 类语句（第 ${index + 1} 条被判定为 ${kind}）`,
+            '需要 SQL 写请设置 HANA_SQL_ACCESS=readwrite；对象级 schema/对象访问仍由 HANA 账号权限约束',
           ),
         );
         return;

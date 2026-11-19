@@ -37,3 +37,6 @@ templates/
 
 # graphify 知识图谱产物（本地生成，graphify update 可随时重建）
 graphify-out/
+
+# archify 架构图过程产物（本地生成，不入库）
+.archify/

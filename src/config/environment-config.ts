@@ -14,7 +14,6 @@
  * 本模块只做纯解析与校验，不读 .env、不删 process.env、不建池；生命周期由 config.ts 统一收口。
  */
 
-import { logger } from '../core/logger.js';
 import { splitList } from '../core/text.js';
 import {
   POOL_ACQUIRE_TIMEOUT_MS_DEFAULT,
@@ -36,7 +35,6 @@ import { PARAM_REGISTRY, type ParamSpec } from './param-registry.js';
 import { findInvalidWritePackages } from './write-boundary.js';
 
 export type EnvironmentAccess = 'readwrite' | 'readonly';
-export type ReadonlySqlPolicy = 'select-only' | 'deny';
 export type EnvironmentMode = 'single' | 'multi';
 
 /** 一个可运行环境：envKey 是环境标识（规范化为大写），不再有 LABEL/configKey。 */
@@ -79,11 +77,12 @@ const SCOPED_PARAMS = [...PARAM_REGISTRY].sort((a, b) => b.name.length - a.name.
 
 /** 策略参数的字段映射（解析结果写回 HanaConfig 的对应字段） */
 const POLICY_FIELD = {
-  ACCESS: 'access',
-  READONLY_SQL: 'readonlySql',
+  TOOL_GROUPS: 'toolGroups',
+  TOOL_DENY: 'toolDeny',
   WRITE_PACKAGES: 'writePackages',
   READ_SCHEMA: 'schemaAllow',
   SQL_TIMEOUT_MS: 'sqlTimeoutMs',
+  SQL_ACCESS: 'sqlAccess',
   SQL_ALLOW_MULTI_STATEMENT: 'sqlAllowMultiStatement',
   SQL_MAX_RESULT_BYTES: 'sqlMaxResultBytes',
   SQL_MAX_STATEMENTS: 'sqlMaxStatements',
@@ -149,20 +148,11 @@ function parseBool(key: string, raw: unknown): boolean | undefined {
   );
 }
 
-function parseAccess(key: string, raw: unknown): EnvironmentAccess | undefined {
+function parseSqlAccess(key: string, raw: unknown): 'select-only' | 'readwrite' | undefined {
   const s = nonEmpty(raw);
   if (s === undefined) return undefined;
-  if (s !== 'readwrite' && s !== 'readonly') {
-    throw interceptionError('config_invalid', `${key} 取值非法：只能是 readwrite / readonly`);
-  }
-  return s;
-}
-
-function parseReadonlySql(key: string, raw: unknown): ReadonlySqlPolicy | undefined {
-  const s = nonEmpty(raw);
-  if (s === undefined) return undefined;
-  if (s !== 'select-only' && s !== 'deny') {
-    throw interceptionError('config_invalid', `${key} 取值非法：只能是 select-only / deny`);
+  if (s !== 'select-only' && s !== 'readwrite') {
+    throw interceptionError('config_invalid', `${key} 取值非法：只能是 select-only / readwrite`);
   }
   return s;
 }
@@ -219,16 +209,18 @@ function parseScopedValue(spec: ParamSpec, key: string, raw: unknown): unknown {
     case 'SSL_VALIDATE':
     case 'XS_TLS':
       return parseBool(key, raw);
-    case 'ACCESS':
-      return parseAccess(key, raw);
-    case 'READONLY_SQL':
-      return parseReadonlySql(key, raw);
+    case 'TOOL_GROUPS':
+      return nonEmpty(raw);
+    case 'TOOL_DENY':
+      return splitList(raw);
     case 'WRITE_PACKAGES':
       return parseWritePackages(key, raw);
     case 'READ_SCHEMA':
       return parseReadSchema(raw);
     case 'SQL_TIMEOUT_MS':
       return parseIntRange(key, raw, 1, 3_600_000);
+    case 'SQL_ACCESS':
+      return parseSqlAccess(key, raw);
     case 'SQL_ALLOW_MULTI_STATEMENT':
       return parseBool(key, raw);
     case 'SQL_MAX_RESULT_BYTES':
@@ -407,7 +399,9 @@ function buildEnvConfig(
   const user = requireConnection(envKey, cells, 'USER') as string;
   const password = requireConnection(envKey, cells, 'PASSWORD') as string;
 
-  const access = policyValue<EnvironmentAccess>(baseConfig, cells, 'ACCESS') ?? 'readwrite';
+  // 只读/可写由写包推导：空写包 = readonly；非空 = readwrite。
+  const writePackages = policyValue<string[]>(baseConfig, cells, 'WRITE_PACKAGES') ?? [];
+  const access: EnvironmentAccess = writePackages.length > 0 ? 'readwrite' : 'readonly';
   const config: HanaConfig = {
     ...baseConfig,
     host,
@@ -426,10 +420,18 @@ function buildEnvConfig(
       (getConn('XS_BASE_PATH', CONNECTION_DEFAULTS.XS_BASE_PATH) as string | undefined) ??
       CONNECTION_DEFAULTS.XS_BASE_PATH,
     access,
-    readonlySql: policyValue<ReadonlySqlPolicy>(baseConfig, cells, 'READONLY_SQL') ?? 'select-only',
-    writePackages: policyValue<string[]>(baseConfig, cells, 'WRITE_PACKAGES') ?? [],
+    readonlySql: 'select-only',
+    toolGroups: policyValue<string>(baseConfig, cells, 'TOOL_GROUPS') ?? baseConfig.toolGroups,
+    toolDeny: policyValue<string[]>(baseConfig, cells, 'TOOL_DENY') ?? baseConfig.toolDeny,
+    writePackages,
+    writePackagesExplicit: cells?.has('WRITE_PACKAGES') === true || baseConfig.writePackagesExplicit === true,
     schemaAllow: policyValue<string[]>(baseConfig, cells, 'READ_SCHEMA') ?? [],
+    schemaAllowExplicit: cells?.has('READ_SCHEMA') === true || baseConfig.schemaAllowExplicit === true,
     sqlTimeoutMs: policyValue<number>(baseConfig, cells, 'SQL_TIMEOUT_MS') ?? SQL_TIMEOUT_MS_DEFAULT,
+    sqlAccess:
+      policyValue<'select-only' | 'readwrite'>(baseConfig, cells, 'SQL_ACCESS') ??
+      baseConfig.sqlAccess ??
+      'select-only',
     sqlAllowMultiStatement: policyValue<boolean>(baseConfig, cells, 'SQL_ALLOW_MULTI_STATEMENT') ?? false,
     sqlMaxResultBytes: policyValue<number>(baseConfig, cells, 'SQL_MAX_RESULT_BYTES') ?? SQL_MAX_RESULT_BYTES_DEFAULT,
     sqlMaxStatements: policyValue<number>(baseConfig, cells, 'SQL_MAX_STATEMENTS') ?? SQL_MAX_STATEMENTS_DEFAULT,
@@ -539,16 +541,7 @@ export function buildEnvironments(
 
   const entries: EnvironmentEntry[] = [];
   for (const envKey of [...envKeys].sort((a, b) => a.localeCompare(b))) {
-    const entry = buildEnvConfig(baseConfig, envKey, cells.get(envKey));
-    // 共享 readwrite 的安全提示：没显式覆盖 ACCESS 时提醒一次
-    const explicitAccess = cells.get(envKey)?.has('ACCESS') === true;
-    if (entry.access === 'readwrite' && !explicitAccess) {
-      logger.warn(
-        { envKey },
-        '多环境环境未显式覆盖 ACCESS，使用共享值/默认 readwrite；如果它是生产环境，请设置 HANA_ACCESS_ENV_<XXXX>=readonly',
-      );
-    }
-    entries.push(entry);
+    entries.push(buildEnvConfig(baseConfig, envKey, cells.get(envKey)));
   }
 
   const startRaw = nonEmpty(opts.start);

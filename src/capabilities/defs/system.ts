@@ -62,7 +62,6 @@ export const systemCapabilities = {
     id: 'hana_env_list',
     category: 'system',
     kind: 'read',
-    rootTool: true,
     effects: { destructive: false, idempotent: true, mutates: 'none' },
     routing: {
       intent: '列出本进程配置的 HANA 环境与当前 active 环境（含切换 token）',
@@ -73,8 +72,8 @@ export const systemCapabilities = {
     title: '列出 HANA 环境',
     description:
       '列出本进程配置的 HANA 环境：当前 active 环境标识、每个环境的 access/state/运行任务数，' +
-      '以及可切列表与一次性 switchToken。多环境部署才注册；不连 HANA，当前环境不可用时也能查看。' +
-      '切换用 hana_system({capability:"hana_env_switch"})，token 由本工具发放。',
+      '以及可切列表与一次性 switchToken。多环境部署才可见（经 hana_tool_search 发现/hana_invoke 执行）；不连 HANA，当前环境不可用时也能查看。' +
+      '切换用 hana_invoke({capability:"hana_env_switch", args:{…}})，token 由本工具发放；先经 hana_tool_search 取契约。',
     inputSchema: z.object({}),
     annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   }),
@@ -96,7 +95,7 @@ export const systemCapabilities = {
     description:
       '切换当前 active 环境（多环境、stdio）。必须先用 hana_env_list 获取 from/epoch/switchToken，' +
       'confirm 等于目标环境标识（大小写不敏感）；目标有运行中任务时需 acknowledgeRunningTasks=true。' +
-      'HTTP 模式拒绝（多客户端共享进程）。只经 hana_system 门面路由，不注册为平铺工具。',
+      'HTTP 模式拒绝（多客户端共享进程）。经 hana_tool_search 披露后用 hana_invoke 执行，不注册为平铺工具。',
     inputSchema: z.object({
       to: z.string().min(1).max(32).describe('目标环境标识（见 hana_env_list 返回的 name；大小写不敏感）'),
       from: z.string().min(1).max(32).describe('当前环境标识；必须与 hana_env_list 的 current 一致（大小写不敏感）'),

@@ -5,15 +5,32 @@
  * - effect 面：destructive 来自 services/view-ops.rules.ts（op 的唯一事实源）；
  * - 计划面：planViewOpAlias 把入参还原成父工具的一次 operations 调用，交给父规划器。
  *
- * 条目标 routeOnly: true：可授权、可出现在门面索引，但永不注册为工具——调用方式：
- *   hana_modeling({ capability: "hana_view_update#add_join", args: { packageId, objectName, … } })
- * 与 hana_view_update({ …, operations: [{ op: "add_join", … }] }) 完全等价（同一 handler、同一闸门）。
+ * 条目标 routeOnly: true：可发现、可授权，但永不注册为工具——调用方式：
+ *   hana_invoke({ capability: "hana_view_update#add_join", args: { packageId, objectName, … } })
+ * 与 hana_invoke({ capability: "hana_view_update", args: { …, operations: [{ op: "add_join", … }] } })
+ * 完全等价（同一 handler、同一闸门）。
  */
 
 import { z } from 'zod';
 import { cap, type Capability } from '../types.js';
 import { VIEW_UPDATE_IDENTITY_FIELDS, planViewOpAlias } from '../planners.js';
 import { VIEW_OPS } from '../../services/view-ops.rules.js';
+
+/** 操作级别名的 canonical 示例载荷（只用于契约披露的 call/canonicalCall；不参与执行）。 */
+const ALIAS_EXAMPLE_PAYLOAD: Record<string, Record<string, unknown>> = {
+  add_join: {
+    sourcePackageId: 'ZDEMO.ZDEMO_MGF',
+    sourceObjectName: 'SRC_CV',
+    conditions: [{ leftField: 'A', rightField: 'B' }],
+  },
+  set_script: { script: 'SELECT 1 AS A FROM DUMMY', scriptColumns: [{ name: 'A', dataType: 'INTEGER' }] },
+  set_description: { description: '示例描述' },
+  rename_field: { field: 'FIELD_A', newName: 'FIELD_B' },
+  drop_field: { field: 'FIELD_A' },
+  add_calculated_column: { name: 'CALC_A', formula: '1', datatype: 'INTEGER' },
+  set_attribute_filter: { attribute: 'FIELD_A', value: 'X' },
+  set_variable: { variableId: 'P_X' },
+};
 
 /** 从 `operations` 的判别式 union 抽出「op 值 → 该成员的字段形状（去判别式）」 */
 function operationsMemberShapes(parent: Capability): Map<string, Record<string, z.ZodTypeAny>> {
@@ -79,7 +96,12 @@ export function buildViewOpCapabilities(parent: Capability): Record<string, Capa
       routing: {
         intent: `${decl.title}（操作级别名 op=${decl.id}）`,
         priority: 'advanced',
-        requires: `经 ${parent.id} 门面路由；不注册为工具`,
+        requires: `经 hana_invoke({capability:"${decl.id}", args}) 调用；不注册为工具`,
+        exampleArgs: {
+          packageId: 'ZDEMO.ZDEMO_MGF',
+          objectName: 'ZDEMO02_CV008',
+          ...(ALIAS_EXAMPLE_PAYLOAD[decl.id] ?? {}),
+        },
       },
       title: decl.title,
       description:
@@ -87,9 +109,9 @@ export function buildViewOpCapabilities(parent: Capability): Record<string, Capa
         (decl.effects.destructive
           ? '此项为破坏性变更、不可自动回滚：改前用 hana_metadata_get_view(format=xml) 留档，恢复=用该 XML 重新 update。\n'
           : '') +
-        `经门面路由调用（本条目不注册为工具）：args = 父工具身份参数（packageId / objectName 必填；` +
+        `经 hana_invoke 调用（本条目不注册为工具）：args = 父工具身份参数（packageId / objectName 必填；` +
         `ifMatch / dryRun / migration 可选）+ 本 op 参数。与 ` +
-        `${parent.id}({ operations: [{ op: "${decl.id}", … }] }) 完全等价（同一 handler、同一闸门与破坏性判定）。`,
+        `hana_invoke({capability:"${parent.id}", args:{operations:[{op:"${decl.id}", …}]}}) 完全等价（同一 handler、同一闸门与破坏性判定）。`,
       // 身份字段复用父 schema 的同名字段（保留其 .default()/.optional() 语义）；载荷字段来自 union 成员
       inputSchema: z.object({ ...identity, ...payload }),
       // 注解从本条的 effects 派生（set_description 这类非破坏 op 的 destructiveHint 必须为 false）。

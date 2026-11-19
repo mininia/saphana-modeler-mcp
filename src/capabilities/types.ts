@@ -65,6 +65,11 @@ export interface CapabilityRouting {
   requires?: string;
   exampleArgs?: Readonly<Record<string, unknown>>;
   constraints?: readonly string[];
+  /**
+   * 结果使用说明（契约披露用）：主要结构 / 分页 / 条数上限 / 完整-摘要-引用 / 失败与部分成功。
+   * **不复制完整输出 schema**——那是第二事实源；这里只给模型「拿到结果后怎么用」。
+   */
+  returns?: readonly string[];
 }
 
 /** 路由预检结果：issues 非空 = 无效调用；hint 是恢复指引（可选）。 */
@@ -86,40 +91,91 @@ export interface CapabilityPreflightResult {
 export type CapabilityPreflight = (args: unknown) => CapabilityPreflightResult | undefined;
 
 /**
- * 能力分类（**AI 能力视角**，2026-10-09 重构；参照 SAP HANA MCP Server 的 six areas）：
- * 分类轴 = "AI 想干什么"，而不是"代码长在哪"——门面、索引、提升都按它分组。
+ * 能力分类（**AI 能力视角**）：分类轴 = "AI 想干什么"，用于发现过滤与分类描述。
  *
- * **六个业务域，与门面一一对应**：`FACADE_CATEGORIES` 就是这六个（见下方它的说明）。
- * 2026-11 新增的 `sql` 是**独立分类**，只承载与门面同级的根工具（`hana_sql_execute`）：
- * 它没有门面、不进入任何门面的索引/描述，也不参与分类提升。六个业务域与六个门面的
- * 一一对应关系保持不变。
+ * 2026-11-19 起**不再有常驻门面**：工具面只有两个平台入口（`hana_tool_search` 选择、
+ * `hana_invoke` 执行），具体能力一律经本体层选择后执行。分类只回答“它属于哪类问题”，
+ * 不创建任何可绕过本体层的入口。
+ *
+ * `sql` 是独立分类（直接执行 SQL，默认关闭）；`tool_search` 承载平台入口。
  */
-export type CapabilityCategory = 'system' | 'discovery' | 'data' | 'insights' | 'modeling' | 'diagnostics' | 'sql';
+export type CapabilityCategory =
+  'system' | 'discovery' | 'data' | 'insights' | 'modeling' | 'diagnostics' | 'sql' | 'tool_search';
+
+/** 全部能力分类（zod 枚举 / 发现过滤 / 测试遍历用；业务域在前、独立分类在后） */
+export const ALL_CAPABILITY_CATEGORIES = [
+  'system',
+  'discovery',
+  'data',
+  'insights',
+  'modeling',
+  'diagnostics',
+  'sql',
+  'tool_search',
+] as const satisfies readonly CapabilityCategory[];
+
+/** 全部可见性归属（zod 枚举 / 发现过滤用） */
+export const TOOL_KINDS = ['read', 'write', 'admin', 'sql'] as const satisfies readonly ToolKind[];
 
 /**
- * 分类目录（**单一事实源**）：id + 名称 + 一句话说明。门面工具（`hana_<分类>`）的
- * 标题与描述**从这里生成**（见 facades.ts），所以目录与门面正文不可能漂移。
+ * 常驻工具面：只有两个平台入口。
+ * - `hana_tool_search`：本体层（发现 / 契约 / 配方），不改工具面、不执行；
+ * - `hana_invoke`：唯一执行入口，按目标能力统一授权后派发。
+ *
+ * 具体能力（含 `hana_sql_execute`、环境切换、操作级别名）一律不注册为工具。
+ */
+export const PLATFORM_TOOL_IDS = ['hana_tool_search', 'hana_invoke'] as const;
+export type PlatformToolId = (typeof PLATFORM_TOOL_IDS)[number];
+
+/** 是否平台入口（常驻面 / 不可作为 invoke 目标 / 不参与 profile 与分组判定） */
+export function isPlatformToolId(id: string): id is PlatformToolId {
+  return (PLATFORM_TOOL_IDS as readonly string[]).includes(id);
+}
+
+/**
+ * 分类目录（**单一事实源**）：id + 名称 + 一句话说明。发现回执与分类说明从这里派生，
+ * 目录与业务分类不会漂移。`tool_search` / `sql` 不进目录。
  */
 export const CAPABILITY_CATALOG = [
-  { id: 'system', name: '连接与环境', description: '当前连接是谁/连到哪（版本、权限档位、规则库）' },
-  { id: 'discovery', name: '浏览与查找', description: '找包/对象/表，读定义与字段结构' },
-  { id: 'data', name: '取数预览', description: '看已激活视图/基表的数据（含预览诊断）' },
-  { id: 'insights', name: '结构与血缘分析', description: '影响面（谁依赖它）、字段级计算逻辑' },
-  // 校验能力清单（hana_view_check_actions）自本次分类调整起归 modeling——它服务于校验流程，
+  {
+    id: 'system',
+    name: '连接与环境',
+    description: '当前连接是谁/连到哪（版本、权限档位、规则库）',
+  },
+  {
+    id: 'discovery',
+    name: '浏览与查找',
+    description: '找包/对象/表，读定义与字段结构',
+  },
+  {
+    id: 'data',
+    name: '取数预览',
+    description: '看已激活视图/基表的数据（含预览诊断）',
+  },
+  {
+    id: 'insights',
+    name: '结构与血缘分析',
+    description: '影响面（谁依赖它）、字段级计算逻辑',
+  },
+  // 校验能力清单（hana_view_check_actions）归 modeling——它服务于校验流程，
   // 与 hana_view_validate 同类；本域只留"看结构、看血缘"两件事。
-  { id: 'modeling', name: '建模与仓库变更', description: '创建/修改/校验/激活/删除设计时对象，导入导出' },
-  { id: 'diagnostics', name: '运维与性能', description: '健康/会话/存储/趋势与仓库审计（SQL 分析为高级/低频）' },
+  {
+    id: 'modeling',
+    name: '建模与仓库变更',
+    description: '创建/修改/校验/激活/删除设计时对象，导入导出',
+  },
+  {
+    id: 'diagnostics',
+    name: '运维与性能',
+    description: '健康/会话/存储/趋势与仓库审计（SQL 分析为高级/低频）',
+  },
 ] as const;
 
 /**
- * **有门面的分类**——就是上面六个业务域，与 `CapabilityCategory` 当前**取值完全相同**。
- *
- * 仍然分成两个类型是刻意的：前者是"能力归属哪一类"（声明用），本类型是"哪几类需要常驻入口"
- * （注册/判定用）。二者混成一个会让"新增一个分类"隐式多出一个门面，而门面的入参 schema、
- * kind 推导、可见性规则都得跟着成立——那不该是加一行目录就能带来的后果。
- * 2026-11 的 `sql` 分类正是这条规则的实例：它有成员、但没有门面，只承载根工具。
+ * **业务域分类**——六个业务域。发现过滤可以按它分组，但**不创建常驻入口**：
+ * 所有具体能力都经 `hana_tool_search` 选择、`hana_invoke` 执行。
  */
-export const FACADE_CATEGORIES = [
+export const BUSINESS_CATEGORIES = [
   'system',
   'discovery',
   'data',
@@ -128,8 +184,8 @@ export const FACADE_CATEGORIES = [
   'diagnostics',
 ] as const satisfies readonly CapabilityCategory[];
 
-/** 有门面的分类（字面量联合） */
-export type FacadeCategory = (typeof FACADE_CATEGORIES)[number];
+/** 业务域分类（字面量联合） */
+export type BusinessCategory = (typeof BUSINESS_CATEGORIES)[number];
 
 /**
  * 资源计划的档位**由 `effects.plan` 是否存在唯一表达**：所有能力都过同一个调用期闸门
@@ -183,49 +239,29 @@ export interface Capability<S extends z.ZodType = z.ZodType> {
   kind: ToolKind;
   effects: CapabilityEffects;
   /**
-   * **门面归属**：声明了它 = 该能力是某分类的常驻入口（`hana_<分类>`）。
+   * **平台入口**：常驻 `tools/list` 的极简入口（仅 `hana_tool_search` / `hana_invoke`）。
    *
-   * 门面是**入口**，不参与能力层（kind / 档案）判定——权限只有一层，谁的能力可用一律按**目标能力**
-   * 判（`tools/groups.ts` 的 `shouldRegisterTool`、`config/authorize.ts` 的 `authorizeCall`）。
-   * 环境副作用是正交的另一维，按目标能力的 `effects.mutates` 判（见 `MutationScope`）。
-   * 所以部署收窄时入口照旧常在：只读部署也看得到 `hana_modeling`/`hana_diagnostics`，只是索引里
-   * 只剩 read 档成员（`hana_modeling` 剩 `hana_task_get`，`hana_diagnostics` 为空）。只有显式 deny
-   * 才会让门面消失：命中门面 id，或把它**全部**成员 deny 掉。
+   * 平台入口不参与分组、档案、资源与环境判定；它们本身不执行任何 HANA 操作：
+   * - `hana_tool_search` 只做发现/契约/配方，不改工具面；
+   * - `hana_invoke` 只按目标能力做统一授权后派发，目标能力逐次过同一闸门。
    *
-   * **具体能力默认只出现在门面索引里**（可经门面路由调用，不进 `tools/list`）；调门面会把该分类的
-   * 成员**提升**进 `tools/list`（此后可平铺直调、带完整 schema）。提升表按调用方隔离——键 = HTTP 的
-   * clientId / stdio 的 `'(stdio)'`，未配 Token 的 HTTP 部署整体关闭；进程内状态、重启即退回；
-   * 超出 `MCP_CAPABILITY_SURFACE_MAX` 时按分类 FIFO 淘汰（见 `tools/surface.ts` 头注的
-   * entitlement / promoted / surface 三层定义）。
-   *
-   * 所以本字段表达的是「门面入口」，**不**表达"具体能力不进面"：具体能力是否在面上由提升决定。
+   * 可见性由 `config/policy-snapshot.ts` 统一编译：未显式 deny ∧ 至少一个具体能力
+   * 在 entitlement 内。平台入口不是“第七个门面”，也不构成绕过本体层的执行捷径：
+   * 它要求调用方先给出能力 id，而能力 id 只能从 `hana_tool_search` 得到。
    */
-  facadeOf?: FacadeCategory;
+  platform?: true;
   /**
-   * **根工具**：与门面同级、常驻 `tools/list` 的具体能力（2026-11 新增 `hana_sql_execute`）。
-   *
-   * - 仍属于其 `category`（会出现在该分类索引里、可经门面路由调用）；
-   * - 受 entitlement 约束：`shouldRegisterTool` / 档案判定与其它具体能力**完全同一条**——
-   *   区别只在 `computeSurface`：entitled 时直接进面，不必先调用门面提升；
-   * - **不参与动态提升的重复注册**：它已由注册器静态注册，提升时跳过（否则同名注册两次）。
-   *
-   * 用途是「默认关闭的敏感能力」：`kind: 'sql'` 组默认不启用（见 tools/groups.ts），
-   * 但部署方显式启用后它必须能直接被看到，不能要求模型先调门面才发现。
-   */
-  rootTool?: boolean;
-  /**
-   * **只经路由**的能力（操作级条目 `<工具>#<op>`，2026-10-10）：有清单声明、可路由、可授权、
-   * 可出现在门面索引里，但**永不注册为工具**（注册名 = module = 父工具名，注册即撞名）。
+   * **只经路由**的能力（操作级条目 `<工具>#<op>`，2026-10-10）：有清单声明、可路由、可授权，
+   * 但**永不注册为工具**（注册名 = module = 父工具名，注册即撞名）。
    * 三个落点必须一致（各有一处显式判定，别只改一处）：
-   *   · `registerVisibleTool`/`registerCapabilitiesDynamically`（surface.ts）不把它们搬进 tools/list；
+   *   · `computeSurface`（surface.ts）不把它们搬进 tools/list；
    *   · handler 注册走 `CapabilityRegistrar.routeOnly`（只登记原始 handler 表，不注册工具）；
-   *   · 门面描述只列非 routeOnly 成员（索引两者都列）。
+   *   · 发现/契约把它们标为可路由条目（`operation` 给出 op）。
    */
   routeOnly?: boolean;
   /**
-   * 控制面能力（如 hana_env_switch）：只经门面路由、不注册为工具；与 routeOnly 的区别是
-   * **不参与门面的 kind / destructive / idempotent 推导**——否则把 env switch 放进 system
-   * 分类会把只读的 `hana_system` 门面误标成 admin/destructive。
+   * 控制面能力（如 hana_env_switch）：只经 `hana_invoke` 路由、不注册为工具；
+   * 与 routeOnly 的区别是**不参与环境副作用推导**（控制动作本身不碰 HANA 数据）。
    */
   control?: boolean;
   title: string;

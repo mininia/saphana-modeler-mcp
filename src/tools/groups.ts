@@ -4,22 +4,22 @@
  * 分组映射由能力清单的 kind 字段派生（单一事实源在 capabilities/manifest.ts），
  * 本模块只保留可见性算法：解析 env、glob 匹配、优先级。
  *
- * 三个变量（详见 README「工具分组与可见性控制」）：
- * - HANA_TOOL_GROUPS  启用的分组（逗号分隔）；空=全启用
- * - HANA_TOOL_ALLOW   强制启用的工具名 glob
- * - HANA_TOOL_DENY    强制禁用的工具名 glob（优先级最高；命中父工具会连带关闭其别名）
- * 优先级：deny > allow > 分组开关。
+ * **只有两个能力面变量**（2026-11 收口）：
+ * - `HANA_TOOL_GROUPS`：组名（read/write/admin/sql）或能力 id/glob，同一逗号列表；
+ *   空 = read/write/admin（sql 关闭）；显式列出 = 只启用列出的组/工具。
+ * - `HANA_TOOL_DENY`：强制禁用的能力 glob（优先级最高；命中父工具会连带关闭其别名）。
+ * 优先级：deny > 显式 enable > 默认组。
  */
 
 import { splitList } from '../core/text.js';
-import { CAPABILITY_LIST, findCapability, membersOfCategory } from '../capabilities/manifest.js';
+import { CAPABILITY_LIST, findCapability } from '../capabilities/manifest.js';
 
 /**
  * 工具功能分组。
  *
- * `sql` 是 2026-11 新增的**默认关闭**分组（直接执行 HANA SQL）：空配置下只启用 read/write/admin，
- * 绝不因为「空=全部」顺带开启它；须显式 `HANA_TOOL_GROUPS=sql` 或
- * `HANA_TOOL_ALLOW=hana_sql_execute` 才启用，`HANA_TOOL_DENY` 仍最高。
+ * `sql` 是**默认关闭**的敏感分组（直接执行 HANA SQL）：空配置下只启用 read/write/admin，
+ * 绝不因为「空=全部」顺带开启它；须显式 `HANA_TOOL_GROUPS=sql`（或直接写
+ * `hana_sql_execute`），`HANA_TOOL_DENY` 仍最高。
  */
 export type ToolGroup = 'read' | 'write' | 'admin' | 'sql';
 
@@ -39,26 +39,34 @@ export const GROUP_LABELS: Record<ToolGroup, string> = {
  */
 export const TOOL_GROUPS: Record<string, ToolGroup> = Object.fromEntries(CAPABILITY_LIST.map((c) => [c.id, c.kind]));
 
-/** 工具过滤配置（来自环境变量，启动时解析一次） */
+/** 工具过滤配置（来自环境变量；启动时解析一次） */
 export interface ToolFilterConfig {
-  /** 启用的分组集合。空集合=不限制（全部分组启用，向后兼容默认） */
+  /** 启用的分组集合。空集合 + groupsExplicit=false = 默认 read/write/admin（sql 关闭） */
   enabledGroups: Set<ToolGroup>;
-  /** 强制启用的工具名 glob 模式（即便其分组未启用也注册） */
+  /** 显式列出的能力 id/glob（即使不在启用分组内也可见） */
   allowPatterns: string[];
-  /** 强制禁用的工具名 glob 模式（优先级最高，覆盖 allow 与分组） */
+  /** 强制禁用的能力 id/glob（优先级最高，覆盖 allow 与分组） */
   denyPatterns: string[];
+  /**
+   * true = `HANA_TOOL_GROUPS` 被显式设置（非空）：
+   * - 只写 glob 时，不会因为「组集合为空」回退到默认 read/write/admin；
+   * - 显式只写组名时，未列出的组不启用。
+   */
+  groupsExplicit?: boolean;
 }
 
 /** 分组名 → 该分组下的全部工具名（由 TOOL_GROUPS 反查，保持单一事实源） */
 function toolsOfGroup(group: ToolGroup): string[] {
+  // 平台入口的 kind 只是注册占位；把它们展开进 read 组会让 `HANA_TOOL_DENY=read`
+  // 连带把 tools/list 清空（写/管理能力还在 entitlement 内，却没有任何入口可达）。
   return Object.entries(TOOL_GROUPS)
-    .filter(([, g]) => g === group)
+    .filter(([name, g]) => g === group && findCapability(name)?.platform !== true)
     .map(([name]) => name);
 }
 
 /**
- * 把 allow/deny 里的组名展开成该组的全部工具名；非组名 token 原样保留。
- * 对齐 tableau-mcp 的 INCLUDE_TOOLS/EXCLUDE_TOOLS 支持组名的做法。
+ * 把 deny 里的组名展开成该组的全部工具名；非组名 token 原样保留。
+ * deny 用组名是「禁一整类」；enable 不用展开——组名直接进 enabledGroups。
  */
 function expandGroupTokens(tokens: string[]): string[] {
   const out: string[] = [];
@@ -88,11 +96,33 @@ export function matchGlob(name: string, patterns: string[]): boolean {
 }
 
 /**
- * 解析环境变量为 ToolFilterConfig。分组名大小写不敏感，未知分组名抛错（fail-closed）；
- * allow/deny 里的组名展开成工具名。
+ * 解析 `HANA_TOOL_GROUPS` / `HANA_TOOL_DENY`（运行时路径）。
+ *
+ * `HANA_TOOL_GROUPS` 的 token 分两类：
+ * - 组名（大小写不敏感）→ `enabledGroups`；
+ * - 其余 → 能力 id/glob（`allowPatterns`）。
+ * 空串 = 默认 read/write/admin（sql 关闭）；非空 = 显式声明（只写 glob 也不回退默认组）。
  */
-export function parseToolFilter(rawGroups: string, rawAllow: string, rawDeny: string): ToolFilterConfig {
-  const groups = splitList(rawGroups).map((g) => g.toLowerCase());
+function parseEnableAndDeny(rawEnable: string, rawDeny: string): ToolFilterConfig {
+  const tokens = splitList(rawEnable);
+  const groups: ToolGroup[] = [];
+  const globs: string[] = [];
+  for (const token of tokens) {
+    const lower = token.toLowerCase();
+    if (ALL_TOOL_GROUPS.includes(lower as ToolGroup)) groups.push(lower as ToolGroup);
+    else globs.push(token);
+  }
+  return {
+    enabledGroups: new Set(groups),
+    allowPatterns: globs,
+    denyPatterns: expandGroupTokens(splitList(rawDeny)),
+    ...(tokens.length > 0 ? { groupsExplicit: true } : {}),
+  };
+}
+
+/** 历史三参数签名（groups, allow, deny）：仅测试/内部兼容，不再对应任何 env 变量 */
+function parseLegacy(groupsRaw: string, allowRaw: string, denyRaw: string): ToolFilterConfig {
+  const groups = splitList(groupsRaw).map((g) => g.toLowerCase());
   if (groups.length > 0) {
     const invalid = groups.filter((g) => !ALL_TOOL_GROUPS.includes(g as ToolGroup));
     if (invalid.length > 0) {
@@ -101,14 +131,36 @@ export function parseToolFilter(rawGroups: string, rawAllow: string, rawDeny: st
   }
   return {
     enabledGroups: new Set(groups as ToolGroup[]),
-    allowPatterns: expandGroupTokens(splitList(rawAllow)),
-    denyPatterns: expandGroupTokens(splitList(rawDeny)),
+    allowPatterns: expandGroupTokens(splitList(allowRaw)),
+    denyPatterns: expandGroupTokens(splitList(denyRaw)),
+    ...(groups.length > 0 ? { groupsExplicit: true } : {}),
   };
 }
 
+export function parseToolFilter(rawEnable: string, rawDeny: string): ToolFilterConfig;
+/** @deprecated 三参数仅内部/测试兼容；env 侧只有 HANA_TOOL_GROUPS/HANA_TOOL_DENY */
+export function parseToolFilter(rawGroups: string, rawAllow: string, rawDeny: string): ToolFilterConfig;
+export function parseToolFilter(a: string, b: string, c?: string): ToolFilterConfig {
+  return c === undefined ? parseEnableAndDeny(a, b) : parseLegacy(a, b, c);
+}
+
 /**
- * 非门面能力的可见性判定（deny 已先行扣除）：allow 优先，其次分组开关。
- * 门面不走这里。
+ * 从**某个环境**的配置构造过滤器。多环境下 `toolGroups` / `toolDeny` 可由
+ * `HANA_TOOL_GROUPS_ENV_<KEY>` / `HANA_TOOL_DENY_ENV_<KEY>` 覆盖：
+ * entitlement（发现/执行）必须按当前绑定环境编译，而不是进程级单例。
+ */
+export function toolFilterOf(
+  config: { toolGroups?: string; toolDeny?: readonly string[] },
+  fallback?: ToolFilterConfig,
+): ToolFilterConfig {
+  // 测试/脚本的最小 config 可能没有这两个字段：此时回退到调用方显式传入的 filter。
+  if (fallback && config.toolGroups === undefined && config.toolDeny === undefined) return fallback;
+  return parseToolFilter(config.toolGroups ?? '', (config.toolDeny ?? []).join(','));
+}
+
+/**
+ * 具体能力的可见性判定（deny 已先行扣除）：allow 优先，其次分组开关。
+ * 平台入口不走这里。
  *
  * **空配置的例外**：`enabledGroups.size === 0` 表示「默认启用 read/write/admin」，
  * 但 `sql` 组**默认关闭**——它接受任意 SQL（含写/管理类），不能靠「空=全部」顺带放开。
@@ -120,7 +172,12 @@ function registerableByName(name: string, filter: ToolFilterConfig): boolean {
   const group = TOOL_GROUPS[name];
   if (group === undefined) return false; // 未登记 = 不暴露（fail-closed）
   if (matchGlob(name, filter.allowPatterns)) return true;
-  if (filter.enabledGroups.size === 0) return group !== 'sql';
+  if (filter.enabledGroups.size === 0) {
+    // 旧环境变量：空 = 默认 read/write/admin（sql 除外）
+    if (filter.groupsExplicit !== true) return group !== 'sql';
+    // 显式空 groups = 不启用任何分组（HANA_TOOL_GROUPS 非空但只含 glob 时）
+    return false;
+  }
   return filter.enabledGroups.has(group);
 }
 
@@ -136,9 +193,8 @@ function deniedByPatterns(cap: { id: string; module: string; routeOnly?: boolean
  * 判定单个能力是否应注册（是否对 MCP 客户端可见）。优先级：deny > allow > 分组开关。
  * 全空配置 = 全部启用（向后兼容）。
  *
- * 门面层不做限制：门面是入口，不参与分组过滤，谁的能力可用由能力层的 kind 决定
- * （只读部署仍看得到 hana_modeling，只是索引里只剩 read 档成员）。deny 仍最高：
- * 命中门面 id 或 deny 掉它全部成员时门面才消失。
+ * 平台入口不做限制：入口不参与分组过滤，谁的能力可用由 entitlement 决定。
+ * deny 仍最高：显式 deny 平台入口会让整个选择/执行链消失。
  *
  * 未登记 = 不暴露（fail-closed）；deny 覆盖操作级别名（父被 deny 时别名一并失效），
  * allow 方向不扩展（需写 hana_view_update*）。
@@ -153,11 +209,10 @@ export function shouldRegisterTool(name: string, filter: ToolFilterConfig): bool
   if (cap === undefined) return false; // 未登记 = 不暴露（fail-closed）
   // 1b) 按条目再判一次 deny：操作级别名会跟随父工具 id（见 deniedByPatterns）
   if (deniedByPatterns(cap, filter.denyPatterns)) return false;
-  // 2) 门面：入口不参与分组过滤（门面层不做限制）；只有"全部成员被 deny"才让它消失
-  //    成员是否被 deny 用同一条别名感知判定，与 1b 保持同一口径
-  if (cap.facadeOf !== undefined) {
-    return membersOfCategory(cap.facadeOf).some((m) => !deniedByPatterns(m, filter.denyPatterns));
-  }
-  // 3) 具体能力：allow 优先，其次分组开关
+  // 1c) 平台入口（hana_tool_search / hana_invoke）：不受 HANA_TOOL_GROUPS 分组限制
+  //     （只读部署/只开写组都应能发现并执行能力）。是否真的可见由 entitlement 的
+  //     「至少一个具体能力可见」决定（见 config/policy-snapshot.ts）。
+  if (cap.platform === true) return true;
+  // 2) 具体能力：allow 优先，其次分组开关
   return registerableByName(name, filter);
 }

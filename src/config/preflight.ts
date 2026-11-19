@@ -194,11 +194,7 @@ function policyFromEnvValues(env: Record<string, unknown>, source: string): Poli
   // 无别名层（2026-10-14）：直接按正名读取。旧名/已删名在这里**取不到值**（等价于未配置），
   // 与 loadConfig 的硬切换同口径——不静默拿旧名当新名用
   return {
-    capability: parseToolFilter(
-      String(env.HANA_TOOL_GROUPS ?? ''),
-      String(env.HANA_TOOL_ALLOW ?? ''),
-      String(env.HANA_TOOL_DENY ?? ''),
-    ),
+    capability: parseToolFilter(String(env.HANA_TOOL_GROUPS ?? ''), String(env.HANA_TOOL_DENY ?? '')),
     resource: {
       writePackages: splitPackages(env.HANA_WRITE_PACKAGES),
       schemaAllow: splitList(env.HANA_READ_SCHEMA),
@@ -375,7 +371,7 @@ function writesRepositoryPackages(name: string): boolean {
  * 空白名单」的部署仍会报 boundary_off。
  *
  * 只看**具体能力**（`CONCRETE_CAPABILITY_IDS`），不看门面：门面的 kind 是成员摘要，
- * `hana_modeling` 是 admin 却也含 write 档成员——拿它当"写能力可达"的证据会给每一次
+ * 业务域（如 modeling）是 admin 却也含 write 档成员——拿它当"写能力可达"的证据会给每一次
  * describePolicy 都刷出假的 boundary_off。
  */
 function writeCapableExposed(policy: Policy): boolean {
@@ -566,11 +562,16 @@ function assemble(policy: Policy, grants: Grant[], requestLines: string[]): Verd
 }
 
 function formatCapability(c: ToolFilterConfig): string {
-  const none = c.enabledGroups.size === 0 && c.allowPatterns.length === 0 && c.denyPatterns.length === 0;
+  const legacyEmpty =
+    c.enabledGroups.size === 0 &&
+    c.allowPatterns.length === 0 &&
+    c.denyPatterns.length === 0 &&
+    c.groupsExplicit !== true;
   // 空配置不再等于「全部」：sql 组默认关闭（hana_sql_execute 必须显式启用）
-  if (none) return '未过滤（read/write/admin 启用；sql 组默认关闭）';
+  if (legacyEmpty) return '未过滤（read/write/admin 启用；sql 组默认关闭）';
   const parts: string[] = [];
   if (c.enabledGroups.size > 0) parts.push(`启用分组 ${[...c.enabledGroups].join('/')}`);
+  else if (c.groupsExplicit === true) parts.push('启用分组 (无)');
   else parts.push('启用分组 read/write/admin（sql 默认关闭）');
   if (c.allowPatterns.length > 0) parts.push(`allow ${c.allowPatterns.join(', ')}`);
   if (c.denyPatterns.length > 0) parts.push(`deny ${c.denyPatterns.join(', ')}`);

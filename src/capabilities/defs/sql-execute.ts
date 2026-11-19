@@ -1,10 +1,9 @@
 /**
  * 独立分类 `sql` 的清单条目：hana_sql_execute（直接执行 HANA SQL）。
  *
- * 它是**第七个默认根工具**：kind=`sql` 是独立且默认关闭的分组（见 tools/groups.ts），
- * `rootTool: true` 让它在显式启用后与 6 个门面同级常驻 tools/list。
- * 它不属于任何业务分类、不进任何门面索引/描述——授权（sql 组 + 调用方档案）先管控，
- * 通过后模型直接看到/调用这个根工具。
+ * kind=`sql` 是独立且默认关闭的分组（见 tools/groups.ts）。
+ * 它不是常驻工具：显式启用后经 `hana_tool_search` 发现/披露，再由 `hana_invoke` 执行；
+ * 授权（sql 组 + 调用方档案）在发现与执行两层都生效。
  *
  * SQL 专用 schema 闸门已按产品决策移除：服务端不扫描/拦截 schema，访问范围由数据库账号权限约束。
  */
@@ -24,14 +23,13 @@ export const sqlExecuteCapabilities = {
     id: 'hana_sql_execute',
     category: 'sql',
     kind: 'sql',
-    rootTool: true,
     effects: { plan: planSqlExecute, destructive: true, idempotent: false, mutates: 'persistent' },
     routing: {
       intent: '在 HANA 上直接执行 SQL（读/写/管理类；默认关闭）',
       whenToUse: ['用户明确要求执行某条 SQL，且部署已启用 sql 组'],
       notFor: ['建模/读元数据/预览用专用工具；EXPLAIN 用 hana_sql_analyze'],
       priority: 'advanced',
-      requires: 'sql 组显式启用（HANA_TOOL_GROUPS=sql 或 HANA_TOOL_ALLOW=hana_sql_execute）',
+      requires: 'sql 组显式启用（HANA_TOOL_GROUPS 含 sql 或 hana_sql_execute）',
       exampleArgs: { sql: 'SELECT * FROM DUMMY' },
     },
     title: '直接执行 HANA SQL',
