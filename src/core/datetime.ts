@@ -28,8 +28,7 @@ export function toIsoInTimezone(date: Date, timezone: string): string {
 /**
  * HANA DATETIME 字面量（`'YYYY-MM-DD HH:MM:SS'`，无毫秒）：写库时间与日志**同一时区口径**。
  *
- * 存在理由：写库侧曾用 `new Date().toISOString().slice(0, 19).replace('T', ' ')`（UTC 口径），
- * 日志侧用 toIsoInTimezone（配置时区）—— 同一进程写出两个相差数小时的"现在"，
+ * 若写库用 UTC（`toISOString`）而日志用配置时区，同一进程会写出两个相差数小时的"现在"，
  * 事后比对「写入时间 vs 日志时间」永远对不上。两处统一走本函数。
  */
 export function toHanaDateTime(date: Date, timezone: string = DEFAULT_TIMEZONE): string {

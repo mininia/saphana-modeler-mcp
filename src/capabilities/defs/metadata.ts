@@ -12,8 +12,8 @@ import { VIEW_KIND, VERSION_SCOPE, zObjectName, zReadPackageId } from '../schema
 /**
  * hana_metadata_search_objects 的跨字段规则（纯函数）。
  *
- * 门面**提升前预检**与 handler 共用同一份实现：这些规则 zod 表达不了（条件必填/互斥），
- * 过去只在 handler 入口拒绝，而门面在 handler 之前已提升分类——无效调用也会改动工具面。
+ * 这些规则 zod 表达不了（条件必填/互斥），由 preflight 与 handler 共用同一份实现，
+ * 入口与直接调用两处的判定不会漂移。
  */
 export function validateSearchObjectsArgs(args: {
   pattern?: string;

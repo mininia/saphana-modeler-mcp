@@ -9,7 +9,7 @@
  *     失败 rollback，finally 恢复 autoCommit=true）。只读多语句不开事务（无副作用可回滚）。
  * - 任何失败都标明**第几条语句**、是否已回滚；DDL 在 HANA 可能隐式提交，回执如实提示。
  *
- * 2026-11 产品决策：SQL 专用 schema 闸门已移除。本层不扫描 schema、不查 CURRENT_SCHEMA、
+ * SQL 专用 schema 闸门不存在：本层不扫描 schema、不查 CURRENT_SCHEMA、
  * 不参与 HANA_READ_SCHEMA / 写 schema 白名单判定——能访问什么由数据库账号权限约束。
  *
  * 驱动交互全部在 core/hana-client.ts（本文件不 import @sap/hana-client）。

@@ -5,7 +5,7 @@
  * 它不是常驻工具：显式启用后经 `hana_tool_search` 发现/披露，再由 `hana_invoke` 执行；
  * 授权（sql 组 + 调用方档案）在发现与执行两层都生效。
  *
- * SQL 专用 schema 闸门已按产品决策移除：服务端不扫描/拦截 schema，访问范围由数据库账号权限约束。
+ * SQL 专用 schema 闸门不存在：服务端不扫描/拦截 schema，访问范围由数据库账号权限约束。
  */
 
 import { z } from 'zod';

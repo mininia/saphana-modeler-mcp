@@ -68,10 +68,9 @@ export function aggMeasures(node: ViewNode): ViewNodeMeasure[] {
 /**
  * BW on HANA：设计时 XML 中 schemaName="ABAP" 是**源系统名**而非数据库 schema，真实表在 SAPABAP1。
  *
- * 单点定义的原因（与 aggGroupBy/aggMeasures 同款上移到 model 层）：XML 推导（preview.derive 的
- * leafSql）、诊断追溯（preview-diagnose 的基表可达性）与结构 diff（view-diff 规则 7）三方必须用
- * 同一映射，各存一份必然漂移——漂移的表现是同一张表「推导能查、诊断报不可访问」，或「diff 说没变、
- * 实际换了源」。放 model 层是因为 view-diff（model）也消费它，而 model 不得 import services。
+ * 单点定义的原因：XML 推导（preview.derive 的 leafSql）、诊断追溯（preview-diagnose 的基表可达性）
+ * 与结构 diff（view-diff 规则 7）三方必须用同一映射，各存一份必然漂移（同一张表「推导能查、诊断
+ * 报不可访问」，或「diff 说没变、实际换了源」）。放 model 层是因为 view-diff 也消费它。
  */
 export function normalizeBwSchema(schemaName: string): string {
   return schemaName === 'ABAP' ? 'SAPABAP1' : schemaName;
@@ -80,8 +79,7 @@ export function normalizeBwSchema(schemaName: string): string {
 /**
  * 图论汇点：没有任何节点通过 input 引用它的节点（`#` 前缀是 XML 引用语法糖，比较前去掉）。
  * 单点定义的原因：view-diff（输出换人判定）与 view-edit（add_join 挂载点判定）都枚举汇点，
- * 引用集合的构造语法各写一份必然漂移。返回原顺序；「恰好一个才可判」「多汇点如何降级」
- * 等策略由各自调用方决定。
+ * 引用集合各写一份必然漂移。返回原顺序；「多汇点如何降级」等策略由调用方决定。
  */
 export function sinkNodes(nodes: ViewNode[]): ViewNode[] {
   const referenced = new Set(nodes.flatMap((n) => n.inputs.map((i) => i.node.replace(/^#/, ''))));

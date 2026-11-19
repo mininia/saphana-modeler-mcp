@@ -5,7 +5,7 @@
  * - 只读闸门：ACCESS=readonly 只拦 persistent；transient/none 放行。
  *   hana_sql_execute 在 select-only 下交给 SQL 规则层，deny 下整体拒绝。
  * - expectedEnvironment：多环境下**所有**调用都必须自报当前环境标识与代际
- *   （防环境漂移，不是授权凭证；大小写不敏感）。不再按 effects.mutates 推测哪些调用需要确认。
+ *   （防环境漂移，不是授权凭证；大小写不敏感）。
  *
  * 本模块只产出 Grant（与 profile/资源维度同一条判定链），不改写任何配置。
  */
@@ -50,7 +50,7 @@ export function environmentGrants(
 
   const grants: Grant[] = [];
   if (runtime.multiEnv) {
-    // 信封优先（P2）；args 回退兼容旧调用
+    // 信封优先；args 回退兼容无信封的直调
     const expected =
       assertion?.key ?? (typeof args['expectedEnvironment'] === 'string' ? args['expectedEnvironment'] : undefined);
     if (expected === undefined || expected.trim() === '') {
@@ -71,7 +71,7 @@ export function environmentGrants(
         ),
       );
     }
-    // 只有环境名会误判：DEV 4 → PRD 5 → 再回 DEV 6 的旧披露必须靠代际失效。
+    // 只靠环境名会误判：DEV → PRD → 再回 DEV 期间签发的凭证必须靠代际失效。
     const epoch = assertion?.epoch ?? (typeof args['expectedEpoch'] === 'number' ? args['expectedEpoch'] : undefined);
     if (epoch === undefined || !Number.isInteger(epoch) || epoch < 1) {
       grants.push(

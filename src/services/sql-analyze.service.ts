@@ -41,42 +41,34 @@ import {
 /**
  * hana_sql_analyze 服务层：SQL 执行计划（EXPLAIN PLAN）+ 可选的实际执行与运行时统计。
  *
- * 三条硬约束**全部来自真机实测**（test-verification/probe-explain-plan.mjs 与 verify-sql-analyze.mjs）：
- * 1. **计划表是全库可读的**（与最初推断相反，实测跨连接可见；行里记录写入者 CONNECTION_ID，
- *    断开连接也**不会**清掉）。所以：**唯一语句名是唯一的正确性保证**——同名是**追加**而非替换
- *    （实测同名两次 → 回读 4 行），而名字处于全库命名空间，复用/撞名会把别人的计划混进来，
- *    那是**错结果**不是慢结果。CONNECTION_ID 过滤是"只读自己这次写的"第二道；
- *    回读仍放在同一次 `withConnection` 内（写入与回读同连接，且清理也在同一条连接上完成），
- *    但注意这只是工程上的收拢，**不再是正确性前提**。
- * 2. **用完即清**：行不随连接销毁、会全库累积（实测），且该表**可 DELETE**（实测 2 行→0，33ms）——
- *    故回读后按唯一名删掉本次写入的行，避免长期运行后计划表被历史行塞满（失败不影响结果）。
- * 3. **EXPLAIN 不含实际执行信息**：编译期只有估计值；真实运行时统计只存在于计划缓存
- *    （M_SQL_PLAN_CACHE），故 analyze 模式是"先用**完全相同的语句文本**执行一次，
- *    再按文本关联到计划缓存条目"——这也正是 SAP 文档给的标准做法（重编译/参数感知计划）。
+ * 三条硬约束**全部来自真机实测**：
+ * 1. **计划表全库可读**（实测跨连接可见；行记录写入者 CONNECTION_ID，断开连接也**不清**）⇒
+ *    **唯一语句名是唯一的正确性保证**：同名是**追加**而非替换（实测同名两次 → 回读 4 行），
+ *    名字处于全库命名空间，复用/撞名会把别人的计划混进来（错结果，不是慢结果）。
+ *    CONNECTION_ID 过滤是"只读自己这次写的"第二道；回读放在同一次 `withConnection` 内只是工程收拢。
+ * 2. **用完即清**：行不随连接销毁、会全库累积，且该表**可 DELETE**（实测 2 行→0，33ms）——
+ *    回读后按唯一名删掉本次写入的行（清理失败不影响结果）。
+ * 3. **EXPLAIN 不含实际执行信息**：编译期只有估计值；真实统计只存在于计划缓存（M_SQL_PLAN_CACHE），
+ *    故 analyze 模式 = 用**完全相同的语句文本**执行一次，再按文本关联缓存条目（SAP 文档的标准做法）。
  *
- * 分组归 write 的含义：本工具**不写业务数据、不碰仓库**（与建模同档做暴露面控制）——
- * 接受任意 SQL 文本 + 可选真实执行，不要把它当成有副作用的写工具。
+ * 归 write 组的原因：本工具**不写业务数据、不碰仓库**（与建模同档做暴露面控制）——接受任意 SQL
+ * 文本 + 可选真实执行，不要把它当成有副作用的写工具。
  */
 
 const PLAN_TABLE = 'SYS.EXPLAIN_PLAN_TABLE';
 const PLAN_CACHE = 'SYS.M_SQL_PLAN_CACHE';
 
 /**
- * analyze 模式真执行的护栏（交给 core 的 execStreamingOn 落地执行）。
- * 只在这里定义一次：两条执行路径（PlanViz 的 `EXECUTE PLANVIZ STATEMENT ID` 与降级路径的
- * 原样语句）跑的是同一套边界，"只允许 SELECT"由规则层的 validateAnalyzeRequest 负责。
- *
- * `as const`：这是**只读**的共享配置，不是跨请求传的状态（HTTP 模式多客户端并发下，
- * 可变模块级状态会把别的请求的取值串进来）。
+ * analyze 模式真执行的护栏（由 core 的 execStreamingOn 落地执行），两条执行路径（PlanViz 与降级）
+ * 共用同一套边界；"只允许 SELECT"由规则层的 validateAnalyzeRequest 负责。
+ * `as const`：只读共享配置，不是跨请求状态（HTTP 多客户端并发下可变模块级状态会串请求）。
  */
 const ANALYZE_EXECUTION_GUARD = { timeoutMs: ANALYZE_EXECUTION_TIMEOUT_MS, maxRows: ANALYZE_MAX_ROWS } as const;
 
 /**
- * 控制面/诊断查询（EXPLAIN 执行、计划缓存查询、计划表回读）的语句超时。
- * 与 PlanViz 控制面调用（planVizCall）**同一口径**：这些查询一旦在服务端排队等待
- * （对象锁、并发 DDL、计划表竞争——恰恰是本工具最常用的诊断场景），不设上限就会一直占着池位
- * （池上限 4），几次这样的调用之后所有工具调用都会在 acquire 30s 上失败。
- * `as const`：只读共享配置，不是跨请求传的状态（HTTP 模式多客户端并发下同 ANALYZE_EXECUTION_GUARD）。
+ * 控制面/诊断查询（EXPLAIN、计划缓存查询、计划表回读）的语句超时，与 planVizCall 同一口径：
+ * 这些查询一旦在服务端排队（对象锁、并发 DDL、计划表竞争——恰恰是最常用的诊断场景），不设上限
+ * 就会一直占着池位（池上限 4），几次之后所有工具调用都会在 acquire 30s 上失败。
  */
 const CONTROL_QUERY_OPTS = { timeoutMs: ANALYZE_CONTROL_TIMEOUT_MS } as const;
 
@@ -182,17 +174,13 @@ export type ExecutionStats = ExecStreamingStats;
 export interface SqlAnalyzeResult {
   /**
    * 计划来源：
-   * - sql=按语句文本编译解释（对应官方 Visualize Plan 的估计计划）
-   * - planCacheEntry=解释计划缓存条目（官方「SQL Plan Cache → Visualize Plan」同款）
+   * - sql=按语句文本编译解释（估计计划）；planCacheEntry=解释计划缓存条目
    * - sqlExecuted=先执行、再解释缓存条目（仍是估计值 + 语句级运行时统计）
-   * - plv=analyze=true 的**默认取计划通道**（官方 Executed Plan 的落点，逐算子实测耗时/时间轴）；
-   *   通道不可用（服务端版本不支持等）时降级为 sqlExecuted，notes 写明原因。
-   *   实测（HANA 2.00.085）普通连接、无需 trace 权限即可走通全流程：
-   *   `CALL SYS.PLANVIZ_ACTION(103|110,'')` 建 planviz 会话（老客户端走 `SET 'PLANVIZ'='ON'`）→
-   *   `PLANVIZ_ACTION(201, sql)` 编译并返回 queryId（`<连接号>_<hash>`，即 Statement ID）→
-   *   执行 = 把 `EXECUTE PLANVIZ STATEMENT ID '<上一步原样返回的 queryId>'` 当语句发出去 →
-   *   `PLANVIZ_ACTION(402|401|301, queryId)` 取回 `XML_PLAN`，此时为 `Type="Executed"` 逐算子实测；
-   *   不做第三步则同一步返回 `Type="Estimated"`。
+   * - plv=analyze=true 的**默认取计划通道**（逐算子实测耗时/时间轴）；通道不可用时降级为
+   *   sqlExecuted，notes 写明原因。实测（HANA 2.00.085）普通连接、无需 trace 权限即可走通：
+   *   `CALL SYS.PLANVIZ_ACTION(103|110,'')` 建会话 → `PLANVIZ_ACTION(201, sql)` 编译拿 queryId
+   *   （`<连接号>_<hash>`）→ 执行 `EXECUTE PLANVIZ STATEMENT ID '<原样 queryId>'` →
+   *   `PLANVIZ_ACTION(402|401|301, queryId)` 取回 `XML_PLAN`（此时 Type="Executed"）。
    *   **id 必须原样传递**——自行拼 `ID_` 前缀/`_1` 后缀会让 HANA 直接打掉连接（89006）。
    */
   source: 'sql' | 'planCacheEntry' | 'sqlExecuted' | 'plv';
@@ -309,17 +297,15 @@ export async function analyzeSql(pool: HanaPool, opts: SqlAnalyzeOptions): Promi
 /**
  * 删掉本次写入的计划行。
  *
- * 为什么必须清：实测该表**全库可读且不随连接销毁**，每调用一次就留 N 行（N=算子数），
- * 长期运行会让计划表被历史行塞满，也会让别人看到我们分析过的语句。
- * 实测 `DELETE FROM SYS.EXPLAIN_PLAN_TABLE WHERE STATEMENT_NAME = ?` 真生效（2 行→0，33ms）。
- *
+ * 必须清：该表全库可读且不随连接销毁，每调用一次留 N 行（N=算子数），长期运行会塞满，
+ * 也会让别人看到我们分析过的语句。实测 `DELETE … WHERE STATEMENT_NAME = ?` 真生效（2 行→0，33ms）。
  * 清理失败不影响本次结果（只读账号可能没有 DELETE 权限）——如实回报，不吞不报。
  */
 async function cleanupPlanRows(pool: HanaPool, conn: HanaConnection, statementNames: string[]): Promise<boolean> {
   let allCleaned = true;
   // 逐个名字各自 try：一次调用要清的名字不止一个（降级路径用派生名写行，见 fallbackStatementName），
   // 共用一次 try 会让第一个名字失败就跳过其余——真正写了行的那个（派生名）反而没被删，
-  // 提示里也只报主名，按提示去查是 0 行，孤儿行无人知晓。这正是当初要消灭的情况。
+  // 提示里也只报主名，按提示去查是 0 行，孤儿行无人知晓。
   for (const name of statementNames) {
     try {
       await pool.execOn(conn, `DELETE FROM ${PLAN_TABLE} WHERE STATEMENT_NAME = ?`, [name]);
@@ -450,14 +436,12 @@ async function analyzeCacheEntry(
 /**
  * 模式三：**先实际执行再分析**（可选，默认关闭）。
  *
- * 取计划有两条路，**优先走 PlanViz 通道**（官方 Executed Plan / F8 的同一条路）：
- * - PlanViz 通道拿得到**逐算子实测**：独占/含子耗时、实际行数、时间轴、线程数、表访问次数；
- * - 拿不到时（旧版本不支持 `EXECUTE PLANVIZ STATEMENT ID`、或会话被占等）**降级**到
- *   "执行后按语句文本关联计划缓存条目"的老路——那条路只有**语句级**聚合统计，计划仍是估计值。
- * 降级是静默可解释的：notes 里说明为什么退、退到了哪。
+ * 取计划两条路：**优先 PlanViz 通道**（逐算子实测：耗时、实际行数、时间轴、线程数、表访问次数）；
+ * 拿不到时降级到"执行后按语句文本关联计划缓存条目"（只有语句级聚合统计，计划仍是估计值）。
+ * 降级原因写进 notes（为什么退、退到了哪）。
  *
- * 护栏（服务层只给常量，**执行由 core 的 execStreamingOn 落地**）：语句超时 5 min、最多取 100 行
- * 即关闭结果集、只允许 SELECT、执行前先过读取范围。**不返回数据行**。两道执行路径都套同一套护栏。
+ * 护栏（常量在本层，**执行由 core 的 execStreamingOn 落地**）：语句超时 5 min、最多取 100 行、
+ * 只允许 SELECT、执行前先过读取范围。**不返回数据行**。两道路径套同一套护栏。
  */
 async function analyzeByExecution(
   pool: HanaPool,

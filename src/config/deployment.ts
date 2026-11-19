@@ -1,17 +1,14 @@
 /**
  * 部署不变量（纯叶子模块：无依赖、无 I/O）——启动期「配置组合是否自洽」的判定规则。
  *
- * 借鉴 tableau-mcp（github.com/tableau/tableau-mcp）在 Config 构造期直接 throw 的做法：
- * 单项配置各自合法，**组合起来却构成安全暴露**的情况，必须在启动时就拒绝，
- * 而不是留一条 warn 让服务带着敞口跑起来。其典型例子是
- * `TRANSPORT=http` 必须配 `OAUTH_ISSUER`，否则 throw（除非显式 DANGEROUSLY_DISABLE_OAUTH=true）。
+ * 单项配置各自合法，**组合起来却构成安全暴露**的情况必须在启动时就拒绝，
+ * 而不是留一条 warn 让服务带着敞口跑起来。
  *
  * 本模块只放规则（纯函数），调用方：
  * - 预检层 preflight.ts：解析出生效姿态后据此产出不变量结论（启动自检 / 报告）
  * - http.ts：复用 isLoopbackHost 判定监听地址
  *
- * 为什么单独成模块：写边界有 write-boundary.ts，部署姿态也该有自己的规则叶子，
- * 避免判定散落在启动入口、HTTP 层与预检层三处各写一遍。
+ * 单独成模块与 write-boundary.ts 同理：避免判定散落在启动入口、HTTP 层与预检层三处各写一遍。
  */
 
 /** 回环地址判定（"仅本机可达" = 无认证时的访问边界） */
@@ -22,7 +19,7 @@ export function isLoopbackHost(host: string): boolean {
   return LOOPBACK_HOSTS.has(host.trim().toLowerCase());
 }
 
-/** 显式承认"对外监听且不认证"风险的开关名（对照 tableau-mcp 的 DANGEROUSLY_* 约定） */
+/** 显式承认"对外监听且不认证"风险的开关名 */
 export const ALLOW_ANONYMOUS_ENV = 'MCP_HTTP_ALLOW_ANONYMOUS';
 
 /**

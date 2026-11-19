@@ -2,7 +2,7 @@
  * ActionContract 投影（Disclose）——把能力清单的 `routing` / `inputSchema` / `effects` 投影成
  * 「一次调用即可照抄」的完整技术契约。
  *
- * 边界（评审 I1/I2）：
+ * 边界：
  * - **不新增第二份能力表**：所有字段都从 `CAPABILITY_LIST` 派生；
  * - 只描述技术层：入参、约束、前置、副作用、调用方式；不存 HANA 数据/权限快照；
  * - 不复制完整输出 schema：只给 `routing.returns` 的结果使用说明；
@@ -77,7 +77,7 @@ export const ACCESS_PROBE_ARGS: Readonly<Record<string, unknown>> = {
   objectName: 'PROBE_OBJ',
 };
 
-/** 运行风险派生（§5.2）：`transient` 不是 `read` */
+/** 运行风险派生：`transient` 不是 `read` */
 export function operationalRiskOf(cap: Capability): OperationalRisk {
   if (cap.effects.destructive) return 'destructive';
   if (cap.effects.mutates === 'persistent') return 'high';

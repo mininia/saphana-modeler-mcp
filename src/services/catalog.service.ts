@@ -5,18 +5,18 @@ import { suffixInClause, suffixesOf } from '../model/view-suffixes.js';
 import { CROSSREF_TABLE, type VersionScope } from '../model/view-scope.js';
 
 /**
- * 关系图（catalog）：对象级多跳遍历与影响半径（P4 交付，只读零风险）。
+ * 关系图（catalog）：对象级多跳遍历与影响半径（只读）。
  *
- * 设计口径（SSD §3.2/§3.3，2026-10-08 侦察定）：
+ * 设计口径：
  * - 对象图**直查** `_SYS_REPO.ACTIVE_OBJECTCROSSREF`（不做启动期全量索引、不做持久化）；
  *   version=inactive 时改查 `_SYS_REPO.INACTIVE_OBJECTCROSSREF`（未激活/挂起版本的血缘），
- *   默认 active（既有行为不变）；
+ *   默认 active；
  * - 遍历按层 BFS：每层一次批量 SQL（frontier 分块，避免参数上限），visited-set 用
  *   `(packageId, objectName, objectSuffix)` 三元组去重（CV 理论无环，防御性保留）；
  * - **只沿设计时视图类型继续展开**（calculationview/attributeview/analyticview，与
  *   whereUsed 的 kind 口径同源）；非视图邻居（TABLE、`__RT_*` 运行时目录视图）只收进结果、
  *   不再从它们继续展开——否则运行时副本会与设计时对象形成平行图；
- * - 所有结果带 `asOf`（构建时刻，进程时区），可能被截断时带 `truncated`（I2 诚实性）。
+ * - 所有结果带 `asOf`（构建时刻，进程时区），可能被截断时带 `truncated`（如实回报）。
  */
 
 export interface GraphNode {
@@ -119,9 +119,8 @@ export async function expandLevel(
              FROM "_SYS_REPO".${crossRefTable}
              WHERE (${wherePairsTo}) AND TO_OBJECT_SUFFIX IN ${suffixIn}`;
 
-    // 写路径 SQL 超时（§4.3）：P6 起本查询进了写路径（update 判定在锁内、delete 判定在锁外，每次写前各查一次），
-    // 不设超时就不受 HANA_SQL_TIMEOUT_MS 约束——与 P5 写路径四处同一写法（超时值取自池）。
-    // 假池/旧调用点拿到 undefined 时行为与今天一致（hana-client 的 positiveTimeoutMs 按「未给」处理）。
+    // 写路径 SQL 超时：本查询也进了写路径（update 判定在锁内、delete 判定在锁外，每次写前各查一次），
+    // 不设超时就不受 HANA_SQL_TIMEOUT_MS 约束——超时值取自池（hana-client 的 positiveTimeoutMs 对未给值按「未设」处理）。
     const rows = await pool.query<CrossRefRow>(sql, [...pairParams, ...suffixes], {
       timeoutMs: pool.statementTimeoutMs,
     });
@@ -134,15 +133,13 @@ export async function expandLevel(
  * 闭包遍历（按层 BFS，**两个方向各跑一条**）。语义承诺：
  * - 结果与 whereUsed 的单跳查询**同源**（同一张 ACTIVE_OBJECTCROSSREF + 同一 suffix 过滤口径），
  *   但**顺序不承诺逐项一致**：这里统一按 (objectSuffix, packageId, objectName) 做 localeCompare 排序，
- *   单跳 SQL 则是 ORDER BY OBJECT_SUFFIX, OBJECT_NAME（由 DB 排序，没有 packageId 这一级）；
+ *   单跳 SQL 则是 ORDER BY OBJECT_SUFFIX, OBJECT_NAME（没有 packageId 这一级）；
  * - 环防护：visited-set 含种子，任一层命中已访问节点即跳过；
  * - `depth='all'` 仍受 maxNodes 约束，触达即 `truncated:true`（不静默丢）；
- * - **frontier 按到达方向分流**（upstream 只从 upstream 到达的节点出发，反之亦然）：
- *   若两个方向共用 frontier，第 2 层起就会出现"从下游节点再向上游扩"的交替路径——
- *   diamond（多个视图共享同一上游/下游）是该仓库场景常态，那样会把与种子无上下游关系的
- *   节点混进方向桶，真·传递节点也可能被另一方向抢先标走。等价于跑两次独立 BFS，
- *   只是按层同步执行以共享 maxNodes 预算；同一节点若两个方向都可达，会在结果里各出现一条
- *   （两个桶都是真的，谁也不能替谁作证）。
+ * - **frontier 按到达方向分流**（upstream 只从 upstream 到达的节点出发，反之亦然）：若两个方向共用
+ *   frontier，第 2 层起就会出现"从下游节点再向上游扩"的交替路径——diamond（多个视图共享同一上游/
+ *   下游）是该仓库场景常态，那样会把与种子无上下游关系的节点混进方向桶。等价于跑两次独立 BFS，
+ *   只是按层同步执行以共享 maxNodes 预算；同一节点若两个方向都可达，会在结果里各出现一条。
  */
 export async function closure(pool: HanaPool, seed: GraphNode, opts: ClosureOptions = {}): Promise<ClosureResult> {
   const direction = opts.direction ?? 'both';
@@ -202,8 +199,8 @@ export async function closure(pool: HanaPool, seed: GraphNode, opts: ClosureOpti
 }
 
 /**
- * 影响半径：下游**直接引用（单跳）**的语义别名（P6 破坏性判定与编排层切分工作用）。
- * 默认 depth=1 是刻意的口径：P6 的破坏性判定/回执每次写都要跑一遍，跑到图穷（depth='all'）代价太大。
+ * 影响半径：下游**直接引用（单跳）**的语义别名（破坏性判定与编排层切分工作用）。
+ * 默认 depth=1 是刻意的口径：破坏性判定/回执每次写都要跑一遍，跑到图穷（depth='all'）代价太大。
  * 需要传递影响面（多跳闭包）请用 `hana_metadata_where_used` 的 depth>1，不要在本函数默认值上加码；
  * 回执与注释一律把判定输入称作「直接下游（单跳）」，别写成「闭包」——那会让人高估判定覆盖面。
  */

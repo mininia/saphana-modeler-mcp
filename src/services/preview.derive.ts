@@ -4,7 +4,7 @@ import { aggGroupBy, aggMeasures, normalizeBwSchema } from '../model/view-types.
 import type { ViewDataSource, ViewDefinition, ViewNode } from '../model/view-types.js';
 
 /**
- * 节点级数据预览的 SQL 推导（方案 B：依据视图 XML 直接推导，纯只读）。
+ * 节点级数据预览的 SQL 推导（依据视图 XML 直接推导，纯只读）。
  *
  * 与 HANA Studio「点击节点 Data Preview 临时建 SQL 虚拟视图」不同：这里不建任何对象，
  * 直接从已解析的 ViewDefinition 自底向上重构成一条嵌套 SELECT，直查基表/引用运行时视图。
@@ -15,7 +15,7 @@ import type { ViewDataSource, ViewDefinition, ViewNode } from '../model/view-typ
  * 明确不支持：SqlScriptView（脚本节点，按需求不解析脚本）、其他
  *
  * 列裁剪（优化 SQL 长度）：从目标节点自顶向下传播「需求列」——中间节点只 SELECT
- * 父级真正需要的输出列，叶子按需选列（不再 SELECT *）；聚合/Join/Rank 的语义必需列
+ * 父级真正需要的输出列，叶子按需选列（不做 SELECT *）；聚合/Join/Rank 的语义必需列
  * （分组/度量/关联键/窗口分组排序）不受裁剪影响，保证结果正确。
  *
  * 纯函数：输入 ViewDefinition + 目标节点 ID，输出可执行的 SELECT（无外层 LIMIT）。
@@ -243,7 +243,7 @@ function leafSql(ds: ViewDataSource, need: string[] | undefined): string {
   if (ds.type === 'DATA_BASE_TABLE' && ds.schemaName && ds.columnObjectName) {
     // 纵深防御：叶子表 schema 走白名单（SAPABAP1 等）。不在白名单时 assertSchemaAllowed 直接抛
     // HanaBusinessError（文案由 core/sql 用 describeSchemaWhitelist 生成，含 HANA_READ_SCHEMA 指引），
-    // 此处不再包一层改写文案——改写只会让白名单变更时漏改这份副本。
+    // 此处不包一层改写文案——改写只会让白名单变更时漏改这份副本。
     const schema = normalizeBwSchema(ds.schemaName);
     assertSchemaAllowed(schema);
     return `( SELECT ${cols} FROM ${quoteIdentifier(schema)}.${quoteIdentifier(ds.columnObjectName)} )`;
@@ -358,7 +358,7 @@ function attributeFilterClause(node: ViewNode, resolve: (col: string) => string)
  * - isnull(x) → (x IS NULL)   // COLUMN_ENGINE 的 isnull 是"判空"函数，HANA SQL 无此函数
  * 递归处理嵌套；未知结构原样保留（由数据库报错，不静默产出错误数据）。
  * 说明：BW 运行时视图（_SYS_BIC）把度量暴露为数值类型 + NULL，算术无需空串容错；
- * 曾尝试 NULLIF(col,'') 容错，但对数值列会把 '' 转数值触发 HANA 339，已回退。
+ * 不要用 NULLIF(col,'') 容错——对数值列会把 '' 转数值触发 HANA 339。
  */
 export function translateColumnEngine(exprStr: string): string {
   let result = exprStr;
@@ -684,9 +684,9 @@ function rankSql(node: ViewNode, gen: (ref: string) => string, emit: string[]): 
 }
 
 /**
- * aggGroupBy / aggMeasures / normalizeBwSchema 的实现已上移到 model/view-types.ts（分层修正：
- * model 不得 import services，而 view-diff、节点预览推导与诊断必须共用同一份方言判定 / schema 别名映射）。
- * 此处保留 re-export，本文件的对外导出面零变化。
+ * aggGroupBy / aggMeasures / normalizeBwSchema 的实现位于 model/view-types.ts：
+ * model 不得 import services，而 view-diff、节点预览推导与诊断必须共用同一份方言判定 / schema 别名映射。
+ * 此处只做 re-export。
  */
 export { aggGroupBy, aggMeasures, normalizeBwSchema };
 

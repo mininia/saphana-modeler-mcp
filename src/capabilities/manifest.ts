@@ -58,7 +58,7 @@ export const CAPABILITY_LIST: readonly Capability[] = Object.values(CAPABILITIES
 /** 按 id 查能力；未登记返回 undefined（调用方一律按"未知能力"处理，不泄漏存在性） */
 export function findCapability(id: string): Capability | undefined {
   // Object.hasOwn 守卫：CAPABILITIES 是普通对象，下标访问会命中原型链属性名（'toString' 等），
-  // 把「未登记」报成「已登记」——实测曾因此 fail-open。
+  // 把「未登记」报成「已登记」（fail-open）。
   return Object.hasOwn(CAPABILITIES, id) ? (CAPABILITIES as Record<string, Capability | undefined>)[id] : undefined;
 }
 

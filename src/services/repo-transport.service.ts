@@ -36,7 +36,7 @@ export function configureWritePackages(packages: string[]): void {
   WRITE_ALLOWED_PACKAGES = packages.map((p) => p.trim().toUpperCase()).filter((p) => p.length > 0);
 }
 
-/** 当前生效的可写包：优先当前环境 runtime（v2 策略参数可按环境不同），否则进程级回退 */
+/** 当前生效的可写包：优先当前环境 runtime（策略参数可按环境不同），否则进程级回退 */
 function effectiveWritePackages(): string[] {
   const runtime = currentEnvironmentRuntime();
   return runtime !== undefined ? runtime.config.writePackages : WRITE_ALLOWED_PACKAGES;
@@ -77,7 +77,7 @@ export function assertWritePackageAllowed(packageId: string, objectName?: string
         `（生效范围：${effectiveWritePackages().join(', ') || '(空)'}）。请求未执行。`,
     );
   }
-  // §4.4 归因：agentLabel 是进程级标签（MCP_AGENT_LABEL）——多代理拓扑下每个子代理一个进程，
+  // 归因：agentLabel 是进程级标签（MCP_AGENT_LABEL）——多代理拓扑下每个子代理一个进程，
   // 仓库侧（_SYS_REPO 的 OWNER/ACTIVATED_BY）只能看到共享技术账号，日志里没有它就分不清
   // 「哪个代理写了这个包」。有则附、无则省（未配置时不产生恒为空字段，写法与 config/authorize.ts 一致）。
   const agentLabel = currentAgentLabel();
@@ -98,7 +98,7 @@ export function assertWritePackageAllowed(packageId: string, objectName?: string
  * 键的维度是「**同一设计时文件**」：同一文件无论以裸对象名还是带后缀文件名寻址都是同一个键；
  * 不同文件互不阻塞，同一文件上的 check-then-act 序列严格串行。
  *
- * 全局锁序（SSD §4.3，写死）：**keyed lock → 信号量 → 网络/DB**。任何新写路径不得反向获取，
+ * 全局锁序（写死）：**keyed lock → 信号量 → 网络/DB**。任何新写路径不得反向获取，
  * 否则与 update 的「持锁 → 写时经 writeFile 取激活信号量」构成锁序反转 = 死锁。
  * 锁**不可重入**：withKeyedLock 对同一 key 是排队串行，持锁期间再取同一把锁会自等（排队内自锁）；
  * 现有各路径均满足「各自只取一次、不嵌套」（详见各调用点注释）。
@@ -154,8 +154,8 @@ export async function repositoryRest(
 ): Promise<RepoRestResponse> {
   const j = Buffer.from(JSON.stringify(request), 'utf8');
   // 附件区：files 的每个元素序列化为**一条** [4B 长度][内容] 记录；头部 count 必须等于实际记录数——
-  // 写成 `1 + 文件数 × 2` 会多报（写对象时实际只有 2 条记录），头/体不一致时实测在传输层报
-  // Transporter.consume，还会掩盖真实原因「缺仓库会话 40106」。count 从同一个数组推导，杜绝再次漂移。
+  // 多报会在传输层报 Transporter.consume，还会掩盖真实原因「缺仓库会话 40106」。
+  // count 从同一个数组推导，杜绝再次漂移。
   const attachmentRecords = files.flatMap((f) => [u32le(f.length), f]);
   const attachmentCount = files.length;
   const idata = Buffer.concat([
@@ -167,7 +167,7 @@ export async function repositoryRest(
   ]);
   // CALL SYS.REPOSITORY_REST(?, ?)：第三个实参 1 = OUT 参数个数；只绑定 IN（第 1 个 ?），
   // OUT 经 getParameterValue(1) 读回（driver 约定）。
-  // 写路径 SQL 超时（§4.3）：REPOSITORY_REST 一挂住就占着池位（池上限 4），必须可设上限；
+  // 写路径 SQL 超时：REPOSITORY_REST 一挂住就占着池位（池上限 4），必须可设上限；
   // 假池/未配超时的池拿到 undefined 时行为与今天一致（不加超时）
   const outs = await pool.callProcedure('CALL SYS.REPOSITORY_REST(?, ?)', [idata], 1, {
     timeoutMs: pool.statementTimeoutMs,
@@ -232,7 +232,7 @@ export function activationSummary(detail: ActivationDetail, fallback = '激活�
 }
 
 /**
- * 写路径成功后的视图缓存失效（SSD §4.5，五条写路径统一经此助手，不各写一遍）。
+ * 写路径成功后的视图缓存失效（五条写路径统一经此助手，不各写一遍）。
  * 对象名一律传**裸名**（与 viewDefinitionCache.get 的 key 构造 `${pkg}/${obj}/…` 一致；
  * 带后缀不会命中前缀，只会静默退化成「等 60s 自愈」）。
  * 定位：失效只是把「最多 60s 后自愈」变成「立即」，**不是正确性依赖**——
@@ -308,7 +308,7 @@ export async function writeViaInactiveObject(
 ): Promise<void> {
   // 写库时间与日志同口径（取配置时区的本地时间，不用 UTC——两者相差一个时区会让比对失真）
   const now = toHanaDateTime(new Date(), timezone);
-  // 写路径 SQL 超时（§4.3）：兜底直写同样是写前必经腿（假池/旧调用点 undefined = 不加超时）
+  // 写路径 SQL 超时：兜底直写同样是写前必经腿（假池/旧调用点 undefined = 不加超时）
   await pool.execute(
     `INSERT INTO "_SYS_REPO"."INACTIVE_OBJECT"
        (PACKAGE_ID, OBJECT_NAME, OBJECT_SUFFIX, OWNER, WORKSPACE, VERSION_ID, LAST_CHANGED_AT, IS_DELETION, EDIT, CDATA)
@@ -331,7 +331,7 @@ const DESIGN_TIME_SUFFIXES: readonly string[] = [
 ];
 
 /**
- * 锁键归一（SSD §4.1）：**循环**剥掉已知的设计时后缀直到稳定，得到**裸对象名**。
+ * 锁键归一：**循环**剥掉已知的设计时后缀直到稳定，得到**裸对象名**。
  * 为什么需要：import 传的是设计时文件名（X.calculationview），create/update/validate 传裸对象名——
  * 带后缀与不带后缀的键互不阻塞，同一文件上的并发写等于没加锁（本文件全部 withKeyedLock 统一走本函数）。
  * 为什么是**循环**而不是只剥一层：裸对象名本身可能就以设计时后缀结尾（就叫 A.calculationview），
@@ -413,7 +413,7 @@ export async function updateViaRest(
   // ifMatch 由调用方在**锁内**捕获（「读时取」：窗口一直覆盖到 PUT，期间任何并发写入都使基线失效——
   // 锁内取则进程内不再有他人写入；跨进程仍由服务端 412 兜底）。
   // 这里**刻意不补读** fileMeta 取当前 ETag 当基线：补读若发生在第三方写入之后，会把冲突基线悄悄刷新
-  // （PUT 不再 412），与 §4.2「禁止补读拼装」同型。没有基线就不带 If-Match，退化事实进回执。
+  // （PUT 不再 412），与「禁止补读拼装」同型。没有基线就不带 If-Match，退化事实进回执。
   return rest.writeFile(packageId, file, xml, {
     activate: opts.activate ?? false,
     ...(opts.ifMatch ? { ifMatch: opts.ifMatch } : {}),
@@ -422,14 +422,14 @@ export async function updateViaRest(
 
 /**
  * XS REST 通道：删除设计时对象（锁内两步：取基线 → 带 If-Match 的 DELETE）。
- * 实测（§4.9#C）：正确基线 → 204、陈旧基线 → 412、对象已不存在 → 404（core 层已把它们分类成
+ * 实测：正确基线 → 204、陈旧基线 → 412、对象已不存在 → 404（core 层已把它们分类成
  * 机读码 + conflict 载荷）。基线是**删除前读**得到的——对象删掉后没有可读的基线。
  * 基线缺失（读取未返回 ETag）时退回不带 If-Match 删除：退化事实经 ifMatchMissing 带出（调用方如实上报）。
  * 锁不可重入：本函数取一次锁，调用方不得再在持锁状态下调用它。
  *
  * `ifMatch`（可选）：调用方**预读**的删除基线——变更集的 delete 项把「写入前紧贴本项读到的 ETag」
  * 显式传入，使「预读 → 删除」之间的第三方写入必得 412（该项 ⇒ conflict_external）；
- * 不传 = 锁内自取删除前基线（单对象通道语义零改动）。
+ * 不传 = 锁内自取删除前基线（单对象通道语义）。
  */
 export async function deleteViaRest(
   config: HanaConfig,

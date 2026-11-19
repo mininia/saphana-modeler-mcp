@@ -8,11 +8,9 @@ import { currentEnvironmentRuntime } from './environment-context.js';
 /**
  * 乐观锁冲突（412）/ 目标缺失（404）的机读载荷，经 withErrorEnvelope 进 envelope.raw.conflict。
  *
- * 关于 currentETag：它是**冲突时点的补读值**（捕获 412 后立刻再读一次 fileMeta），
- * **不是**本次写的新基线——实测 412 响应不带 ETag 头，只能补读；
- * 这一次额外往返不可省，且补读结果不许被当成"最新基线"回写或重试。
- * 补读本身失败（如对象已被并发删除）时原因写进 currentUnavailable——
- * 不许把补读失败静默成 undefined（"查不到"与"没去查"必须可区分）。
+ * currentETag 是**冲突时点的补读值**（捕获 412 后立刻再读一次 fileMeta），**不是**本次写的新基线——
+ * 实测 412 响应不带 ETag 头，只能补读；补读结果不许被当成"最新基线"回写或重试。
+ * 补读失败的原因写进 currentUnavailable（"查不到"与"没去查"必须可区分）。
  */
 export interface ConflictInfo {
   /** 原始 HTTP 状态：412 或 404 */
@@ -30,17 +28,12 @@ export interface ConflictInfo {
 }
 
 /**
- * HANA 业务错误：驱动/SQL 层错误归一化载体（对齐既有 BW 建模服务错误对象的 code/sqlState/messages 三元组形状）。
+ * HANA 业务错误：驱动/SQL 层错误归一化载体（对齐 BW 建模服务错误对象的 code/sqlState/messages 三元组形状）。
  * - code：HANA/SAP 错误码（如 '7'=权限不足、'259'=对象不存在、'-10709'=连接失败）
- * - sqlState：SQLSTATE
- * - messages：可选的结构化消息列表（激活错误明细等）
- * - diagnosis：可选的排障报告（如数据预览权限诊断），经 withErrorEnvelope 进 envelope.raw.diagnosis
+ * - sqlState / messages / diagnosis：SQLSTATE、结构化消息列表、排障报告（→ envelope.raw.diagnosis）
  */
 export class HanaBusinessError extends Error {
-  /**
-   * 冲突载荷：412/404 的机读形状，经 withErrorEnvelope 进 envelope.raw.conflict。
-   * 非 readonly（可写）：由 withConflict 工厂在构造后赋值，构造器保持原签名不变。
-   */
+  /** 冲突载荷：412/404 的机读形状，经 withErrorEnvelope 进 envelope.raw.conflict；由 withConflict 构造后赋值。 */
   conflict?: ConflictInfo;
 
   constructor(
@@ -50,10 +43,7 @@ export class HanaBusinessError extends Error {
     public readonly messages: HanaMessage[] = [],
     /** 排障报告（如预览权限诊断）；由失败路径自动附加，envelope.raw.diagnosis 透传给调用方 */
     public readonly diagnosis?: unknown,
-    /**
-     * 服务端原始错误载荷（如 XS 写失败的 CheckResult + 响应体）。
-     * 与 diagnosis 同为「失败后无需二次调用即可定位」的附加信息，envelope.raw.errorDetail 透传。
-     */
+    /** 服务端原始错误载荷（如 XS 写失败的 CheckResult + 响应体），envelope.raw.errorDetail 透传。 */
     public readonly rawDetail?: unknown,
   ) {
     super(message);
@@ -62,20 +52,15 @@ export class HanaBusinessError extends Error {
 
   /**
    * 便捷构造：只带「服务端原始错误载荷」（→ envelope.raw.errorDetail）。
-   *
-   * 位置参数构造器有 6 个槽，而这条失败路径（如 XS 激活失败）实际只有 message/code/rawDetail
-   * 三个有值 —— 直接调用会写成 `new HanaBusinessError(msg, code, undefined, [], undefined, detail)`，
-   * 占位噪声把「到底带了什么」淹没。本工厂只暴露有值的字段，构造器签名保持不变。
+   * 位置参数构造器有 6 个槽，这条失败路径实际只有 message/code/rawDetail 三个有值——
+   * 本工厂只暴露有值的字段，避免 `undefined, [], undefined` 占位噪声。
    */
   static withRawDetail(message: string, code: string | undefined, rawDetail: unknown): HanaBusinessError {
     return new HanaBusinessError(message, code, undefined, [], undefined, rawDetail);
   }
 
   /**
-   * 便捷构造：只带「冲突载荷」（→ envelope.raw.conflict）。
-   *
-   * 冲突错误实际只有 message/code/conflict 三个有值，其余槽位（sqlState/messages/diagnosis/rawDetail）
-   * 与本场景无关——与 withRawDetail 同理，只暴露有值的字段，避免 `undefined, []` 占位噪声。
+   * 便捷构造：只带「冲突载荷」（→ envelope.raw.conflict）。与 withRawDetail 同理，只暴露有值的字段。
    * code 收敛为两个机读值（412=乐观锁冲突、OBJECT_NOT_FOUND=对象不存在），工具层按码分流。
    */
   static withConflict(message: string, code: '412' | 'OBJECT_NOT_FOUND', conflict: ConflictInfo): HanaBusinessError {
@@ -121,7 +106,7 @@ export async function withErrorEnvelope<T>(fn: () => Promise<T>): Promise<Envelo
   const clientId = currentClientId();
   const agentLabel = currentAgentLabel();
   const runtime = currentEnvironmentRuntime();
-  // 单环境不产生环境字段，保持旧输出逐字兼容；多环境附执行环境与入口环境。
+  // 单环境不产生环境字段（保持输出形状兼容）；多环境附执行环境与入口环境。
   const envFields = runtime?.multiEnv
     ? {
         environment: runtime.envKey,
@@ -138,7 +123,7 @@ export async function withErrorEnvelope<T>(fn: () => Promise<T>): Promise<Envelo
   });
   try {
     const data = await fn();
-    // P0-1 / P0-2 的唯一提升点：服务层把 resultInfo 挂在 data 上（见 core/result-info.ts），
+    // 唯一的提升点：服务层把 resultInfo 挂在 data 上（见 core/result-info.ts），
     // 信封在这里把它搬到顶层并从 data 摘掉——所有工具共用同一段逻辑，handler 不各自拼字段。
     const lifted = liftResultInfo(data);
     // 空集：有 resultInfo 时以 returnedCount=0 且 **未被截断** 为准（0 条 + 扫描上限截断 = 没看完，
@@ -242,13 +227,10 @@ export function mcpErrorText(
 /**
  * 请求被策略拦截时的统一前缀（对外形状契约：客户端与冒烟脚本按该文本断言）。
  *
- * 拦截消息是**返回给调用方（通常是模型）**的，它需要一眼看出「这是服务端策略拦截，
- * 不是我的参数写错了」，从而停下并交由人决策。
- * 三个使用方（config/authorize.ts、config/preflight.ts、services/repository.service.ts）
- * 都从这里取——services → config/preflight 会经能力清单成环，故定义放在叶子层。
- *
- * 同样重要的一点：这些消息**不得**包含"改哪一项配置即可放行"之类的补救指引——
- * 那等于把绕过方法直接交给被拦的一方。补救指引只应出现在面向运维的位置
- * （服务启动自检、README），不出现在请求响应里。
+ * 拦截消息返回给调用方（通常是模型），它需要一眼看出「这是服务端策略拦截，不是我的参数写错了」，
+ * 从而停下并交由人决策。三个使用方（authorize.ts、preflight.ts、repository.service.ts）都从这里取——
+ * services → config/preflight 会经能力清单成环，故定义放在叶子层。
+ * 这些消息**不得**包含"改哪一项配置即可放行"之类的补救指引——那等于把绕过方法交给被拦的一方；
+ * 补救指引只应出现在面向运维的位置（服务启动自检、README）。
  */
 export const BLOCKED_PREFIX = '被 MCP 安全策略拦截';

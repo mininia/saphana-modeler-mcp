@@ -1,5 +1,5 @@
 /**
- * hana_sql_execute 工具层：SQL 直接执行（默认关闭的 `sql` 组，独立第七根工具）。
+ * hana_sql_execute 工具层：SQL 直接执行（默认关闭的 `sql` 组）。
  *
  * 执行前先跑规则层（零 I/O）把可恢复问题变成 isError；执行走统一错误信封；
  * 有截断时用 `resultInfoOf` 挂统一截断契约（信封提升到 envelope.resultInfo）。
@@ -42,7 +42,7 @@ async function executeEnvelope(pool: HanaPool, config: HanaConfig, params: SqlEx
 }
 
 /**
- * SQL 直接执行工具。经 capabilityRegistrar 注册；资源维度不声明（SQL 专用 schema 闸门已移除），
+ * SQL 直接执行工具。经 capabilityRegistrar 注册；资源维度不声明（SQL 不扫描 schema），
  * 授权只按 `sql` 组 + 调用方档案判定；能访问什么由数据库账号权限约束。
  */
 export function registerSqlExecuteTools(server: McpServer, ctx: ToolContext): void {

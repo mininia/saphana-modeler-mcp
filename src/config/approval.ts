@@ -5,8 +5,7 @@
  * 审批结果绑定**能力 + 参数摘要 + 调用方 + 环境 + 过期时间**（HMAC 签名的 requestState）；
  * 参数或身份变化、状态过期 → 重新请求，不复用旧同意。
  *
- * 2026-11 权限收口后**固定启用**：不再有 `HANA_APPROVAL` 开关；破坏性能力一旦策略允许，
- * 就必须经过一次人工确认。审批不是授权：`authorizeCall` 仍先判策略。
+ * 破坏性能力一旦策略允许就必须经过一次人工确认（无开关）；审批不是授权：`authorizeCall` 仍先判策略。
  */
 
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';

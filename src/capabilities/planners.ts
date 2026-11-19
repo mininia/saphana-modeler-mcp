@@ -218,8 +218,8 @@ export function planViewUpdate(args: Record<string, unknown>): WritePlan {
   const pkg = asStr(args.packageId);
   const objectArg = asStr(args.objectName);
   const object = objectArg ?? '(未指定)';
-  // changeset：与 xml/operations 三选一的多对象批次——不再是单个目标对象，
-  // 各动作的读写集取并集（见文件末尾），排序与相交判定由执行侧（services/changeset.plan）消费。
+  // changeset：与 xml/operations 三选一的多对象批次，各动作的读写集取并集（见文件末尾），
+  // 排序与相交判定由执行侧（services/changeset.plan）消费。
   // 包级维度同样按"批内全部动作"取并集：writePackages = 各 action 的包（预检报告与写边界判定
   // 必须覆盖整批，见下方对象级段落）；载荷里的 schema 引用同样**逐动作扫描**并入 readSchemas
   // （与单对象通道同一套扫描器，见下方逐动作段落——漏扫 = 单对象被拦的载荷换进批次就能写）。
@@ -457,7 +457,7 @@ export function planViewDelete(args: Record<string, unknown>): WritePlan {
   p.steps.push(`删除 ${pkg ?? '?'}/${objectArg ?? '?'} 的设计时对象`);
   // 对象级写集：删除的即是目标对象本身；下游依赖是 breaking 判定输入，不在此展开。
   if (pkg && objectArg) p.writes = [{ packageId: pkg, objectName: objectArg }];
-  // 「下游依赖会失效」不再是模糊提醒，而是判定输入的说明：服务层删前查影响半径（_SYS_REPO.ACTIVE_OBJECTCROSSREF
+  // 「下游依赖会失效」是破坏性判定的输入说明：服务层删前查影响半径（_SYS_REPO.ACTIVE_OBJECTCROSSREF
   // 下游闭包），有下游引用属破坏性变更——未声明 migration.strategy=acknowledge_dependents 时拒绝且不删除（零写入）。
   p.steps.push(
     '删前按影响半径判定下游引用（_SYS_REPO.ACTIVE_OBJECTCROSSREF 下游闭包）：有下游引用属破坏性变更，未声明 migration 时会被拒绝且不删除',
@@ -616,7 +616,7 @@ export function planSqlAnalyze(args: Record<string, unknown>): WritePlan {
 /**
  * hana_sql_execute：**直接执行任意 SQL**（读/写/管理类）。
  *
- * 产品决策（2026-11）：SQL 专用 schema 闸门已移除——不扫描 readSchemas/writeSchemas，
+ * SQL 专用 schema 闸门不存在：不扫描 readSchemas/writeSchemas，
  * 不参与 HANA_READ_SCHEMA / 写 schema 白名单判定；能访问什么由 HANA 账号权限决定。
  * 本函数只做叙述计划（`effects.plan` 是清单对非 read 档的硬性要求），不声明任何资源。
  */
@@ -684,16 +684,6 @@ export function planReadless(tool: string): WritePlan {
 }
 
 /**
- * 分类门面（`hana_<分类>`）的计划：**不声明任何资源**，只说明"这次要路由到谁 / 只是取索引"。
- *
- * 为什么门面不声明资源：门面自己从不触碰 HANA。资源维度属于**目标能力**——门面 handler 在派发前
- * 会对目标能力再跑一次 `authorizeCall`（同一条判定、同一份报告，见 tools/capability.tools.ts）。
- * 这里若也声明资源，同一件事就有了两个真值源；而且门面从入参静态确定不了目标要碰什么
- * （`args` 是自由对象，按目标能力的 schema 才解析得出）。
- *
- * 未给 `capability` 的索引调用同理：它只读清单，不触碰任何资源。
- */
-/**
  * `hana_view_update` 操作级别名（`hana_view_update#<op>`）的**身份参数**清单：调用别名时这些字段
  * 留在父工具调用外层（它们是父工具通道的旋钮），其余字段一律是 op 载荷。
  *
@@ -725,8 +715,7 @@ export function aliasArgsToParentCall(op: string, args: Record<string, unknown>)
  *
  * 身份参数（packageId/objectName 与旋钮 ifMatch/dryRun/migration）原样转发：dryRun/migration 各自会
  * 让父规划器追加一行叙述，剥掉就会让同一次调用出现两套描述。不加任何别名专属叙述——计划文本除
- * 报告头与归因行里的能力名（归因指向实际被调的能力）外与直调父工具逐字一致，把能力名归一后可按
- * 字节比对（tests/unit/dynamic-surface.test.ts 的断言口径）。
+ * 报告头与归因行里的能力名（归因指向实际被调的能力）外与直调父工具逐字一致。
  */
 export function planViewOpAlias(op: string, args: Record<string, unknown>): WritePlan {
   return planViewUpdate(aliasArgsToParentCall(op, args));

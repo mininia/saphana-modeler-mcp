@@ -1,25 +1,18 @@
 /**
  * 环境档案（EnvironmentProfile）——"本环境实际是什么样"的探测结果。
  *
- * ## 为什么要有它
+ * SPS/版本、权限档位、激活器行为这类**事实**集中在这里：进程内探测一次，模型经
+ * `hana_system_get_info` 的 `profile` 字段按需查（**零新增工具**）。
  *
- * SPS/版本、权限档位、激活器行为这类**事实**原先只存在于散文（instructions 与工具描述）里，
- * 每个会话、每个子代理都要重新读一遍；搬进档案后：进程内探测一次，模型经 `hana_system_get_info`
- * 的 `profile` 字段按需查（**零新增工具**）。
- *
- * ## 三条硬约束（改代码前先读）
- *
+ * 三条硬约束（改代码前先读）：
  * 1. **fail-open**：档案是附加信息，不是任何调用的前置条件——探测失败一律返回
- *    `{detected:false, note}` 且**绝不抛错**；连不上 HANA 时，工具自身的报错照常给出（那才是调用方要看的）。
- * 2. **不阻塞启动**：连接池是懒连接，`index.ts` 不在启动时探测；首次被调用（hana_system_get_info）才探。
+ *    `{detected:false, note}` 且**绝不抛错**；连不上 HANA 时，工具自身的报错照常给出。
+ * 2. **不阻塞启动**：连接池是懒连接，首次被调用（hana_system_get_info）才探测。
  * 3. **不另写探测 SQL**：权限档位复用 `hana_check_privileges` 的实现（`services/system.service` 的
  *    `getPrivileges`）——两处各写一套判定口径，迟早会漂移成两个不同的"档位"。
  *
- * ## 缓存语义
- *
- * 探测成功（`detected:true`，含"部分字段缺失"）即进程内缓存；**失败不缓存**——一次瞬时故障
- * （HANA 未起 / 连接抖动）若被固化，会把档案永久钉死在"未探测到"，而失败路径的成本只是一次查询报错。
- * `refresh:true` 强制重探（测试经 `resetEnvironmentProfileCache()` 清空）。
+ * 缓存语义：探测成功（含"部分字段缺失"）即进程内缓存；**失败不缓存**——一次瞬时故障若被固化，
+ * 会把档案永久钉死在"未探测到"。`refresh:true` 强制重探（测试经 `resetEnvironmentProfileCache()` 清空）。
  */
 
 import type { HanaPool } from '../core/hana-client.js';
@@ -43,16 +36,15 @@ export interface EnvironmentProfile {
 }
 
 /**
- * 版本可读源（按序尝试）：SYS.M_DATABASE 是本仓库既有实现（getSystemInfo）用过的源；
- * 主源被权限（错误码 7）或存在性（259）拒绝时回退 ACTIVE 视图——两者都读不到才算"未探测到"。
+ * 版本可读源（按序尝试）：主源 SYS.M_DATABASE 被权限（错误码 7）或存在性（259）拒绝时
+ * 回退 ACTIVE 视图——两者都读不到才算"未探测到"。
  */
 const VERSION_SOURCES = ['SYS.M_DATABASE', 'SYS.M_DATABASE_ACTIVE'] as const;
 
 /**
  * 版本串 → SPS 号。
  *
- * 口径：HANA 2.0 版本串的第三段 = SPS×10 + 修订（本仓库实机环境 `2.00.085` = SPS08，
- * 见 `src/core/xs-rest.ts` 头注释的实测契约与各处「实测（SPS08）」标注）。
+ * 口径：HANA 2.0 版本串的第三段 = SPS×10 + 修订（如 `2.00.085` = SPS08，实测契约见 `src/core/xs-rest.ts` 头注释）。
  * 只认 `2.00.xxx` 这一形状——形不成就不猜（缺省会让激活器行为一并缺省 + note）。
  */
 function spsOf(version: string): string | undefined {
@@ -62,8 +54,8 @@ function spsOf(version: string): string | undefined {
 }
 
 /**
- * 激活器行为的**实测事实表**（按 SPS 记录）：探测只能取到版本，事实来自实机验证。
- * 事实源：`src/core/xs-rest.ts` 头注释 §6（SPS08 实测契约）与规则对象 `write_transport`。
+ * 激活器行为的**实测事实表**（按 SPS 记录）：探测只能取到版本，事实来自实机验证
+ * （见 `src/core/xs-rest.ts` 头注释与规则对象 `write_transport`）。
  *
  * 表里没有的 SPS 一律**不猜**（缺省 + note）：把 SPS08 的结论套到别的环境，等于让档案撒谎——
  * 档案的价值全在于"它说的是本环境实测过的事实"。
@@ -110,7 +102,7 @@ async function probeVersion(pool: HanaPool): Promise<string> {
  */
 async function probePrivilegeTier(pool: HanaPool): Promise<string> {
   // 动态 import：本模块 ← services/system.service（getSystemInfo 要档案），而档案又要复用
-  // getPrivileges 的判定——静态互引会形成 import 环（本地保留的 tests/unit/import-cycles.test.ts（不入库）的棘轮会拦）。
+  // getPrivileges 的判定——静态互引会形成 import 环。
   // 调用期取值：那时两个模块都已求值完，不存在"模块级数据尚未初始化"的窗口。
   const { getPrivileges } = await import('../services/system.service.js');
   const { summary, schemaSelect } = await getPrivileges(pool);

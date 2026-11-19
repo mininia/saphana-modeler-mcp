@@ -15,7 +15,7 @@ import { CAP } from '../capabilities/manifest.js';
 import { resolvePreviewTarget, SAMPLE_ROWS_DEFAULT } from '../capabilities/preview-target.js';
 import type { Envelope } from '../types/hana.js';
 
-// 单测历史从本模块 import resolvePreviewTarget：保留 re-export，实现已移到 capabilities 叶子层。
+// 保留 re-export：实现位于 capabilities/preview-target.ts（测试从本模块 import）。
 export { resolvePreviewTarget, type PreviewTarget } from '../capabilities/preview-target.js';
 
 export function registerPreviewTools(server: McpServer, ctx: ToolContext): void {

@@ -3,13 +3,13 @@ import { normalizeHanaError } from './errors.js';
 /**
  * HANA 错误码 → 成因语义的**单点判定**。
  *
- * 存在理由：同一批错误码（7/10/258/259/2950）在 health、preview、preview-diagnose 三处
- * 各有一套判定，且**码集互不相同** —— 结果是同一个错误在不同工具里被解释成不同原因
+ * 存在理由：同一批错误码（7/10/258/259/2950）在不同链路（health、preview、preview-diagnose）
+ * 需要**互不相同**的码集——若各写一套判定，同一个错误会在不同工具里被解释成不同原因
  * （例如 259 在健康检查里是"版本没这个视图"，在预览诊断里是对象不可见）。
  *
  * 本模块只回答"这个错误**是什么**"，不回答"**要不要**触发诊断/给什么建议"：
  * 后者是各调用点的策略，码集差异因此**显式参数化**暴露出来，而不是被合并成一个更大的集合
- * 悄悄改变某条链路的行为（详见下面对三个码集的说明）。
+ * 悄悄改变某条链路的行为。
  *
  * detail 一律经 normalizeHanaError 归一（内含 redactSensitive），避免连接目标/账号
  * 随错误文本进入 evidence 与 metrics。
@@ -22,8 +22,8 @@ export const PERMISSION_DENIED_CODES: ReadonlySet<string> = new Set(['7', '258',
 export const OBJECT_MISSING_CODES: ReadonlySet<string> = new Set(['259']);
 
 /**
- * 预览链路的权限码（实测口径，**不与上面合并**）：
- * XS/预览路径上出现过 code=10，而该路径下 258 由 shouldDiagnoseAccessError 单独处理。
+ * 预览链路的权限码（**不与上面合并**）：
+ * XS/预览路径上 code=10 属权限类，而该路径下 258 由 shouldDiagnoseAccessError 单独处理。
  */
 export const PREVIEW_PERMISSION_CODES: ReadonlySet<string> = new Set(['10', '2950']);
 
@@ -89,7 +89,7 @@ export function shouldDiagnoseAccessError(e: unknown): boolean {
 
 /**
  * HANA 错误码 → unknown 结论的成因。
- * 语义（保持既有口径不变）：259=该版本没有这个视图；258/7=权限被拒；其余=执行出错。
+ * 语义：259=该版本没有这个视图；258/7=权限被拒；其余=执行出错。
  */
 export function classifyHanaError(e: unknown): { reason: UnknownReason; detail: string } {
   const normalized = normalizeHanaError(e);

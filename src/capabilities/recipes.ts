@@ -271,12 +271,12 @@ export function isValidSelectPath(select: string): boolean {
   return /^\$(?:\.[A-Za-z0-9_]+|\[\d+\])+$/.test(select);
 }
 
-/** 路径解析结果（边界码与 §10.1 对齐） */
+/** 路径解析结果（边界码） */
 export type SelectResult =
   { status: 'ok'; value: unknown } | { status: 'missing' } | { status: 'empty' } | { status: 'ambiguous' };
 
 /**
- * 按受限路径取值（单测/配方校验用；运行期由 AI 从前序结果代入）。
+ * 按受限路径取值（配方校验用；运行期由 AI 从前序结果代入）。
  * - 路径不存在 → missing；
  * - 命中 null/空串/空数组 → empty；
  * - 需要穿过一个多元素数组却没写索引 → ambiguous（不猜）。

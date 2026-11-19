@@ -3,12 +3,8 @@ import type { RuleObject } from './index.js';
 /**
  * 数据预览规则（视图预览 / 基表勘察 / 节点预览 / 权限诊断）。
  *
- * 来源（搬迁自，保留原文措辞）：
- * - src/server.ts 的 SERVER_INSTRUCTIONS 第 34、36 行；
- * - src/capabilities/defs/preview.ts 的 hana_data_preview.description（两模式与节点通道一段）
- *   与 hana_data_preview_diagnose.description（通道语义与 brief 字段）；
- * - src/services/preview.service.ts 与 preview-diagnose.service.ts 的头注（中间视图命名/释放口径、
- *   访问类失败自动诊断的码集 10/258/259/2950（或权限消息正则））。
+ * 正文覆盖：两模式与节点通道、hana_data_preview_diagnose 的通道语义与 brief 字段、
+ * 中间视图命名/释放口径、访问类失败自动诊断的码集 10/258/259/2950（或权限消息正则）。
  */
 
 export const previewRules: readonly RuleObject[] = [

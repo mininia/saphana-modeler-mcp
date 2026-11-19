@@ -20,7 +20,7 @@ export interface CheckAction {
  * 允许作为校验目标的 CHECK 过程清单（防注入：仅 SYS 下 CHECK_* 系过程）。
  *
  * 单一事实源：hana_view_check_actions 的参数枚举（capabilities/defs/modeling.ts）与规划器
- * 兜底默认值都由它派生——清单两处手写时，schema 放行的值可能被服务层以中文硬错误拒绝。
+ * 兜底默认值都由它派生——两处手写清单时，schema 放行的值可能被服务层以中文硬错误拒绝。
  */
 export const CHECK_PROCEDURES = [
   'CHECK_CALCULATION_VIEW',
@@ -92,7 +92,7 @@ export async function validateCalculationView(
 ): Promise<ViewValidateResult> {
   assertSchemaAllowed(schema);
   // 运行时名允许 /（_SYS_BIC 的 "包/视图" 形态）；值仍参数绑定。
-  // 字符集与错误文案统一走 core/sql（原先这里是 SAFE_RUNTIME_NAME_RE 的手抄副本，两份会漂移）
+  // 字符集与错误文案统一走 core/sql（不要在这里手抄第二份正则）
   assertSafeRuntimeName(viewName, '运行时视图名');
   // action 白名单：calculationview 相关仅 CHECK_CONSISTENCY（实测 GET_CHECK_ACTIONS 结论）
   const SAFE_ACTIONS = new Set(['CHECK_CONSISTENCY']);

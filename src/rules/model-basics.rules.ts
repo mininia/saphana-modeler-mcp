@@ -3,7 +3,7 @@ import type { RuleObject } from './index.js';
 /**
  * 建模基础规则（服务定位 / 仓库与运行时布局 / 对象类型 / 命名与引用约定 / 工具命名）。
  *
- * 非冻结 id（补充落点）：这些背景事实是其余规则与工具描述的上下文（对象是什么、放哪、怎么引用），
+ * 这些背景事实是其余规则与工具描述的上下文（对象是什么、放哪、怎么引用），
  * 模型经 hana_system_get_info(rules=model_basics) 按需查询，不必常驻 instructions。
  */
 

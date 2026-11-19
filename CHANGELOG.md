@@ -4,17 +4,12 @@
 >
 > 约定：每次提交前把变化补到对应版本条目下；每条 1–3 行，只写对外可见变化。
 
-## 1.6.0 - 2026-11-19
+## 1.5.0 - 2026-11-19
 
-- **破坏性变更（单一入口）**：`tools/list` 只保留 `hana_tool_search`（选择）与 `hana_invoke`（执行）；删除六个分类门面、`hana_sql_execute` 根工具与所有分类/集合提升。
-- 具体能力（含 SQL、环境切换、`hana_view_update#<op>` 操作级别名）一律经本体层发现/披露后由 `hana_invoke({capability,args})` 执行；契约 `call.via` 恒为 `hana_invoke`。
-- 删除 `MCP_CAPABILITY_SURFACE_MAX`；多环境写/临时对象的环境断言统一放在 `hana_invoke` 顶层 `expectedEnvironment:{key,epoch}`，旧 `args` 写法仍兼容。
-
-## 1.5.0 - 2026-11-18
-
-- 新增 `hana_tool_search`：discover/contract/goal 三模式 + 预算；取消门面自动提升，`tools/list` 稳定为六门面 + 平台入口；门面 schema 错误回执升级为完整契约参数卡。
-- P2：`expectedEnvironment:{key,epoch}` 调用信封、`disclosure` 一致性检查（policy_stale/manifest_stale）、单一策略文档 `MCP_POLICY`、执行上下文与审计 requestId、Token 预算校准。
-- P3：`promote:true` 集合级提升（按工具 FIFO、恰好一次 list_changed）、`HANA_APPROVAL=destructive` 的 input_required 人工确认（绑定 args/principal/5 分钟过期）；多环境写调用逾期披露按 epoch 失效。
+- **破坏性变更（单一入口）**：`tools/list` 只保留 `hana_tool_search`（discover/contract/goal 三模式）与 `hana_invoke`（唯一执行入口）；删除六个分类门面、`hana_sql_execute` 根工具、分类提升与 `list_changed`、`MCP_CAPABILITY_SURFACE_MAX`。
+- 所有具体能力（含 SQL 执行、环境切换、`hana_view_update#<op>` 操作级别名）一律先经本体层发现/披露，再由 `hana_invoke({capability,args})` 执行；契约 `call.via` 恒为 `hana_invoke`，未知与无权能力逐字同形。
+- 新增 `contextToken`（`hana_tool_search` 签发，绑定调用方/环境/epoch/策略/清单，10 分钟有效）：多环境调用用它替代 `expectedEnvironment`/`disclosure`（旧字段兼容一个版本）；`HANA_TOOL_SEARCH_GOAL=off` 可关闭 goal 模式。
+- 权限参数收口为 `HANA_TOOL_GROUPS` / `HANA_TOOL_DENY` / `HANA_WRITE_PACKAGES` / `HANA_READ_SCHEMA` + `HANA_SQL_ACCESS`：移除 `HANA_ACCESS` / `HANA_READONLY_SQL` / `HANA_APPROVAL` / `HANA_TOOL_ALLOW` / `MCP_POLICY`；只读由写包是否为空推导，破坏性操作固定要求人工确认。
 
 ## 1.4.5 - 2026-11-16
 

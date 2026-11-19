@@ -1,13 +1,11 @@
 /**
  * 操作级 effect 声明（hana_view_update 的 operations 通道各 op 的效应面与参数面清单的单一事实源）。
  *
- * 为什么要有这个文件：hana_view_update 的 operations 读写面若只在 PLANNERS['hana_view_update']（按**工具名**
- * 声明）里整体覆盖，「这个 op 碰什么」就没有单一落点，新增 op 只能靠读变换实现反推。effect 声明必须与操作
- * 定义**同处**（按操作类型声明）：本模块就是那唯一一份声明——每条 op 一句话摘要 + 结构面 effect + 参数面清单。
- * 工具面 schema（判别式与字段）在 `capabilities/defs/modeling.ts`；
- * 两侧对齐由 tests/unit/view-ops.rules.test.ts 逐字段交叉断言（一条规则一份实现，任一侧漂移即红）。
+ * effect 声明与操作定义**同处**（按操作类型声明）：否则「这个 op 碰什么」没有单一落点，新增 op
+ * 只能靠读变换实现反推。工具面 schema（判别式与字段）在 `capabilities/defs/modeling.ts`；
+ * 两侧对齐由单测逐字段交叉断言（一条规则一份实现，任一侧漂移即红）。
  *
- * 语义（每个字段都给了判据；改声明前先读这五条）：
+ * 语义（改声明前先读这五条）：
  *
  * 1. `destructive` = **可能触碰结构面/口径面**（可能破坏既有对象/数据/下游语义），不是「经判定会破坏下游」。
  *    判据：true ⇔ 变换会改动 输出字段 / 节点接线映射 / 数据源引用 / **取数口径（过滤器、变量默认值）**
@@ -15,11 +13,10 @@
  *    「描述/显示名变更永不破坏」）。
  *    ⚠ **它不是闸门**：真正的放行判定是 assessBreaking（结构 diff × 下游引用，见 services/migrate.rules.ts），
  *    「可能触碰结构」与「真的破坏下游」之间隔着下游引用门槛，别把本字段当第二道闸用：
- *      · add_join 的实测 diff 形态（数据源仅新增 + 既有输出字段仅 sourceObject 机械重挂且 passThrough
- *        证据成立 + 只新增输出字段）判**非破坏**（否则闸门会拦下良性的加 join，见
- *        migrate.rules.ts 头注）——但它照样声明 destructive=true：口径是「可能触碰」，
- *        与「已知变换结果当前恰好判非破坏」不矛盾；谁拿本字段去要求「必须给 migration 声明」，
- *        就会把这条良性路径重新拦死。
+ *      · add_join 的 diff 形态（数据源仅新增 + 既有输出字段仅 sourceObject 机械重挂且 passThrough
+ *        证据成立 + 只新增输出字段）判**非破坏**（否则闸门会拦下良性的加 join），但它照样声明
+ *        destructive=true：口径是「可能触碰」，与「变换结果当前恰好判非破坏」不矛盾；拿本字段去要求
+ *        「必须给 migration 声明」，会把这条良性路径重新拦死。
  *      · set_script 恒为 true：脚本一变，判定表按 script_changed 要求显式声明（保守口径），且输出列集合常变。
  *
  * 2. `touchesOutputFields` = 输出字段面被触碰：logicalModel 的输出属性/度量增删改名、SQL 模式节点
@@ -31,8 +28,7 @@
  *    （diff 里表现为既有输出字段的 sourceObject 等**解析类字段位**变化）。与第 2 条正交：
  *    set_script 重建输出段（2=true）但不动任何节点接线（3=false）。
  *
- * 4. `dataSourceRefs` = 对**跨对象数据源引用**的访问方向，与 planViewUpdate 的既有实读声明同口径
- *    （单一事实源在那里；本字段只是把「这个 op 属于哪一类」提前写成静态声明）：
+ * 4. `dataSourceRefs` = 对**跨对象数据源引用**的访问方向（与 planViewUpdate 的实读声明同口径）：
  *      · 'read'  = 变换要读外部对象/范围——add_join 读 join 源视图（跨包只读引用，planViewUpdate 并进
  *                  readPackages）；set_script 的脚本 schema 限定名进 readSchemas（HANA_READ_SCHEMA 面）。
  *      · 'write' = 会写外部数据源——当前**无 op 如此**（所有 op 只写目标对象自身的 XML；该值留给将来的 op）。
@@ -44,11 +40,10 @@
  *    且判定表以 attribute_filter_changed / variable_changed 判「有下游 ⇒ 破坏」，不让这两类编辑
  *    从闸门旁边走过去。
  *
- * 依赖方向：声明层叶子——只 import core/errors（未知 id 要以中文硬错误暴露，与工具层错误口径一致），
+ * 依赖方向：声明层叶子——只 import core/errors（未知 id 以中文硬错误暴露，与工具层错误口径一致），
  * 不做 I/O、不 import services/tools（同 src/rules/index.ts 的约定）。
  *
- * 覆盖范围：8 个 op 全量声明（清单见 `ViewOpId`）。`mode=spec`（目标态覆盖）有意不做——它只对
- * 「本服务生成过的视图」有可选意义，当前无实际需求。
+ * 覆盖范围：8 个 op 全量声明（清单见 `ViewOpId`）。
  */
 
 import { HanaBusinessError } from '../core/errors.js';
@@ -84,7 +79,7 @@ export interface OpEffects {
  */
 export interface ViewOpDeclaration {
   id: ViewOpId;
-  /** 短标题（门面索引里的展示名，如「加 join」；操作级能力条目 `<工具>#<op>` 的 title 用它） */
+  /** 短标题（如「加 join」；操作级能力条目 `<工具>#<op>` 的 title 用它） */
   title: string;
   summary: string;
   effects: OpEffects;
@@ -93,7 +88,7 @@ export interface ViewOpDeclaration {
   detail?: string;
 }
 
-/** 全量 op 声明（只读；顺序 = 列示顺序，不构成契约）。每条的依据是变换实现（model/view-edit.ts）与实测结论（view-diff / migrate.rules），不是拍脑袋 */
+/** 全量 op 声明（只读；顺序 = 列示顺序，不构成契约）。每条的依据是变换实现（model/view-edit.ts）与实测结论（view-diff / migrate.rules） */
 export const VIEW_OPS: readonly ViewOpDeclaration[] = [
   {
     // 依据（addJoinToViewXml）：新增 <DataSource>（读源视图定义 → 跨包只读引用）+ Projection/Join 节点；
@@ -211,8 +206,8 @@ export const VIEW_OPS: readonly ViewOpDeclaration[] = [
 const VIEW_OP_BY_ID: ReadonlyMap<string, ViewOpDeclaration> = new Map(VIEW_OPS.map((op) => [op.id, op]));
 
 /**
- * 按 id 取声明。未知 id **抛中文硬错误并列出合法值**（口径同 src/rules/index.ts 的 getRules：
- * 静默给空会被读成「这条 op 没有声明」；调用方拿到的 id 可能是模型拼出来的，必须当场看到合法清单）。
+ * 按 id 取声明。未知 id **抛中文硬错误并列出合法值**（静默给空会被读成「这条 op 没有声明」；
+ * 调用方拿到的 id 可能是模型拼出来的，必须当场看到合法清单）。
  * 参数类型写 ViewOpId（编译期收口）；运行期仍兜底未知值——供 JS 调用方与反序列化数据。
  */
 export function getViewOp(id: ViewOpId): ViewOpDeclaration {

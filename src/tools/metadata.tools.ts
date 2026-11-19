@@ -53,7 +53,7 @@ export function registerMetadataTools(server: McpServer, ctx: ToolContext): void
   regCap(
     CAP.hana_metadata_search_objects,
     async ({ pattern, by, field, category, kind, packageId, schema, lang, limit, maxCandidates, version }) => {
-      // 跨字段条件必填/互斥：与门面提升前的 preflight 共用同一份实现。
+      // 跨字段条件必填/互斥：与清单的 preflight 共用同一份实现。
       const rule = validateSearchObjectsArgs({ pattern, by, field, category, kind, packageId, schema, lang, version });
       if (rule) return mcpErrorText(rule.message, rule.hint);
       const mode = by ?? 'name';
@@ -106,7 +106,7 @@ export function registerMetadataTools(server: McpServer, ctx: ToolContext): void
             truncated: data.truncated,
           }),
         );
-        // 空集标记（P0-2）：零命中是合法结果，不是错误；与 package_list 等列表工具同口径
+        // 空集标记：零命中是合法结果，不是错误；与 package_list 等列表工具同口径
         return returned === 0 ? markEmptyResult(enriched) : enriched;
       });
       return toToolResult(envelope);

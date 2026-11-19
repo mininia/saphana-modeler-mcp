@@ -1,22 +1,13 @@
 /**
- * 统一截断契约 `resultInfo`（P0-1）与空集语义（P0-2）的**唯一实现**。
- *
- * 规则（对齐 Tableau v4.29 的定调：「返回结果少于匹配数时，必须说出来」）：
- * - 无 limit / cap 生效 → **不出现** `resultInfo`（没有"可能被截断"这回事，就不加噪音字段）；
- * - 调用方显式给的 limit 截断 → `truncationReason='requested-limit'`；
- * - 服务端默认 limit / 上限钳制 / 候选与节点上限 → `'server-cap'`；
- * - 固定安全上限（如分析行数硬顶）→ `'safety-cap'`，调用方要能在 `messages` 里看到稳定码；
+ * 统一截断契约 `resultInfo` 与空集语义的**唯一实现**（「返回结果少于匹配数时，必须说出来」）：
+ * - 无 limit / cap 生效 → **不出现** `resultInfo`；调用方显式 limit 截断 → `'requested-limit'`；
+ *   服务端默认 limit / 上限钳制 / 候选与节点上限 → `'server-cap'`；固定安全上限 → `'safety-cap'`（并给稳定码）；
  * - **恰好 N 条不等于截断**：知道总数时用 `totalAvailable > returnedCount` 判定；
- *   不知道总数时（如预览的 n+1 探测失败）才按"取满上限"判真；
- * - **空集不是截断**：`returnedCount=0` 时 truncated 恒为 false（P0-2）。
+ * - **空集不是截断**：`returnedCount=0` 时 truncated 恒为 false。
  *
- * 落点：服务层用 {@link attachResultInfo} 把契约挂到返回对象上，`withErrorEnvelope`
- * （core/errors.ts）在构造信封时把它**提升到 envelope 顶层**并从 data 里摘掉——
- * 所有工具共享同一段提升逻辑，工具 handler 不各自拼结果字段。
- *
- * 兼容：业务 data 里既有的 `truncated` / `count` / `limit` 字段保留一个版本（调用方仍可读），
- * 但**新代码以 envelope.resultInfo 为准**；两者不一致时以 resultInfo 为契约（由本模块的
- * 不变量保证它至少与 count/limit 自洽）。
+ * 落点：服务层用 {@link attachResultInfo} 挂到返回对象上，`withErrorEnvelope`（core/errors.ts）
+ * 在构造信封时把它**提升到 envelope 顶层**并从 data 里摘掉——所有工具共享同一段逻辑。
+ * 业务 data 里仍可能有 `truncated` / `count` / `limit` 字段，但**新代码以 envelope.resultInfo 为准**。
  */
 
 /** 截断原因（互斥，取最强的一条） */
@@ -162,7 +153,7 @@ export function attachPagedInfo<
 }
 
 /**
- * 标记「合法的空集」（P0-2）：用于没有 limit 语义、却可能出现"什么都没匹配到"的列表结果。
+ * 标记「合法的空集」：用于没有 limit 语义、却可能出现"什么都没匹配到"的列表结果。
  * 空集**不是错误**：信封仍是 success=true，只额外带 `empty:true` 与一句可读说明。
  */
 export function markEmptyResult<T extends object>(data: T): T {

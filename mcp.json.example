@@ -42,12 +42,9 @@
         "HANA_PASSWORD_ENV_PROD": "PROD_PASSWORD",
         "HANA_DB_NAME_ENV_PROD": "PRODDB",
 
-        "HANA_ACCESS": "readonly",
-        "HANA_ACCESS_ENV_DEV": "readwrite",
         "HANA_WRITE_PACKAGES_ENV_DEV": "ZDEMO1,ZDEMO2.ZDEMO_SD",
         "HANA_ENV_START": "DEV",
         "HANA_ENV_SWITCHABLE": "DEV,UAT,PROD",
-        "HANA_READONLY_SQL": "select-only",
         "LOG_LEVEL": "info"
       }
     }

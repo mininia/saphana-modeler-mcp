@@ -27,7 +27,7 @@
 - [ ] `npm run check` 全绿（含 `check:tool-names`、类型检查、单测；测试文件在本地 `tests/`，CI 环境需自备）；
 - [ ] `npm run format:check` 通过；
 - [ ] 版本号 bump（`package.json`；`src/version.ts` 从它读取，不要另改）；
-- [ ] **工具面变化**：新增/删除/改名的工具写明 old → new 映射，并在 `scripts/check-tool-names.mjs` 的 `REMOVED_TOOL_NAMES` 留档（若删名后仍有旧引用）；
+- [ ] **工具/能力 id 变化**：新增/删除/改名写明 old → new 映射，并在 `scripts/check-tool-names.mjs` 的 `REMOVED_TOOL_NAMES` 留档（若删名后仍有旧引用）；平台入口（`hana_tool_search` / `hana_invoke`）是唯一注册面，具体能力永不注册为工具；
 - [ ] **schema 变化**：入参/回执字段的增删改在 CHANGELOG 标注「客户端需重连」；
 - [ ] **行为变化**：截断口径（`resultInfo`）、空集语义（`empty`）、审计终态（`denied/completed/failed`）的变化必须写；
 - [ ] 面预算通过（`tests/unit/surface-budget.test.ts`：能力数 / tools/list 字节 / 单条描述 / 规则库字节）；
@@ -142,6 +142,6 @@ types ← core ← model ← services ← tools ← server ← index
    与文本扫描（SQL/XML/脚本）。会写仓库包的能力**必须**有其中之一（测试强制）；
    混合模式的参数（如 `hana_view_validate.packageId`：design 写、runtime 不写）**不要打无条件标签**，交给规划器按模式声明。
    **忘了登记 = 能力不暴露也不可调用**（fail-closed），`tests/unit/capability-manifest.test.ts` 会拦。
-2. **注册**：在对应 `src/tools/<模块>.tools.ts` 里 `regCap(CAP.<id>, handler)`——注册名、schema、描述、注解都从清单取，模块里只写 handler。
+2. **注册**：在对应 `src/tools/<模块>.tools.ts` 里 `regCap(CAP.<id>, handler)`——handler 入表供 `hana_invoke` 派发，注册配置（schema/描述/注解）仍从清单取；具体能力不进 `tools/list`，只有平台入口注册为工具。
 3. **闸门**：不需要做任何事。所有能力都经 `capabilityRegistrar` → `config/authorize.ts` 的 `authorizeCall`；
    **不要在工具模块里自己判权限**（那会绕开「多入口、单闸门」这条不变量）。判定结果由策略层出，报告由 `preflight.ts` 出一份。

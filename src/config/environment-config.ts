@@ -1,15 +1,15 @@
 /**
- * 多环境配置层（v2）：按参数性质分三类，模式先判断、再做作用域解析。
+ * 多环境配置层：按参数性质分三类，模式先判断、再做作用域解析。
  *
- * 规则（见 docs/multi-hana-environment-redesign.md §0）：
- * - **单环境**（没有任何 `_ENV_` 变量）：扁平 `HANA_*` 就是唯一环境，行为与旧版一致；
+ * 规则：
+ * - **单环境**（没有任何 `_ENV_` 变量）：扁平 `HANA_*` 就是唯一环境；
  *   `HANA_LABEL` 残留静默忽略（不告警、不报错）。
  * - **多环境**（出现任意 `_ENV_` 变量）：
  *   - **连接参数**：扁平键忽略（不参与解析）；只能 `HANA_<PARAM>_ENV_<XXXX>`，每个环境必须解析到；
  *   - **策略/授权参数**：扁平键 = 所有环境共享；`_ENV_<XXXX>` 覆盖单个环境；
  *   - **进程级参数**：只能扁平写；`_ENV_` 形式启动失败。
  * - 环境标识 = `_ENV_<XXXX>` 的 `<XXXX>`，大小写不敏感，内部规范化为大写；
- *   不再有 `HANA_LABEL` / `HANA_LABEL_ENV_*`。
+ *   `HANA_LABEL` / `HANA_LABEL_ENV_*` 不再支持（多环境下启动报错）。
  *
  * 本模块只做纯解析与校验，不读 .env、不删 process.env、不建池；生命周期由 config.ts 统一收口。
  */
@@ -37,7 +37,7 @@ import { findInvalidWritePackages } from './write-boundary.js';
 export type EnvironmentAccess = 'readwrite' | 'readonly';
 export type EnvironmentMode = 'single' | 'multi';
 
-/** 一个可运行环境：envKey 是环境标识（规范化为大写），不再有 LABEL/configKey。 */
+/** 一个可运行环境：envKey 是环境标识（规范化为大写）。 */
 export interface EnvironmentEntry {
   envKey: string;
   access: EnvironmentAccess;
@@ -66,7 +66,7 @@ const GLOBAL_ENV_KEYS = new Set([
   'HANA_ENV_INHERIT',
   'HANA_ENV_LOAD_DOTENV',
 ]);
-/** 已移除的 LABEL 键（单环境静默忽略；多环境报 label_removed） */
+/** HANA_LABEL：单环境静默忽略；多环境报 label_removed */
 const REMOVED_LABEL_KEYS = new Set(['HANA_LABEL']);
 
 const TRUE_VALUES = new Set(['true', '1', 'TRUE']);
@@ -272,14 +272,14 @@ export function canonicalEnvKey(raw: string, keyForError = '环境标识'): stri
  *
  * 只有**已识别参数**的 `_ENV_` 键才算多环境；无法识别的 `_ENV_` 键按按需读取直接忽略——
  * 父进程/其它工具残留的 `HANA_*_ENV_*` 不能把单环境部署拖进多环境模式。
- * 需要响亮失败的旧形态（`HANA_LABEL_ENV_*` / `HANA_ENV_*` / `MCP|LOG_*_ENV_*`）仍返回 true，
+ * 需要响亮失败的形态（`HANA_LABEL_ENV_*` / `HANA_ENV_*` / `MCP|LOG_*_ENV_*`）仍返回 true，
  * 由 scanOverrides 给出对应错误码。
  */
 export function hasScopedEnvironmentKeys(env: NodeJS.ProcessEnv): boolean {
   return Object.keys(env).some((key) => {
     if (GLOBAL_ENV_KEYS.has(key)) return false;
     if (key.startsWith('HANA_LABEL_ENV_')) return true;
-    // 旧前缀 HANA_ENV_<NAME>_<PARAM> 与 HANA_ENV_CONFIG：进入多环境分支后由 scanOverrides 响亮失败
+    // HANA_ENV_<NAME>_<PARAM> 与 HANA_ENV_CONFIG：进入多环境分支后由 scanOverrides 响亮失败
     if (key.startsWith('HANA_ENV_')) return true;
     if (/^(MCP|LOG)_.*_ENV_/.test(key)) return true;
     if (!key.startsWith('HANA_')) return false;
@@ -287,7 +287,7 @@ export function hasScopedEnvironmentKeys(env: NodeJS.ProcessEnv): boolean {
   });
 }
 
-/** 扫描所有 `_ENV_` 键；进程级/旧前缀/标签一律响亮失败，无法识别的参数键忽略 */
+/** 扫描所有 `_ENV_` 键；进程级/前缀错误/标签一律响亮失败，无法识别的参数键忽略 */
 function scanOverrides(env: NodeJS.ProcessEnv): ScannedOverrides {
   const envKeys = new Set<string>();
   const cells = new Map<string, Map<string, OverrideCell>>();
@@ -520,7 +520,7 @@ export function buildEnvironments(
     };
   }
 
-  // 多环境：LABEL 已移除；扁平连接键忽略（不参与解析，环境只由 _ENV_ 键定义）。
+  // 多环境：扁平连接键忽略（不参与解析，环境只由 _ENV_ 键定义）。
   if (Object.keys(env).some((k) => k === 'HANA_LABEL')) {
     throw interceptionError(
       'label_removed',

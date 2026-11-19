@@ -3,7 +3,7 @@
  *
  * 为什么要有这一层（改代码前先读）：
  *   1. **省 token**：instructions 与工具描述是常驻文本；规则对象不进常驻文本，模型按需查
- *      （经 hana_system_get_info 的 rules 参数）——I3：一条规则一份实现，manifest 的 description
+ *      （经 hana_system_get_info 的 rules 参数）——一条规则一份实现，manifest 的 description
  *      只引用规则 id，不复写规则内容。
  *   2. **不丢知识**：每条 detail 都是实测/踩坑换来的口径；要从常驻文本里删一句话，先在规则里指出
  *      它的落点（原文措辞保留）。
@@ -12,7 +12,7 @@
  *
  * id 契约（持久约定，勿动）：
  *   - FROZEN_RULE_IDS 里的 9 个 id 已被 instructions / 工具描述以文本引用——**不要改名**；
- *   - 已删条目的 id 不要复用（旧引用会静默指向新语义）；其余 id（补充落点）同为稳定 id；
+ *   - 已删条目的 id 不要复用（旧引用会静默指向新语义）；其余 id 同为稳定 id；
  *   - 新增规则追加到 RULE_IDS 末尾并补条目（顺序 = 对外列示顺序）。
  *
  * 依赖方向：本模块只依赖 core/errors（未知 id 要以中文硬错误暴露，与工具层错误口径一致），
@@ -47,7 +47,7 @@ export const RULE_IDS = [
   'sql_analyze',
   'metadata_graph',
   'bw_dialect',
-  // ── 补充落点（非冻结；同为稳定 id，勿改名/复用）──────────────────────
+  // ── 补充落点（同为稳定 id，勿改名/复用）────────────────────────────
   'model_basics',
   'health_check',
   'activity_locks',
@@ -56,7 +56,7 @@ export const RULE_IDS = [
   // ── 视图操作（op 别名）与异步任务 API ────────────────────────────────
   'view_ops',
   'async_task',
-  // ── 回执结果契约（P0-1 / P0-2）────────────────────────────────────
+  // ── 回执结果契约（截断与空集）──────────────────────────────────────
   'result_contract',
 ] as const;
 

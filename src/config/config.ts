@@ -29,9 +29,9 @@ import { interceptionError } from './error-codes.js';
 import { IMPLICIT_DEFAULT_PROFILE_ID, parseProfiles, type CallerProfile } from './profiles.js';
 
 /**
- * 权限参数收口（2026-11）：只保留 4 个 env——
+ * 权限参数只保留 4 个 env：
  * `HANA_TOOL_GROUPS` / `HANA_WRITE_PACKAGES` / `HANA_READ_SCHEMA` / `HANA_TOOL_DENY`。
- * 已移除的旧变量**忽略（不生效）**，只记一次 warn：升级时残留变量不应阻断启动。
+ * 其余权限变量**忽略（不生效）**，只记一次 warn：升级时残留变量不应阻断启动。
  */
 const REMOVED_PERMISSION_ENV = [
   'HANA_ACCESS',
@@ -56,7 +56,7 @@ function warnRemovedPermissionEnv(env: NodeJS.ProcessEnv): void {
 }
 import { DEFAULT_HTTP_HOST, DEFAULT_SSL_VALIDATE, DEFAULT_TLS } from './deployment.js';
 
-/** 默认 Locale（仅本文件使用）。2026-10-14 起由 zh_CN 改为 zh（不带国家码） */
+/** 默认 Locale（仅本文件使用；不带国家码） */
 const DEFAULT_LOCALE = 'zh';
 
 /**
@@ -70,9 +70,8 @@ const ENV_FALSE_VALUES = ['false', '0', 'FALSE'] as const;
 const BOOL_ENV_VALUES = [...ENV_TRUE_VALUES, ...ENV_FALSE_VALUES] as const;
 
 /**
- * 真值判定（与 boolSchema 同一集合）。
- * 供读原始 env 的调用点复用（preflight 的 mcp.json / 进程 env 路径）——那边拿不到 zod，
- * 非真值一律按假处理；语义差异见 preflight.deploymentFromEnvValues 的注释。
+ * 真值判定（与 boolSchema 同一集合）。供读原始 env、拿不到 zod 的调用点复用
+ * （preflight 的 mcp.json / 进程 env 路径）：那边非真值一律按假处理。
  */
 export function isEnvTrue(v: unknown): boolean {
   return (ENV_TRUE_VALUES as readonly string[]).includes(String(v));
@@ -80,8 +79,7 @@ export function isEnvTrue(v: unknown): boolean {
 
 /**
  * 「非空值」判定与取值的唯一原语（空串/全空白视同未设置 = undefined；非空串返回 trim 后的字符串）。
- * hasValue 是它的布尔投影；emptyAsUnset 的「空」判定也委托它——字符串域的"空"只有这一处口径，
- * 将来调整空白定义只改这里，不会出现 hasValue 与各 preprocess 分叉。
+ * hasValue 与 emptyAsUnset 的「空」判定都委托它——字符串域的"空"只有这一处口径，不会分叉。
  */
 function nonEmptyEnvValue(v: unknown): string | undefined {
   if (v === undefined || v === null) return undefined;
@@ -120,8 +118,8 @@ const timeZoneSchema = z
   }, '非法 IANA 时区名称（如 Asia/Shanghai、UTC）');
 
 /**
- * 空串/纯空白按「未设置」处理（"空"的判定委托 {@link nonEmptyEnvValue}，唯一原语）。
- * 非字符串值原样通过；非空字符串也原样返回、不 trim（需要去掉首尾空白的消费方见 {@link trimmedOrUnset}）。
+ * 空串/纯空白按「未设置」处理。非字符串值原样通过；非空字符串也原样返回、不 trim
+ * （需要去掉首尾空白的消费方见 {@link trimmedOrUnset}）。
  * 不先归一就交给下游会报出与真实原因无关的错：z.coerce.number('') 解析成 0 撞下限、parseInt('') 得 NaN。
  */
 const emptyAsUnset = (v: unknown): unknown =>
@@ -135,10 +133,8 @@ const trimmedOrUnset = (v: unknown): unknown => {
 
 /**
  * 数字型环境变量（正整数、可留空）：池、超时与激活并发这类运行旋钮共用，默认值见 core/limits.js。
- * - 空串按「未设置」处理（见 emptyAsUnset）；
- * - 非数字/越界取值启动即失败（fail-closed，与本文件其余部分同口径）——这些值静默取错
- *   只表现为「莫名变慢/莫名失败」，比启动失败难查得多；
- * - 默认值一律从 core/limits.js 取常量，不写数字字面量（避免「配置默认值 ≠ 运行时兜底值」分叉）。
+ * 非数字/越界取值启动即失败（fail-closed）——这类值静默取错只表现为「莫名变慢/莫名失败」，比启动失败难查。
+ * 默认值一律从 core/limits.js 取常量（避免「配置默认值 ≠ 运行时兜底值」分叉）。
  */
 const intEnvSchema = (defaultValue: number, min: number, max: number) =>
   z.preprocess(emptyAsUnset, z.coerce.number().int().min(min).max(max).default(defaultValue));
@@ -149,13 +145,9 @@ const envSchema = z.object({
   // 单环境必填；多环境必须用 HANA_HOST_ENV_<XXXX>（扁平连接键在多环境下被忽略）。
   HANA_HOST: z.string().min(1).optional(),
   /**
-   * SQL 端口（**必填**）。2026-10-14 起不再有实例号（HANA_INSTANCE 已删除）：
-   * 端口一律由部署方显式给出，服务端不按 `3<实例>13/15` 推导——那条规则只覆盖默认实例与
-   * 首个租户，非默认租户（如 `3<实例>4<序号>` 这类）推不出来，猜错的表现是连到另一套库或
-   * 直接连不上（非默认租户即属此类），而报错发生在首次工具调用时。宁要一行配置，不要猜。
-   * 只接受纯数字（空串/纯空白按未设置，见 emptyAsUnset）：'3.5'/'30115abc'/'30,015'
-   * 这类笔误在 parseInt 下会被静默截断成 3 / 30115 / 30 并连到从未配置过的端口，失败要拖到
-   * 首次工具调用才暴露、报错里的端口还与会话里写的对不上——故格式校验与 HANA_XS_PORT 同口径。
+   * SQL 端口（**必填**）：不按 `3<实例>13/15` 推导——那条规则只覆盖默认实例与首个租户，
+   * 猜错的表现是连到另一套库或直接连不上，且报错拖到首次工具调用。宁要一行配置，不要猜。
+   * 只接受纯数字：'3.5'/'30115abc' 这类笔误在 parseInt 下会被静默截断并连到从未配置过的端口。
    */
   HANA_PORT: z.preprocess(
     trimmedOrUnset,
@@ -171,8 +163,8 @@ const envSchema = z.object({
   /** 租户数据库名（MDC 指定租户时填写，如 SYSTEMDB / 业务租户名；非 MDC 可省略） */
   HANA_DB_NAME: z.string().min(1).optional(),
   /**
-   * 环境模式（可选）：single / multi。
-   * 不设置时自动判断：出现任意 `_ENV_` 变量 = multi。显式值与实际不一致时启动失败。
+   * 环境模式（可选）：single / multi。不设置时自动判断：出现任意 `_ENV_` 变量 = multi。
+   * 显式值与实际不一致时启动失败。
    */
   HANA_ENV_MODE: z.preprocess(emptyAsUnset, z.enum(['single', 'multi']).optional()),
   /** 兼容模式开关：本版仅支持 strict；legacy 兼容层未实现（启动时拒绝） */
@@ -181,22 +173,19 @@ const envSchema = z.object({
     .default('')
     .transform((s) => s.trim()),
   /**
-   * 是否启用 TLS 加密连接。默认 true（fail-closed：未显式配置时不允许明文传输凭据/数据）。
+   * 是否启用 TLS 加密连接。默认 true（fail-closed：未显式配置时不允许明文传输凭据/数据）；
    * 仅当确认网络链路可信（如 localhost）且需兼容自签证书时才显式置 false。
    */
   HANA_TLS: boolSchema(DEFAULT_TLS),
   /**
-   * TLS 下是否校验服务器证书。默认 true（防止中间人替换证书窃取认证与数据）。
-   * 内网自签证书环境需跳过校验时显式置 false（应与 HANA_TLS=false 权衡，避免加密但不认证）。
+   * TLS 下是否校验服务器证书。默认 true（防中间人替换证书）；内网自签环境需跳过时显式置 false
+   * （应与 HANA_TLS=false 权衡，避免加密但不认证）。
    */
   HANA_SSL_VALIDATE: boolSchema(DEFAULT_SSL_VALIDATE),
   HANA_TIMEZONE: timeZoneSchema,
   /**
-   * 启用的工具分组或能力（逗号分隔）：
-   * - 组名 `read/write/admin/sql` → 启用整组；
-   * - 能力 id 或 glob（如 `hana_view_*`）→ 单独放行；
-   * 两者可混写。空/未填 = 默认 read/write/admin（**sql 关闭**）。
-   * 例：HANA_TOOL_GROUPS="read" → 仅数据读取；"read,hana_sql_analyze" → 读取 + 单个分析能力。
+   * 启用的工具分组或能力（逗号分隔，可混写）：组名 `read/write/admin/sql` → 启用整组；
+   * 能力 id 或 glob（如 `hana_view_*`）→ 单独放行。空/未填 = 默认 read/write/admin（**sql 关闭**）。
    */
   HANA_TOOL_GROUPS: z
     .string()
@@ -208,14 +197,9 @@ const envSchema = z.object({
    */
   HANA_TOOL_DENY: z.string().default('').transform(splitList),
   /**
-   * 工具面省略说明的调试开关（P1-7）：默认关闭，只说明"哪些类别被收窄/加载失败"，**不点名**被隐藏的能力。
-   * 置 `names` 才在说明里输出被隐藏/失败的能力名（排障用；会泄漏能力存在性，不要常开）。
-   */
-  /**
    * 调用方档案定义：`name=kinds[:glob|glob][;name2=…]`，kinds 用 + 连接。
    * 例：MCP_PROFILES="analyst=read;dev=read+write:hana_view_*|hana_metadata_*;default=read"
    * 档案**只能收紧**部署策略；配了档案就必须定义 default（HTTP 无档案参数的 Token 与 stdio 都落它）。
-   * 解析即校验（src/config/profiles.ts），非法条目启动失败。
    */
   MCP_PROFILES: z
     .string()
@@ -231,7 +215,7 @@ const envSchema = z.object({
     .transform((s) => s.trim()),
   /**
    * 进程级归因标签（可选）：写进 envelope 与每一条审计日志，用于区分"这条记录来自哪套部署"。
-   * 例：MCP_AGENT_LABEL="prod-cn-01"。空 = 不产生该字段（不制造恒为空的噪音）。
+   * 空 = 不产生该字段（不制造恒为空的噪音）。
    */
   MCP_AGENT_LABEL: z
     .string()
@@ -239,27 +223,21 @@ const envSchema = z.object({
     .transform((s) => s.trim()),
   /** 额外允许的 SQL 查询 schema（逗号分隔，追加到 core/sql.ts 白名单；默认仅系统 schema）。
    *  多环境下扁平值 = 所有环境共享；HANA_READ_SCHEMA_ENV_<XXXX> 覆盖单个环境。
-   *  2026-10-14 由 HANA_SCHEMA_ALLOW 改名而来（原名只说明「allow」，看不出 allow 什么）；
-   *  **无别名层**：旧名不再识别，会被当作未设置（按需拉取，不扫描/告警无关变量）。 */
+   *  **无别名层**：未在此声明的名称一律按未设置处理（按需拉取，不扫描/告警无关变量）。 */
   HANA_READ_SCHEMA: z.string().default('').transform(splitList),
   /**
    * 允许写操作的仓库包（逗号分隔的包前缀；含子包）。
-   * 多环境下扁平值 = 所有环境共享；HANA_WRITE_PACKAGES_ENV_<XXXX> 覆盖单个环境
-   * （显式空 = 该环境无写包）。
-   * 填写后仅允许指定包及其下级子包写操作。
-   * **空/未填不是「所有包可写」**：端到端表现为写不可用——写工具已暴露时，任何声明写包的调用
-   * 都会被运行期闸门以 boundary_off 拒绝（只有服务层的纵深防御是 fail-open，见 config/write-boundary.ts 头注）。
-   * 例：HANA_WRITE_PACKAGES="ZDEMO,ZDEMO.ZDEMO_SD" → 允许 ZDEMO、ZDEMO.X、ZDEMO.ZDEMO_SD、ZDEMO.ZDEMO_SD.SUB，
-   * 拒绝 OTHER、OTHER.X（既不等于配置项，也不以其加「.」开头）。
+   * 多环境下扁平值 = 所有环境共享；HANA_WRITE_PACKAGES_ENV_<XXXX> 覆盖单个环境（显式空 = 该环境无写包）。
+   * **空/未填不是「所有包可写」**：端到端表现为写不可用——声明写包的调用会被闸门以 boundary_off 拒绝
+   * （服务层那层 fail-open 的纵深防御见 config/write-boundary.ts 头注）。
    */
   HANA_WRITE_PACKAGES: z
     .string()
     .default('')
     .transform((s) => {
       const entries = splitList(s).map((x) => x.toUpperCase());
-      // 非法条目（"ZDEMO." / "ZDE MO" / "*" 等）会被静默保留成永不匹配的前缀：
-      // 表现为「所有写操作被拒」或「边界形同虚设」，两种都只会在写链路末端才暴露，
-      // 故在配置加载时即失败（fail-closed），并把修复方式写进错误消息。
+      // 非法条目会被静默保留成永不匹配的前缀：表现为「所有写操作被拒」或「边界形同虚设」，
+      // 两种都只会在写链路末端才暴露，故在配置加载时即失败（fail-closed），并把修复方式写进错误消息。
       const invalid = findInvalidWritePackages(entries);
       if (invalid.length > 0) {
         throw new Error(
@@ -272,11 +250,9 @@ const envSchema = z.object({
     }),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
   /**
-   * XS Classic 设计时 REST 端口（直连 HTTP）。**写/导出等走 XS 通道的能力使用**。
-   * 默认 `8010`（适配多数单实例部署）；非默认实例/租户请显式覆盖——仍不按实例号推导
-   * `80<instance>`（HANA_INSTANCE 已删除，那条规则推不出非默认租户）。
-   * 与 HANA_PORT 同口径：空串按未设置（→ 默认 8010）、纯数字校验在装载时做，越界（如 '0'/'99999'）
-   * 在 loadConfig 统一收口——不让坏值拖到首次 XS REST 调用才以驱动层错误暴露。
+   * XS Classic 设计时 REST 端口（直连 HTTP；**写/导出等走 XS 通道的能力使用**）。
+   * 默认 `8010`；非默认实例/租户请显式覆盖（不按实例号推导 `80<instance>`，那条规则推不出非默认租户）。
+   * 与 HANA_PORT 同口径：空串按未设置、纯数字校验在装载时做，越界在 loadConfig 统一收口。
    */
   HANA_XS_PORT: z.preprocess(
     trimmedOrUnset,
@@ -319,16 +295,12 @@ const envSchema = z.object({
   /** 写路径语句超时 ms HANA_SQL_TIMEOUT_MS：防一条挂死的写语句占住池位直到进程重启（只给写路径，不加全局默认，理由见 core/limits.js） */
   HANA_SQL_TIMEOUT_MS: intEnvSchema(SQL_TIMEOUT_MS_DEFAULT, 1, 3_600_000),
   /**
-   * SQL 直接执行（hana_sql_execute）的访问模式：
-   * - select-only（默认）：只允许 SELECT 类；
-   * - readwrite：允许 DML/DDL/管理类（仍受规则层与 HANA 账号权限约束）。
-   * 与全局写包无关；对象级 schema/对象访问由数据库账号决定。多环境可用 `_ENV_` 覆盖。
+   * SQL 直接执行（hana_sql_execute）的访问模式：select-only（默认，只允许 SELECT 类）/
+   * readwrite（允许 DML/DDL/管理类，仍受规则层与 HANA 账号权限约束）。与全局写包无关；可 `_ENV_` 覆盖。
    */
   HANA_SQL_ACCESS: z.enum(['select-only', 'readwrite']).default('select-only'),
-  /* ── hana_sql_execute（直接执行 HANA SQL）：默认关闭分组的多语句开关与结果硬上限 ──
-   * 工具本身还须 HANA_TOOL_GROUPS 含 sql 组（或 hana_sql_execute）才会暴露
-   * （sql 组默认关闭，见 tools/groups.ts）。maxRows / timeoutMs 是**工具参数**，不在这里配置；
-   * 这里只保留“多语句解锁”与两个服务端结果上限（默认值取自 core/limits.js）。 */
+  /* ── hana_sql_execute 的多语句开关与结果硬上限（工具还须 HANA_TOOL_GROUPS 含 sql 组才暴露；
+   * maxRows / timeoutMs 是**工具参数**，不在这里配置）── */
   /** 同时解锁“多物理行”与“多语句”；默认 false（单条 + 单行） */
   HANA_SQL_ALLOW_MULTI_STATEMENT: boolSchema(false),
   /** 单次结果累计字节上限（默认 1000000，最小 1024，最大 50MB） */
@@ -346,38 +318,33 @@ const envSchema = z.object({
   /** 激活并发上限 HANA_ACTIVATION_CONCURRENCY：激活是重操作（2–10s/次），不限流会被并发激活占满 HANA 侧资源 */
   HANA_ACTIVATION_CONCURRENCY: intEnvSchema(ACTIVATION_CONCURRENCY_DEFAULT, 1, 64),
   /**
-   * Streamable HTTP transport 端口。未设置 = stdio 传输（默认，向后兼容）；
-   * 设置后以 Streamable HTTP 模式监听（端点 /mcp）。0 = 随机端口（测试用）。
-   * 空串（`MCP_HTTP_PORT=`）按"未设置"处理（见 emptyAsUnset，与 HANA_PORT 等同一约定），
-   * 也避免出现「配置解析成 0（= 进 HTTP 模式）而策略判定成 stdio」的分叉。
+   * Streamable HTTP transport 端口。未设置 = stdio 传输（默认）；设置后以 Streamable HTTP 模式监听
+   * （端点 /mcp）。0 = 随机端口（测试用）。空串按"未设置"处理（见 emptyAsUnset），
+   * 避免「解析成 0（= 进 HTTP 模式）而策略判定成 stdio」的分叉。
    */
   MCP_HTTP_PORT: z.preprocess(emptyAsUnset, z.coerce.number().int().min(0).max(65535).optional()),
   /**
-   * Streamable HTTP 监听地址。默认 127.0.0.1（仅本机，fail-closed）；
-   * 对外暴露需显式配置（如 0.0.0.0），并同步放行 MCP_HTTP_ALLOWED_HOSTS/ORIGINS。
+   * Streamable HTTP 监听地址。默认 127.0.0.1（仅本机，fail-closed）；对外暴露需显式配置
+   * （如 0.0.0.0），并同步放行 MCP_HTTP_ALLOWED_HOSTS/ORIGINS。
    */
   MCP_HTTP_HOST: z.string().min(1).default(DEFAULT_HTTP_HOST),
   /**
    * [DEPRECATED] Streamable HTTP Bearer Token。等价于 MCP_HTTP_TOKENS="shared:<token>"
-   * ——读入**同一张 Token → 身份映射表**（clientId=shared），401 语义与归因行为完全不变。
-   * 保留为别名只为向后兼容（现有只配本项的部署不需要改配置）；新部署请只配 MCP_HTTP_TOKENS，
-   * 本项计划在下一个大版本删除。
+   * （读入同一张身份映射表，clientId=shared）；新部署请只配 MCP_HTTP_TOKENS。
    * sha256 摘要后 timingSafeEqual 比较，防时序侧信道。≥16 字符防弱凭据。
    */
   MCP_HTTP_TOKEN: z
     .string()
-    // 先 trim 再查长度（与 MCP_HTTP_TOKENS 路径同口径）：长度下限在 trim 之前会被空白填充绕过——
-    // 'a' + 15 个空格能通过 16 字符校验，实际口令只有 1 字符；纯空白则 trim 成空串、同样被拒
-    //（不允许"看起来配了 Token、实际按未配置处理"，那会静默改变这些部署的认证语义）。
+    // 先 trim 再查长度（与 MCP_HTTP_TOKENS 同口径）：长度下限在 trim 之前会被空白填充绕过——
+    // 'a' + 15 个空格能通过校验、实际口令只有 1 字符；也不允许"看起来配了 Token、实际按未配置处理"。
     .transform((s) => s.trim())
     .refine((s) => s.length >= 16, 'MCP_HTTP_TOKEN 长度须 ≥16 字符（防弱凭据）')
     .optional(),
   /**
-   * 多客户端 Token → 身份映射（逗号分隔的 `name:token`）。
+   * 多客户端 Token → 身份映射（逗号分隔的 `name:token[:profile]`）。
    * 用于 HTTP 模式下把请求归属到具体客户端：envelope.clientId、审计日志与排障都据此归因
    * （多客户端共享同一 HANA 技术账号，仓库侧的修改记录无法区分调用方，归属信息只有这里能给）。
-   * name 限 [A-Za-z0-9_.-]{1,32}；token ≥16 字符；name/token 重复或格式非法在启动时即失败。
-   * 可与 MCP_HTTP_TOKEN（deprecated 别名，映射为身份 shared）并存。格式：alice:<token>,bob:<token>
+   * name 限 [A-Za-z0-9_.-]{1,32}；token ≥16 字符；重复或格式非法在启动时即失败。
    */
   MCP_HTTP_TOKENS: z
     .string()
@@ -385,8 +352,7 @@ const envSchema = z.object({
     .transform((s) => s.trim()),
   /**
    * HTTP 多客户端 Token → 环境标识绑定（`clientId:ENV`，逗号分隔）。
-   * 仅 HTTP 模式有效；多环境 HTTP 必须为每个 Token 绑定环境（否则启动失败）。
-   * 环境标识大小写不敏感，内部规范化为大写。
+   * 仅 HTTP 模式有效；多环境 HTTP 必须为每个 Token 绑定环境（否则启动失败）；环境标识大小写不敏感。
    */
   MCP_HTTP_CLIENT_ENVS: z
     .string()
@@ -400,17 +366,15 @@ const envSchema = z.object({
   /**
    * 允许的 Origin 主机名（浏览器类客户端防护；逗号分隔，不含 scheme/端口）。
    * 无 Origin 头的请求一律放行（非浏览器 MCP 客户端不发 Origin）。
-   * **未设置时继承 MCP_HTTP_ALLOWED_HOSTS**（默认即回环名）——对外暴露时只在一个变量里放行，
-   * 不放松安全：默认仍是回环名；显式置空则拒绝一切带 Origin 的请求。
+   * **未设置时继承 MCP_HTTP_ALLOWED_HOSTS**；显式置空则拒绝一切带 Origin 的请求。
    */
   MCP_HTTP_ALLOWED_ORIGINS: z
     .string()
     .optional()
     .transform((s) => (s === undefined ? undefined : splitList(s))),
   /**
-   * 显式承认「HTTP 对外监听且不配置任何 Bearer Token」的风险（默认 false = 拒绝启动）。
-   * 非回环监听 + 无 Token 时，任何可达者都能调用全部工具（含写操作）且无法归因，
-   * 故默认 fail-closed；确实需要（如已置于带认证的反向代理之后）再显式置 true。
+   * 显式承认「HTTP 对外监听且不配置任何 Bearer Token」的风险（默认 false = 拒绝启动）：
+   * 非回环监听 + 无 Token 时，任何可达者都能调用全部工具（含写操作）且无法归因。
    */
   MCP_HTTP_ALLOW_ANONYMOUS: boolSchema(false),
 });
@@ -433,14 +397,10 @@ const SHARED_CLIENT_ID = 'shared';
 
 /**
  * 解析 HTTP 客户端身份映射：MCP_HTTP_TOKENS 的 `name:token[:profile]` 列表 + 可选单一 MCP_HTTP_TOKEN。
+ * 第三段是**调用方档案名**（须在 MCP_PROFILES 中定义）；省略则落进程默认档案。
  *
- * 三段式：第三段是**调用方档案名**（须在 MCP_PROFILES 中定义，启动自检核对）。
- * 两段式仍完全兼容（= 不给档案，落进程默认档案）。
- *
- * fail-closed：名字/Token 重复、Token 过短、分段数非法、**Token 段含 `:`** 一律抛错（启动失败），
- * 不静默降级为「无身份」。最后一条是刻意的：旧配置里真有 token 含 `:` 时，按"第一个冒号切分"
- * 会被**静默改义**（后半截变成档案名）——宁可用"响亮失败 + 迁移提示"换一次人工确认。
- * 错误信息不含 Token 原文（配置错误会进日志，凭据不得回显）。
+ * fail-closed：名字/Token 重复、Token 过短、分段数非法、**Token 段含 `:`** 一律抛错（启动失败）——
+ * 按"第一个冒号切分"会把含冒号的 Token 静默改义（后半截变成档案名）。错误信息不含 Token 原文。
  */
 export function parseHttpClients(raw: string, singleToken?: string): HttpClientIdentity[] {
   const clients: HttpClientIdentity[] = [];
@@ -453,8 +413,8 @@ export function parseHttpClients(raw: string, singleToken?: string): HttpClientI
   }
   const entries = splitList(raw);
   entries.forEach((entry, idx) => {
-    // 分段：name:token（两段，兼容）或 name:token:profile（三段）。
-    // >3 段或空段一律失败——那通常意味着 Token 里带了 `:`，按旧口径会被静默改义。
+    // 分段：name:token 或 name:token:profile。
+    // >3 段或空段一律失败——那通常意味着 Token 里带了 `:`，按第一个冒号切分会被静默改义。
     const parts = entry.split(':');
     if (parts.length < 2 || parts.length > 3 || parts.some((p) => p.trim() === '')) {
       // 不回显 entry 原文（可能含 Token）
@@ -560,7 +520,7 @@ export function parseHttpClientEnvironments(
 export interface HanaConfig {
   /** HANA 主机名/IP（真实值仅存在于本地 mcp.json/.env） */
   host: string;
-  /** SQL 端口（来自必填的 HANA_PORT；2026-10-14 起不再由实例号推导） */
+  /** SQL 端口（来自必填的 HANA_PORT，不由实例号推导） */
   port: number;
   user: string;
   password: string;
@@ -580,9 +540,7 @@ export interface HanaConfig {
   schemaAllowExplicit?: boolean;
   /**
    * 允许写操作的仓库包前缀（大写）。非空=仅允许这些包及其下级子包；**空数组=本判定层不限制**，
-   * 但端到端不是「所有包可写」——声明写包的调用会被运行期闸门以 boundary_off 拒绝（见同名字段在
-   * envSchema 的说明与 config/write-boundary.ts 头注）。
-   * 来自 mcp.json/.env 的 HANA_WRITE_PACKAGES（逗号分隔）。运行时由 configureWritePackages 接线。
+   * 但端到端不是「所有包可写」——声明写包的调用会被闸门以 boundary_off 拒绝（见 envSchema 同名字段）。
    */
   writePackages: string[];
   /** true = 写包范围由策略文档**显式**声明（含空数组 = deny-all；区别于未配置） */
@@ -626,7 +584,7 @@ export interface HanaConfig {
   access?: 'readwrite' | 'readonly';
   /** SQL 直接执行的访问模式（HANA_SQL_ACCESS；默认 select-only） */
   sqlAccess?: 'select-only' | 'readwrite';
-  /** 破坏性操作审批策略：固定为 destructive（不再可配） */
+  /** 破坏性操作审批策略：固定为 destructive（不可配） */
   approvalPolicy: 'off' | 'destructive';
   /** 只读环境 SQL 策略：固定 select-only（要完全关闭 SQL 请不启用 sql 组） */
   readonlySql?: 'select-only' | 'deny';
@@ -644,7 +602,7 @@ export interface HanaConfig {
   connectionSourceMixed: boolean;
   /**
    * XS Classic 设计时 REST 直连端口（来自 HANA_XS_PORT，**默认 8010**）。
-   * 不再按实例号推导；非默认实例/租户由部署方显式覆盖。
+   * 不按实例号推导；非默认实例/租户由部署方显式覆盖。
    */
   xsPort: number;
   /** XS 设计时 REST 基础路径（默认 /sap/hana/xs/dt/base） */
@@ -673,11 +631,8 @@ export interface HanaConfig {
 
 /**
  * 连接目标与凭据：这组变量决定「连到哪个库、以谁的身份」，跨来源混用会导致静默误连
- * （例：shell 里残留的 HANA_USER 覆盖 .env 里的用户名，其余变量仍来自 .env）。
- * 仅这组参与「来源一致性」判定——日志级别/工具分组/HTTP 端口等调优项混用无此风险。
- *
- * HANA_XS_PORT 同属此组：它决定写通道（XS REST）连到哪个端点，且 XS 走**明文 HTTP**——
- * 混用时同样会静默连到另一套环境，且在 TLS 的 HANA_PORT 之外多一条不太被注意的明文链路。
+ * （例：shell 残留的 HANA_USER 覆盖 .env 里的用户名）。HANA_XS_PORT 同属此组——XS 走**明文 HTTP**，
+ * 混用同样会静默连到另一套环境。仅这组参与「来源一致性」判定。
  */
 const CONNECTION_KEYS = [
   'HANA_HOST',
@@ -706,14 +661,13 @@ export interface DotEnvLoadResult {
 
 /**
  * 尝试加载 .env（Node 原生 process.loadEnvFile，无 dotenv 依赖）。
- * - 外部注入（mcp.json env / 真实环境变量）已提供 主机+用户+密码 三件套时跳过（外部配置优先，不覆盖）
- * - 否则按候选路径补齐：当前工作目录 .env → 项目根 .env
- *   （本模块位于 dist/config/config.js，需上两级才到项目根；MCP 客户端常以工作区为 cwd，凭据文件在项目根）
+ * - 外部注入已提供 主机+用户+密码 三件套时跳过（外部配置优先，不覆盖）
+ * - 否则按候选路径补齐：当前工作目录 .env → 项目根 .env（客户端常以工作区为 cwd，凭据文件在项目根）
  * - **逐变量生效**：loadEnvFile 不覆盖已存在的变量，因此「三件套只有一部分来自外部」时会出现
  *   .env 与环境变量混用 —— 返回值记录每个变量的实际来源，由 loadConfig 判定并告警。
  *
  * 注意：HTTP 模式下没有 MCP 客户端拉起本进程，mcp.json 的 env 不会注入 ——
- * 配置来源实际为 shell/容器环境变量 → .env 兜底（见 README「配置参数」）。
+ * 配置来源实际为 shell/容器环境变量 → .env 兜底。
  */
 export function tryLoadDotEnv(env: NodeJS.ProcessEnv = process.env): DotEnvLoadResult {
   const sources: Partial<Record<ConnectionKey, string>> = {};
@@ -769,12 +723,9 @@ export function tryLoadDotEnv(env: NodeJS.ProcessEnv = process.env): DotEnvLoadR
 /**
  * 档案配置自检（启动即失败，不给"以为生效其实没有"的机会）：
  * 0. **未配置 MCP_PROFILES 时也不放过显式档案名**：MCP_PROFILE 非 default、或任一 Token 带第三段
- *    → 拒绝启动（没有条目可解析，静默忽略就是"生效值 ≠ 运维以为的值"；Token 里含一个冒号的
- *    旧写法也会在此响亮失败，见 parseHttpClients）；
- * 1. 配了 MCP_PROFILES 就必须定义 `default` —— HTTP 里不带第三段的 Token 与 stdio 进程都落它，
- *    缺了会把"没指定档案"误读成"没有限制"；
- * 2. MCP_PROFILE 指向的档案必须存在；
- * 3. 每个 Token 的第三段档案必须存在。
+ *    → 拒绝启动（没有条目可解析，静默忽略就是"生效值 ≠ 运维以为的值"）；
+ * 1. 配了 MCP_PROFILES 就必须定义 `default`——HTTP 里不带第三段的 Token 与 stdio 进程都落它；
+ * 2. MCP_PROFILE 指向的档案必须存在；3. 每个 Token 的第三段档案必须存在。
  * （"档案 ⊆ 部署策略"的越界检查在 preflight 的 describePolicy 里，因为它需要完整策略。）
  */
 function assertProfileConfig(
@@ -832,8 +783,8 @@ function assertProfileConfig(
  * 加载并校验配置。HANA_HOST/HANA_PORT/HANA_USER/HANA_PASSWORD 必填（无默认值），
  * 缺失或非法抛 zod 校验错误（服务启动即失败，不给半配置运行的机会）。
  *
- * 内部实现返回基础环境 + 命名环境表；对外保留 loadConfig（只要基础 config）与
- * loadEnvironments（要完整环境表）两个入口，避免脚本/测试一次性全改。
+ * 内部实现返回基础环境 + 命名环境表；对外分 loadConfig（只要基础 config）与
+ * loadEnvironments（要完整环境表）两个入口。
  */
 function loadInternal(env: NodeJS.ProcessEnv): LoadedEnvironments {
   const dotenv = tryLoadDotEnv(env);
@@ -848,9 +799,8 @@ function loadInternal(env: NodeJS.ProcessEnv): LoadedEnvironments {
     throw interceptionError('config_invalid', `无效的 SQL 端口: ${parsed.HANA_PORT}`);
   }
 
-  // XS 端口：默认 8010（envSchema 已给默认值）。'0'/'99999' 这类越界值若放行，要到首次
-  // XS REST 调用才以驱动层错误暴露，故在装载时收口；不按实例号推导（HANA_INSTANCE 已删除），
-  // 非默认实例/租户由部署方用 HANA_XS_PORT 覆盖。
+  // XS 端口：默认 8010（envSchema 已给默认值）。越界值若放行要到首次 XS REST 调用才以驱动层错误暴露，
+  // 故在装载时收口；非默认实例/租户由部署方用 HANA_XS_PORT 覆盖。
   const xsPort = parseInt(parsed.HANA_XS_PORT, 10);
   if (xsPort < 1 || xsPort > 65535) {
     throw new Error(`无效的 XS 端口: ${parsed.HANA_XS_PORT}`);
@@ -859,11 +809,9 @@ function loadInternal(env: NodeJS.ProcessEnv): LoadedEnvironments {
   // 将解析后的时区应用到整个进程（影响 new Date() 等本地时间语义）
   process.env.TZ = parsed.HANA_TIMEZONE;
 
-  // 凭据生命周期：先不删密码——命名环境的 `HANA_PASSWORD_ENV_*` 还要用；
-  // 构建完环境表后由 deletePasswordKeys 统一从 env/process.env 移除。
-  // HTTP Bearer Token 与密码同属"能触发全部工具（含写）的凭据"，同一威胁模型下一并移除：
-  // 值已进 config.httpTokens 内存副本，后续判定不再读 env（服务进程内禁止重新解析 env，
-  // 见 index.ts 与 preflight.policyFromConfig 的说明）
+  // 凭据生命周期：先不删密码——命名环境的 `HANA_PASSWORD_ENV_*` 还要用；构建完环境表后由
+  // deletePasswordKeys 统一移除。HTTP Token 与密码同属"能触发全部工具（含写）的凭据"，一并移除：
+  // 值已进 config.httpTokens 内存副本，后续判定不再读 env。
   delete process.env.MCP_HTTP_TOKEN;
   delete process.env.MCP_HTTP_TOKENS;
 
@@ -940,7 +888,7 @@ function loadInternal(env: NodeJS.ProcessEnv): LoadedEnvironments {
     );
   }
 
-  // 授权参数收口：旧变量必须移除（静默忽略会让“以为生效、实际没生效”）。
+  // 残留的已移除权限变量：只告警不阻断（静默忽略会让“以为生效、实际没生效”）。
   warnRemovedPermissionEnv(env);
 
   const loaded = buildEnvironments(env, baseConfig, {
@@ -986,7 +934,7 @@ function deletePasswordKeys(env: NodeJS.ProcessEnv): void {
   delete process.env.HANA_PASSWORD;
 }
 
-/** 只要基础环境配置（既有脚本/测试入口，行为保持）。 */
+/** 只要基础环境配置（既有脚本/测试入口）。 */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): HanaConfig {
   return loadInternal(env).base.config;
 }

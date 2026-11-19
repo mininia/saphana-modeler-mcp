@@ -4,8 +4,8 @@
  *   协议（实测 + SAP-archive/xsk 开源佐证）：IN/OUT 均为 repoV2 二进制信封 ——
  *     "repoV2"(6B ASCII) + attachmentCount(4B 小端, = 附件区**实际序列化记录数**) + contentLength(4B 小端, JSON 字节数)
  *     + JSON UTF-8 + 附件区（每条 [4B 小端长度][内容]；写对象时 = [名称槽, 内容槽] 共 2 条；读对象时 XML 在槽 0）。
- *     头部 count 与记录数必须一致：旧式 `1 + 文件数 × 2` 会多报（实测报 Transporter.consume），修法见 repositoryRest。
- * - INACTIVE_OBJECT 直写：兜底（实测 SAPABAP1 无直写权限，实际不可用，保留供有权限账号参考）。
+ *     头部 count 与记录数必须一致：多报会触发 Transporter.consume。
+ * - INACTIVE_OBJECT 直写：兜底（实测 SAPABAP1 无直写权限，实际不可用，供有权限账号参考）。
  * 安全护栏：写操作的包名边界由 HANA_WRITE_PACKAGES 配置（**两层口径**：空白名单在本判定层 fail-open、
  * 不限制；端到端空白名单 = 声明写包的调用被运行期闸门以 boundary_off 拒绝，详见 config/write-boundary.ts 文件头），
  * 对象名校验，凭据不落日志。

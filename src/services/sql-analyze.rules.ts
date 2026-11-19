@@ -229,9 +229,9 @@ export function generateStatementName(): string {
 /**
  * 降级路径专用的语句名：由主名字**派生**（固定后缀），不重新随机。
  *
- * 为什么派生而不是再生成一个随机名：写计划行用哪个名字、回读就得用哪个名字、清理也得删得掉。
- * 派生名让这三处只凭主名字就能推导出来——早先用随机新名的那版，`finish` 仍按主名字回读 → 0 行硬失败，
- * 写进去的行成了孤儿永远清不掉（真机实测：计划表里躺着 3 行删不掉的 MCP_* 行）。
+ * 为什么派生而不是再生成一个随机名：写计划行、回读、清理三处必须用同一个名字。派生名让三处
+ * 只凭主名字就能推导出来——若另生成随机名，回读会按主名字查而得到 0 行（硬失败），
+ * 写进去的行成了孤儿永远清不掉（真机实测）。
  */
 export function fallbackStatementName(primary: string): string {
   return `${primary}_FB`;
@@ -347,7 +347,7 @@ export function renderTree(lines: TreeLine[], limit: number, truncatedNote?: str
  * 只在有值时展开字段（避免响应里出现一堆 null）。
  *
  * **通用版**：value 可以是任何类型（算子/统计里的可选字段既有数字也有字符串）。
- * 服务层曾另有一份 number-only 的副本，已并入这里——"缺省字段不出现"是本工具全部输出的统一口径。
+ * "缺省字段不出现"是本工具全部输出的统一口径。
  */
 export function withDefined<K extends string, V>(key: K, value: V | undefined): Partial<Record<K, V>> {
   return value === undefined ? {} : ({ [key]: value } as Record<K, V>);
@@ -407,7 +407,7 @@ function toOperator(row: PlanRow): PlanOperator {
 // ── 分析结论（**默认输出**：把算子计划翻译成人能读懂的结论）────────
 //
 // 为什么要这一层：原始算子表对模型和人都是噪声（200 行算子、缩写名、估计值）。
-// 验收标准要的是"一段可理解的 SQL 分析结论"，所以默认只给结论，原始计划退到 raw=true。
+// 默认只给可读结论，原始计划退到 raw=true。
 //
 // 每条结论都必须**可回溯**：evidence 指到具体算子/表，不做无依据的断言；
 // 拿不准的（如表规模是估计值、文本启发式）如实标注，不假装确定。

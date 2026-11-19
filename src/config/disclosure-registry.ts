@@ -1,9 +1,9 @@
 /**
- * 披露 id 注册表（P2）：只用于**过期关联/一致性检查**，不是授权凭证。
+ * 披露 id 注册表：只用于**过期关联/一致性检查**，不是授权凭证。
  *
  * `hana_tool_search` 发出披露包时登记 id → (toolIds/envKey/epoch/policyRev/manifestRev)；
  * 执行入口收到 `disclosure.id`/`disclosureId` 时按当前上下文核对。进程内、有界、带 TTL：
- * 重启/跨进程即视为旧披露（`disclosure_stale`），不会把注册表当会话或授权。
+ * 重启/跨进程即视为失效（`disclosure_stale`），不会把注册表当会话或授权。
  */
 
 export interface DisclosureRecord {

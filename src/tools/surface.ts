@@ -1,14 +1,14 @@
 /**
  * 调用方面（surface）与可触达上限（entitlement）。
  *
- * 2026-11-19（单一入口）起工具面固定为**两个平台入口**：
+ * 工具面固定为**两个平台入口**：
  * - `hana_tool_search`：本体层（发现 / 契约 / 配方），不改工具面、不执行；
  * - `hana_invoke`：唯一执行入口，按目标能力统一授权后派发。
  *
  * 具体能力（含 `hana_sql_execute`、环境切换、操作级别名）**永不注册**为工具；
  * entitlement 仍是“可发现 + 可执行”的天花板（部署策略 ∩ 档案）。
  *
- * 关系：surfaceIds ⊆ entitlementIds ⊆ 部署策略（不变量 A）。面是呈现设施，不是授权设施：
+ * 关系：surfaceIds ⊆ entitlementIds ⊆ 部署策略（可见性逐层收紧）。面是呈现设施，不是授权设施：
  * 每次调用仍过 `authorizeCall`（见 config/authorize.ts）。
  */
 
@@ -56,7 +56,7 @@ export function currentSurfaceKey(): string {
 /**
  * 调用方的可触达能力（entitlement）：部署静态面 ∩ 档案。
  *
- * 编译委托给 `config/policy-snapshot.ts`（P2 快照）：平台入口按「未显式 deny ∧
+ * 编译委托给 `config/policy-snapshot.ts`：平台入口按「未显式 deny ∧
  * 至少一个具体能力 entitled」出现；它们不单独受分组/档案 kind 限制。
  */
 export function entitlementOf(
@@ -110,7 +110,7 @@ export function surfaceCapabilities(ids: ReadonlySet<string>): Capability[] {
   return CAPABILITY_LIST.filter((c) => ids.has(c.id)).sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
-/** 能力的一句话摘要（门面索引用）：优先 routing.intent，其次描述首句 */
+/** 能力的一句话摘要（发现/契约摘要用）：优先 routing.intent，其次描述首句 */
 export function summaryOf(cap: Capability): string {
   const firstLine = (cap.routing?.intent ?? cap.description.split('\n')[0] ?? '').replace(/\s+/g, ' ').trim();
   const stop = firstLine.search(/[。；]/);
@@ -177,7 +177,7 @@ export function paramDetailsOf(
   multiEnv = false,
   mode: 'args' | 'envelope' = 'envelope',
 ): ParamDetail[] {
-  // 契约默认走信封（P2）：expectedEnvironment/expectedEpoch 不在 args 里。
+  // 契约默认走信封：expectedEnvironment/expectedEpoch 不在 args 里。
   const schema = capabilityInputSchema(cap, multiEnv, mode);
   const shape = (schema as unknown as { shape?: Record<string, unknown> }).shape;
   if (!shape) return [];

@@ -1,19 +1,14 @@
 /**
- * SQL 读取范围的最后一道校验（**服务层**，与工具层预检分工不同）。
+ * SQL 读取范围的最后一道校验（服务层；工具层预检负责**限定名**的扫描与判定，见
+ * capabilities/planners.ts + config/preflight.ts，扫描盲区写进计划）。
  *
- * 分工：
- * - 工具层预检（src/capabilities/planners.ts 的规划器 + config/preflight.ts）负责**限定名**：
- *   扫描 `SCHEMA."表"` 后按 HANA_READ_SCHEMA 判定，并把扫描盲区写进计划；
- * - 本模块负责**未限定表名**（`FROM MARA`）：它由 HANA 按当前用户的默认 schema 解析，
- *   扫描器无从得知，只能查 CURRENT_SCHEMA 再判。没有这一步时 `SELECT * FROM MARA`
- *   会完全绕过 HANA_READ_SCHEMA。
+ * 本模块负责**未限定表名**（`FROM MARA`）：它由 HANA 按当前用户的默认 schema 解析，
+ * 扫描器无从得知，只能查 CURRENT_SCHEMA 再判。没有这一步时 `SELECT * FROM MARA`
+ * 会完全绕过 HANA_READ_SCHEMA。
  *
  * 为什么由调用方注入"怎么读当前 schema"：SQL 分析工具必须把这条查询放在**已持有的连接**上
- * （它的执行计划缓冲按连接隔离），不能走 pool.query 另取一条连接；存储过程那条路径则没这约束。
- * 判定规则本身只有一份，读法由调用方给。
- *
- * 从 repository.service 的 assertScriptReadScopes 提取而来（原先只有 SQL 模式视图在用），
- * 避免出现第二份"未限定表名"判定——两份实现漂移时，先被绕过的一定是边界。
+ * （执行计划缓冲按连接隔离），不能走 pool.query 另取一条；存储过程路径没这约束。
+ * 判定规则只有这一份，读法由调用方给。
  */
 
 import { HanaBusinessError } from '../core/errors.js';
@@ -48,9 +43,9 @@ export async function assertSqlReadScopes(
   try {
     assertSchemaAllowed(schema);
   } catch (e) {
-    // 保留 catch（**确有改写文案的理由**）：调用方从未写过这个 schema —— 它来自会话默认值，
-    // 直接上抛 core 的「schema "X" 不在允许列表」会让调用方无从对应；改写时保留 core 的原因描述，
-    // 使白名单枚举/配置指引始终与 core 同源（不在这里手抄一份）。
+    // 改写文案：该 schema 来自会话默认值、调用方从未写过它，直接上抛 core 的
+    // 「schema "X" 不在允许列表」会让调用方无从对应；嵌入 hanaErrorMessage 使白名单
+    // 枚举/配置指引始终与 core 同源（不在这里手抄一份）。
     throw new HanaBusinessError(
       `${noun}含未限定 schema 的表名，按${schemaLabel} "${schema}" 解析，而它不在服务端允许读取的范围内 —— ${hanaErrorMessage(e)}。` +
         '请把表名写成全限定名（SCHEMA."表"），或由部署方调整可读 schema 配置',

@@ -21,7 +21,7 @@ export function registerTaskTools(server: McpServer, ctx: ToolContext): void {
   // params 必须整体透传：清单已声明 taskId 必填，handler 不读取就拿不到值。
   regCap(CAP.hana_task_get, async (params) => {
     const view = taskViewFor(params.taskId, currentSurfaceKey());
-    // 未知/他人任务：硬错误文本、不泄漏存在性（与门面路由的「未知能力」同形）。
+    // 未知/他人任务：硬错误文本、不泄漏存在性（与「未知能力」回执同形）。
     if (!view) return mcpErrorText(UNKNOWN_TASK_TEXT);
     const envelope: Envelope = await withErrorEnvelope(async () => view);
     return toToolResult(envelope);

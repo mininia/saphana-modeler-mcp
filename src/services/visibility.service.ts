@@ -10,8 +10,7 @@
  * 三者都会输出**假的健康结论**。
  *
  * 判定依据：`CATALOG READ` 系统权限（预定义 `MONITORING` 角色含之，持该角色者同样命中）
- * 决定监视视图是否返回未过滤数据。这是实测结论（同一账号在两套环境下的行数差 15 倍，
- * 见 docs/health-monitoring-findings.md §一/§二）。
+ * 决定监视视图是否返回未过滤数据（实测：同一账号在两套环境下的行数差 15 倍）。
  *
  * ⚠️ 这是**启发式**：unfiltered=true 只说明"有权限拿到全量"，不代表具体某个视图一定有数据。
  * 反之 unfiltered=false 也不代表完全看不到——很多实例内视图（服务、表、计划缓存）本就不需要该权限。
@@ -36,13 +35,12 @@ export interface Visibility {
 /**
  * 探测当前连接的可见性上下文。
  *
- * ⚠️ 与 system.service.getPrivileges 的「系统权限矩阵」查询是同一张表上的两件事（那份在
- * system.service.ts 内，不属本文件）：
+ * ⚠️ 与 system.service.getPrivileges 的「系统权限矩阵」查询是同一张表上的两件事：
  * - 那边要"用户持有哪些系统权限"的**完整清单**（OBJECT_NAME IS NULL，不筛 SCHEMA_NAME），用于建模能力摘要；
  * - 这边只判定 CATALOG READ 是否在列（OBJECT_NAME/SCHEMA_NAME 均 NULL = 纯系统权限，
- *   排除对象级/ schema 级授权行）。角色不在这条查询的结果里（角色清单在 SYS.EFFECTIVE_ROLES）；
+ *   排除对象级/schema 级授权行）。角色不在这条查询的结果里（角色清单在 SYS.EFFECTIVE_ROLES）；
  *   预定义 MONITORING 角色内含 CATALOG READ，故持该角色者仍会被命中。
- * 两者口径与用途不同，刻意不合并；若后续要抽公共查询，必须同时确认两处口径。
+ * 两者口径与用途不同，刻意不合并；若抽公共查询，必须同时确认两处口径。
  *
  * 查询失败**不**上抛：四个诊断工具都在入口直接 await 本函数，抛错会让整份报告连
  * "哪一段看不见"都拿不到。按**不可见**降级（fail-closed：空结果继续附不确定性提示），

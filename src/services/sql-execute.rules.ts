@@ -4,10 +4,10 @@
  * 这里只定下两类“必须在执行前定下来”的判定（handler 用它给可恢复错误，服务层再用同一份兜底）：
  * 1. 脚本形状：空/NUL/绑定占位符/物理多行/多语句（后两者由 HANA_SQL_ALLOW_MULTI_STATEMENT 解锁）；
  * 2. 逐语句分类：read / dml / ddl / admin / transaction / unknown。**WITH 必须看 CTE 之后的主语句**
- *    （`WITH x AS (SELECT …) DELETE FROM Z.T` 是 dml，不是 read——这是已知绕过，测试钉住）。
+ *    （`WITH x AS (SELECT …) DELETE FROM Z.T` 是 dml，不是 read——已知绕过点）。
  *
- * 2026-11 产品决策：**SQL 专用 schema 闸门已移除**——本模块不扫描 read/write schema，
- * 不参与 HANA_READ_SCHEMA / 写 schema 白名单判定；能访问什么由 HANA 账号权限决定。
+ * SQL 专用 schema 闸门不存在：本模块不扫描 read/write schema，不参与 HANA_READ_SCHEMA /
+ * 写 schema 白名单判定；能访问什么由 HANA 账号权限决定。
  * 管理类语句也默认允许（受数据库权限约束）；仅显式事务控制、会修改会话状态的 SET、
  * EXPLAIN、DO 匿名块仍拒绝。
  *

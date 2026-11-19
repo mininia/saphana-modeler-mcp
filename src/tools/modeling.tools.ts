@@ -237,7 +237,7 @@ export function registerModelingTools(server: McpServer, ctx: ToolContext): void
       const inapplicable = [
         ifMatch !== undefined ? 'ifMatch' : undefined,
         activate === true ? 'activate=true' : undefined,
-        // 经门面路由进来的 args 可能没跑过默认值填充：undefined 要放行。
+        // 直调 handler 的 args 可能没跑过默认值填充：undefined 要放行。
         probeRows !== undefined && probeRows !== DEFAULT_PROBE_ROWS ? 'probeRows' : undefined,
         dryRun === true ? 'dryRun=true' : undefined,
         migration !== undefined ? 'migration' : undefined,

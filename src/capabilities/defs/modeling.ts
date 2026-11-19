@@ -461,7 +461,8 @@ const baseModelingCapabilities = {
       ],
     },
     title: '更新 Calculation View（声明式 operations / 全量 XML / 变更集）',
-    // 硬保留（验收脚本断言）：三方式互斥、关键参数名、migration 合法值、机读码全集、回执字段名、零写入语义。
+    // 以下为契约锁定项（改描述时勿删）：三方式互斥、关键参数名、migration 合法值、机读码全集、
+    // 回执字段名、零写入语义。
     description:
       '更新已有 Calculation View，三种方式三选一（互斥）：\n' +
       '① operations（推荐）：声明式操作补丁 op=' +
@@ -655,7 +656,7 @@ const baseModelingCapabilities = {
 
 /**
  * 建模域全量条目 = 基础清单 + 操作级别名（`hana_view_update#<op>`）。
- * 别名从父 schema 与 VIEW_OPS 派生，标 routeOnly：可授权、可出现在门面索引里，但永不注册为工具。
+ * 别名从父 schema 与 VIEW_OPS 派生，标 routeOnly：可授权、可出现在发现/契约里，但永不注册为工具。
  */
 export const modelingCapabilities = {
   ...baseModelingCapabilities,

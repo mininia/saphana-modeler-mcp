@@ -166,7 +166,7 @@ export interface CreateCalcViewResult {
   /**
    * 跨进程并发迹象（只有实测到时才产生该字段，不制造恒为空噪音）：
    * PUT 是 create-or-update、服务端不返回 409；锁内检查说「不存在」而写入后 Version > 1
-   * ⇒ 本次调用期间有他人写过同名对象（last-write-wins，SSD §4.1 列为 I1 的已知例外）。
+   * ⇒ 本次调用期间有他人写过同名对象（last-write-wins 的已知例外）。
    * 需要并发保护时：写入前读基线，更新时显式传 ifMatch。
    */
   concurrencyNote?: string;
@@ -192,7 +192,7 @@ export async function probeRuntimeRows(
   const empty: RowProbe = { sampledRows: 0, truncated: false, columns: [], rows: [] };
   const limit = clampLimit(Math.trunc(probeRows), 1, 1, MAX_PROBE_ROWS);
   try {
-    // 写路径 SQL 超时（§4.3）：行探测跟在写后，超时值取自池（假池/旧调用点 undefined = 不加超时）
+    // 写路径 SQL 超时：行探测跟在写后，超时值取自池（假池/旧调用点 undefined = 不加超时）
     const rows = await pool.query<Record<string, unknown>>(
       `SELECT * FROM ${qualifyName('_SYS_BIC', `${packageId}/${objectName}`)} LIMIT ?`,
       [limit + 1],
@@ -238,7 +238,7 @@ async function probeIfActivated(
  * 默认 schema 解析——扫描器无从得知，故这里查出 CURRENT_SCHEMA 再判它是否在允许范围内。
  * 没有这一步时 `SELECT * FROM MARA` 这类写法会完全绕过 HANA_READ_SCHEMA。
  *
- * 判定规则已提取到 read-scope.service（SQL 分析工具要在**已持有连接**上做同一件事），此处只注入读法。
+ * 判定规则在 read-scope.service（SQL 分析工具要在**已持有连接**上做同一件事），此处只注入读法。
  */
 async function assertScriptReadScopes(pool: HanaPool, script: string): Promise<void> {
   return assertSqlReadScopes(script, () => currentSchema(pool), '脚本');
@@ -257,7 +257,7 @@ export function definitionScriptsOf(def: ViewDefinition): string[] {
 async function objectExists(pool: HanaPool, packageId: string, objectName: string): Promise<boolean> {
   for (const table of ['ACTIVE_OBJECT', 'INACTIVE_OBJECT']) {
     // 表名来自本函数内的字面量常量，仍统一走 quoteIdentifier（纵深防御：标识符引用只此一种拼法）。
-    // 写路径 SQL 超时（§4.3）：存在性检查是写前必经腿，超时值取自池（假池/旧调用点 undefined = 不加超时）
+    // 写路径 SQL 超时：存在性检查是写前必经腿，超时值取自池（假池/旧调用点 undefined = 不加超时）
     const rows = await pool.query<{ C: number }>(
       `SELECT COUNT(*) AS C FROM "_SYS_REPO".${quoteIdentifier(table)}
        WHERE PACKAGE_ID = ? AND OBJECT_NAME = ? AND OBJECT_SUFFIX = 'calculationview'`,
@@ -538,12 +538,10 @@ export type AppliedOperationResult =
   | SetVariableOperationResult;
 
 /**
- * 迁移声明闸门的结果记录（SSD §5.4 / D2）——回执审计字段，与 DryRunReport.migration 同一形状。
- * 语义：`required` = 本次变更被判定为破坏性（必须声明才放行）；`provided` = 调用方声明的策略
- * （update 通道为 cast/preserve_column/move 或 acknowledge_dependents，delete 通道为 acknowledge_dependents）；
- * `accepted` = 闸门结论。
- * **不做任何自动迁移动作**：migration 只是「调用方显式承认破坏并声明策略」的声明位，
- * 对下游视图的实际处理由编排层按影响半径决定（自动改下游视图超出本服务边界）。
+ * 迁移声明闸门的结果记录（回执审计字段，与 DryRunReport.migration 同一形状）。
+ * `required` = 本次变更被判定为破坏性（必须声明才放行）；`provided` = 调用方声明的策略；
+ * `accepted` = 闸门结论。**不做任何自动迁移动作**：migration 只是「调用方显式承认破坏并声明策略」
+ * 的声明位，对下游视图的实际处理由编排层按影响半径决定。
  */
 export interface MigrationGateRecord {
   required: boolean;
@@ -554,59 +552,39 @@ export interface MigrationGateRecord {
 }
 
 /**
- * dryRun 预演回执（SSD §5.1）：只读预演——一次 PUT、一次 probe、一次缓存失效、一次信号量都不发生。
- * 与 UpdateCalculationViewResult 用 `mode` 字段判别（联合返回类型），调用方一眼可辨「这是预演、什么都没写」。
+ * dryRun 预演回执：只读预演——一次 PUT、一次 probe、一次缓存失效、一次信号量都不发生。
+ * 与 UpdateCalculationViewResult 用 `mode` 字段判别（联合返回类型）。
  */
 export interface DryRunReport {
   mode: 'dryRun';
-  /**
-   * 设计时基线，与本次判定同源（同一次锁内 fileMeta 读）：etag 缺省 = 该次读取没拿到 ETag
-   * （不是没去读，也不补读拼装）；versionId = 同一次读取的 SapBackPack.Version 字符串形式
-   * （XS REST 通道不暴露 _SYS_REPO.VERSION_ID，需要审计对账请用 hana_metadata_get_view）。
-   */
+  /** 设计时基线，与判定同源（同一次锁内 fileMeta 读）；etag 缺省 = 该次读取没拿到 ETag（不补读拼装） */
   base: { versionId?: string; etag?: string };
-  /**
-   * 归一化后的结构 diff（§5.2；布局/文档序/聚合方言等写法差异不产生条目）。
-   * baselineUnavailable=true 时它是「未判」的空壳占位（empty=true、各集合为空），不是比较结果。
-   */
+  /** 归一化后的结构 diff；baselineUnavailable=true 时是「未判」的空壳占位（empty=true、各集合为空），不是比较结果 */
   diff: ViewDiff;
   /**
-   * 破坏性判定（**直接下游（单跳）** × diff；level='none' 表示下游无引用或变更不在判定表内）。
-   * level 三值：none=判为非破坏；breaking=判为破坏；unknown=**未判**（基线不可用，判定从未执行——
-   * unknown ≠ 非破坏，必须配合 baselineUnavailable 一起读）。
-   * 下游只计**设计时引用**（运行时目录引用已过滤，见 designTimeDownstream 的实测说明）。
+   * 破坏性判定（**直接下游（单跳）** × diff；level: none=非破坏, breaking=破坏,
+   * unknown=**未判**——unknown ≠ 非破坏，须配合 baselineUnavailable 读）。
+   * 下游只计**设计时引用**（运行时目录引用已过滤，见 designTimeDownstream）。
    */
   breaking: BreakingAssessment;
   /**
-   * 影响半径：**直接下游（单跳）**（impact() 默认 depth=1，判定/回执都用这一口径；需要传递影响面
-   * 请用 hana_metadata_where_used 的 depth>1）。**已剔除运行时目录引用**——不过滤时任何已激活对象的
-   * 下游恒非空，见 designTimeDownstream 的实测说明；truncated=true 时 downstream 与 downstreamCount 只是下界。
-   * runtimeOnly = 被过滤掉的运行时引用条数（>0 才产生该字段）：downstream.length + runtimeOnly
-   * = 本次单跳检索的原始节点数，调用方据此复核「过滤没有静默吃掉引用」。
-   * 选择字段而不是 warnings 上报的理由：它是可机读核对的**计数**（warnings 是解释性文字，
-   * 留给「归一化/截断」这类需要解释的提示），脚本能据此机器化对齐、不必解析散文。
+   * 影响半径：**直接下游（单跳）**（impact() 默认 depth=1；传递影响面请用 hana_metadata_where_used 的 depth>1）。
+   * truncated=true 时 downstream 与 downstreamCount 只是下界。runtimeOnly（>0 才出现）=被过滤掉的运行时
+   * 引用条数：downstream.length + runtimeOnly = 本次单跳检索的原始节点数，过滤可复核、不静默。
    */
   impact: { downstream: GraphEdge[]; truncated: boolean; asOf: string; runtimeOnly?: number };
-  /**
-   * 闸门在预演里的投影：accepted=false 表示「同样的调用去掉 dryRun 会被服务端拒绝」；
-   * 基线不可用（未做判定，breaking.level='unknown'）时如实为 required=false / accepted=true——
-   * unknown 不是 breaking，不判就不拦。
-   */
+  /** 闸门在预演里的投影：accepted=false 表示「同样的调用去掉 dryRun 会被拒绝」；未判时不拦（required=false/accepted=true） */
   migration: MigrationGateRecord;
   /**
-   * 设计时内容为空/缺失（基线不可用）：本次**未做破坏性判定**——diff 是空壳占位、breaking.level='unknown'
-   * （**未判 ≠ 判为非破坏**），migration.required 如实为 false（不判就不拦）。仅在该情形产生该字段。
-   * 为什么 fail-open：空串基线会被 diff 视作「全部新增」，据以判定会误报破坏、拦住合法写入；
-   * 与本仓探测类失败的既有口径一致（fail-open + 响亮标注，warnings 里有一句），不拿假基线拦人。
+   * 设计时内容为空/缺失（基线不可用，仅在该情形产生）：本次**未做破坏性判定**——diff 是空壳占位、
+   * breaking.level='unknown'（未判 ≠ 非破坏）、migration.required 如实为 false。
+   * fail-open 的理由：空串基线会被 diff 视作「全部新增」，据以拦截会误拦合法写入；宁可放行 + 响亮标注
+   * （warnings 里有一句），也不拿假基线拦人。
    */
   baselineUnavailable?: boolean;
-  /**
-   * 目标对象**没有已激活版本**（仅在该情形产生）：影响半径/破坏性判定基于 ACTIVE_OBJECTCROSSREF，
-   * 该图中没有本对象节点，结果不含未激活侧（INACTIVE_OBJECTCROSSREF）的下游引用。
-   * 与 warnings 里同一句提示配套（机读位 + 可读句）。
-   */
+  /** 目标对象**没有已激活版本**（仅在该情形产生）：判定基于 ACTIVE_OBJECTCROSSREF，未含 inactive 侧下游引用 */
   noActiveVersion?: boolean;
-  /** 诚实性提示（有则列、无则空数组）：如影响半径被截断、归一化后文本差异不判为变更、基线不可用 */
+  /** 诚实性提示（有则列、无则空数组）：影响半径被截断、归一化后文本差异不判为变更、基线不可用 */
   warnings: string[];
 }
 
@@ -615,12 +593,12 @@ export interface UpdateCalculationViewResult {
   updated: boolean;
   /** 实测激活状态（本 SPS 合法模型写入即激活） */
   activated: boolean;
-  /** 写入时激活检查失败明细（存在即新内容未激活成功） */
+  /** 激活检查失败的一行摘要 */
   activationErrors?: string;
   /** 激活未通过的完整明细（含 DDL 全文）：无需再调 hana_view_validate 即可定位 */
   activationDetail?: ActivationDetail;
   meta?: FileMeta;
-  /** operations 模式：操作应用明细（xml 全量模式无此字段） */
+  /** operations 模式：逐条应用明细（xml 全量模式无此字段） */
   operationsResult?: {
     applied: AppliedOperationResult[];
     xmlBytes: { before: number; after: number };
@@ -629,47 +607,30 @@ export interface UpdateCalculationViewResult {
   xmlVerification?: FullXmlGuardResult;
   /** 激活后的行探测（probeRows>0 且对象已激活时才有）——与 create 回执同形 */
   rowProbe?: RowProbe;
-  /** 写入回执的新基线（写响应头 ETag；可能缺省——响应头没给就不补读拼装，语义见 etagSource） */
+  /** 写入回执的新基线（写响应头 ETag）；缺省 = 响应头没给，不补读拼装（语义见 etagSource） */
   etag?: string;
-  /** etag 的来源（见 EtagSource；'response-header'=写响应头同刻读数，'unavailable'=响应头未带 ETag） */
+  /** etag 来源：'response-header'=写响应头同刻读数；'unavailable'=响应头未带 ETag */
   etagSource?: EtagSource;
-  /** 写入后的服务端版本号（SapBackPack.Version；与 etag 同一次写响应读取，不拼装） */
+  /** 写入后的服务端版本号（与 etag 同一次写响应读取，不拼装） */
   version?: number;
-  /** ETag 基线缺失、本次更新退回无 If-Match 旧行为时的如实说明（正常路径不产生该字段） */
+  /** ETag 基线缺失、本次更新退回无 If-Match 路径时的如实说明（正常路径不产生该字段） */
   updateNote?: string;
   /**
-   * 破坏性判定（**直接下游（单跳）** × 结构 diff；判定/回执都用 impact() 的默认 depth=1 口径，
-   * 需要传递影响面请用 hana_metadata_where_used 的 depth>1）。成功回执必然带出（非破坏时
-   * level='none'、items=[]）；Optional 仅表示它不参与写入是否发生的判别。基线不可用时它是「未判」
-   * 的空壳占位（level='unknown'、items=[]）——unknown ≠ 非破坏，由 baselineUnavailable 标注。
+   * 破坏性判定（**直接下游（单跳）** × 结构 diff；成功回执必然带出，非破坏时 level='none'、items=[]）。
+   * 基线不可用时是「未判」空壳（level='unknown'、items=[]）——unknown ≠ 非破坏，由 baselineUnavailable 标注。
    */
   breaking?: BreakingAssessment;
-  /** 迁移声明闸门记录（update 的声明位；形状见 MigrationGateRecord）。成功回执必然带出（只报告，不阻断） */
+  /** 迁移声明闸门记录（只报告，不阻断）。成功回执必然带出 */
   migration?: MigrationGateRecord;
-  /**
-   * 判定输入中被过滤掉的**运行时目录引用**条数（>0 才产生该字段，不制造恒为空噪音；见 designTimeDownstream）。
-   * 用途：让「下游计数被过滤过」可复核——breaking.downstreamCount + runtimeOnly = 本次单跳检索的原始节点数。
-   */
+  /** 判定输入中被过滤掉的**运行时目录引用**条数（>0 才出现；downstreamCount + runtimeOnly = 原始节点数） */
   runtimeOnly?: number;
-  /**
-   * 设计时内容为空/缺失（基线不可用）：本次**未做破坏性判定**（diff 空壳占位、breaking.level='unknown'、
-   * migration 闸门一并跳过），仅在该情形产生该字段（配套 warnings 里有一句响亮标注）。为什么 fail-open：
-   * 空串基线会被 diff 视作「全部新增」，据以拦截会把合法写入误拦——宁可放行 + 如实标注，也不拿假基线拦人。
-   */
+  /** 设计时内容为空/缺失：本次**未做破坏性判定**（diff 空壳、breaking.level='unknown'、闸门跳过；仅该情形产生） */
   baselineUnavailable?: boolean;
-  /**
-   * 目标对象在本次写入**之前没有已激活版本**（仅在该情形产生）：影响半径/破坏性判定基于
-   * ACTIVE_OBJECTCROSSREF，该图中没有本对象节点，结果不含未激活侧（INACTIVE_OBJECTCROSSREF）的下游引用。
-   * 本 SPS 写入即激活：回执的 activated 反映写后状态，本字段反映写前判定输入的事实。
-   */
+  /** 目标对象在本次写入**之前没有已激活版本**（判定未含 inactive 侧下游；本字段反映写前事实） */
   noActiveVersion?: boolean;
-  /**
-   * 诚实性提示（仅在有值得标注的事实时产生该字段，不制造恒为空噪音）：
-   * 基线不可用（BASELINE_UNAVAILABLE_WARNING）与影响半径被截断（IMPACT_TRUNCATED_WARNING）各一句——
-   * 与 dryRun 回执共用同一份文案常量（两处各写一遍必然漂移）。
-   */
+  /** 诚实性提示（仅在有值得标注的事实时产生）：基线不可用 / 影响半径被截断 / 无已激活版本 */
   warnings?: string[];
-  /** 端到端耗时（operations 模式含当前/源定义读取与确定性变换；xml 模式无意义故不返回） */
+  /** 端到端耗时（operations 模式含读取与确定性变换；xml 模式无意义故不返回） */
   elapsedMs?: number;
 }
 
@@ -698,22 +659,20 @@ type UpdateLockOutcome =
 
 /**
  * 更新 Calculation View 设计时定义（XS REST：PUT + If-Match ETag 乐观锁；冲突 → 业务失败信封 + 机读码 412）。
- * 两种更新方式二选一（修改 CV 可零 XML）：
- * - input.xml：全量 XML 覆盖（原有方式，复杂改造用）；
- * - input.operations：声明式操作补丁——服务端读设计时当前内容，逐条确定性变换
- *   （view-edit，BW 方言同款），再走原有 PUT 更新路径；模型无需读取也不生成 XML。多条 operations 依序应用（可连续追加多个 join）。
- * 并发：整段「取基线 → 读内容/变换 → PUT」都在同一把 keyed lock 内（锁键与 create/activate/delete/import 同键）。
- * 锁内取基线 ⇒ 锁内不再有他人写入（消除「锁外取基线 + 锁内写新内容」的伪 412）；
- * 调用方显式传 ifMatch 时以传入值为准（跨调用强一致场景；已在入口归一：空串/纯空白 = 未提供），
- * 此时那次 fileMeta 读仍保留为存在性检查。
- * 破坏性判定（SSD §5）：PUT 之前先做「结构化 diff（before=设计时当前内容，两模式同一来源）→ **直接下游（单跳）**
- * 影响半径 → 破坏性判定」，两条分支共用同一份计算（判定输入的下游只计设计时引用、运行时 __RT_* 引用过滤，
- * 见 designTimeDownstream）：
- * - opts.dryRun=true ⇒ 返回 DryRunReport 后立刻收尾：不写库、不发 probe、不改缓存、不取信号量（只读预演）；
- * - 否则破坏性变更（下游有引用且命中判定表）必须有调用方 migration 声明才放行，未声明以 migration_required
- *   拒绝（发生在 PUT 之前 ⇒ 一次写都不发生）；声明只记录、不触发任何自动迁移。
- * - 设计时内容为空/缺失 ⇒ 基线不可用：不做破坏性判定（breaking.level='unknown'、闸门跳过）+ 响亮标注
- *   （fail-open，见 baselineUnavailable 注释）——**未判 ≠ 判为非破坏**，形状上必须可区分。
+ * 两种更新方式二选一：
+ * - input.xml：全量 XML 覆盖（复杂改造用）；
+ * - input.operations：声明式操作补丁——读设计时当前内容，逐条确定性变换（view-edit，BW 方言同款）后
+ *   走同一 PUT 路径；多条按序应用。模型无需读取也不生成 XML。
+ * 并发：整段「取基线 → 读内容/变换 → PUT」同一把 keyed lock（与 create/activate/delete/import 同键）；
+ * 锁内取基线 ⇒ 锁内不再有他人写入（消除「锁外取基线 + 锁内写新内容」的伪 412）。调用方显式传 ifMatch
+ * 时以传入值为准（空串/纯空白已在入口归一为未提供），那次 fileMeta 读仍保留为存在性检查。
+ * 破坏性判定：PUT 之前做「结构 diff（before=设计时当前内容，两模式同源）→ 直接下游（单跳）影响半径 →
+ * 破坏性判定」，两分支共用同一份计算（下游只计设计时引用、运行时 __RT_* 过滤，见 designTimeDownstream）：
+ * - dryRun=true ⇒ 返回 DryRunReport 即收尾（不写库、不 probe、不改缓存、不取信号量）；
+ * - 否则破坏性变更必须有 migration 声明才放行，未声明以 migration_required 拒绝（发生在 PUT 之前 ⇒ 零写入）；
+ *   声明只记录、不触发自动迁移；
+ * - 设计时内容为空/缺失 ⇒ 基线不可用：不做判定（breaking.level='unknown'、闸门跳过）+ 响亮标注
+ *   （fail-open，见 baselineUnavailable 注释）——未判 ≠ 判为非破坏。
  */
 export async function updateCalculationView(
   config: HanaConfig,
@@ -725,9 +684,9 @@ export async function updateCalculationView(
     ifMatch?: string;
     activate?: boolean;
     probeRows?: number;
-    /** true=只读预演（SSD §5.1）：算 diff/影响半径/破坏性判定后返回 DryRunReport，不发起任何写入 */
+    /** true=只读预演：算 diff/影响半径/破坏性判定后返回 DryRunReport，不发起任何写入 */
     dryRun?: boolean;
-    /** 破坏性变更的显式声明位（SSD §5.4）：未声明时破坏性变更被拒绝。
+    /** 破坏性变更的显式声明位：未声明时破坏性变更被拒绝。
      *  取值 = 字段级迁移策略（cast/preserve_column/move）或 acknowledge_dependents（显式承担、不做字段级迁移）。 */
     migration?: { strategy: MigrationDeclaration; note?: string };
   } = {},
@@ -749,17 +708,11 @@ export async function updateCalculationView(
   // 写入全程复用同一 XS 会话（读基线 → 变换 → PUT）：省掉一次登录往返，也让读到的基线
   // 与写出的 If-Match 出自同一会话视角
   const { rest, file: designFile } = designTimeTarget(config, objectName, client);
-  // 写临界区（keyed lock）覆盖「基线读 → 内容读 → 判定 → PUT」**整段**：
-  // - 基线在锁内取（读时取 + 锁内取）⇒ 锁内不再有他人写入，不会出现两个并发 update 各自读基线再互相覆盖；
-  // - operations 的逐条变换（含 add_join 的源视图读取）也在锁内，变换基线与 PUT 同源；
-  // - 破坏性判定（diff 基线读 + 影响半径查询）同样在锁内：diff 基线与判定一致，且 DryRunReport.base 与
-  //   写入路径出自同一次 fileMeta 读（dryRun 只读，取锁不引入副作用，只是与写路径同序排队）；
-  // - 锁内顺序 keyed lock → 网络/DB；激活信号量在 writeFile 内部取（晚于本锁，全局锁序不反转）；
-  // - 锁不可重入：本临界区内不再取同一把锁（updateViaRest 只做 PUT）。
-  // 调用方显式传 ifMatch 时以传入值为准（跨调用强一致场景；空串/纯空白已在入口归一为「未提供」）；
-  // 此时那次 fileMeta 读仍保留为存在性检查（对象不存在 → 立即失败，不会经 PUT 误建）。
-  // 注意：全量 xml 的内容由调用方给出，若其基于更早的一次读取，服务端无从得知 ——
-  // 返回 envelope 里的 412 是唯一的冲突信号，需要更强保证请显式传 ifMatch。
+  // 写临界区（keyed lock）覆盖「基线读 → 内容读/变换 → 判定 → PUT」整段：基线读与写同源
+  // （不会出现两个并发 update 各读基线再互相覆盖）；operations 的源视图读取与 diff/影响半径也在锁内，
+  // 判定材料与 PUT 同源（dryRun 只读，取锁只是与写路径同序排队）。
+  // 锁序 keyed lock → 网络/DB；激活信号量在 writeFile 内部取（晚于本锁，不反转）；锁不可重入。
+  // 全量 xml 由调用方给出，若其基于更早的读取服务端无从得知——412 是唯一冲突信号，需要更强保证请传 ifMatch。
   const outcome = await withKeyedLock(
     writeLockKey(packageId, normalizeObjectName(objectName)),
     async (): Promise<UpdateLockOutcome> => {
@@ -807,13 +760,11 @@ export async function updateCalculationView(
         xml = input.xml!;
       }
 
-      // 判定三件套（dryRun 与闸门共用同一份计算——两处各算一遍必然漂移）：影响半径 → 设计时下游过滤 → 结构 diff → 破坏性判定。
-      // 影响半径 seed 用**调用方原名**（本通道的 objectName 就是裸对象名），**不复用锁键的 normalizeObjectName**：
-      // 图节点名必须与 _SYS_REPO.ACTIVE_OBJECTCROSSREF 的 OBJECT_NAME 精确等值，而归一会把「本身就以设计时
-      // 后缀结尾的合法对象名」（如 A.calculationview）剥成另一个节点 A ⇒ downstream 判空、migration 闸门静默放行。
-      // 锁键保留归一（那是「同一设计时文件」的口径，与图节点名是两回事）。
-      // depth: 1 显式写死（= impact() 的默认值）：判定/回执只认**直接下游（单跳）**，每次写都跑全闭包代价太大；
-      // 写死是为了防止将来有人改 impact 的默认值、让判定口径静默变化——需要传递影响面请用 hana_metadata_where_used(depth>1)。
+      // 判定三件套（dryRun 与闸门共用同一份计算）：影响半径 → 设计时下游过滤 → 结构 diff → 破坏性判定。
+      // 影响半径 seed 用**调用方原名**（本通道 objectName 就是裸对象名），不复用锁键的 normalizeObjectName：
+      // 图节点名必须与 ACTIVE_OBJECTCROSSREF.OBJECT_NAME 精确等值，归一会把「本身以设计时后缀结尾的
+      // 合法对象名」剥成别的节点 ⇒ downstream 判空、闸门静默放行。锁键归一是「同一设计时文件」的另一回事。
+      // depth: 1 显式写死（= impact() 默认值）——防止有人改默认值让判定口径静默变化；传递影响面用 where_used(depth>1)。
       const impactResult = await impact(
         pool,
         {
@@ -848,7 +799,7 @@ export async function updateCalculationView(
           }),
         };
       }
-      // D2 闸门：破坏性变更必须有声明才放行；拒绝发生在 PUT **之前** ⇒ 一次写都不发生。
+      // 迁移声明闸门：破坏性变更必须有声明才放行；拒绝发生在 PUT **之前** ⇒ 一次写都不发生。
       // 基线不可用时 breaking 是「未判」（level='unknown'，unknown ≠ 'breaking'）⇒ 本行自然跳过——
       // 这正是基线不可用时的 fail-open 落点。
       assertMigrationDeclared(breaking, opts.migration, `更新 ${packageId}/${objectName}`);
@@ -893,7 +844,7 @@ export async function updateCalculationView(
   if (baselineUnavailable) warnings.push(BASELINE_UNAVAILABLE_WARNING);
   if (breaking.impactTruncated) warnings.push(IMPACT_TRUNCATED_WARNING);
   if (noActiveVersion) warnings.push(NO_ACTIVE_VERSION_WARNING);
-  // 写后失效视图缓存（§4.5）：紧贴写路径，把「最多 60s 后自愈」变成「立即」
+  // 写后失效视图缓存：紧贴写路径，把「最多 60s 后自愈」变成「立即」
   invalidateViewCache(packageId, objectName);
   const activated = meta.Attributes?.SapBackPack?.Activated === true;
   const detail = activationDetailOf(meta);
@@ -939,19 +890,15 @@ export async function updateCalculationView(
 /* ── 破坏性判定与迁移闸门（update 与 delete 共用的判定/拒绝/回执组装）────── */
 
 /**
- * 设计时下游引用（判定输入，**直接下游（单跳）**口径：impact() 默认 depth=1）与运行时引用条数——
- * update 闸门与删除闸门**共用同一份过滤**（一处实现，别写两遍：两个闸门各写一份的那天，过滤口径必然漂移成两种行为）。
- * 判定刻意只认单跳：每次写都要跑一遍，全闭包代价太大；需要传递影响面请用 hana_metadata_where_used(depth>1)。
+ * 设计时下游引用（**直接下游单跳**，impact() 默认 depth=1）与运行时引用条数——update 闸门与删除闸门
+ * **共用同一份过滤**（一处实现，别写两遍）。判定只认单跳：每次写都要跑，全闭包代价太大。
  *
- * 实测事实（2026-10-08 真实库只读核证）：全库 **2277 个 calculationview 无一例外**都带一条
- * `__RT_CATALOG_VIEW__` 后继行——激活后的运行时目录视图引用本对象自身（isRuntime 的判定见
- * catalog.service.ts:81 与 metadata.service.ts:290 的既有说明）。
- * 因此 `impact()` 的 nodes 对**任何已激活对象恒非空**；不过滤 ⇒「已激活视图的普通删除」与
- * 「任何已激活对象的 DryRun」会被一律判成破坏，删除闸门会拦截所有已激活对象的删除
- * （实测：不加过滤会把本可正常执行的删除一律拦下）。
- * 过滤理由：下游判定只认**设计时引用**——设计时引用才是会因 schema/定义变更而断的东西；
- * 运行时目录视图是激活链自动生成的伴生品、随对象生命周期起落，不构成「下游消费者」。
- * 返回值 runtimeOnly = 被过滤掉的条数：调用方**如实上报**（回执的 runtimeOnly 字段），不许静默过滤。
+ * 实测事实（真实库只读核证）：全库 2277 个 calculationview 无一例外都带一条 `__RT_CATALOG_VIEW__`
+ * 后继行（运行时目录视图引用本对象自身，isRuntime 判定见 catalog.service.ts:81 与
+ * metadata.service.ts:290）。因此 impact() 的 nodes 对**任何已激活对象恒非空**；不过滤则「已激活视图的
+ * 普通删除」与「任何已激活对象的 DryRun」会被一律判成破坏，拦下本可正常执行的删除。
+ * 过滤理由：下游只认**设计时引用**——它才会因 schema/定义变更而断；运行时目录视图是激活链自动生成的
+ * 伴生品，不构成「下游消费者」。runtimeOnly = 被过滤掉的条数，调用方如实上报、不许静默过滤。
  */
 function designTimeDownstream(impactResult: ClosureResult): { downstream: GraphEdge[]; runtimeOnly: number } {
   const downstream = impactResult.nodes.filter((e) => !e.isRuntime);
@@ -976,12 +923,10 @@ export interface DeletionGateAssessment {
 }
 
 /**
- * 评估「删除某个对象」是否命中破坏性判定表（SSD §5.3 最后一行）。
- * 判定用的对象名用**调用方原名**（delete 通道的 objectName 就是裸对象名）：图节点名必须与
- * ACTIVE_OBJECTCROSSREF 的 OBJECT_NAME 精确等值，归一会把「本身以设计时后缀结尾的合法对象名」
- * （如 A.calculationview）剥成 A ⇒ 判到另一个（通常不存在的）节点、downstream 判空。
- * 锁键的归一（writeLockKey 用 normalizeObjectName）与图节点名是两件事，不可复用。
- * depth: 1 显式写死（= impact() 的默认值）：判定/回执只认**直接下游（单跳）**，语义见 designTimeDownstream。
+ * 评估「删除某个对象」是否命中破坏性判定表的删除行。
+ * 判定用**调用方原名**：图节点名必须与 ACTIVE_OBJECTCROSSREF 的 OBJECT_NAME 精确等值，归一会把
+ * 「本身以设计时后缀结尾的合法对象名」（如 A.calculationview）剥成 A ⇒ downstream 判空
+ * （锁键归一与图节点名是两件事）。depth: 1 写死 = 只认**直接下游（单跳）**，见 designTimeDownstream。
  */
 export async function assessDeletionGate(
   pool: HanaPool,
@@ -997,35 +942,31 @@ export async function assessDeletionGate(
 }
 
 /**
- * 基线不可用时的统一告警句（dryRun 回执与写路径回执共用同一句——两处各写一遍必然漂移）。
- * 口径：**不做判定 + 响亮标注**（fail-open）。为什么不是 fail-closed：空串设计时内容是一个**假基线**，
- * 拿它判 diff 会把「无基线」读成「全部新增」，据此拦截会把合法写入误拦——与本仓探测类失败的既有口径
- * 一致（如行探测失败只进 rowProbe.error，不影响写入结果），宁可放行并如实标注，也不拿假基线拦人。
+ * 基线不可用时的统一告警句（dryRun 与写路径回执共用同一句——两处各写一遍必然漂移）。
+ * 口径：**不做判定 + 响亮标注**（fail-open）——空串设计时内容是**假基线**，拿它判 diff 会把
+ * 「无基线」读成「全部新增」，据此拦截会误拦合法写入；宁可放行并如实标注，也不拿假基线拦人。
  */
 const BASELINE_UNAVAILABLE_WARNING = '设计时内容为空，无法建立 diff 基线：本次未做破坏性判定';
 
 /**
- * 影响半径被截断时的统一告警句（dryRun 回执与写路径回执共用同一句——两处各写一遍必然漂移）。
- * 截断 = 达到 impact() 的节点上限：级别照判（截断不改变「有没有下游」），但 downstream 列表与
- * downstreamCount 只是下界，判定可能低估影响面。两条通道必须一字不差。
+ * 影响半径被截断时的统一告警句（dryRun 与写路径共用）。截断 = 达到 impact() 节点上限：
+ * 级别照判，但 downstream 列表与 downstreamCount 只是下界，判定可能低估影响面。两通道一字不差。
  */
 const IMPACT_TRUNCATED_WARNING =
   '影响半径检索被截断（达到节点上限）：downstream 列表与 downstreamCount 只是下界，破坏性判定可能低估影响面';
 
 /**
- * 目标对象没有已激活版本时的统一提示（update / dryRun / delete 三处共用同一句，各写一份必然漂移）。
- * 只标注事实，不改变判定口径：影响半径/破坏性判定仍只查 ACTIVE_OBJECTCROSSREF，
- * 未激活侧（INACTIVE_OBJECTCROSSREF）的下游引用**不在**本次判定内。
+ * 目标对象没有已激活版本时的统一提示（update / dryRun / delete 三处共用）。
+ * 只标注事实、不改判定口径：影响半径仍只查 ACTIVE_OBJECTCROSSREF，未激活侧的下游引用不在本次判定内。
  */
 const NO_ACTIVE_VERSION_WARNING =
   '目标对象没有已激活版本：影响半径与破坏性判定基于 ACTIVE_OBJECTCROSSREF（该图中没有本对象节点），' +
   '结果不含未激活侧 INACTIVE_OBJECTCROSSREF 的下游引用';
 
 /**
- * 无基线时的**空壳占位** diff 工厂：只在 baselineUnavailable=true 时使用（每次返回新对象，
- * 避免共享可变常量被调用方就地改坏）。它**不是比较结果**（没有可比较的基线），必须与回执的
- * baselineUnavailable + warnings 一起读。刻意不产出「空定义 vs 新 XML」的真 diff：
- * 那会把「无基线」显示成「全部新增」，把读者引向错误结论。
+ * 无基线时的**空壳占位** diff 工厂（每次返回新对象，避免共享常量被就地改坏）。它**不是比较结果**，
+ * 必须与 baselineUnavailable + warnings 一起读；刻意不产出「空定义 vs 新 XML」的真 diff
+ * （那会把「无基线」显示成「全部新增」）。
  */
 function emptyViewDiff(): ViewDiff {
   return {
@@ -1040,11 +981,9 @@ function emptyViewDiff(): ViewDiff {
 }
 
 /**
- * 判定用的解析：解析失败转成可读业务错误，不裸抛。
- * 为什么：裸抛（fast-xml-parser 的 Error）会被工具层当成未知内部错误（SdkError），调用方看不出是 XML 的问题；
- * 「判不了」不等于「不是破坏性」——**基线存在但解析不了**时 fail-closed（不写入），而不是静默跳过闸门。
- * 与「基线不可用」（设计时内容为空）刻意区别：那是不存在可信基线，不能拿它判（fail-open + 标注，见
- * BASELINE_UNAVAILABLE_WARNING）；这里是基线和内容都在、只有解析这一层失败，如实报错才是诚实。
+ * 判定用的解析：解析失败转成可读业务错误，不裸抛（裸抛会被工具层当成未知内部错误）。
+ * 「判不了」不等于「不是破坏性」——**基线存在但解析不了**时 fail-closed（不写入），而不是静默跳过闸门；
+ * 与「基线不可用」（不存在可信基线，fail-open + 标注）刻意区别：这里基线和内容都在，只有解析层失败。
  */
 function parseForAssessment(xml: string, label: string): ViewDefinition {
   try {
@@ -1058,11 +997,9 @@ function parseForAssessment(xml: string, label: string): ViewDefinition {
 
 /**
  * 更新判定的核心件（dryRun 与写路径共用同一份计算——两处各算一遍必然漂移）：
- * 设计时下游过滤（运行时 __RT_* 目录引用是激活链伴生品，见 designTimeDownstream）→ 基线可用性 →
- * 结构 diff → 破坏性判定。返回 downstream/runtimeOnly 供回执组装直接引用（判定与回执同源）。
- * 基线不可用（设计时内容为空/纯空白：对象只有激活版本没有设计时内容，或文件被清空）时**不做判定**：
- * 拿空定义当 diff 基线会把「无基线」读成「全部新增」，据此拦截会误拦本可放行的写——宁可 fail-open +
- * 响亮标注（见 BASELINE_UNAVAILABLE_WARNING），也不拿假基线拦人。
+ * 设计时下游过滤 → 基线可用性 → 结构 diff → 破坏性判定；downstream/runtimeOnly 一并返回供回执引用。
+ * 基线不可用（设计时内容为空/纯空白）时**不做判定**：拿空定义当 diff 基线会把「无基线」读成
+ * 「全部新增」、误拦本可放行的写——宁可 fail-open + 响亮标注，也不拿假基线拦人。
  */
 function assessUpdateBreaking(
   beforeXml: string,
@@ -1113,10 +1050,9 @@ export function migrationGateRejected(
 }
 
 /**
- * D2 闸门（SSD §5.4）：破坏性变更必须有调用方的显式 migration 声明才放行；只判定与拒绝，
- * **不做任何自动迁移动作**（自动改下游视图超出本服务边界，交给编排层按影响半径处理）。
- * 拒绝点在任何写动作之前 ⇒「一次写都不发生」；消息只陈述事实（命中哪几条 rule/target + 限制由服务端
- * 判定施加），**不给补救指引**（SSD §1.3：写明怎么放行等于教调用方绕过）；机读材料在 rawDetail.breaking.items。
+ * 迁移声明闸门：破坏性变更必须有显式 migration 声明才放行；只判定与拒绝，**不做任何自动迁移动作**
+ * （自动改下游视图超出本服务边界）。拒绝点在任何写动作之前 ⇒ 零写入；消息只陈述事实（命中哪几条
+ * rule/target），**不给补救指引**（写明怎么放行等于教调用方绕过）；机读材料在 rawDetail.breaking.items。
  * level='unknown'（基线不可用 ⇒ 未判）不是 breaking ⇒ 不拦（不判就不拦；unknown ≠ 非破坏，由回执标注）。
  */
 function assertMigrationDeclared(
@@ -1130,7 +1066,7 @@ function assertMigrationDeclared(
       `（${summarizeBreakingItems(breaking.items)}），调用方未声明 migration 迁移策略。` +
       `该限制由服务端在写入之前判定施加，本次未发生任何写入。`,
     'migration_required',
-    // 机读载荷：调用方据此逐条决定策略（计划 §4.2）；形状与成功回执的 breaking 字段一致
+    // 机读载荷：调用方据此逐条决定策略；形状与成功回执的 breaking 字段一致
     { breaking },
   );
 }
@@ -1142,9 +1078,9 @@ export function summarizeBreakingItems(items: BreakingAssessment['items']): stri
 }
 
 /**
- * 闸门结果记录（回执审计）。`accepted` = 闸门结论：写路径走到回执时必然为 true（否则早已被拒）；
- * dryRun 里它回答「同样的调用去掉 dryRun 会不会被放行」——预演需要能看见未声明时会被拒的事实。
- * level='unknown'（基线不可用 ⇒ 未判）⇒ required=false / accepted=true：不判就不拦（unknown ≠ 非破坏）。
+ * 闸门结果记录（回执审计）。`accepted` = 闸门结论：写路径走到回执时必为 true；
+ * dryRun 里它回答「同样的调用去掉 dryRun 会不会被放行」。未判（level='unknown'）⇒ required=false /
+ * accepted=true：不判就不拦（unknown ≠ 非破坏）。与单对象路径的闸门谓词**同一实现**。
  */
 function migrationGateRecord(
   breaking: BreakingAssessment,
@@ -1160,7 +1096,7 @@ function migrationGateRecord(
 }
 
 /**
- * 组装 dryRun 回执（SSD §5.1 形状）。
+ * 组装 dryRun 回执。
  * base/impact 都必须与判定同源：base 取自锁内那次 fileMeta 读，impact 就是本次判定的那次影响半径查询
  * （两处各查一次会给出互相矛盾的版本/半径，预演就不可信了）。
  * 两处过滤/占位在组装期如实标注、不静默：下游列表已剔运行时引用（runtimeOnly 给条数）；
@@ -1233,7 +1169,7 @@ export interface DeleteCalculationViewResult {
   etagSource?: EtagSource;
   /** 删除前读到的服务端版本号（与 etag 同一次读取） */
   version?: number;
-  /** ETag 基线缺失、本次删除退回无 If-Match 旧行为时的如实说明（正常路径不产生该字段） */
+  /** ETag 基线缺失、本次删除退回无 If-Match 路径时的如实说明（正常路径不产生该字段） */
   deleteNote?: string;
   /**
    * 破坏性判定（**直接下游（单跳）**有引用 ⇒ level='breaking'；无引用 ⇒ 'none'；判定/回执都用
@@ -1271,17 +1207,17 @@ export interface DeleteCalculationViewResult {
 /**
  * 删除 Calculation View 设计时对象（XS REST：锁内取基线 + If-Match DELETE；412/404 以机读码透出）。
  *
- * 破坏性判定（SSD §5.3 判定表「删除整个视图」行 + §5.4 / D2 闸门——**对 SSD 的扩展**）：
- * SSD §5.4 只写了 update 的 migration 参数，但判定把「删除整个视图（下游有引用）」列为破坏、
- * 处置口径是「先解除依赖或调用方显式承担」，D2 又要求破坏性变更阻断 ⇒ 按最忠实读法：删除同样进闸门，
- * 声明位 strategy 固定为 acknowledge_dependents（删除没有可自动化的迁移策略）。
+ * 破坏性判定（判定表「删除整个视图」行 + 迁移声明闸门）：
+ * 判定把「删除整个视图（下游有引用）」列为破坏、处置口径是「先解除依赖或调用方显式承担」，
+ * 破坏性变更必须在写入前阻断 ⇒ 删除同样进闸门，声明位 strategy 固定为 acknowledge_dependents
+ * （删除没有可自动化的迁移策略）。
  * 下游无引用 ⇒ 不阻断，回执带 breaking.level='none'。
  * 「下游」= **直接下游（单跳）的设计时下游**（impact() 默认 depth=1）：运行时 __RT_* 目录引用在判定
  * 输入处过滤（与 update 闸门共用 designTimeDownstream）——实测每个已激活对象都带一条
  * __RT_CATALOG_VIEW__ 自引用行，不过滤则本闸门会拦截所有已激活对象的删除。
  * 影响半径查询放在锁**外**（deleteViaRest 自持锁且锁不可重入；更根本地，**本对象的锁挡不住别人加依赖**——
  * 加依赖是去写「依赖方」对象，取的是依赖方的锁。放锁内只会拉长临界区、买不到任何保护；跨进程真相
- * 仍是 ETag + 服务端语义，见 SSD §4.1）。判定与 DELETE 之间的依赖新增窗口由此如实存在——回执带
+ * 仍是 ETag + 服务端语义）。判定与 DELETE 之间的依赖新增窗口由此如实存在——回执带
  * impactAsOf（判定读取时点），调用方据此核对窗口；判定刻意只认单跳（每次写都跑全闭包代价太大），
  * 需要传递影响面请用 hana_metadata_where_used(depth>1)。
  *
@@ -1309,10 +1245,10 @@ export async function deleteCalculationView(
   // 判定件与变更集整体预检共用（assessDeletionGate：impact → 运行时引用过滤 → assessViewDeletion）——
   // 两处各写一份时「这次删除会不会被拦」的判定必然漂移（见该函数头注）。
   const gate = await assessDeletionGate(pool, packageId, objectName);
-  // D2 闸门：下游有引用且未声明 ⇒ 在 DELETE 之前拒绝（一次写都不发生；deleteViaRest 尚未被调用）
+  // 迁移声明闸门：下游有引用且未声明 ⇒ 在 DELETE 之前拒绝（一次写都不发生；deleteViaRest 尚未被调用）
   assertMigrationDeclared(gate.breaking, opts.migration, `删除 ${packageId}/${objectName}`);
   const baseline = await deleteViaRest(config, packageId, objectName, client, opts.ifMatch);
-  // 写后失效视图缓存（§4.5）：删除也是写（运行时对象下线由服务端激活链处理，缓存立即失效更诚实）
+  // 写后失效视图缓存：删除也是写（运行时对象下线由服务端激活链处理，缓存立即失效更诚实）
   invalidateViewCache(packageId, objectName);
   const result: DeleteCalculationViewResult = {
     object: { packageId, objectName, objectSuffix: 'calculationview' },
@@ -1583,7 +1519,7 @@ async function applyAddJoinOperation(
  *    构成串行临界区（见下）
  * 5.（可选）激活
  * 注：client 为**可选共享会话**（与 updateCalculationView/deleteCalculationView 的既有形状对齐）——
- * 变更集内多对象批复用一个会话（省掉逐对象登录往返），单测也可注入桩；既有调用点零改动。
+ * 变更集内多对象批复用一个会话（省掉逐对象登录往返），单测也可注入桩。
  */
 export async function createCalculationView(
   config: HanaConfig,
@@ -1721,7 +1657,7 @@ export async function createCalculationView(
         result.activationDetail = detail;
       }
       // 回执基线：etag/etagSource/version 与 activated 读数取自**同一次写响应**（响应头 ETag + SapBackPack），
-      // 不二次读取不拼装（§4.2#1 约定：回执里的读数必须来自同一时刻的同一次读取）
+      // 不二次读取不拼装（回执里的读数必须来自同一时刻的同一次读取）
       const receiptBaseline = writeReceiptBaseline(meta);
       const version = receiptBaseline.version;
       result.etag = receiptBaseline.etag;
@@ -1748,7 +1684,7 @@ export async function createCalculationView(
     }
   });
 
-  // 写后失效视图缓存（§4.5）：写成功才失效；失败路径整段抛出，缓存本就未被本次写入污染
+  // 写后失效视图缓存：写成功才失效；失败路径整段抛出，缓存本就未被本次写入污染
   if (result.wrote) invalidateViewCache(input.packageId, input.objectName);
 
   if (result.wrote && input.activate && transport !== 'xs_rest') {
@@ -1785,7 +1721,7 @@ export interface ActivateCalculationViewResult {
   etagSource?: EtagSource;
   /** 激活后的服务端版本号（SapBackPack.Version；与 etag 同一次写响应读取，不拼装） */
   version?: number;
-  /** ETag 基线缺失、退回无 If-Match 旧行为时的如实说明（正常路径不产生该字段） */
+  /** ETag 基线缺失、退回无 If-Match 路径时的如实说明（正常路径不产生该字段） */
   activateNote?: string;
 }
 
@@ -1826,7 +1762,7 @@ export async function activateCalculationView(
         { httpStatus: meta['_httpStatus'], ...(detail ?? {}) },
       );
     }
-    // 写后失效视图缓存（§4.5）：激活成功即运行时对象换版，立即失效比等 TTL 更诚实
+    // 写后失效视图缓存：激活成功即运行时对象换版，立即失效比等 TTL 更诚实
     invalidateViewCache(packageId, objectName);
     const result: ActivateCalculationViewResult = { transport: 'xs_rest', meta };
     // 回执基线：etag/etagSource/version 与 meta 同一次写响应（响应头 ETag + SapBackPack），不拼装
@@ -1838,7 +1774,7 @@ export async function activateCalculationView(
     // 同形（那两处都走 stripInternalMeta），不把内部字段泄漏给调用方
     result.meta = stripInternalMeta(meta);
     if (!ifMatch) {
-      // 基线缺失（理论上不该发生）：本次激活退回无 If-Match 旧行为——并发第三方修改不会被 412 拦截。
+      // 基线缺失（理论上不该发生）：本次激活退回无 If-Match 路径——并发第三方修改不会被 412 拦截。
       // 如实体现（回执 + 日志），不静默。本通道没有可传入基线的参数，故不给补救指引。
       result.activateNote = noIfMatchNote('fileMeta 未返回 ETag，无法建立 If-Match 基线', '激活');
       logger.warn({ packageId, objectName }, result.activateNote);
@@ -1858,7 +1794,7 @@ export async function activateCalculationView(
     ),
   );
   assertNoRepoRestError(resp, 'activate');
-  // 写后失效视图缓存（§4.5）
+  // 写后失效视图缓存
   invalidateViewCache(packageId, objectName);
   return { transport: 'repo_rest', repoResp: resp };
 }
@@ -1876,7 +1812,8 @@ function describeActivationFailure(meta: FileMeta & { CheckResult?: WriteCheckRe
  * 结果放进响应体。因此「无副作用的设计时校验」= 临时副本方案：
  *   内容写到 <截断基名>_<短哈希>_CHKTMP 临时对象（附 Check，读 CheckResult 判定）→ 删除临时对象。
  * 短哈希掺入**进程随机 nonce**（见 tempCheckName）：进程内同名恒定（残片可自愈）、跨进程永不撞名
- * （互不干扰）；副本归属由「不可猜的名字 + 进程内登记表」证明，不再按对象实例验身份（见下）。
+ * （互不干扰）；副本归属由「不可猜的名字 + 进程内登记表」证明（不按对象实例验身份，理由见
+ * checkCalculationViewDesignTime 头注）。
  * 校验通过与否，原对象的激活状态都不受影响（合法副本被激活后随删除一起下线）。 */
 
 /** 设计时校验（临时副本 Check）结果 */
@@ -1892,15 +1829,14 @@ export interface DesignCheckResult {
   /** 临时校验对象名（正常路径校验后已删除；删除未完成时见 tempResidue） */
   tempObject: string;
   /**
-   * 临时副本清理**未完成**（仅在异常路径产生该字段）：残留物仍在仓库里，且可能**已被激活为运行时对象**
-   * （本 SPS 写入即激活），需要人工或后续调用清理。reason = 失败原因（经 redactSensitive 脱敏：本字段
-   * 会进**成功信封**的 data，脱敏口径必须与失败信封一致）。校验本身也抛错时，同一残留信息会挂到抛出的
-   * 错误上（消息含残留对象名 + rawDetail，见 withTempResidueDetail）——「清理失败不静默」对调用方同样成立。
+   * 临时副本清理**未完成**（仅异常路径产生）：残留物仍在仓库里，且可能**已被激活为运行时对象**
+   * （本 SPS 写入即激活），需人工或后续调用清理。reason 经脱敏（本字段会进**成功信封**的 data，
+   * 脱敏口径必须与失败信封一致）；校验本身也抛错时，同一残留信息会挂到错误上（见 withTempResidueDetail）。
    */
   tempResidue?: { tempObject: string; reason: string };
 }
 
-/** 临时校验对象名总长上限：HANA 对象名上限 30 字符，留 1 字符安全余量 ⇒ 29（SSD §4.1 validate 行写死） */
+/** 临时校验对象名总长上限：HANA 对象名上限 30 字符，留 1 字符安全余量 ⇒ 29 */
 export const TEMP_CHECK_NAME_MAX = 29;
 
 /** 临时副本固定后缀（7 字符，含前导下划线） */
@@ -1989,17 +1925,15 @@ function withTempResidueDetail(
 
 /**
  * 对设计时对象做「激活前校验」（临时副本 + Check，原对象不受影响；可写包边界由 HANA_WRITE_PACKAGES 配置）。
- * 并发（§4.1 validate 行）：
- * - 内容读取在锁内（与写入序列同源：锁外读时，窗口内的并发写入会让校验对象与当时的设计时内容名实不符）；
+ * 并发：
+ * - 内容读取在锁内（锁外读时，窗口内的并发写入会让校验对象与当时的设计时内容名实不符）；
  * - 临时名由 tempCheckName 按「对象名 + 进程 nonce」推导（总长 ≤29、带短哈希）：进程内同名恒定、
- *   跨进程永不撞名。同一进程的并发校验互删副本、跨进程的残留互删都从命名层消除；
- *   锁只需把「探测 → 预清理 → 写入校验 → 收尾清理」整段按对象串行化；
- * - 写入前探测推导名是否已是既有对象：**存在且不在登记表里** ⇒ 不写不删、抛 TEMP_NAME_CONFLICT（如实报告）。
- * 为什么**不**用 If-Match 按「对象实例」验身份（该机制已否决，**勿再加回**）：
- *   ① 预清理的基线取自**本次探测读数**，恒等于当前占用者 ⇒ 它只能证明「这个名字上有对象」，
- *      证明不了「它属于本进程」——自指，挡不住跨进程同名时的误删（实测删除链：留残片的一方登记未撤销时，
- *      后续进程探测到同一占用者、用本次读数当基线，把它删掉）；
- *   ② 归属现在由「不可猜的 nonce 名 + 进程内登记表」证明（见 tempCheckRegistry 不变量），实例基线不再承担该职责；
+ *   跨进程永不撞名。锁只需把「探测 → 预清理 → 写入校验 → 收尾清理」整段按对象串行化；
+ * - 写入前探测推导名是否已是既有对象：**存在且不在登记表里** ⇒ 不写不删、抛 TEMP_NAME_CONFLICT。
+ * 为什么**不**用 If-Match 按「对象实例」验身份（**勿再加回**）：
+ *   ① 预清理的基线取自**本次探测读数**，恒等于当前占用者 ⇒ 只能证明「这个名字上有对象」，
+ *      证明不了「它属于本进程」——自指，挡不住跨进程同名时的误删；
+ *   ② 归属由「不可猜的 nonce 名 + 进程内登记表」证明（见 tempCheckRegistry 不变量）；
  *   ③ 同一进程内 checkFile 的写会推进 ETag，旧基线做 If-Match 必得伪 412，重试路径会把自己的副本误报成残片。
  * 失败语义：推导名撞无法归属的同名对象时**抛错**（而不是 skipped 回执）——校验未执行不是校验结果，
  * 失败信封可机读、也不会让调用方把「没执行」误当成「通过」。

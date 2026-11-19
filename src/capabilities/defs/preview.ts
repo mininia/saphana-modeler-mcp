@@ -61,8 +61,7 @@ export const previewCapabilities = {
       '① 基表勘察（schema + table [+ columns] [+ sampleRows]）：对源表采样并逐列画像（去重值样例/长度区间/前导零/NULL 数），跨表建模前先做；统计只基于采样行（默认 200）。\n' +
       '② 视图预览（packageId + objectName [+ kind]）：对已激活视图整体预览（_SYS_BIC 直查），支持 filter（AND 连接、值参数绑定）、parameters（VIRTUAL 输入参数）、limit（省略时按有无筛选默认 10/100，上限 1000）。\n' +
       '仅当明确要求看某节点时才传 node（原生中间视图机制，需 EXECUTE 权限）；forceDerive=true = 只读 XML 推导模式。\n' +
-      '节点预览/派生 SQL 成功只证明该节点数据链路可达，不代表整体运行时视图的权限校验通过；整体权限以不带 node 的预览/诊断为准。\n' +
-      '本工具是取数工具，按 SELECT * 投影全部列；宽视图即使 limit=1 也可能很慢。权限/可达性验证（含上游逐个确认）用 hana_data_preview_diagnose（内部 SELECT 1 LIMIT 1，不返回业务数据）。\n' +
+      '本工具只取数（SELECT * 投影全部列）；权限/可达性验证（含上游逐个确认）用 hana_data_preview_diagnose（内部 SELECT 1 LIMIT 1，不返回业务数据）。\n' +
       '权限类失败自动附诊断报告（raw.diagnosis），手动排查用 hana_data_preview_diagnose；支持范围与细则见 rules=preview。',
     inputSchema: z.object({
       schema: tagResource(
@@ -144,7 +143,7 @@ export const previewCapabilities = {
         '只做 SELECT 1 实测，不返回业务数据',
       ],
       constraints: [
-        '根对象与上游逐个确认都用本工具；内部 SELECT 1 LIMIT 1，不返回业务数据',
+        '根对象与上游逐个确认都用本工具',
         '不要用 hana_data_preview 取数验证权限（宽视图按 SELECT * 投影会慢）',
       ],
     },
@@ -157,7 +156,7 @@ export const previewCapabilities = {
       'STATUS 语义：APPLIED=已生效；NOT AUTHORIZED=命中检查但未获授权（该对象无 APPLIED 条目，实测会出现）；NOT GRANTED=未授予；NO MATCHING ATTRIBUTE=过滤器属性不在视图；NO FILTER VALUES FOUND=动态过滤器无值。无行=没有适用条目（通常缺授权）。\n' +
       '参数：channel=direct/intermediate/derived；verbose=true 才返回完整 checks/baseTables/privileges 明细与 blockers/hints。\n' +
       '若所有能建模的根因都通过但运行时仍 258/2950，会明确报「未建模根因」并给 Authorization Dependency Viewer / owner GRANT OPTION / SQL SECURITY 等下一步。\n' +
-      '注意：根对象权限类失败时，hana_data_preview 已自动附完整诊断，通常无需再手动调用；但上游逐个确认仍用本工具（channel=direct 或 derived），不要用 hana_data_preview 取数验证。',
+      '注意：根对象权限类失败时，hana_data_preview 已自动附完整诊断；上游逐个确认仍用本工具。',
     inputSchema: z.object({
       packageId: zReadPackageId('视图包名，层级用 . 分隔，如 ZDEMO.ZDEMO_MGF'),
       objectName: zObjectName('视图对象名，如 ZDEMO02_CV008'),

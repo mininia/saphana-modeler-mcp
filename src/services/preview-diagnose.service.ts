@@ -13,16 +13,15 @@ import type { ViewDefinition, ViewKind } from '../model/view-types.js';
  *
  * 触发场景：hana_data_preview 失败且判定为访问类错误时，由 preview.service 自动调用本服务定位阻塞点。
  * 访问类错误的判定单点是 core/hana-errors 的 shouldDiagnoseAccessError：错误码 10/258/259/2950，
- * 或消息命中 not authorized / insufficient privilege / 无权限（码集口径一律以那里为准）；也可经
- * hana_data_preview_diagnose 工具手动调用做前置排查。
+ * 或消息命中 not authorized / insufficient privilege / 无权限；也可经 hana_data_preview_diagnose
+ * 工具手动调用做前置排查。
  *
  * 按预览通道（direct/intermediate/derived）定向检查各自所需权限：
  * - direct：_SYS_BIC 的 SELECT + 运行时视图存在性
  * - intermediate：SYS.CREATE/DROP_INTERMEDIATE_CALCULATION_VIEW_DEV 的 EXECUTE + _SYS_BIC SELECT
- * - derived：_SYS_REPO/_SYS_BIC SELECT，并解析视图 XML 追溯全部叶子基表逐个校验 SELECT（含白名单检查）
+ * - derived：_SYS_REPO/_SYS_BIC SELECT，并解析视图 XML 追溯全部叶子基表逐个校验 SELECT（含白名单）
  *
- * 只读：仅查询 SYS.EFFECTIVE_PRIVILEGES / SYS.VIEWS / _SYS_REPO.ACTIVE_OBJECT(INACTIVE_OBJECT)，
- * 不执行任何写/DDL。
+ * 只读：仅查询 SYS.EFFECTIVE_PRIVILEGES / SYS.VIEWS / _SYS_REPO.ACTIVE_OBJECT(INACTIVE_OBJECT)。
  */
 
 /** 预览通道合法值（单源）：defs 的 z.enum 从这里取，不要在别处手抄第二份；新增通道只改这一行 */
@@ -33,8 +32,8 @@ export type PreviewChannel = (typeof PREVIEW_CHANNELS)[number];
  * 运行时探测失败的「权限不足」码集：258=insufficient privilege，2950=分析权限/授权缺失。
  *
  * 与 core/hana-errors 的 PERMISSION_DENIED_CODES（7/258/2950）**刻意不同**：这里回答的是
- * 「探测失败要不要按权限不足给 BW 补授权指引」，历史判定只认 258/2950（7 是一般错误，
- * 不改变既有结论）；与那里一样用参数化的 isPermissionError 表达口径，而不是并集合。
+ * 「探测失败要不要按权限不足给 BW 补授权指引」，只认 258/2950（7 是一般错误，
+ * 不改变结论）；与那里一样用参数化的 isPermissionError 表达口径，而不是并集合。
  */
 const INSUFFICIENT_PRIVILEGE_CODES: ReadonlySet<string> = new Set(['258', '2950']);
 
@@ -80,7 +79,7 @@ export interface DiagnosisBrief {
   object: { packageId: string; objectName: string; kind?: ViewKind };
   channel: PreviewChannel;
   /**
-   * 分析权限结论。**三态**（评审 #1118）：完全不可判定时 `determined:false` 且不写 protected/grantedCount
+   * 分析权限结论。**三态**：完全不可判定时 `determined:false` 且不写 protected/grantedCount
    * 的肯定值（读不到 XML ≠ 未受保护）；`protected` 只在判定成立时出现。
    */
   analyticPrivilege: {
@@ -118,7 +117,7 @@ export interface DiagnosisBrief {
 /** 分析权限检测结果 */
 export interface AnalyticPrivilegeStatus {
   /**
-   * 视图是否受分析权限保护。**只认 checkAnalyticPrivileges=true**（评审 #1120）：
+   * 视图是否受分析权限保护。**只认 checkAnalyticPrivileges=true**：
    * 仅声明 applyPrivilegeType=ANALYTIC_PRIVILEGE 而未启用校验时不给「受保护」级结论，
    * 该情形由 checkAnalyticPrivilege 的结果另行如实报告（本服务自建视图恒为该形态）。
    */
@@ -129,7 +128,7 @@ export interface AnalyticPrivilegeStatus {
   checkAnalyticPrivileges?: boolean;
   /**
    * 当前用户被授予的 ANALYTICAL_PRIVILEGE 条数；**授权数查询失败（无法判定）时缺省**——
-   * 不写 0，别把「未知」读成「缺失」（评审 #1118；detail 里给原因）。
+   * 不写 0，别把「未知」读成「缺失」（detail 里给原因）。
    */
   grantedCount?: number;
   /** 是否通过（不受保护，或受保护且有授权）；无法判定时为 true（不阻断，留给运行时探测） */
@@ -155,8 +154,10 @@ export interface StructuredPrivilegeEntry {
  * SQL 结构化权限（SQL analytic privilege）检测结果。
  *
  * 与经典 ANALYTICAL_PRIVILEGE 分开：HANA 2.0 的 BW 视图常用
- * `applyPrivilegeType="SQL_ANALYTIC_PRIVILEGE"` 注册 **structured privilege** 检查，
- * 此时 `checkAnalyticPrivileges` 为 false 并不代表「无需分析权限」。
+ * `applyPrivilegeType="SQL_ANALYTIC_PRIVILEGE"` 注册 **structured privilege** 检查，此时
+ * `checkAnalyticPrivileges` 为 false 并不代表「无需分析权限」。
+ * STATUS 语义：APPLIED=已生效；NOT AUTHORIZED=命中检查但未获授权（官方文档未列，实测会返回）；
+ * NOT GRANTED=未授予；NO MATCHING ATTRIBUTE=过滤器属性不在视图；NO FILTER VALUES FOUND=动态过滤器无值。
  */
 export interface StructuredPrivilegeStatus {
   /** 是否检测了 SQL 结构化权限（仅 applyPrivilegeType=SQL_ANALYTIC_PRIVILEGE 时为 true） */
@@ -254,7 +255,7 @@ export async function diagnosePreview(
   }
 
   // 2. 运行时视图存在性（direct/intermediate 依赖 _SYS_BIC 运行时对象）
-  //    三态（评审 #1121）：只有**确定不存在**（'missing'）才写 blocker；'unknown'（SYS.VIEWS 读失败/
+  //    三态：只有**确定不存在**（'missing'）才写 blocker；'unknown'（SYS.VIEWS 读失败/
   //    不可见）不可判定——不把权限/瞬时问题误报成「激活失败或运行时未生成」。
   let viewExists: boolean | undefined;
   if (opts.channel === 'direct' || opts.channel === 'intermediate') {
@@ -291,7 +292,7 @@ export async function diagnosePreview(
 
   // 4. 分析权限检测：视图受分析权限保护时，schema SELECT 通过 ≠ 可查询（BW on HANA 常见根因）。
   //    读设计时 XML 的 applyPrivilegeType/checkAnalyticPrivileges，并查当前用户被授予的 ANALYTICAL_PRIVILEGE 条数。
-  //    "受保护"只认 checkAnalyticPrivileges=true（评审 #1120）；XML 读不到 ⇒ 不可判定（评审 #1118）。
+  //    "受保护"只认 checkAnalyticPrivileges=true；XML 读不到 ⇒ 不可判定。
   //    精简模式仍需检测（brief 要三态结论），但不写 checks 明细/blockers/hints（那些属于 verbose 产物）。
   const analyticCheck = await checkAnalyticPrivilege(pool, packageId, objectName, opts.kind, verbose ? checks : []);
   const analyticPrivilege = analyticCheck.kind === 'protected' ? analyticCheck.status : undefined;
@@ -393,7 +394,7 @@ export async function diagnosePreview(
             '错误码 258/2950 + 视图受分析权限保护（checkAnalyticPrivileges=true）→ 确认为分析权限缺失（非 schema SELECT 问题），需在 BW 侧补分析权限授权',
           );
         } else if (analyticCheck.kind === 'unprotected' && analyticCheck.declaredApplyPrivilegeType) {
-          // 仅声明 applyPrivilegeType、未启用校验：不给「确认为分析权限缺失」的定论（评审 #1120）——
+          // 仅声明 applyPrivilegeType、未启用校验：不给「确认为分析权限缺失」的定论——
           // 本服务自建视图恒为该形态（applyPrivilegeType=ANALYTIC_PRIVILEGE + checkAnalyticPrivileges=false）
           hints.push(
             `错误码 258/2950：视图声明了 applyPrivilegeType=${analyticCheck.declaredApplyPrivilegeType} 但未启用校验（checkAnalyticPrivileges≠true）——` +
@@ -483,7 +484,7 @@ export async function diagnosePreview(
     object: { packageId, objectName, kind: opts.kind },
     channel: opts.channel,
     analyticPrivilege: briefAnalyticPrivilege(analyticCheck),
-    // 实测未执行（激活状态不可判定 / 未激活）时缺省：不把「没测」写成「不可达」（评审 #1118 同型失配）
+    // 实测未执行（激活状态不可判定 / 未激活）时缺省：不把「没测」写成「不可达」
     ...(runtimeProbe !== undefined ? { runtimeAccessible: runtimeProbe.accessible } : {}),
     upstreamInaccessible,
     structuredPrivilege,
@@ -546,7 +547,7 @@ async function checkViewActivation(
 }
 
 /**
- * 运行时视图存在性三态（评审 #1111/#1121）：**读失败不得冒充「不存在」**——
+ * 运行时视图存在性三态：**读失败不得冒充「不存在」**——
  * 'missing' 才是确定的「不存在」，'unknown' 的判读入口（诊断 blocker / 预览的 CREATE 回退）各自定策。
  */
 export type RuntimeViewExistence = 'exists' | 'missing' | 'unknown';
@@ -573,15 +574,14 @@ export async function runtimeViewExists(pool: HanaPool, viewName: string): Promi
 /**
  * 节点预览中间视图的**新鲜度信息回报**：复用到的视图建于何时、源 CV 最近一次激活于何时。
  *
- * 为什么只回报不改行为：复用策略是用户明确口径（存在即复用、**不校验新鲜度**，见 preview.service
- * 头注与 rules=preview）。本函数只提供**判据**——`stale=true`（中间视图创建时间早于源 CV 最近激活）
- * 时调用方自行决定「先删该视图 / 改 forceDerive / 接受旧数据」，服务端不替它做选择。
+ * 只回报不改行为：复用策略是「存在即复用、**不校验新鲜度**」（见 rules=preview）。本函数只提供判据
+ * ——`stale=true`（中间视图创建时间早于源 CV 最近激活）时调用方自行决定「先删该视图 / 改 forceDerive /
+ * 接受旧数据」。
  *
- * 全部时间戳比较**在 SQL 里做**（`A.LAST_ACT > V.CREATE_TIME`）：两列出自不同口径的系统表，
- * 驱动回传的字符串格式不保证一致，拉回 JS 再 parse 是自找口径分叉。
+ * 时间戳比较**在 SQL 里做**（`A.LAST_ACT > V.CREATE_TIME`）：两列出自不同口径的系统表，驱动回传的
+ * 字符串格式不保证一致，拉回 JS 再 parse 是自找口径分叉。
  *
- * fail-open：任何失败（SYS.VIEWS/_SYS_REPO 不可读、视图刚被并发删掉）都只回 `detail`，
- * **绝不让信息回报把预览本身打挂**——它不是预览结果的一部分，只是附注。
+ * fail-open：任何失败都只回 `detail`，**绝不让信息回报把预览本身打挂**——它只是附注。
  */
 export interface IntermediateFreshness {
   /** 中间视图创建时间（SYS.VIEWS.CREATE_TIME，原样文本） */
@@ -638,7 +638,7 @@ function timestampText(v: unknown): string | undefined {
  *
  * `OBJECT_NAME IS NULL` 是对象层级的判别式（与 visibility.service 的区分口径同源）：
  * 该表同时含 schema 级与**对象级**授权行——不加这个过滤时，用户只对 schema 下某一张表有 SELECT
- * 也会命中（BW 常见对象级授权），同 schema 的其它基表被误判「已授予」（评审 #1119）。
+ * 也会命中（BW 常见对象级授权），同 schema 的其它基表被误判「已授予」。
  */
 async function hasSchemaSelect(pool: HanaPool, schema: string): Promise<boolean> {
   const rows = await pool.query<{ C: number }>(
@@ -674,15 +674,12 @@ async function checkSchemaSelect(
 /**
  * 当前用户对过程的 EXECUTE 权限判定 —— 预览前置检查与诊断通道的**唯一**实现。
  *
- * 两种匹配口径都沿用既有实现，SQL 与判定逐字保留：合成单一查询必然改动其中一条链路的口径
- * （属 HANA 侧行为变更，而两条链路的结论用途不同），故口径显式参数化而非取并集：
- * - 'exact'（默认）：OBJECT_NAME 精确 + SCHEMA_NAME='SYS'。诊断通道逐过程核对，
- *   未通过时给出该过程的 GRANT 文案；
- * - 'family'：OBJECT_NAME 前缀（CREATE_/DROP_ 两族）一次问全。预览前置检查只关心
- *   「中间视图这套过程能不能用」——过程名在不同版本可能带 _DEV 等后缀，故用前缀，且不做逐过程结论
- *   （任一族的授权缺失都意味着节点预览不可用，直接返回「不支持」）。
+ * 两种匹配口径**不合并**（合成单一查询会改动其中一条链路的口径，而两条链路的结论用途不同）：
+ * - 'exact'（默认）：OBJECT_NAME 精确 + SCHEMA_NAME='SYS'。诊断通道逐过程核对，未通过时给 GRANT 文案；
+ * - 'family'：OBJECT_NAME 前缀（CREATE_/DROP_ 两族）一次问全。预览前置检查只关心「中间视图这套过程
+ *   能不能用」——过程名在不同版本可能带 _DEV 等后缀，故用前缀；任一族的授权缺失即节点预览不可用。
  *
- * @param procName 'exact' 口径的过程名；'family' 口径按固定前缀两族查询，不使用该参数
+ * @param procName 'exact' 口径的过程名；'family' 口径不使用该参数
  */
 export async function hasExecutePrivilege(
   pool: HanaPool,
@@ -762,7 +759,7 @@ function isLeafAccessible(leaf: LeafAccess): boolean {
  *
  * 叶子遍历与去重只有一份实现（collectLeafAccess＋两个纯渲染函数），verbose/brief 仅在渲染层分叉，
  * 判定与去重规则不会在两份遍历间漂移。
- * 返回的 leaves 与 XML 中的出现**一一对应**（不在这里去重）：渲染层保持既有行为
+ * 返回的 leaves 与 XML 中的出现**一一对应**（不在这里去重）：渲染层保留重复项的独立呈现
  * （verbose 对重复出现逐个报 blocker；baseTables/brief 清单按首次出现去重）。
  * 探测并行（Promise.all）：上游数可达十几个，串行往返会成倍拖慢；连接池满时自动排队复用。
  */
@@ -796,7 +793,7 @@ async function collectLeafAccess(
       if (ds.type === 'CALCULATION_VIEW' && ds.resourceUri) {
         // resourceUri 形如 /包路径/calculationviews/对象名 → _SYS_BIC."包路径/对象名"（与 preview.derive.parseResourceUri 同源）
         const parsed = parseResourceUri(ds.resourceUri);
-        if (!parsed) return null; // 解析不出即跳过（与既有行为一致：诊断不报这条）
+        if (!parsed) return null; // 解析不出即跳过（诊断不报这条）
         const probe = await probeRuntimeAccess(pool, parsed.pkg, parsed.name);
         return { type: 'CALCULATION_VIEW', schema: '_SYS_BIC', table: `${parsed.pkg}/${parsed.name}`, probe };
       }
@@ -977,7 +974,7 @@ async function probeRuntimeAccess(pool: HanaPool, packageId: string, objectName:
 }
 
 /**
- * 分析权限检测三态（评审 #1118/#1120）：
+ * 分析权限检测三态：
  * - 'undetermined'：设计时 XML 读不到/无 CDATA——保护与否**无法判定**（不是「未受保护」）；
  * - 'unprotected'：确定不启用分析权限校验（checkAnalyticPrivileges≠true）；仅声明 applyPrivilegeType
  *   时经 declaredApplyPrivilegeType 如实带出（不给「受保护」级结论）；
@@ -988,7 +985,7 @@ type AnalyticPrivilegeOutcome =
   | { kind: 'unprotected'; declaredApplyPrivilegeType?: string; applyPrivilegeType?: string }
   | { kind: 'protected'; status: AnalyticPrivilegeStatus; applyPrivilegeType?: string };
 
-/** brief 的分析权限子对象（评审 #1118）：不可判定时不写 protected=false/grantedCount=0 这类肯定值 */
+/** brief 的分析权限子对象：不可判定时不写 protected=false/grantedCount=0 这类肯定值 */
 function briefAnalyticPrivilege(check: AnalyticPrivilegeOutcome): DiagnosisBrief['analyticPrivilege'] {
   if (check.kind === 'undetermined') return { determined: false, detail: check.detail };
   if (check.kind === 'unprotected') {
@@ -1014,8 +1011,8 @@ function briefAnalyticPrivilege(check: AnalyticPrivilegeOutcome): DiagnosisBrief
  * 分析权限检测：读设计时 XML 的 applyPrivilegeType / checkAnalyticPrivileges，并查当前用户被授予的
  * ANALYTICAL_PRIVILEGE 条数。BW 视图几乎都 checkAnalyticPrivileges=true，schema SELECT 无法替代分析权限。
  *
- * 「受保护」只认 checkAnalyticPrivileges=true（评审 #1120）：applyPrivilegeType 单独出现时不给
- * 「受保护 / 确认为分析权限缺失」级结论；XML 读不到时如实返回 'undetermined'（评审 #1118）。
+ * 「受保护」只认 checkAnalyticPrivileges=true：applyPrivilegeType 单独出现时不给
+ * 「受保护 / 确认为分析权限缺失」级结论；XML 读不到时如实返回 'undetermined'。
  */
 async function checkAnalyticPrivilege(
   pool: HanaPool,
@@ -1090,7 +1087,7 @@ async function checkAnalyticPrivilege(
       },
     };
   } catch (e) {
-    // 查不到授权信息时无法判定，不阻断（运行时探测兜底）；grantedCount **缺省**——不写 0（评审 #1118）
+    // 查不到授权信息时无法判定，不阻断（运行时探测兜底）；grantedCount **缺省**——不写 0
     logger.warn({ packageId, objectName, err: e }, '无法查询 ANALYTICAL_PRIVILEGE 授权数（降级为运行时探测兜底）');
     const detail = '受分析权限保护，但无法查询授权情况（运行时探测兜底判定）';
     checks.push({ item: '分析权限', required: 'ANALYTICAL_PRIVILEGE 授权', passed: true, detail });
@@ -1109,17 +1106,13 @@ async function checkAnalyticPrivilege(
  * `checkAnalyticPrivileges` 为 false 只表示 **XML-based** 分析权限未启用，不代表「无需分析权限」——
  * HANA 2.0 的 BW 视图常用 structured privilege 做运行时授权（与 XML-based AP 互斥）。
  *
- * 查询 `SYS.EFFECTIVE_STRUCTURED_PRIVILEGES`（该视图要求 ROOT_SCHEMA_NAME / ROOT_OBJECT_NAME /
- * USER_NAME 三个等值谓词）。STATUS 语义：
- * - APPLIED：权限已生效；
- * - NOT AUTHORIZED：命中检查但未获授权（该对象没有 APPLIED 条目；官方文档未列此值，实测环境会返回）；
- * - NOT GRANTED：未授予；
- * - NO MATCHING ATTRIBUTE：权限过滤器引用了视图里不存在的属性（配置问题）；
- * - NO FILTER VALUES FOUND：动态过滤器没取到值（配置/数据问题）。
- * 无行 = 没有适用于该根对象的结构化权限——视图已注册 SQL AP 检查时通常意味着缺授权。
+ * 查询 `SYS.EFFECTIVE_STRUCTURED_PRIVILEGES`（要求 ROOT_SCHEMA_NAME / ROOT_OBJECT_NAME /
+ * USER_NAME 三个等值谓词）。STATUS 语义：APPLIED=已生效；NOT AUTHORIZED=命中检查但未获授权
+ * （官方文档未列此值，实测会返回）；NOT GRANTED=未授予；NO MATCHING ATTRIBUTE=过滤器属性不在视图；
+ * NO FILTER VALUES FOUND=动态过滤器无值。无行 = 没有适用于该根对象的结构化权限——视图已注册
+ * SQL AP 检查时通常意味着缺授权。
  *
- * 无法查询（权限/版本不支持）时返回 `determined:false` 且 `passed:true`：不把「未知」渲染成「缺授权」，
- * 最终以运行时探测为准。
+ * 无法查询（权限/版本不支持）时返回 `determined:false` 且 `passed:true`：不把「未知」渲染成「缺授权」。
  */
 export async function checkStructuredPrivilege(
   pool: HanaPool,

@@ -123,7 +123,7 @@ function toCard(cap: Capability, entitledIds: ReadonlySet<string>): CandidateCar
 /**
  * 在一次调用方的 entitlement 内做确定性发现。
  *
- * @param entitledIds 当前调用方的可触达能力 id（含门面；本函数会排除门面与 tool_search）
+ * @param entitledIds 当前调用方的可触达能力 id（含平台入口；本函数会排除平台入口）
  * @param q 过滤条件（query 为空 = 只按标签过滤并按 priority/声明顺序排序）
  */
 export function discoverCapabilities(entitledIds: ReadonlySet<string>, q: DiscoveryQuery = {}): CandidateCard[] {

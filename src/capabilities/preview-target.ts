@@ -1,7 +1,7 @@
 /**
  * 数据预览目标形态判定（纯函数）。
  *
- * 放在 capabilities/ 叶子层：`defs/preview.ts` 用它做**提升前**的跨字段预检，
+ * 放在 capabilities/ 叶子层：`defs/preview.ts` 用它做**派发前**的跨字段预检，
  * `tools/preview.tools.ts` 用它做 handler 的防御性复核——同一份实现，不抄第二份。
  * 本模块不得 import defs/tools/service（避免成环）。
  */

@@ -4,7 +4,7 @@
  * 分组映射由能力清单的 kind 字段派生（单一事实源在 capabilities/manifest.ts），
  * 本模块只保留可见性算法：解析 env、glob 匹配、优先级。
  *
- * **只有两个能力面变量**（2026-11 收口）：
+ * **只有两个能力面变量**：
  * - `HANA_TOOL_GROUPS`：组名（read/write/admin/sql）或能力 id/glob，同一逗号列表；
  *   空 = read/write/admin（sql 关闭）；显式列出 = 只启用列出的组/工具。
  * - `HANA_TOOL_DENY`：强制禁用的能力 glob（优先级最高；命中父工具会连带关闭其别名）。
@@ -120,7 +120,7 @@ function parseEnableAndDeny(rawEnable: string, rawDeny: string): ToolFilterConfi
   };
 }
 
-/** 历史三参数签名（groups, allow, deny）：仅测试/内部兼容，不再对应任何 env 变量 */
+/** 三参数签名（groups, allow, deny）：仅测试/内部兼容，不对应任何 env 变量 */
 function parseLegacy(groupsRaw: string, allowRaw: string, denyRaw: string): ToolFilterConfig {
   const groups = splitList(groupsRaw).map((g) => g.toLowerCase());
   if (groups.length > 0) {
@@ -173,7 +173,7 @@ function registerableByName(name: string, filter: ToolFilterConfig): boolean {
   if (group === undefined) return false; // 未登记 = 不暴露（fail-closed）
   if (matchGlob(name, filter.allowPatterns)) return true;
   if (filter.enabledGroups.size === 0) {
-    // 旧环境变量：空 = 默认 read/write/admin（sql 除外）
+    // 空配置：默认 read/write/admin（sql 除外）
     if (filter.groupsExplicit !== true) return group !== 'sql';
     // 显式空 groups = 不启用任何分组（HANA_TOOL_GROUPS 非空但只含 glob 时）
     return false;

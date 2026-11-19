@@ -12,11 +12,11 @@ import type {
 } from './view-types.js';
 
 /**
- * 两个 ViewDefinition 的**结构化 diff**（dryRun 的地基，SSD §5.2）。
+ * 两个 ViewDefinition 的**结构化 diff**（dryRun 的地基）。
  *
  * 为什么必须先归一化再比：同一份视图经 Studio 重存、Aggregation 方言改写（格式 A/B）、布局重排后，
  * XML 文本会大面积变化而语义不变——直接比文本/raw 会被假 diff 淹死，破坏性判定随之失真。
- * 所以只比结构化模型（view-types.ts 的 ViewDefinition），并逐条落实 SSD §5.2 的归一化：
+ * 所以只比结构化模型（view-types.ts 的 ViewDefinition），归一化规则：
  *   1) 数组按**集合**比（文档序无语义）；例外：输出字段 order 当值比、Rank 的 ORDER BY 次序有语义；
  *   2) Aggregation 方言归一：格式 A（aggregateBy+measureMapping）与 B（viewAttribute/@aggregationType）
  *      共用 model/view-types 的 aggGroupBy/aggMeasures 做比较基准（同一份规则，不复制判定）；
@@ -33,9 +33,8 @@ import type {
  *
  * 确定性：所有数组按 id 升序（字符串码点序，无 locale/环境依赖），同一输入两次调用逐字节一致。
  *
- * 依赖方向说明：Aggregation 方言判定（aggGroupBy/aggMeasures）与 BW schema 别名归一
- * （normalizeBwSchema）均已上移到 model/view-types.ts——预览推导、诊断与 diff 三方共用同一份规则，
- * 本文件（model 层）不再 import services，依赖方向只朝内。
+ * 依赖方向：Aggregation 方言判定（aggGroupBy/aggMeasures）与 BW schema 别名归一（normalizeBwSchema）
+ * 定义在 model/view-types.ts（预览推导、诊断与 diff 共用同一份规则）；本文件不 import services。
  */
 
 /** logicalModel 的五个输出字段列表（keyMapping 属性 / 计算属性 / 基础度量 / 计算度量 / 受限度量） */
@@ -226,7 +225,7 @@ function diffDataSources(before: ViewDataSource[], after: ViewDataSource[]): Vie
 /* ── 节点 ─────────────────────────────────────────────────── */
 
 /**
- * 节点逐字段比较的字段位（与 SSD §5.2 的 fields 允许集逐字对齐；改这个清单 = 改契约）。
+ * 节点逐字段比较的字段位（fields 允许集以本清单为准；改这个清单 = 改契约）。
  * 注意 fields 的完整允许集 = 本清单 ∪ {'inputs'}：'inputs' 由输入绑定比较产出（见 mappingIndex），
  * 不是标量字段位，故不进本数组。
  */
@@ -541,7 +540,7 @@ function diffOutputNode(before: ViewDefinition, after: ViewDefinition): ViewDiff
   // 只有两侧都判到、且判到同一节点，才是「未换人」。
   if (from !== undefined && from === to) return { changed: false };
   // 两侧都不可判（undefined === undefined）不能短路成 changed=false：那正是把「不可判」呈现为
-  // 「未换人」——声明输出真的换人（如 P1→P2 的半重挂对）会被报成未换。changed 的一手依据是
+  // 「未换人」——声明输出真的换人（半重挂对）会被报成未换。changed 的一手依据是
   // 「把结果交给 logicalModel 的那个节点」，此时退化比较两侧 logicalModel 声明 id：相同（含两侧
   // 都无声明——AV 等无节点树形态）报无变化；不同即如实报 changed=true（from/to 缺省 = 该侧不可判；
   // passThrough=false——两侧不可判时不给豁免证据）。
@@ -559,7 +558,7 @@ function diffOutputNode(before: ViewDefinition, after: ViewDefinition): ViewDiff
 
 /* ── 输出字段 ─────────────────────────────────────────────── */
 
-/** 输出字段逐字段比较的字段位（与 SSD §5.2 的 fields 允许集逐字对齐） */
+/** 输出字段逐字段比较的字段位（fields 允许集以本清单为准） */
 const OUTPUT_FIELDS = [
   'datatype',
   'length',
@@ -703,7 +702,7 @@ function diffVariables(before: ViewVariable[], after: ViewVariable[]): ViewDiff[
 
 /* ── 根级属性 ─────────────────────────────────────────────── */
 
-/** 根级属性逐字段比较的字段位（与 SSD §5.2 的 fields 允许集逐字对齐） */
+/** 根级属性逐字段比较的字段位（fields 允许集以本清单为准） */
 const ROOT_FIELDS = [
   'description',
   'dataCategory',

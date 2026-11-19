@@ -177,7 +177,7 @@ export const healthCapabilities = {
       '每项查什么、单位口径与阈值语义见 rules=health_check（hana_system_get_info）。',
     inputSchema: z.object({
       // 刻意用 z.string() 而非 z.enum(ALL_CHECKS)：非法值要落到 handler 的中文硬错误并列出合法值；
-      // z.enum 会在协议层被英文拒绝（verify-health 锁定的契约，别改回枚举）。
+      // z.enum 会在协议层被英文拒绝（别改回枚举）。
       checks: z
         .array(z.string())
         .optional()

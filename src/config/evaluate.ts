@@ -1,14 +1,13 @@
 /**
- * 统一判定入口（P1）——`hana_tool_search` 的 preview 与 `authorizeCall` 的 enforce 共用同一函数。
+ * 统一判定入口——`hana_tool_search` 的 preview 与 `authorizeCall` 的 enforce 共用同一函数。
  *
  * 为什么必须同一个：披露如果另写一套策略判断，就会「预测 A、执行 B」。这里只把现有判定器
- * （`planFor` + `runPreflight` + `checkProfile` + `environmentGrants`）组合一次，语义与 P1 之前
- * 逐项不变；区别只有 `mode`：
+ * （`planFor` + `runPreflight` + `checkProfile` + `environmentGrants`）组合一次，区别只有 `mode`：
  * - `preview`：不写审计、不派发、不连 HANA；
  * - `enforce`：由 `authorizeCall` 包装为「evaluate + 审计 + blocked 回执」。
  *
  * 判定顺序固定：能力（entitlement/profile）→ 资源（写包/schema）→ 环境（只读/断言/代际）。
- * SQL 规则层（select-only/deny）与 P3 审批不在本函数内。
+ * SQL 规则层（select-only/deny）与审批不在本函数内。
  */
 
 import { manifestRev, planFor } from '../capabilities/manifest.js';
@@ -43,7 +42,7 @@ export interface EvaluationInput {
   args: Record<string, unknown>;
   mode: EvaluateMode;
   runtime?: EnvironmentRuntime;
-  /** 调用信封里的环境断言（P2）；省略时回退 args.expectedEnvironment/expectedEpoch */
+  /** 调用信封里的环境断言；省略时回退 args.expectedEnvironment/expectedEpoch */
   envAssertion?: EnvironmentAssertion;
   /** 调用信封里的披露上下文：只做一致性检查（不是授权凭证） */
   disclosure?: { id?: string; policyRev?: string; manifestRev?: string };
@@ -67,7 +66,7 @@ export interface EvaluationResult {
 }
 
 /**
- * 档案维度（只能收紧）：与 authorize.ts 原实现逐条一致。
+ * 档案维度（只能收紧）。
  *
  * `profile === undefined` 的两种情形分开处理：
  * - 部署未启用档案机制（policy.profiles 为空）：跳过；

@@ -1,16 +1,9 @@
 /**
- * 能力清单（Capability Manifest）—— 类型与声明辅助（P10-a）。
+ * 能力清单（Capability Manifest）—— 类型与声明辅助。
  *
- * **为什么需要它**：在 P10 之前，「一个工具是什么」这件事分散在**四处且互不派生**——
- *   1. `src/tools/groups.ts` 的分组（可见性归属）；
- *   2. `src/tools/index.ts` 里选哪个注册器（有没有调用期闸门）；
- *   3. `src/tools/write-plans.ts` 的 PLANNERS（这次调用会读写什么）；
- *   4. 各 `*.tools.ts` 内联的 `annotations`（给客户端的提示）。
- * 单靠"注册期过滤"这套是够用的；但动态调用面（门面索引 / 路由：模型按分类入口拿到索引、
- * 再按能力 id 路由调用）要在**调用期**
- * 按 `(能力, 参数, 资源, 调用方)` 判定，四处分散的事实源撑不住——没有一处能回答"这个能力是什么"。
- * 本清单把四者收敛成**一条声明**，且声明的字段互不派生：`kind`（可见性）/
- * `effects`（读写与破坏性；资源维度由 `plan` 的有无表达）/ `annotations`（客户端提示，不构成授权）。
+ * **为什么需要它**：一个能力「是什么」由这里的一条声明回答——`kind`（可见性）/
+ * `effects`（读写与破坏性；资源维度由 `plan` 的有无表达）/ `annotations`（客户端提示，不构成授权），
+ * 各字段互不派生。清单是唯一事实源：注册、发现、契约披露与调用期判定都从这里读。
  *
  * **依赖方向（硬约束）**：`capabilities/` **不 import `tools/`**（反向依赖会与 `tools/index.ts` ↔
  * `tools/*.tools.ts` 之间本就存在的环叠加，让 manifest 的求值顺序变得不确定）；各 `tools/*.tools.ts`
@@ -18,13 +11,12 @@
  *
  * 允许 import 的还有**纯常量/纯规则叶子**：`core/*`、`write-plan`，以及服务侧导出「入参合法值」的常量
  * （如 `services/health.service` 的 `ALL_CHECKS`、`services/sql-analyze.rules` 的上限值）——
- * 这些常量同时被 schema 与服务实现使用，抄第二份就违反 I3（一条规则一份实现）。
+ * 这些常量同时被 schema 与服务实现使用，抄第二份就会漂移。
  * 代价是 manifest 会连带求值这些服务模块；**底线是不成环**，由
  * `tests/unit/import-cycles.test.ts`（运行时 import 图遍历 + 棘轮）常态化保证：涉及 `capabilities/` 的环为 0。
  * `capabilities/` 内**不得调用任何 I/O 或 service 函数**——它是声明层，只在注册与判定时被读取。
  *
  * **未登记 = 不暴露**：清单是唯一事实源，未登记的能力既不注册也不可见（fail-closed）。
- * 此前 `shouldRegisterTool` 对未登记名字按 `read` 兜底（fail-open），已一并纠正。
  */
 
 import type { ToolAnnotations } from '@modelcontextprotocol/server';
@@ -47,10 +39,10 @@ export type MutationScope = 'none' | 'transient' | 'persistent';
 /**
  * 能力路由卡（呈现元数据，**不参与授权判定**）。
  *
- * 目的不是关键词检索，而是让模型在门面索引/平铺工具里**选得对**：
- * - `intent` 回答“这是什么问题的工具”，门面索引的摘要优先取它；
+ * 目的不是关键词检索，而是让模型在发现/契约里**选得对**：
+ * - `intent` 回答“这是什么问题的工具”，发现卡的摘要优先取它；
  * - `whenToUse` / `notFor` 做正负例消歧（尤其是权限、预览、SQL 分析这几组近邻能力）；
- * - `priority` 决定门面描述的主干/高级分组与索引排序信号；
+ * - `priority` 决定摘要分组与发现排序信号；
  * - `requires` 写前置条件（如只读环境不可用）；
  * - `exampleArgs` 给一条 canonical 参数示例，避免模型猜参数名；
  * - `constraints` 写跨字段约束（如“视图预览需 packageId+objectName”）。
@@ -79,23 +71,21 @@ export interface CapabilityPreflightResult {
 }
 
 /**
- * 路由预检：schema 通过后、**提升/派发之前**的纯跨字段校验。
+ * 路由预检：schema 通过后、**派发之前**的纯跨字段校验。
  *
  * 为什么需要它：zod 只表达单字段类型/枚举，表达不了「by=name 需要 pattern」「勘察与视图目标二选一」
- * 这类跨字段规则；这些规则此前在 handler 入口才拒绝，而门面在 handler 之前已经提升分类——
- * 结果是**无效调用也会改动工具面**，把同批/下一步的合法调用打成 `UNKNOWN_TOOL`。
+ * 这类跨字段规则；在这里统一拦下，错误回执才能带可恢复提示。
  *
- * 约束：纯函数、无 I/O；返回 issues 即无效调用，门面返回参数卡且不提升。handler 仍保留自己的
- * 校验作为防御纵深（防绕过门面直接平铺调用）。
+ * 约束：纯函数、无 I/O；返回 issues 即无效调用，由入口返回参数卡。handler 仍保留自己的
+ * 校验作为防御纵深（防绕过入口直接调用）。
  */
 export type CapabilityPreflight = (args: unknown) => CapabilityPreflightResult | undefined;
 
 /**
  * 能力分类（**AI 能力视角**）：分类轴 = "AI 想干什么"，用于发现过滤与分类描述。
  *
- * 2026-11-19 起**不再有常驻门面**：工具面只有两个平台入口（`hana_tool_search` 选择、
- * `hana_invoke` 执行），具体能力一律经本体层选择后执行。分类只回答“它属于哪类问题”，
- * 不创建任何可绕过本体层的入口。
+ * 工具面只有两个平台入口（`hana_tool_search` 选择、`hana_invoke` 执行），具体能力一律经本体层
+ * 选择后执行。分类只回答“它属于哪类问题”，不创建任何可绕过本体层的入口。
  *
  * `sql` 是独立分类（直接执行 SQL，默认关闭）；`tool_search` 承载平台入口。
  */
@@ -205,17 +195,16 @@ export interface CapabilityEffects {
   /**
    * 本次调用会读写什么（纯只读分析，无副作用）。
    *
-   * 语义（P10-b）：**声明了它 = 这个能力的闸门带资源维度**（写包边界 + 读 schema 白名单照它判定）；
+   * 语义：**声明了它 = 这个能力的闸门带资源维度**（写包边界 + 读 schema 白名单照它判定）；
    * 不声明 = 只有能力级（可见性）判定，没有资源维度。所以：
    * - 会**写仓库包**的能力必须声明（`tests/unit/capability-manifest.test.ts` 强制），
    *   否则会退到 `planFallback`（按参数表面兜底，fail-closed 方向）；
-   * - 读**用户指定 schema** 的能力应当声明（`planRead`）：这是读范围从"服务层逐点接线"升级为
-   *   "调用期统一判定"的落点；
+   * - 读**用户指定 schema** 的能力应当声明（`planRead`）：这是读范围统一判定的落点；
    * - 读**固定系统 schema**（`_SYS_REPO`/`_SYS_BIC`/`SYS.M_*`）的能力不声明——恒可读的面上声明资源
-   *   只会制造"已被保护"的假象（D-12：已激活视图自身定义的读取不做约束）。
+   *   只会制造"已被保护"的假象（已激活视图自身定义的读取不做约束）。
    */
   plan?: CapabilityPlanner;
-  /** 是否可能破坏既有对象/数据（P6 的 migration 闸门据此判定） */
+  /** 是否可能破坏既有对象/数据（migration 闸门据此判定） */
   destructive: boolean;
   /** 同参数重复调用是否等价（客户端重试安全性的依据） */
   idempotent: boolean;
@@ -226,7 +215,7 @@ export interface CapabilityEffects {
 /**
  * 清单条目。`inputSchema` 是**声明式 zod schema 的唯一副本**：
  * 工具的注册配置由它生成（见 tools/index.ts 的 capabilityRegistrar），
- * P10-d 的路由参数也由它在服务端校验（客户端拿到的 JSON Schema 只是便利，不是校验层）。
+ * 派发时的路由参数也由它在服务端校验（客户端拿到的 JSON Schema 只是便利，不是校验层）。
  */
 export interface Capability<S extends z.ZodType = z.ZodType> {
   /** 能力 id：工具级 = 工具名原样；操作级 = `<工具>#<op>`（如 hana_view_update#add_join） */
@@ -246,12 +235,12 @@ export interface Capability<S extends z.ZodType = z.ZodType> {
    * - `hana_invoke` 只按目标能力做统一授权后派发，目标能力逐次过同一闸门。
    *
    * 可见性由 `config/policy-snapshot.ts` 统一编译：未显式 deny ∧ 至少一个具体能力
-   * 在 entitlement 内。平台入口不是“第七个门面”，也不构成绕过本体层的执行捷径：
+   * 在 entitlement 内。平台入口不构成绕过本体层的执行捷径：
    * 它要求调用方先给出能力 id，而能力 id 只能从 `hana_tool_search` 得到。
    */
   platform?: true;
   /**
-   * **只经路由**的能力（操作级条目 `<工具>#<op>`，2026-10-10）：有清单声明、可路由、可授权，
+   * **只经路由**的能力（操作级条目 `<工具>#<op>`）：有清单声明、可路由、可授权，
    * 但**永不注册为工具**（注册名 = module = 父工具名，注册即撞名）。
    * 三个落点必须一致（各有一处显式判定，别只改一处）：
    *   · `computeSurface`（surface.ts）不把它们搬进 tools/list；
@@ -265,9 +254,9 @@ export interface Capability<S extends z.ZodType = z.ZodType> {
    */
   control?: boolean;
   title: string;
-  /** 路由卡：门面索引/平铺描述的选择辅助（可选；不参与授权判定） */
+  /** 路由卡：发现/契约的选择辅助（可选；不参与授权判定） */
   routing?: CapabilityRouting;
-  /** 纯跨字段预检：schema 通过后、提升/派发前执行；返回 issues 即无效调用（不提升）。 */
+  /** 纯跨字段预检：schema 通过后、派发前执行；返回 issues 即无效调用（不派发）。 */
   preflight?: CapabilityPreflight;
   description: string;
   inputSchema: S;
@@ -282,7 +271,7 @@ export type CapabilitySpec<S extends z.ZodType> = Omit<Capability<S>, 'module'> 
 
 /**
  * 声明一条能力。泛型保留 `inputSchema` 的**精确类型**——
- * 注册侧据此把 handler 的参数推断成 `z.infer<S>`（与内联 schema 时代完全一致，零类型回归）。
+ * 注册侧据此把 handler 的参数推断成 `z.infer<S>`（零类型回归）。
  */
 export function cap<S extends z.ZodType>(spec: CapabilitySpec<S>): Capability<S> {
   return { ...spec, module: spec.module ?? spec.id.split('#')[0] };

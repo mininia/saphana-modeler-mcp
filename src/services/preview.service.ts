@@ -29,22 +29,21 @@ import {
  * **凡不支持即直接返回「不支持」，不做其他尝试/回退。**
  *
  * 三种路径：
- * - 默认（无 node）：对已激活视图整体预览 —— `SELECT * FROM "_SYS_BIC"."包/视图名"`，
- *   无需解析 XML；VIRTUAL 视图用 parameters 传输入参数（WITH PARAMETERS PLACEHOLDER）。
- * - 节点（有 node，默认）：调用 HANA 原生机制 `SYS.CREATE_INTERMEDIATE_CALCULATION_VIEW_DEV`
- *   （HANA Studio 节点预览同款）——HANA 为指定节点生成 SQL 虚拟视图，用完按占用情况释放。
- *   类型/连接键/表达式由 HANA 自身计算，任意节点类型均支持。需 EXECUTE 权限；缺权限直接返回「不支持」。
- * - 节点（有 node + forceDerive=true，显式启用）：XML 推导只读模式（preview.derive.ts），
- *   支持类型受限（见文档），不自动启用。
+ * - 默认（无 node）：对已激活视图整体预览 —— `SELECT * FROM "_SYS_BIC"."包/视图名"`，无需解析 XML；
+ *   VIRTUAL 视图用 parameters 传输入参数（WITH PARAMETERS PLACEHOLDER）。
+ * - 节点（有 node，默认）：HANA 原生 `SYS.CREATE_INTERMEDIATE_CALCULATION_VIEW_DEV`（Studio 节点
+ *   预览同款）——HANA 为指定节点生成 SQL 虚拟视图，用完按占用情况释放。任意节点类型均支持；
+ *   需 EXECUTE 权限，缺权限直接返回「不支持」。
+ * - 节点 + forceDerive=true（显式启用）：XML 推导只读模式（preview.derive.ts），支持类型受限，不自动启用。
  *
  * 中间视图命名与生命周期（确定性命名 + 复用 + 有条件释放）：
- * - 视图名固定为 `<包路径/对象名>/dp/<节点名>`（见 intermediateViewName），人工可在 _SYS_BIC 中直接定位；
+ * - 视图名固定为 `<包路径/对象名>/dp/<节点名>`（见 intermediateViewName），人工可在 _SYS_BIC 定位；
  * - 创建前先查 SYS.VIEWS：已存在则**不重复创建**，直接复用（并发调用、上次残留、他人建的都走这条）；
- *   存在性查询失败（不可判定）时仍尝试创建，CREATE 撞「对象已存在」按复用继续（评审 #1111）；
- * - 释放时先判断占用：本进程内还有调用在用、或视图非本服务创建 → 保留；无人占用才 DROP；
- *   DROP 失败（本进程外的会话正在读）同样保留，交由下次调用复用。
- *   注意：复用不校验视图新鲜度——CV 在视图创建后被重新激活时，同名视图仍是旧定义，
- *   结果里以 `intermediate.reused` 如实回报，需要最新数据时先删掉该视图或改用 forceDerive。
+ *   存在性查询失败（不可判定）时仍尝试创建，CREATE 撞「对象已存在」按复用继续；
+ * - 释放先判断占用：本进程内还有调用在用、或视图非本服务创建 → 保留；无人占用才 DROP；
+ *   DROP 失败（本进程外的会话正在读）同样保留，交由下次复用。
+ *   注意：复用不校验新鲜度——CV 在视图创建后重新激活时，同名视图仍是旧定义，结果里以
+ *   `intermediate.reused` 如实回报；需要最新数据时先删掉该视图或改用 forceDerive。
  *
  * 行数规则：无筛选默认 10 行，有筛选默认 100 行；显式 limit 上限 1000。
  * 截断判定：多取 1 行探测是否还有更多（LIMIT n+1 → truncated）。
@@ -179,7 +178,7 @@ const INTERMEDIATE_SCHEMA = '_SYS_BIC';
 const MAX_IDENTIFIER_LEN = 127;
 /**
  * 中间视图控制面调用（CREATE / DROP）的语句超时：这两个 CALL 一挂住就占着池位（池上限 4），
- * 不设超时会让几个请求拖垮整个工具面（评审 #1112）。控制面调用不该跑几分钟，给固定小上限。
+ * 不设超时会让几个请求拖垮整个工具面。控制面调用不该跑几分钟，给固定小上限。
  */
 const INTERMEDIATE_CONTROL_TIMEOUT_MS = 30_000;
 /** CREATE 撞「对象已存在」的错误消息特征（服务端无稳定错误码，只有消息文本；按特征识别） */
@@ -237,7 +236,7 @@ export async function previewData(
   assertSafeRuntimeName(packageId, '包名');
   assertSafeRuntimeName(objectName, '对象名');
   const limit = clampLimit(opts.limit, opts.filter && opts.filter.length > 0 ? 100 : 10, 1, MAX_LIMIT);
-  // 空 parameters 对象（{}）折叠为「未传」（评审 #1113）：{} 为真值，会让直接预览拼出
+  // 空 parameters 对象（{}）折叠为「未传」：{} 为真值，会让直接预览拼出
   // `WITH PARAMETERS ()`（空参数列表是 HANA 语法错），也会让节点预览的无参校验误报「不支持输入参数」
   const parameters = opts.parameters && Object.keys(opts.parameters).length > 0 ? opts.parameters : undefined;
 
@@ -290,7 +289,7 @@ export async function previewData(
   const where = buildWhere(opts.filter);
   const sql = `${base}${where.clause} LIMIT ?`;
   const rows = await withPermissionDiagnosis(pool, packageId, objectName, opts.kind, 'direct', () =>
-    // 语句超时与写路径同源（pool.statementTimeoutMs）：无上限的慢预览会占着池位拖垮整个工具面（评审 #1112）
+    // 语句超时与写路径同源（pool.statementTimeoutMs）：无上限的慢预览会占着池位拖垮整个工具面
     pool.query<Record<string, unknown>>(sql, [...where.params, limit + 1], { timeoutMs: pool.statementTimeoutMs }),
   );
   const { rows: sliced, truncated } = slicePage(rows, limit);
@@ -352,14 +351,11 @@ async function withPermissionDiagnosis<T>(
 
 /**
  * 节点预览主路径：HANA 原生中间视图（Studio 节点预览同款机制）。
- * CALL CREATE_INTERMEDIATE_CALCULATION_VIEW_DEV(schema, view, node, view_name, version=0)
- * → SELECT * FROM "_SYS_BIC"."<包/对象/dp/节点>" → 按占用情况释放（见 release）。
+ * CALL CREATE_INTERMEDIATE_CALCULATION_VIEW_DEV(...) → SELECT * FROM 中间视图 → 按占用情况释放。
  *
  * 取用与释放都在同一把 keyed lock 内完成（key=视图名），保证「创建 / 复用 / 占用计数 / 释放」
- * 这一组操作对同一视图严格串行：
- * - 两个并发调用不会同时判定「不存在」而重复 CREATE（后者会因对象已存在失败）；
- * - 也不会出现「A 释放并 DROP 的瞬间 B 刚判定复用」——B 要么在 A 之前登记占用（A 遂不删），
- *   要么在 A 删除之后进入（判定不存在 → 自行创建）。
+ * 对同一视图严格串行：两个并发调用不会同时判「不存在」而重复 CREATE；也不会出现「A 释放并 DROP
+ * 的瞬间 B 刚判定复用」——B 要么先登记占用（A 遂不删），要么在 A 删除之后进入（自行创建）。
  */
 async function previewNodeViaIntermediate(
   pool: HanaPool,
@@ -378,7 +374,7 @@ async function previewNodeViaIntermediate(
   let freshness: IntermediateFreshness | undefined;
   const scopeKey = intermediateScopeKey(viewName);
   await withKeyedLock(intermediateLockKey(viewName), async () => {
-    // 存在性三态（评审 #1111/#1121）：'unknown'（SYS.VIEWS 读失败/不可见）不得冒充「不存在」——
+    // 存在性三态：'unknown'（SYS.VIEWS 读失败/不可见）不得冒充「不存在」——
     // 它照走 CREATE，但容忍「对象已存在」并回退到复用；只有 'missing' 是确定的「不存在」。
     const existence = await runtimeViewExists(pool, viewName);
     if (existence === 'exists') {
@@ -394,8 +390,8 @@ async function previewNodeViaIntermediate(
         intermediateOwned.add(scopeKey); // 本服务创建的才可清理（预存在的他人对象不在此列）
       } catch (e) {
         // 存在性不可判定（读失败）或跨进程竞态（两进程同判「不存在」，一方先 CREATE）下，
-        // 对象其实在场 ⇒ CREATE 撞「对象已存在」：按复用继续（重读新鲜度），不让只读预览打成假失败
-        // （评审 #1111）。其余错误照常上抛。
+        // 对象其实在场 ⇒ CREATE 撞「对象已存在」：按复用继续（重读新鲜度），不让只读预览打成假失败。
+        // 其余错误照常上抛。
         if (ALREADY_EXISTS_RE.test(hanaErrorMessage(e))) {
           logger.warn({ viewName, err: e }, '中间视图已存在（存在性不可判定或并发创建）：跳过创建，按复用继续');
           reused = true;
@@ -414,18 +410,16 @@ async function previewNodeViaIntermediate(
   try {
     const where = buildWhere(opts.filter);
     sql = `SELECT * FROM ${qualifyName(INTERMEDIATE_SCHEMA, viewName)}${where.clause} LIMIT ?`;
-    // 语句超时（评审 #1112）：重 join 视图上的 SELECT 可能长时间不返回（LIMIT 不保证提前返回）
+    // 语句超时：重 join 视图上的 SELECT 可能长时间不返回（LIMIT 不保证提前返回）
     rows = await pool.query<Record<string, unknown>>(sql, [...where.params, limit + 1], {
       timeoutMs: pool.statementTimeoutMs,
     });
   } finally {
-    // 无论成败都解除占用（失败路径下由释放策略决定是否清理）。
-    // 释放做成 **best-effort**：锁等待超时（keyed lock 的排队上限）或锁内异常都不得让整个预览请求失败
-    // （那不是「预览失败」，是一次假失败）；但**占用计数必须递减**——它才是泄漏源：只增不减会让该视图
-    // 从此不再被 DROP（且每次都用一次假失败换来一次泄漏）。锁体里的递减位于**任何可失败操作之前**
-    // （纯 Map 操作不可能抛），故锁体一旦开始执行就必然完成递减；下面的兜底只覆盖「锁体根本没跑」
-    // （锁等待超时被跳过 / 获取失败）的情形，不会双扣。兜底递减在锁外做（此时锁体没跑，没有并发方
-    // 在改这个计数；计数只是 DROP 的尽力而为门槛，不是正确性依赖），并如实保留「视图未释放」。
+    // 无论成败都解除占用（失败路径下由释放策略决定是否清理）。释放做成 **best-effort**：
+    // 锁等待超时或锁内异常都不得让整个预览请求失败；但**占用计数必须递减**——它是泄漏源：
+    // 只增不减会让该视图从此不再被 DROP。锁体里的递减位于任何可失败操作之前（纯 Map 操作），
+    // 故锁体一旦开始执行就必然完成；下面的兜底只覆盖「锁体根本没跑」（锁等待超时被跳过）的情形，
+    // 不会双扣。兜底递减在锁外做（此时锁体没跑，无并发方改这个计数），并如实保留「视图未释放」。
     try {
       release = await releaseIntermediateView(pool, viewName);
     } catch (e) {
@@ -472,13 +466,12 @@ function decrementIntermediateInUse(viewName: string): number {
 /**
  * 释放中间视图：仅当「本进程已无调用占用」且「由本服务创建」时才 DROP。
  * 保留的三种情形（均不报错、不影响本次预览结果）：
- * - 本进程内还有并发调用在用（引用计数 > 0）
- * - 视图非本服务创建（他人 / 上一次进程的残留）→ 误删他人对象风险，宁可留着
- * - DROP 失败：本进程之外的会话（如 HANA Studio）正在读该视图而占用锁 → 交由下次调用复用
+ * - 本进程内还有并发调用在用（引用计数 > 0）；
+ * - 视图非本服务创建（他人 / 上一次进程的残留）→ 宁可留着，不误删他人对象；
+ * - DROP 失败：本进程之外的会话（如 Studio）正在读 → 交由下次调用复用。
  * 与取用共用同一把锁：保证不会在「刚判定无人占用」之后、DROP 之前被新调用复用。
- * 计数递减放在锁体**最前**（任何可失败操作之前）：调用方（previewNodeViaIntermediate 的 finally）
- * 在锁等待超时等情形会做兜底递减，锁体外无并发方在改这个计数，故不会双扣；反之，锁体一旦开始
- * 执行就必然完成递减——"递减无论如何都要发生"是调用方的硬要求（它是泄漏源）。
+ * 计数递减放在锁体**最前**（任何可失败操作之前）：锁体一旦开始执行就必然完成递减，锁体外无并发方
+ * 改这个计数，故不会双扣；「递减无论如何都要发生」是调用方的硬要求（它是泄漏源）。
  */
 async function releaseIntermediateView(
   pool: HanaPool,

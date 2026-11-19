@@ -1,20 +1,16 @@
 /**
- * 稳定性健康检查的**规则表**（单一事实源）。
+ * 稳定性健康检查的**规则表**（单一事实源）。设计要点（每条都来自实机实测）：
  *
- * 设计要点（每条都来自实机实测，见 docs/health-monitoring-findings.md）：
- *
- * 1. **数据化而非硬编码**：一条规则 = {id, 类别, 用途, 静默过滤?, run()}，引擎只负责调度与归并结论。
+ * 1. **数据化而非硬编码**：一条规则 = {id, 类别, 用途, 静默过滤?, run()}，引擎只负责调度与归并结论；
  *    新增检查项 = 加一条规则，不改引擎。
  *
- * 2. **每条规则自己认领"看不见"**：HANA 的 M_* 监视视图在权限不足时**静默返回空集而不报错**。
- *    若把空集当健康，缺权限的部署会得到一份"全绿"的假报告。故规则必须显式区分三种"看不见"：
- *      - 视图不存在（HANA 259）→ view_missing
- *      - 权限不足被拒（HANA 258）→ permission_denied
- *      - 权限不足被静默过滤成空集 → 由 `silentlyFiltered` + 引擎传入的 unfiltered 标记共同判定
- *    引擎负责把抛出的错误归一到 unknown，规则负责在"查得到但可能是被过滤的空集"时自己判。
+ * 2. **每条规则自己认领"看不见"**：HANA 的 M_* 监视视图在权限不足时**静默返回空集而不报错**，
+ *    把空集当健康就会给缺权限的部署一份"全绿"的假报告。三种"看不见"必须显式区分：视图不存在
+ *    （259→view_missing）、权限不足被拒（258→permission_denied）、被静默过滤成空集
+ *    （由 `silentlyFiltered` + 引擎传入的 unfiltered 共同判定）。抛错由引擎归一到 unknown。
  *
- * 3. **磁盘口径**：用 M_DISKS（文件系统容量）而非 M_DISK_USAGE（HANA 各用途已分配文件的大小占比）。
- *    实测后者在一台完全健康的机器上 7 类里 5 类都是 100%，按它报警会整机误报。见 §三 of findings。
+ * 3. **磁盘口径**：用 M_DISKS（文件系统容量）而非 M_DISK_USAGE（各用途已分配文件的大小占比）——
+ *    实测后者在一台完全健康的机器上 7 类里 5 类都是 100%，按它报警会整机误报。
  *
  * 4. **大表必带时间窗/聚合**：M_BACKUP_CATALOG 实测 258105 行、M_CS_TABLES 74836 行，
  *    任何无窗口的全表扫描都是事故。
@@ -35,15 +31,13 @@ import type { Visibility } from './visibility.service.js';
 /**
  * health / activity / storage / trend 四份报告都会带上的字段。
  *
- * 抽出来的理由：这四个字段原先在四份报告类型里各写一遍，形状逐步漂移——storage 用
- * `caveat?: string` 而 activity/trend 用 `caveats: string[]`，调用方得记四套。统一后
  * "要不要提示不确定性"只有一种答案：**caveats 恒为数组**（无提示时是空数组，不是省略字段）。
  */
 export interface DiagnosticReportBase {
   /**
-   * 报告生成时刻。按**运行进程时区**格式化（与日志时间戳同源同格式），
-   * 不再用 `new Date().toISOString()` —— 那会让同一份报告里的时间戳比日志早 8 小时，
-   * 排障时对不上（时间戳不带时区后缀，口径由 reportCheckedAt 的时区参数决定）。
+   * 报告生成时刻。按**运行进程时区**格式化（与日志时间戳同源同格式）——
+   * 若用 `new Date().toISOString()`，同一份报告里的时间戳会比日志早 8 小时，排障时对不上
+   * （时间戳不带时区后缀，口径由 reportCheckedAt 的时区参数决定）。
    */
   checkedAt: string;
   /** 可见性上下文：`unfiltered=false` 时"空结果"不能读作"没有问题" */
@@ -86,8 +80,8 @@ export type FindingLevel =
 /**
  * unknown 的成因（让调用方知道"为什么没结论"，以及补什么能解锁）。
  *
- * 定义已迁到 core/hana-errors.ts —— 同一组错误码在 preview / preview-diagnose 等链路里
- * 也曾各判一份，两处判定必然漂移。此处**只做转出**，保持既有导入方（health.service、
+ * 定义在 core/hana-errors.ts —— 同一组错误码在 preview / preview-diagnose 等链路里共用，
+ * 各自判定必然漂移。此处**只做转出**，保持既有导入方（health.service、
  * 工具层、测试）的 import 路径不变。
  */
 export type { UnknownReason } from '../core/hana-errors.js';
@@ -214,22 +208,17 @@ export interface HealthThresholds {
 
 /**
  * 默认阈值。取值依据：
- * - 磁盘 80/90：通用运维惯例；HANA 自身对内存告警的阈值实测为 95%/98%（见
- *   _SYS_STATISTICS.STATISTICS_ALERT_THRESHOLDS），故这里取更保守的 80/90 以便提前介入。
- * - CPU 80/95：CPU 打满会直接表现为响应时间劣化；80% 起提示，95% 视为饱和。
- * - 备份 24/72 小时：每日全备是 BW 系统的常规节奏，超过一天即需关注。
- * - 长事务 300/1800 秒：HANA 事务锁等待默认超时为 30 分钟（indexserver.ini [transaction]
- *   lock_wait_timeout），故 1800 秒与"会被强制回滚"的量级对齐。
+ * - 磁盘 80/90、CPU 80/95：通用运维惯例（HANA 自身内存告警阈值实测为 95%/98%，见
+ *   _SYS_STATISTICS.STATISTICS_ALERT_THRESHOLDS，这里取更保守的值以便提前介入）。
+ * - 备份 24/72 小时：每日全备是 BW 系统的常规节奏。
+ * - 长事务 300/1800 秒：HANA 事务锁等待默认超时 30 分钟（indexserver.ini [transaction]
+ *   lock_wait_timeout），1800 秒即"会被强制回滚"的量级。
  *
- * 后四项（内存对象 / 卷 IO / 配置 / 弃用特性）的阈值全部来自**健康机上的实测基线**，
- * 不是行业惯例抄来的。取值时刻意比实测基线宽 2~3 个数量级以避免误报——
- * 它们的价值在于"出现即异常"，而不在于逼近临界：
- * - memPutFail 0.01/0.1 %：实测健康机 2.1e-4 %（9670 次失败 / 45.8 亿次 put）
- * - memShrinkFail 1：实测健康机 FAILED_SHRINK_COUNT = 0（收缩失败 = 内存回收不动）
- * - ioFailed 1 / ioBlockedWrite 1：实测健康机 13 个卷的失败读写、短读、重试、阻塞写**全为 0**，
- *   且同期 TOTAL_WRITES = 559790 —— 计数器确实在走，故"0"是真的 0，不是没采集
- * - configRestart 1：改了未重启生效，实测健康机 0 项
- * - deprecatedFeature 1：实测健康机 25 条已弃用特性中 **7 条仍被调用**（累计 65.5 万次）
+ * 后四项（内存对象 / 卷 IO / 配置 / 弃用特性）来自**健康机实测基线**，刻意比基线宽 2~3 个
+ * 数量级以避免误报——价值在"出现即异常"：memPutFail 0.01/0.1 %（实测 2.1e-4 %）；
+ * memShrinkFail 1（实测 0）；ioFailed 1 / ioBlockedWrite 1（实测 13 个卷全 0，且同期
+ * TOTAL_WRITES = 559790——计数器在走，"0"是真的 0）；configRestart 1（实测 0）；
+ * deprecatedFeature 1（实测 25 条已弃用特性中 7 条仍在用，累计 65.5 万次）。
  */
 export const DEFAULT_THRESHOLDS: HealthThresholds = {
   diskWarnPct: 80,
@@ -279,7 +268,7 @@ export interface HealthRule {
   run(ctx: HealthRuleContext): Promise<HealthFinding>;
 }
 
-// num / round / GIB 一律用 core/num.ts 的唯一实现（四个服务曾各写一份逐字节相同的副本）
+// num / round / GIB 一律用 core/num.ts 的唯一实现（不在各服务里各写一份副本）
 
 /**
  * 字节 → **GiB**（1024³，来自 core/num.ts 的 GIB）。
@@ -312,17 +301,14 @@ export function formatDuration(sec: number): string {
 }
 
 /**
- * 级别全序（由轻到重）——本仓判定优先级的**唯一事实源**。
- * `worst()` 用它取最重；引擎的 `computeVerdict` 也从这里取序（health.service.ts）——
- * 两处各写一份顺序时只靠注释同步，改一处就会让分项级别与整体 verdict 口径矛盾。
+ * 级别全序（由轻到重）——本仓判定优先级的**唯一事实源**：`worst()` 与引擎的 `computeVerdict`
+ * 都从它取序，两处各写一份顺序会静默分叉。
  *
- * ⚠ **顺序里必须有 `unknown`**：`indexOf('unknown')` 一旦返回 -1，unknown 就**永远输给任何
- * 其它级别**——只要其余分项是 ok，整条规则就报 ok。这与本项目存在的理由（"看不见 ≠ 没问题"）
- * 直接冲突，而且它发生在**聚合层**而不是某条规则里，比规则内部的同类错误更难发现
- * （规则各自都写对了 `usedPct < 0 ? 'unknown' : grade(...)`，是汇总时把它丢掉的）。
+ * ⚠ **顺序里必须有 `unknown`**：`indexOf('unknown')` 一旦返回 -1，unknown 就永远输给其它级别
+ * ——其余分项是 ok 时整条规则就报 ok，与"看不见 ≠ 没问题"直接冲突。且它发生在**聚合层**，
+ * 比规则内部的同类错误更难发现（各规则都写对了 unknown，是汇总时把它丢掉的）。
  *
- * 口径：critical > warn > unknown > info > ok（warn 优先于 unknown，因为"确实有问题"
- * 比"看不出来"更该先说）。**调整优先级只改这一处**。
+ * 口径：critical > warn > unknown > info > ok（warn 优先于 unknown："确实有问题"比"看不出来"更该先说）。
  */
 export const LEVEL_ORDER: readonly FindingLevel[] = ['ok', 'info', 'unknown', 'warn', 'critical'];
 
@@ -371,18 +357,12 @@ function emptyMeans(
  * 与 `emptyMeans` 的分工：那个处理"整项判不了"，这个处理"主结论仍成立、但这一层没读到"。
  *
  * 为什么必须留痕：实测受限环境上 `M_MEMORY_OBJECTS` 是**返回 0 行而不是报错**（环境 A 0 行 vs
- * 环境 B 306 行），若只是 `if (行数 > 0) { push 读数 }`，这一层会从 `metrics` 里**静默消失**——
- * 读者看到一份看似完整的读数，却不知道里面少了一块。这正是本项目最反对的那种"看不见 = 没问题"。
+ * 环境 B 306 行）；若只是"行数 > 0 才 push 读数"，这一层会从 `metrics` 里静默消失，读者看到一份
+ * 看似完整的读数却不知道少了一块。**查询抛错与返回空集是同一种"取不到"**：两条路径都留痕、
+ * 参与判级的层都降级——否则"恰好抛错"的部署拿到"看不见当正常"，"返回空集"的部署拿到 unknown。
  *
- * **查询抛错与返回空集是同一种"取不到"**：两条路径必须同口径——都留痕，参与判级的层都降级
- * （否则"查询恰好抛错"的部署会拿到把"看不见"当正常的结论，而"返回空集"的部署拿到 unknown，
- * 同一视图仅因报错与否给出两种结论）。
- *
- * @param carriesJudgment 该层是否参与判级。
- *   true（内存对象层、卷 IO 层）——取不到就不能给"正常"的结论，返回 `unknown`；
- *   false（卷文件用量这类**明确不判级**的纯读数）——只留痕，不影响结论级别。
- * @param unreadable 查询**抛错**时传原始错误（空集路径不传）：读数文案改为"不可读（原因）"，
- *   并记一条 logger.warn；`rule` 供日志归因，`note` 是各层自己的一句话补充（补什么权限 / 缺了它意味着什么）。
+ * @param carriesJudgment 该层是否参与判级（true 时取不到即返回 `unknown`；false 只留痕）。
+ * @param unreadable 查询**抛错**时传原始错误（空集路径不传）：读数文案改为"不可读（原因）"并记日志。
  */
 export function emptyLayer(
   ctx: HealthRuleContext,
@@ -429,12 +409,11 @@ export function emptyLayer(
 
 /**
  * 两个诊断工具查的是**同一视图、同一谓词、同一列清单**（health 做阈值判定，activity 做连接画像）。
- * 取数若各维护一份：改一处（加过滤、换列、改排序）另一处不会同步；同一行在两个工具里拼出的
- * "对象"名也会各不相同（schema 为空时一边给 ".TAB"、一边给 "TAB"）。取数归一处，
- * **输出形状仍各归各**：health 给中文键 + 判级，activity 给英文键 + 连接画像。
+ * 取数若各维护一份：改一处另一处不会同步，同一行在两个工具里拼出的"对象"名也会不同
+ * （schema 为空时一边给 ".TAB"、一边给 "TAB"）。取数归一处，**输出形状仍各归各**。
  *
- * 放在 health.rules 而不是新开模块：本文件已是 services 内的共享落点
- * （activity/storage/trend 都从这里取报告骨架），依赖方向保持 activity → health.rules，无环。
+ * 放在 health.rules 而不是新开模块：本文件已是 services 内的共享落点（activity/storage/trend
+ * 都从这里取报告骨架），依赖方向保持 activity → health.rules，无环。
  */
 
 /** SYS.M_BLOCKED_TRANSACTIONS 的一行（被阻塞事务明细） */
@@ -527,11 +506,8 @@ const diskRule: HealthRule = {
   silentlyFiltered: true,
   async run(ctx) {
     // 口径一：M_DISKS 的 TOTAL_SIZE/USED_SIZE 是**文件系统容量与已用**——判"磁盘还剩多少"看这里。
-    // 同一挂载点上多个 USAGE_TYPE 会各占一行且数值相同（如 /backup 同时是
-    // DATA_BACKUP 与 LOG_BACKUP+CATALOG_BACKUP），故按 (HOST, MOUNT_PATH) 聚合取 MAX，
-    // 用 SUM 会重复计数。
-    // 只查一次：下面是 (HOST, MOUNT_PATH, USAGE_TYPE) 的细分组，挂载点口径由同一批行在 JS 侧
-    // 合并而来（MAX 可结合；细分组行数即 USAGE_TYPE 种数），同一视图不必跑两遍聚合。
+    // 同一挂载点上多个 USAGE_TYPE 会各占一行且数值相同（如 /backup 同时是 DATA_BACKUP 与
+    // LOG_BACKUP+CATALOG_BACKUP），故按 (HOST, MOUNT_PATH) 聚合取 MAX——用 SUM 会重复计数。
     const fsRows = await ctx.pool.query<{
       HOST: string;
       MOUNT_PATH: string;
@@ -603,11 +579,11 @@ const diskRule: HealthRule = {
       .sort((a, b) => b.文件系统已用GiB - a.文件系统已用GiB);
 
     // ── 卷 IO 层：容量回答"还剩多少"，回答不了"盘慢不慢" ──────────────
-    // M_VOLUME_IO_TOTAL_STATISTICS 一份带失败读写、短读、重试读写、阻塞写请求与 IO 时间。
+    // M_VOLUME_IO_TOTAL_STATISTICS 一份带失败读写、短读、重试读写、阻塞写请求与 IO 时间：
     //   • 失败读写 = **硬故障信号**（坏道、路径抖动、多路径切换），>0 就是出过错
     //   • 阻塞写请求 = 最危险的一条：日志卷写被阻塞会直接把整库挂起
-    // 实测健康机（13 个卷）失败读写/短读/重试/阻塞写**全为 0**，而同期 TOTAL_WRITES = 559790
-    // —— 计数器确实在走，所以那个 0 是真的 0，不是"没采集"。
+    // 实测健康机（13 个卷）失败读写/短读/重试/阻塞写全为 0，而同期 TOTAL_WRITES = 559790
+    // ——计数器确实在走，那个 0 是真的 0，不是"没采集"。
     const ioMetrics: HealthMetric[] = [];
     let ioLevel: FindingLevel = 'ok';
     // IO 层抛错时把成因留在手里（空集路径保持 null）：归 unknownReason 时要按**实际错误**分类，
@@ -760,9 +736,9 @@ const diskRule: HealthRule = {
           ? '卷 IO 层无法判定：SYS.M_VOLUME_IO_TOTAL_STATISTICS 未返回数据（该视图需 MONITORING / CATALOG READ）'
           : `卷 IO 出现异常：${num(ioFailedTotal) > 0 ? `读写失败 ${ioFailedTotal} 次` : ''}` +
             `${num(ioBlockedTotal) > 0 ? `${num(ioFailedTotal) > 0 ? '，' : ''}阻塞写请求 ${ioBlockedTotal} 次` : ''}`;
-    // 标题里容量侧与 IO 侧的先后直接取 LEVEL_ORDER（级别全序的**唯一事实源**），不再就地
-    // 维护第二份级别序表——两份序表取值集一旦不同（旧表的 info=0 vs LEVEL_ORDER 的 info=1），
-    // 日后按注释"调整优先级只改 LEVEL_ORDER"时这里的排序会静默与判定口径分叉。
+    // 标题里容量侧与 IO 侧的先后直接取 LEVEL_ORDER（级别全序的**唯一事实源**），不就地
+    // 维护第二份级别序表——两份序表取值集一旦不同，日后按注释"调整优先级只改 LEVEL_ORDER"时
+    // 这里的排序会静默与判定口径分叉。
     const title =
       ioLevel === 'ok' || mountLevel === 'ok'
         ? `${ioText}${ioText ? '；' : ''}${capText}`
@@ -940,8 +916,8 @@ const cpuRule: HealthRule = {
 
     if (!peak) {
       // 成因判定统一走 core/hana-errors 的 classifyHanaError：259 = 该版本没这个视图（授予权限也没用）、
-      // 258/7 = 权限不足被拒、其余 = 执行出错。此前这里是一段内联三元式，与引擎里的另一份判定并存，
-      // 两份判定必然漂移（同一个错误在不同工具里被解释成不同原因）。
+      // 258/7 = 权限不足被拒、其余 = 执行出错。不在本文件内联一份——两份判定必然漂移
+      // （同一个错误在不同工具里被解释成不同原因）。
       const { reason } = classifyHanaError({ code: statsErrCode, message: statsErr });
       // 查询成功却拿不到百分比（0 行或增量全零）≠ 权限不足：此时 statsErr 为 null，
       // 真实原因是统计服务还没有可用快照。按"需要 SELECT 权限"给话术会让已有权限的用户白跑。
@@ -1448,9 +1424,9 @@ const memoryRule: HealthRule = {
     const finalLevel = worst([level, objLevel]);
     const objTrouble = objLevel !== 'ok' && objLevel !== 'unknown';
     const hostTrouble = level === 'warn' || level === 'critical';
-    // 主机侧是否有读数缺失：某主机 FREE+USED 为 NULL/0 时 hostUsedPct 是内部哨兵 -1（不是"已用 -1%"）。
-    // 缺失时标题/建议不许引用哨兵值，也不许把"判不了"写成"未见异常"；成因还必须指对层——
-    // 读不到的是主机内存读数，而不是内存对象层（对象层可能已正常判定，被指错会把排查引偏）。
+    // 主机侧读数缺失：某主机 FREE+USED 为 NULL/0 时 hostUsedPct 是内部哨兵 -1（不是"已用 -1%"）。
+    // 缺失时标题/建议不许引用哨兵值、不许把"判不了"写成"未见异常"，成因也必须指对层
+    // （读不到的是主机内存读数，不是内存对象层——指错会把排查引偏）。
     const hostUnreadable = hosts.some((h) => h.hostUsedPct < 0);
     const hostUnreadableNote = '有主机读数不可用（FREE/USED 为 0 或 NULL）';
     const hostTitle = `主机内存使用率偏高：${peak.host} 已用 ${peak.hostUsedPct}%（${peak.hostUsedGiB}/${peak.hostTotalGiB} GiB）`;
@@ -1462,14 +1438,11 @@ const memoryRule: HealthRule = {
       id: memoryRule.id,
       category: 'memory',
       level: finalLevel,
-      // 标题必须覆盖 finalLevel='unknown' 这一支：主机内存正常、但内存对象层读不到时，
-      // 若落到最后那个分支会输出"主机内存使用率偏高"——把"判不了"说成"有问题"，
-      // 与"把看不见说成正常"是同一种错误的镜像。
-      // 两个分量同时异常时（内存压力下两者常同时出现）**主机侧先行**：实现按 hostTrouble
-      // 布尔决定顺序，不是按级别比较——主机 warn + 对象层 critical 时标题仍以主机开头
-      // （两个结论都会完整输出，先后只影响阅读顺序，不隐藏任何一侧）。
-      // finalLevel='unknown' 时按**实际读不到的那一层**措辞：主机读数缺失与对象层判不了是
-      // 两种不同成因——前者不能说"未见异常"，也不能把成因栽给已正常判定的对象层。
+      // 标题必须覆盖 finalLevel='unknown' 各支：把"判不了"说成"有问题"与"把看不见说成正常"
+      // 是同一类错误的两面。
+      // 两个分量同时异常时**主机侧先行**（按 hostTrouble 布尔而非级别比较决定顺序；两个结论
+      // 都会完整输出，先后只影响阅读顺序）。finalLevel='unknown' 时按**实际读不到的那一层**措辞：
+      // 主机读数缺失与对象层判不了是两种成因，不能把成因栽给已正常判定的对象层。
       title: hostTrouble
         ? objTrouble
           ? `${hostTitle}；${objTitle}`
@@ -2127,8 +2100,7 @@ const lifecycleRule: HealthRule = {
  * 工具无从判断，故本项恒为 info 级（info 不会把整体 verdict 拉离 ok）。
  * 之所以仍要做成一"项"：它是最常被问到的运维问题之一，读数应当出现在报告里，
  * 而不是让人再去翻界面。数据源用 `SYS.M_ENCRYPTION_OVERVIEW` 这个**权威视图**——
- * 参考实现是从 INI 里读 `encryption=on` 字符串再比对，既漏了"控制态与生效态不同步"，
- * 也比这个视图更容易与实情不符。
+ * 相比从 INI 里读 `encryption=on` 字符串再比对，它不会漏掉"控制态与生效态不同步"。
  */
 const encryptionRule: HealthRule = {
   id: 'encryption.status',
@@ -2205,10 +2177,9 @@ export const HEALTH_RULES: readonly HealthRule[] = [
 ];
 
 /**
- * 全部类别（参数校验用）。
- * 与 DEFAULT_CHECKS 曾是**逐字节相同的两份定义**（同一个 map 表达式写两遍），
- * 留着两份只会让人以为"默认项"与"全部"将来可以不同——而本模块的语义是"默认全做"。
- * 现以 ALL_CHECKS 为唯一来源，DEFAULT_CHECKS 仅作别名（health.service 与单测仍按原名导入）。
+ * 全部类别（参数校验用）。ALL_CHECKS 是唯一来源，DEFAULT_CHECKS 仅作别名——
+ * 两份独立定义只会让人以为"默认项"与"全部"将来可以不同，而本模块的语义是"默认全做"
+ * （health.service 与单测仍按原名导入）。
  */
 export const ALL_CHECKS: readonly HealthCategory[] = HEALTH_RULES.map((r) => r.category);
 

@@ -39,7 +39,7 @@ const ROLES = new WeakMap<object, ResourceRole>();
  * 给一个 schema 实例打上资源角色（返回同一对象）。
  *
  * ⚠️ **必须包在链的最外层**：zod 的 `.optional()`/`.describe()`/`.min()` 都返回**新对象**，
- * 标签随旧对象被丢弃（实测踩过一次：`tagResource(z.string(),'readSchema').describe(...)`
+ * 标签随旧对象被丢弃（实测：`tagResource(z.string(),'readSchema').describe(...)`
  * 读回来是 undefined）。正确写法：`tagResource(z.string().optional().describe('…'), 'readSchema')`。
  */
 export function tagResource<T extends z.ZodType>(schema: T, role: ResourceRole): T {
@@ -81,14 +81,14 @@ export function deriveResourcesFromParams(inputSchema: z.ZodType, args: Record<s
   const out: DeclaredResources = { writePackages: [], readSchemas: [], readPackages: [] };
   const shape = (inputSchema as unknown as { shape?: Record<string, unknown> }).shape;
   if (!shape) return out;
-  // 多对象批次模式（hana_view_update 的 changeset，P7）：批次执行**完全不消费**顶层 packageId
+  // 多对象批次模式（hana_view_update 的 changeset）：批次执行**完全不消费**顶层 packageId
   // （applyChangeset 只认 actions，逐动作自带 packageId），它只是单对象通道的目标位。
   // 把顶层 packageId 并进 writePackages 就是**幽灵写声明**：调用方随手填一个别的包（如只读包）
   // 会让完全合法的批次被闸门以 target_outside_boundary **整批拒绝**，计划文本与 capability-audit
   // 的资源里也会列出这个批次从不写入的包。批次写包由 actions 的并集承担（规划器逐动作并进
   // writePackages）——那不是本层的职责，本层只需不制造幽灵声明。
   // 只在 schema 里确有 changeset 参数时才抑制（角色判定仍按参数自己走，其他能力不受影响）；
-  // 判定用宽松形状（`typeof === 'object'`）而非具体字段：与 args 可能未经 zod 解析（门面路由路径）同口径。
+  // 判定用宽松形状（`typeof === 'object'`）而非具体字段：与 args 可能未经 zod 解析（直调 handler 等）同口径。
   const changesetMode = shape.changeset !== undefined && typeof args.changeset === 'object' && args.changeset !== null;
   for (const [name, field] of Object.entries(shape)) {
     const role = resourceRoleOf(field);
@@ -96,10 +96,10 @@ export function deriveResourcesFromParams(inputSchema: z.ZodType, args: Record<s
     if (changesetMode && role === 'writePackage') continue;
     const value = args[name];
     if (typeof value !== 'string') continue;
-    // **不做 trim**（I3 单一口径：判定值必须等于服务层实际拿到的值）。入参归一在**声明侧**完成——
-    // readSchema 类形参的 zod schema 带 `.trim()`（defs/*.ts），经 SDK / 门面路由解析后，闸门、计划、
+    // **不做 trim**（单一口径：判定值必须等于服务层实际拿到的值）。入参归一在**声明侧**完成——
+    // readSchema 类形参的 zod schema 带 `.trim()`（defs/*.ts），经 SDK 解析后，闸门、计划、
     // 服务层拿到的是同一个字符串。这里若再 trim，未经 zod 解析的调用（直调 handler 等）就会出现
-    // "闸门按 trim 后的值判、服务层按原值判"的双口径——正是评审点名的"闸门放行、服务报不在白名单"。
+    // "闸门按 trim 后的值判、服务层按原值判"的双口径——闸门放行、服务层却报不在白名单。
     // 只跳过"去掉首尾空白后为空"的值：空串/纯空白不算声明（模型偶尔用它表示"不指定"）。
     if (value.trim() === '') continue;
     const target =
@@ -122,9 +122,7 @@ export function declaredResourceRoles(inputSchema: z.ZodType): ResourceRole[] {
 /**
  * 把"参数声明的资源"与"规划器给出的资源"合并（并集 = 更严的方向；同一资源不会重复）。
  *
- * 对象级字段（`reads`/`writes`）**原样透传**（P7 修正）：此前只搬 tool/steps/三个包级数组/uncertain，
- * 规划器声明的对象级读写集在这里被静默丢掉——`planFor(...)` 的结果恒为 `reads/writes === undefined`，
- * 声明形同虚设。参数声明层（deriveResourcesFromParams）只认顶层字符串资源，不产生对象级引用，
+ * 对象级字段（`reads`/`writes`）**原样透传**：参数声明层只认顶层字符串资源，不产生对象级引用，
  * 所以这里没有"合并"可言，透传即正确。**可选字段语义**：`undefined` 时不产生键——
  * 未声明（静态不可知）与"已声明无"（`[]`）是两回事，不许在此把前者归一成后者。
  */

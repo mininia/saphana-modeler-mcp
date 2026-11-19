@@ -5,8 +5,7 @@
  * **返回长什么样**归 `tools/common.ts` 的 `toToolResult`（handler 用）。
  * 这样 `capabilities/` 不需要 import `tools/`（依赖方向硬约束，见 types.ts 头注）。
  *
- * 这些片段此前与返回框架一起挤在 `tools/common.ts`：包名/对象名的正则 `/^[A-Za-z0-9_.\-]+$/`
- * 曾手抄 28 处、VIEW_KIND 曾在三个模块各写一份——收敛在这里后，"入参长什么样"只有一种答案。
+ * 包名/对象名正则与 VIEW_KIND 等共享片段集中在这里：入参口径只有一种答案。
  */
 
 import { z } from 'zod';
@@ -37,7 +36,7 @@ export const VIEW_KIND = z.enum(['calculationview', 'attributeview', 'analyticvi
  */
 export const VERSION_SCOPE = z.enum(['active', 'inactive']);
 
-// ── 资源形参（P10-c）────────────────────────────────────────────
+// ── 资源形参 ─────────────────────────────────────────────
 //
 // 下面三个构造器与普通入参的唯一区别是**带资源角色**（见 capabilities/resources.ts 的说明）：
 // 规划器据此派生读/写范围，新增能力只要用对构造器，资源维度就自动成立，不靠人记得写 planner。
@@ -64,6 +63,6 @@ export function zReadPackageId(usage: string) {
  * 受 `HANA_READ_SCHEMA` 与调用方档案的约束（系统 schema 恒可读，无需配置）。
  *
  * 各处 schema 参数的**约束并不相同**（有的带 min/max、有的纯 string），故这里不提供构造器，
- * 由声明处用 `tagResource(z.string()…, 'readSchema')` 就地打标——**保持已发布的约束与描述逐字不变**。
+ * 由声明处用 `tagResource(z.string()…, 'readSchema')` 就地打标——**各处约束与描述保持不变**。
  * 声明处直接 `import { tagResource } from './resources.js'` 即可，不在此二次导出。
  */

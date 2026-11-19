@@ -2,17 +2,12 @@ import { pino, type DestinationStream } from 'pino';
 import { DEFAULT_TIMEZONE, toIsoInTimezone } from './datetime.js';
 
 /**
- * 结构化日志（pino）。密码/Token/Authorization 一律脱敏：
- * - 结构化字段：redact 路径直接剔除
- * - 自由文本（如请求体）：经 redactSensitive 掩码
- * 输出到 stderr：MCP stdio transport 独占 stdout，日志不得混入协议通道。
+ * 结构化日志（pino）。密码/Token/Authorization 一律脱敏：结构化字段经 redact 剔除，
+ * 自由文本（如请求体）经 redactSensitive 掩码。输出到 stderr：MCP stdio transport 独占 stdout。
  *
- * 配置来源：本模块必须在 loadConfig **之前**就可用（配置校验失败时也要能报错，
- * 且启动期告警早于配置就绪），故创建时先用**未经校验**的进程环境变量兜底。
- * 兜底值非法（级别不在 pino 白名单 / 时区不被 Intl 接受）时退回默认值告警，
- * 不把模块求值变成崩溃点（见 createBootstrapLogger）。
- * loadConfig 成功后由入口调用 applyLoggerConfig 换成**已校验**的取值 —— 日志级别与
- * 时区因此与其余模块同源（config），不再各自直读 process.env 造成「判定值 ≠ 运行值」。
+ * 本模块必须在 loadConfig **之前**就可用（配置校验失败时也要能报错），故先用**未经校验**的进程
+ * 环境变量兜底；兜底值非法时退回默认值告警，不把模块求值变成崩溃点（见 createBootstrapLogger）。
+ * loadConfig 成功后由入口调用 applyLoggerConfig 换成**已校验**的取值——日志级别与时区因此与 config 同源。
  */
 
 const DEFAULT_LOG_LEVEL = 'info';
@@ -37,18 +32,11 @@ type SensitiveValueReplacer = (
  * 敏感自由文本掩码规则（HANA 环境）。
  *
  * 三组键值模式共用同一形状：`键名 + 分隔符（可选引号） + 值`，替换时只动值。
- * - 自由文本（`token=abc`）归一为固定形态的 `token: ****`；
- * - JSON 引号形态（`"token":"abc"` → `"token":"****"`）：只认 `键名[:=]值` 时，
- *   键名后面先跟的 `"` 会让整组失配——错误信封 / XS 响应体里的凭据会原样漏出；
- *   引号字节兼容裸 `"`（errors.ts 等直调点传入的未序列化原文）与转义 `\"`（streamWrite
- *   钩子看到的 pino **已序列化**整行——字符串内的引号恒被转义），替换按命中形态补同款引号，
- *   绝不补错形态（转义形态下补裸 `"` 会打破整行）；
- * - 行结构保护是**有限的**，不是伞形承诺：值段以转义对（`\` 与其后一字符）为最小单位、
- *   遇裸 `"` `}` 即停，且分隔符吞下的引号只有在「确为所在字符串的收尾引号、且值段为空」
- *   （空值收尾）时才整段原样放行；收尾引号后紧跟仍会落入值段的字符（如 `["x token: "]`
- *   的 `]`、`PASSWORD= ","` 的 `,`）时掩码会连收尾引号一起吃掉，产出采集器 / jq 会直接
- *   丢的破行日志——取舍是「宁丢行、不漏值」（被丢的恰是审计行）。转义形态不受此限：掩码
- *   只增删转义对与值内容、不动裸引号，已序列化整行的引号结构保持。
+ * - JSON 引号形态（`"token":"abc"`）必须识别：只认 `键名[:=]值` 时，键名后的 `"` 会让整组失配，
+ *   错误信封 / XS 响应体里的凭据会原样漏出；引号字节兼容裸 `"` 与转义 `\"`（pino 已序列化整行），
+ *   替换按命中形态补同款引号，绝不补错形态；
+ * - 行结构保护是**有限的**，不是伞形承诺：值段遇裸 `"` `}` 即停；极端形态下掩码可能连收尾引号一起
+ *   吃掉、产出破行日志——取舍是「宁丢行、不漏值」。转义形态不受此限（只增删转义对与值内容）。
  */
 const SENSITIVE_PATTERNS: Array<[RegExp, SensitiveValueReplacer]> = [
   [/(HANA_PASSWORD|PASSWORD|PASSWD|PWD)(\\?"?\s*[:=]\s*\\?"?)((?:[^&\s;"}\\]|\\.)+)/gi, sensitiveValueReplacer('=')],
@@ -64,12 +52,9 @@ const SENSITIVE_PATTERNS: Array<[RegExp, SensitiveValueReplacer]> = [
 
 /**
  * 生成键值掩码替换函数：保留键名与分隔符（含引号），只把值换成 ****。
- * - 无引号（自由文本）：输出归一为 `键名 + bareSep + ****`（如 `HANA_PASSWORD=****`、`token: ****`）；
- * - 带引号（JSON 位置）：引号原样保留；值本身不带引号（数字 / 布尔 / null）时补一对引号，
- *   否则会产出 `"token":****` 这种非法 JSON；补出的引号形态与命中的一致——裸 `"` 或转义 `\"`
- *   （streamWrite 钩子看到的是 pino 已序列化整行，补裸引号会打破整行）；
- * - 键带引号但值是 `{` / `[` 开头（对象 / 数组）：原样放行——本层只做标量掩码，强行替换会把
- *   整行打成非法 JSON（对象内容不是字符串掩码能安全吞掉的），而结构化凭据另有 pino redact 兜底。
+ * - 无引号（自由文本）：输出归一为 `键名 + bareSep + ****`；
+ * - 带引号（JSON 位置）：引号原样保留；值不带引号（数字/布尔/null）时补一对同款引号，否则产出非法 JSON；
+ * - 键带引号但值是 `{` / `[` 开头（对象/数组）：原样放行——本层只做标量掩码，结构化凭据另有 pino redact 兜底。
  */
 function sensitiveValueReplacer(bareSep: string): SensitiveValueReplacer {
   /** 在 full 前 end 个字符内，未转义的双引号数量是否为奇数（奇数 = 该位置处于字符串字面量内部） */

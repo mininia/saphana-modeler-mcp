@@ -1,7 +1,7 @@
 /**
  * 仓库对象的版本视角（只读元数据/血缘的数据源选择）。
  *
- * - active（默认，兼容既有行为）：`_SYS_REPO.ACTIVE_OBJECT` / `ACTIVE_OBJECTCROSSREF` —— 已激活版本；
+ * - active（默认）：`_SYS_REPO.ACTIVE_OBJECT` / `ACTIVE_OBJECTCROSSREF` —— 已激活版本；
  * - inactive：`_SYS_REPO.INACTIVE_OBJECT` / `INACTIVE_OBJECTCROSSREF` —— 未激活/有挂起改动的版本。
  *
  * 语义边界（实测 SPS08）：

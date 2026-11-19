@@ -22,20 +22,17 @@ import {
 import { definitionScriptsOf, isObjectNotFoundError } from './view-write.service.js';
 
 /**
- * 本地文件路径边界（1138/1139）——本地文件读写（hana_repo_export 的 saveTo、hana_repo_import 的
- * filePath）的允许范围。这两个参数直通**服务器本地文件系统**，不在任何 HANA 边界内
- * （HANA_WRITE_PACKAGES 管不到、读 schema 白名单也管不到）：没有约束时，任何能调到该工具的一方
- * （HTTP 多客户端下持 Token 即可）都能覆盖写服务器上任意可写文件（如 ../../.env、C:\...\mcp.json）
- * 或读取任意文件字节发往 HANA。
+ * 本地文件路径边界——本地文件读写（hana_repo_export 的 saveTo、hana_repo_import 的 filePath）的
+ * 允许范围。这两个参数直通**服务器本地文件系统**，不在任何 HANA 边界内（HANA_WRITE_PACKAGES、
+ * 读 schema 白名单都管不到）：无约束时，任何能调到该工具的一方（HTTP 多客户端下持 Token 即可）
+ * 都能覆盖写服务器上任意可写文件（如 ../../.env）或读取任意文件字节发往 HANA。
  *
- * 单一口径（2026-10-14 起）：根 = **服务器工作目录**（MCP 客户端拉起时即客户端默认工作区），
- * 只接受落在其内的**相对路径**——绝对路径一律拒绝、'..' 逃逸一律拒绝，解析后用 path.relative 复核。
- * 原先的「配置本地根」档（环境变量 MCP_LOCAL_ROOT）已删除：多一档可配范围就多一处「以为隔离了、
- * 其实没配」的空间，而绝大多数部署要的就是工作区内相对路径。注意本档**不覆盖**「工作目录内的
- * 同名文件」（如 cwd 下的 .env/mcp.json），该范围内的覆盖写由调用方自行避免。
- * 纯点段在 core 侧的 encodePath 也有同口径拦截（URL 拼接的纵深层）。
- * 错误信息只陈述拦截事实与可用替代（如改取 base64），**不写**开启方式（配置标识符）——
- * 本消息会随 envelope 返回给调用方，写明"改哪项配置可放行"等于教它绕过（同 assertWritePackageAllowed）。
+ * 单一口径：根 = **服务器工作目录**（MCP 客户端拉起时即客户端默认工作区），只接受落在其内的
+ * **相对路径**——绝对路径与 '..' 逃逸一律拒绝，解析后用 path.relative 复核。不设可配置的本地根：
+ * 多一档可配范围就多一处「以为隔离了、其实没配」的空间。本档**不覆盖**「工作目录内的同名文件」
+ * （如 cwd 下的 .env/mcp.json），那由调用方自行避免。纯点段在 core 侧 encodePath 也有同口径拦截。
+ * 错误信息只陈述拦截事实与可用替代（如改取 base64），**不写**开启方式（配置标识符）——本消息会随
+ * envelope 返回给调用方，写明"改哪项配置可放行"等于教它绕过。
  */
 function resolveLocalPath(inputPath: string, param: string): string {
   const root = process.cwd();
@@ -58,8 +55,8 @@ function resolveLocalPath(inputPath: string, param: string): string {
 
 /**
  * 包创建（XS REST：POST /base/file/<pkg>/ 建目录）。
- * 按 SSD §4.1 明确**不加锁、不需要 If-Match**：这是**幂等**操作——重复建包 200/201 均被接受
- * （xs-rest 的 createPackage 对已存在返回 200），任何时序下终态一致，满足并发不变量 I1。
+ * 明确**不加锁、不需要 If-Match**：这是**幂等**操作——重复建包 200/201 均被接受
+ * （xs-rest 的 createPackage 对已存在返回 200），任何时序下终态一致。
  */
 export async function createPackageViaRest(
   config: HanaConfig,
@@ -119,30 +116,27 @@ export interface ImportObjectResult {
   object: { packageId: string; fileName: string };
   imported: boolean;
   meta?: FileMeta;
-  /** 回读基线：导入**写完之后**独立回读到的 ETag（与写动作不同源，语义见 etagSource；回读失败时缺省） */
+  /** 回读基线：导入**写完之后**独立回读到的 ETag（与写动作不同源；回读失败时缺省） */
   etag?: string;
-  /** etag 的来源（见 EtagSource）：'read-back'=独立回读；'unavailable'=回读未拿到 ETag 或回读失败（后者见 readBackError） */
+  /** etag 来源：'read-back'=独立回读；'unavailable'=回读未拿到 ETag 或回读失败（后者见 readBackError） */
   etagSource?: EtagSource;
   /** 回读到的服务端版本号（与 etag 同一次读取，不拼装） */
   version?: number;
   /**
-   * 写入后回读失败的原因（仅回读失败时产生该字段，此时 meta 缺省）。
-   * 与 etagSource='unavailable' 的区别（「查不到与没去查必须可区分」）：unavailable 只表示这次读取没带 ETag
-   * （读到了对象但无 ETag），readBackError 表示**回读本身失败了**（没读到，原因在此）——导入结果仍以
+   * 写入后回读失败的原因（仅回读失败时产生，此时 meta 缺省）。与 etagSource='unavailable' 的区别：
+   * 后者表示读到了对象但无 ETag；本字段表示**回读本身失败了**（原因在此）。导入结果仍以
    * imported=true 为准（写入确实发生了），回读只是附加信息。
    */
   readBackError?: string;
   /**
-   * 跨进程并发迹象（只有实测到时才产生该字段，不制造恒为空噪音）：
-   * 写前检查为「不存在」而回读版本号 > 1 ⇒ 本次调用期间有他人写过该对象（导入的新对象可能已被覆盖）。
-   * 跨进程无服务端前置（xfer 导入没有 If-Match），属 SSD §4.1 的已知例外。
+   * 跨进程并发迹象（仅实测到时产生）：写前检查为「不存在」而回读版本号 > 1 ⇒ 本次调用期间有他人
+   * 写过该对象（导入的新对象可能已被覆盖）。xfer 导入没有 If-Match 前置，属已知例外。
    */
   concurrencyNote?: string;
   /**
-   * 内容预扫的如实标注（仅当导入内容**无法扫描**时产生，不制造恒为空噪音）：
-   * 导入写入前会解析 SQL 模式视图的 <definition> 脚本，跑与 create/set_script 同一份读取范围判定
-   * （限定名按 schema 白名单、未限定名按 CURRENT_SCHEMA）——命中即拒绝（零写入）。zip 归档等本服务
-   * 不解析的载荷在此说明「本次未做该扫描」，不假装扫过。
+   * 内容预扫的如实标注（仅当导入内容**无法扫描**时产生）：写入前会解析 SQL 模式视图的
+   * <definition> 脚本，跑与 create/set_script 同一份读取范围判定——命中即拒绝（零写入）。
+   * zip 归档等本服务不解析的载荷在此说明「本次未做该扫描」，不假装扫过。
    */
   contentScanNote?: string;
 }
@@ -150,20 +144,16 @@ export interface ImportObjectResult {
 /**
  * 导入内容的读取范围预扫——写入之前执行，命中即拒绝（零写入）。
  *
- * 为什么需要（与工具层规划的真实分工）：工具层规划对内联内容只扫**静态可解析**的部分
- * （resourceUri、基表 schemaName 与 <definition> 脚本的限定名，见 planners 的 planRepoImport）；
- * filePath 通道的内容要到服务端才读到，规划层只能落 uncertain。服务层就地扫描补的正是这些盲区：
- * filePath 导入的全部脚本 + 任何通道的**未限定表名**（按 CURRENT_SCHEMA 解析，工具层扫描器无从得知）
- * ——不扫的话，SQL 模式视图的 <definition> 里可以带越界 schema 引用，而本通道**导入即激活**，
- * 等于给白名单外 schema 建了一个持久取数口。
- * 判定复用 create(mode=sql) / set_script 的同一份扫描器与读取范围判定，不另写第二份。
- * 「扫不了」的载荷都不静默（承诺的 fallback，「查不到与没去查必须可区分」）：
- * - zip 归档：返回标注（进回执 contentScanNote）；
- * - 不含 XML 根元素（纯文本/JSON/空载荷）：同样返回标注；
- * - 含 <definition> 元素却提取不出脚本正文（如命名空间前缀形态）：**拒绝**（零写入）——
- *   「提取不出」不等于「没有可扫的 SQL」，这里是拒绝与放行的分界（fail-closed 一侧）。
- * pool 可选：**未提供时未限定表名一项无从校验**（CURRENT_SCHEMA 必须查库），
- * 同样在标注里如实说明；工具层调用点（hana_repo_import）传 ctx.pool，故生产路径是全量判定。
+ * 为什么要服务层再扫一遍：工具层规划对内联内容只扫**静态可解析**的部分；filePath 通道的内容要
+ * 到服务端才读到，规划层只能落 uncertain。这里补的正是这些盲区：filePath 导入的全部脚本 +
+ * 任何通道的**未限定表名**（按 CURRENT_SCHEMA 解析，工具层扫描器无从得知）——不扫的话，
+ * SQL 模式视图的 <definition> 可以带越界 schema 引用，而本通道**导入即激活**，等于给白名单外
+ * schema 建了持久取数口。判定复用 create(mode=sql) / set_script 的同一份扫描器。
+ * 「扫不了」的载荷都不静默：
+ * - zip 归档 / 不含 XML 根元素：返回标注（进回执 contentScanNote）；
+ * - 含 <definition> 却提取不出脚本正文（如命名空间前缀形态）：**拒绝**（零写入）——
+ *   「提取不出」不等于「没有可扫的 SQL」，这里是 fail-closed 一侧。
+ * pool 可选：未提供时未限定表名一项无从校验，同样在标注里如实说明。
  * @returns 无法扫描/未做某项扫描时的中文标注；完整扫描完成时 undefined；
  *          提取不出脚本正文时抛业务错误（内容无法校验，不导入）
  */
@@ -229,20 +219,19 @@ async function assertImportPayloadReadScopes(
 
 /**
  * 导入单个设计时文件（POST+PUT /base/xfer/import，官方 Transfer API）。
- * 导入是写操作：目标包须在 HANA_WRITE_PACKAGES 配置的可写包范围内（示例值 ZDEMO，含子包）。
- * 【默认拒绝覆盖】目标文件已存在时抛错并指引改用 hana_view_update（已有对象的修改走更新通道，
- * 禁止 delete+重建或静默覆盖）；确需覆盖导入（如备份恢复）须显式 overwrite=true。
- * 来源：content 内联内容（须配 fileName），或 filePath 本地文件（默认取 basename 做目标文件名）。
- * filePath 的本地路径边界：只允许**服务器工作目录内的相对路径**（绝对路径与 '..' 逃逸一律拒绝；
- * 没有可配的本地根）——否则可直接读取服务器任意可读文件并把字节发往 HANA。读文件失败（不存在/不可读）
- * 归一为可修正的中文业务错误，不包装成「内部错误」。
- * 内容预扫：写入前解析 SQL 模式视图的 <definition> 脚本，跑与 create/set_script 同一份
- * 读取范围判定（限定名 + 未限定名），命中即拒绝且零写入；无法解析的载荷（zip 等）在回执如实标注。
- * 并发（§4.1 import 行）：整段「存在性检查 → 导入 → 回读」在同一把 keyed lock 内；锁键用
- * normalizeObjectName(文件名) 剥掉后缀——与外层 create/update/activate/delete/validate 对同一对象同键。
- * 守卫收紧：只有 404（OBJECT_NOT_FOUND）才算「不存在」，其它错误 rethrow（fail-closed）。
- * 注：4 个参数（input/client/pool）。pool 为可选尾参（既有调用点零改动；缺省时
- * 未限定表名一项无从校验，由回执 contentScanNote 如实标注）；工具层调用点应显式传 ctx.pool。
+ * 导入是写操作：目标包须在 HANA_WRITE_PACKAGES 范围内（示例值 ZDEMO，含子包）。
+ * 【默认拒绝覆盖】目标文件已存在时抛错并指引改用 hana_view_update（修改走更新通道，禁止
+ * delete+重建或静默覆盖）；确需覆盖（如备份恢复）须显式 overwrite=true。
+ * 来源：content 内联内容（须配 fileName），或 filePath 本地文件（默认取 basename 做目标文件名）；
+ * filePath 只允许**服务器工作目录内的相对路径**（见 resolveLocalPath）。读文件失败归一为可修正的
+ * 中文业务错误，不包装成「内部错误」。
+ * 内容预扫：写入前解析 SQL 模式视图的 <definition> 脚本并跑读取范围判定，命中即拒绝且零写入；
+ * 无法解析的载荷在回执如实标注。
+ * 并发：整段「存在性检查 → 导入 → 回读」在同一把 keyed lock 内；锁键用
+ * normalizeObjectName(文件名) 剥后缀——与 create/update/activate/delete/validate 同对象同键。
+ * 只有 404（OBJECT_NOT_FOUND）才算「不存在」，其它错误 rethrow（fail-closed）。
+ * pool 为可选尾参：缺省时未限定表名一项无从校验，由 contentScanNote 如实标注；
+ * 工具层调用点应显式传 ctx.pool。
  */
 export async function importObjectViaRest(
   config: HanaConfig,
@@ -304,7 +293,7 @@ export async function importObjectViaRest(
       }
     }
     await rest.importFile(input.targetPackageId, targetFile, content);
-    // 写后失效视图缓存（§4.5）：对象名用剥掉后缀的裸名（与 get() 的 key 构造一致）
+    // 写后失效视图缓存：对象名用剥掉后缀的裸名（与 get() 的 key 构造一致）
     invalidateViewCache(input.targetPackageId, normalizeObjectName(targetFile));
     // 落库状态回读（inactive / active 语义由服务端决定，如实呈现）。
     // 失败保持现状：meta undefined 但 imported=true（写入已发生，回读只是附加信息，不掩盖导入结果）——
@@ -339,7 +328,7 @@ export async function importObjectViaRest(
       result.etagSource = 'unavailable';
     }
     result.version = version;
-    // 跨进程竞态（§4.1 import 行）：写前检查为「不存在」而回读版本号 > 1 ⇒ **通常**意味着期间有他人写过该对象。
+    // 跨进程竞态：写前检查为「不存在」而回读版本号 > 1 ⇒ **通常**意味着期间有他人写过该对象。
     // 该字段只在 overwrite !== true 时产生：overwrite=true 时写前未做检查，回读到的 Version>1 可能本就是
     // 该对象的既有历史版本——报「本次调用期间有他人写过」会把推断说成事实，故不产生该字段。
     // 免责句与 create 路径共用同一常量（VERSION_CONCURRENCY_CAVEAT）。

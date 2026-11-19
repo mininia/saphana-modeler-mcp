@@ -3,13 +3,11 @@ import { currentEnvironmentRuntime } from './environment-context.js';
 
 /**
  * SQL 标识符与字面量防护：
- * - 所有拼进 SQL 的标识符必须经 quoteIdentifier / assertSafeObjectName 处理
- * - schema 名走白名单（系统 schema + 配置项 HANA_READ_SCHEMA 追加）
- * - 值一律优先参数绑定；确需内联时用 quoteLiteral
+ * - 拼进 SQL 的标识符必须经 quoteIdentifier / assertSafeObjectName 处理；schema 名走白名单；
+ *   值一律优先参数绑定；确需内联时用 quoteLiteral。
  *
- * 错误出口：本模块的断言一律抛 HanaBusinessError（带 code），**不抛裸 Error**。
- * 原因：裸 Error 会被 withErrorEnvelope 归入"未知错误"，对外只剩「内部错误，详情见服务端日志」——
- * 「schema 不在允许列表」「对象名含非法字符」这类**调用方可据以修正**的原因会被整体吞掉。
+ * 错误出口：一律抛 HanaBusinessError（带 code），**不抛裸 Error**——裸 Error 会被 withErrorEnvelope
+ * 归入"未知错误"，对外只剩「内部错误」，「schema 不在允许列表」这类**调用方可据以修正**的原因会被吞掉。
  */
 
 /** 系统 schema 白名单（核心模型对象所在；SAPABAP1 为 BW on HANA 业务数据 schema，普通用户按其数据库权限访问） */
@@ -54,7 +52,7 @@ export function configureExtraSchemas(schemas: string[]): void {
 
 /**
  * 当前生效的追加 schema：
- * - 服务进程内（有环境 runtime 绑定）读当前环境的 `schemaAllow`（v2 策略参数可按环境不同）；
+ * - 服务进程内（有环境 runtime 绑定）读当前环境的 `schemaAllow`（策略参数可按环境不同）；
  * - 独立脚本/测试直调（无 runtime）回退 configureExtraSchemas 的进程级值。
  * 单一入口，避免“闸门按环境判、SQL 执行仍按全局白名单走”的分叉。
  */
@@ -91,7 +89,7 @@ export function listAllowedSchemas(): string[] {
 /**
  * 白名单的可读描述（供**所有**拒绝文案与排障提示共用）。
  *
- * 单点生成的原因：手写枚举曾在多处与实际白名单漂移 —— 报错文案漏列 SAPABAP1，
+ * 单点生成的原因：手写枚举会与实际白名单漂移 —— 若报错文案漏列某项，
  * 调用方按报错去排查会得出"我加的 schema 明明在白名单里"这类错误结论。
  * 文案由 SYSTEM_SCHEMAS 生成后，白名单变更不可能再与文案脱节。
  */

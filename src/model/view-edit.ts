@@ -241,11 +241,11 @@ export function addJoinToViewXml(xml: string, spec: AddJoinSpec): AddJoinEditRes
     seenBring.add(f.id);
   }
 
-  // 悬空映射守卫：重接线会把 logicalModel 的全部映射（keyMapping/measureMapping）机械改指新 Join，
-  // 而新 Join 只声明原输出节点的 viewAttributes（+ 带出字段）。原输出节点上若有被映射引用的计算列
-  // （<calculatedViewAttribute>，如 op=add_calculated_column 的产物），重接线后映射会指向新 Join 上
-  // 不存在的列——写出一个悬空映射的坏定义（激活必失败），而变换回执照报成功。
-  // 本变换不代迁计算列（整段 XML 需连 formula/datatype 搬运，列间引用还要传递闭包），故当场拒绝。
+  // 悬空映射守卫：重接线把 logicalModel 全部映射机械改指新 Join，而新 Join 只声明原节点的
+  // viewAttributes（+带出字段）。原节点上若有被映射引用的计算列（<calculatedViewAttribute>，
+  // 如 add_calculated_column 的产物），重接线后映射指向新 Join 上不存在的列——写出悬空映射的
+  // 坏定义（激活必失败）却回执成功。本变换不代迁计算列（需连 formula/datatype 搬运、列间引用
+  // 还要传递闭包），故当场拒绝。
   const joinColumns = new Set([...leftAttrs, ...spec.fields.map((f) => f.id)]);
   const o = def.outputs;
   const dangling = [
@@ -282,10 +282,9 @@ export function addJoinToViewXml(xml: string, spec: AddJoinSpec): AddJoinEditRes
     `    </DataSource>`,
   ].join('\n');
 
-  // DataSource id 冲突守卫：id 直接取源对象名——同一源视图二次 add_join（如换一组条件再拉一次），
-  // 或跨包同名源视图各加一次，会让文档里出现两个同 id 的 <DataSource>，`#id` 引用不再唯一
-  //（<input node="#..."> 解析取谁不再由文档决定）。同 id 同 resourceUri ⇒ 复用现有数据源（不新增，
-  // Projection 的 `#id` 输入自然指回既有声明）；同 id 不同 resourceUri ⇒ 拒绝（fail-closed）。
+  // DataSource id 冲突守卫：id 取源对象名——同一源视图二次 add_join 或跨包同名源视图会让文档里
+  // 出现两个同 id 的 <DataSource>，`#id` 引用不再唯一。同 id 同 resourceUri ⇒ 复用现有声明；
+  // 同 id 不同 resourceUri ⇒ 拒绝（fail-closed）。
   const existingSource = def.dataSources.find((d) => d.id === spec.sourceId);
   if (existingSource && (existingSource.resourceUri ?? '') !== spec.sourceResourceUri) {
     throw new HanaBusinessError(
@@ -569,14 +568,11 @@ export function setScriptInViewXml(xml: string, spec: SetScriptSpec): SetScriptE
 }
 
 /* ── op=set_description：改视图描述/显示名（零 XML）────────────────────────────
- * 真实语料（tests/fixtures 全部夹具 + 实机导出）里，「视图描述 / 显示名」只有**一个** XML 锚点：
- * 根元素下的 `<descriptions defaultDescription="…"/>`——HANA Studio 语义里的 Label/显示名与目录里的
- * 描述是同一处 defaultDescription（对象身份是根 id，改它属于改名而不是改描述；语言相关文本走仓库
- * .properties 翻译文件，不写在 XML 内）。故 `description` 与 `displayName` 两个入参名指向同一锚点：
- *   · 只给一个 → 改它；
- *   · 两个都给 → 必须一致（一个锚点写不进两个值；不一致时显式拒绝，不静默取其一）；
- *   · 都不给 → 显式拒绝（静默返回原文会被调用方读成"改成功了"）。
- * 与 addJoinToViewXml / setScriptInViewXml 同一策略：锚点字符串手术，除被替换的那一个属性外逐字节保留。 */
+ * 真实语料（实机导出）里「视图描述 / 显示名」只有**一个** XML 锚点：根元素下的
+ * `<descriptions defaultDescription="…"/>`——Studio 语义的 Label 与目录描述是同一处
+ * （语言相关文本走仓库 .properties，不写在 XML 内）。故两个入参名指向同一锚点：
+ * 只给一个 → 改它；两个都给 → 必须一致（一个锚点写不进两个值）；都不给 → 显式拒绝
+ * （静默返回原文会被读成"改成功了"）。策略同其它 op：锚点字符串手术，其余逐字节保留。 */
 
 export interface SetDescriptionSpec {
   /** 视图描述（与 displayName 同锚点，见本节头注） */
@@ -602,10 +598,9 @@ interface RootDescriptionsAnchor {
 }
 
 /**
- * 定位根元素的 `<descriptions …>` 段——**刻意不用 locateSection**：那个助手要求标签在文档里唯一，
- * 而 `<descriptions>` 在节点/输出字段/变量里大量重复；这里要的是**根元素的第一处**（真实语料中它恒在
- * `<origin/>` 之后、其余子段之前，是唯一没有歧义的定位点）。第一处之前出现别的子段（或找不到该段）⇒
- * 文档结构与已知方言不符：拒绝变换，而不是拿一处节点级描述当视图描述来改。
+ * 定位根元素的 `<descriptions …>` 段——**刻意不用 locateSection**：`<descriptions>` 在节点/输出字段/
+ * 变量里大量重复，这里要的是**根元素的第一处**（真实语料中恒在 `<origin/>` 之后）。第一处之前出现
+ * 别的子段（或找不到该段）⇒ 结构与已知方言不符：拒绝，而不是拿节点级描述当视图描述改。
  */
 function locateRootDescriptions(xml: string): RootDescriptionsAnchor {
   // 跳过 <?xml …?> 声明；根元素开标签之后才是候选区
@@ -666,7 +661,7 @@ export function setDescriptionInViewXml(xml: string, spec: SetDescriptionSpec): 
  * 与 add_join / set_script / set_description 同一策略：锚点字符串手术（除被改动的片段外逐字节保留）、
  * 锚点缺失或结构与已知方言不符即拒绝，失败不产出半成品。
  * 结构面判据与参数面在 services/view-ops.rules.ts（声明↔schema↔实现三方由单测钉住）。
- * 方言依据：tests/fixtures/*.xml 的真实导出形态 + model/view-xml.ts 的解析契约（两侧同源，不各写一份）。 */
+ * 方言依据：真实导出形态 + model/view-xml.ts 的解析契约（两侧同源，不各写一份）。 */
 
 /** 输出字段的种类（= logicalModel 里五个小节；与 view-xml.parseOutputList 的 section/kind 对应） */
 export type OutputFieldKind =
@@ -1148,10 +1143,9 @@ export function setVariableInViewXml(xml: string, spec: SetVariableSpec): SetVar
   let block = inner.slice(blk.start, blk.end);
 
   // 变量结构守卫**无条件执行**：三个字段（含只给 description）都要求本仓方言的变量形态，
-  // 即 <variable …><variableProperties …/></variable>。此前守卫只包住 defaultValue/mandatory 分支，
-  // 而 description 分支要往 <variable> 内部插 <descriptions>——目标是自闭合 <variable …/> 时
-  // 插入点会落到元素之外（<descriptions> 成为 localVariables 的子元素、变量实际没改，回执却报成功），
-  // 同一残缺变量只有给 defaultValue 才被拒：宽严不一且声明不成立。现提到所有分支之前统一 fail-closed。
+  // 即 <variable …><variableProperties …/></variable>。description 分支要往 <variable> 内部插
+  // <descriptions>——目标是自闭合 <variable …/> 时插入点会落到元素之外（<descriptions> 成为
+  // localVariables 的子元素、变量实际没改，回执却报成功）。故所有分支之前统一 fail-closed。
   const vp = /<variableProperties\b[^>]*\/>/.exec(block);
   if (!vp) {
     throw new HanaBusinessError(

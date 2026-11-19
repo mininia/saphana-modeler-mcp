@@ -7,28 +7,22 @@ import type { ViewDefinition, ViewKind } from './view-types.js';
 import { OBJECT_TABLE, type VersionScope } from './view-scope.js';
 
 /**
- * 视图定义解析缓存（数据预览「XML 预处理」封装）。
- *
- * 背景：_SYS_REPO.ACTIVE_OBJECT.CDATA 的视图 XML 可达几十 KB，节点推导预览每次
- * 都重新拉取并解析很浪费；但缓存不能牺牲正确性（视图可能被重新激活）。
+ * 视图定义解析缓存（数据预览的「XML 预处理」封装）。
+ * 背景：ACTIVE_OBJECT.CDATA 的视图 XML 可达几十 KB，每次预览都重新拉取+解析很浪费；
+ * 但缓存不能牺牲正确性（视图可能被重新激活）。
  *
  * 策略：
- * - 首次请求：走 getViewDefinition 拉 CDATA 并解析，缓存 parsed ViewDefinition
- * - TTL 内命中：先做一次轻量 VERSION_ID 校验（只 SELECT 版本列，不取 CDATA），
- *   版本未变直接返回缓存；变了则删除缓存并重新拉取
- * - 容量上限 + LRU 淘汰：HTTP 模式下一个进程服务多个客户端、对象数不受本进程控制，
- *   无上限的 Map 会被持续拉取的定义撑大内存
- * - 进程级单例（Map 插入序即 LRU 序）
+ * - 首次请求：getViewDefinition 拉 CDATA 并解析，缓存 parsed ViewDefinition；
+ * - TTL 内命中：先做轻量 VERSION_ID 校验（只 SELECT 版本列），未变返回缓存，变了重取；
+ * - 容量上限 + LRU 淘汰：HTTP 模式一个进程服务多个客户端、对象数不受控，无上限 Map 会撑大内存；
+ * - 进程级单例（Map 插入序即 LRU 序）。
  *
- * key 约定：key 必须覆盖「缓存值所依赖的全部维度」——当前是包/对象/类型/**版本视角**
- * （active 与 inactive 的 CDATA 来自两张不同的表，同一对象两侧可以同时存在且内容不同）。
- * 若将来按客户端身份裁剪视图定义（多租户），必须把身份维度加进 key，否则会跨客户端串数据。
+ * key 必须覆盖「缓存值所依赖的全部维度」：包/对象/类型/**版本视角**（active 与 inactive 的 CDATA
+ * 来自两张表，同一对象两侧可同时存在且内容不同）。若将来按客户端身份裁剪定义，必须把身份维度
+ * 加进 key，否则会跨客户端串数据。
  *
- * 依赖例外：本模块 import services/metadata.service 取数与版本校验（model→services 的反向边，
- * 已登记在 CONTRIBUTING 的分层一节）。两模块互为运行时环，导入值只在函数体内使用（求值期不
- * 互相解引用），故在 ESM 下成立。
- *
- * 该模块可被任意需要「读视图定义 + 解析」的服务复用（当前预览服务使用）。
+ * 依赖例外：import services/metadata.service（model→services 反向边）；两模块互为运行时环，
+ * 导入值只在函数体内使用（求值期不互相解引用），故在 ESM 下成立。
  */
 export class ViewDefinitionCache {
   private readonly entries = new Map<string, CacheEntry>();
@@ -39,7 +33,7 @@ export class ViewDefinitionCache {
     private readonly maxEntries = 200,
   ) {}
 
-  /** 取视图定义（优先缓存；版本变化自动失效重取）。version 默认 active（既有行为） */
+  /** 取视图定义（优先缓存；版本变化自动失效重取）。version 默认 active */
   async get(
     pool: HanaPool,
     packageId: string,
@@ -84,16 +78,10 @@ export class ViewDefinitionCache {
   }
 
   /**
-   * 按 (包/对象) 前缀失效（写路径成功后调用）。返回被删除的条目数（供调用方/测试断言）。
-   *
-   * key 形如「包名/对象名/后缀列表」（用斜杠连接，见 get() 的 key 构造），这里把前缀为
-   * `包名/对象名/` 的条目全部删除（后缀维度不同 = 同对象的另一种视图类型，一并失效）。
-   * 缓存本身已有 VERSION_ID 命中校验 + TTL 自愈：失效只是把「最多 60s 后自愈」变成「立即」，
-   * 不是正确性必需。**未激活的设计时写入不改变 ACTIVE_OBJECT**（严格说不必失效），
-   * 但写路径一律失效更简单——不用在每条写路径上判断「这次写会不会改变 ACTIVE_OBJECT」——
-   * 代价只是一次重取。
-   * 调用方传入的 (packageId, objectName) 须与 get() 的 key 维度一致；不一致只是前缀不命中，
-   * 退回 TTL/版本自愈，不会误删别的对象。
+   * 按 (包/对象) 前缀失效（写路径成功后调用）。返回删除的条目数。
+   * 缓存本身已有 VERSION_ID 校验 + TTL 自愈：失效只是把「最多 60s 后自愈」变成「立即」，不是
+   * 正确性必需；写路径一律失效比逐条判断「这次写会不会改变 ACTIVE_OBJECT」更简单，代价只是一次重取。
+   * 前缀不命中只会退回 TTL/版本自愈，不会误删别的对象。
    */
   invalidate(packageId: string, objectName: string): number {
     const prefix = `${currentEnvironmentKey()}/${packageId}/${objectName}/`;

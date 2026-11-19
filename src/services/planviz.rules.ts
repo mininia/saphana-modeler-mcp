@@ -196,10 +196,8 @@ function numOf(v: string | undefined): number | undefined {
  * 取带单位的**时间**字段，统一归一到微秒。
  *
  * ⚠ 必须看 `Unit` 属性：**同一份计划里单位是混用的**——实测那份 10.7MB 计划里有
- * 688 个 `<Exclusive Unit="ms">`（最大 7952.273，即 7.95 s）与 147 个 `Unit="us"`。
- * 一律按 µs 读会把毫秒值缩小 1000 倍，**直接翻转"谁是瓶颈"的结论**（实测症状：
- * 真正的瓶颈算子被算成"占整体 0%"，而 summary 照此报出去）。
- * 缺省按 µs——HANA 计划里绝大多数时间字段是 µs。
+ * 688 个 `<Exclusive Unit="ms">` 与 147 个 `Unit="us"`。一律按 µs 读会把毫秒值缩小 1000 倍，
+ * **直接翻转"谁是瓶颈"的结论**。缺省按 µs——HANA 计划里绝大多数时间字段是 µs。
  */
 function timeUs(body: string, name: string): number | undefined {
   const m = new RegExp(`<${name}(?:\\s+Unit="([^"]*)")?\\s*>([\\s\\S]*?)</${name}>`).exec(body);
@@ -219,19 +217,9 @@ function timeUs(body: string, name: string): number | undefined {
 /**
  * 扫描 `<Relation>`：**必须按嵌套处理，正则匹配不成立**。
  *
- * 实测结构（一份 10.7MB 的大计划里）：
- * ```xml
- * <Relation ID="P" TypeName="TREX_SEARCH">
- *   <Name>COLUMN SEARCH</Name><ExecutionTime>…</ExecutionTime>
- *   <Child ID="C">                                ← 边数据（C 的实测行数）
- *     <ExecutedOutputCardinality>3</…>
- *     <Relation ID="C" TypeName="GROUP_BY">…</Relation>   ← 子算子的 Relation 就嵌在 Child 里
- *   </Child>
- * </Relation>
- * ```
- * 也就是说 `<Relation>` 是**物理嵌套**的（`_2` 里嵌着 `_2_1`/`_2_2`）。非贪婪正则会在第一个
- * `</Relation>` 处截断，父算子的 ExecutionTime 与 Child 引用会整段丢失——实测表现为
- * "844 个 Relation 只解析出 361 个、根算子虚增到 251 个"。故改用栈式配对，
+ * 实测结构：子算子的 `<Relation>` **物理嵌套**在父算子的 `<Child>` 块里（`_2` 里嵌着 `_2_1`/`_2_2`）。
+ * 非贪婪正则会在第一个 `</Relation>` 处截断，父算子的 ExecutionTime 与 Child 引用会整段丢失——
+ * 实测表现为"844 个 Relation 只解析出 361 个、根算子虚增到 251 个"。故改用栈式配对，
  * 并把**自己的字段**（不含嵌套子块）与**边**分开取。
  */
 interface RawRelation {
@@ -284,7 +272,7 @@ function scanRelations(text: string): RawRelation[] {
  *
  * 为什么不能用 `/<X>[\s\S]*?<\/X>/g`：元素会嵌套，非贪婪匹配会在第一个闭合标签处收尾，
  * 剩下的闭合标签会把后续区间整体错位——实测后果是主计划算子被误判成内层计划
- * （那份大计划里 844 个 Relation 被切成"主 361 / 内层 483"，而真实内层区间只有 243 段）。
+ * （844 个 Relation 被切成"主 361 / 内层 483"，而真实内层区间只有 243 段）。
  *
  * `everyDepth=true` 时每一对开闭都算一段（含嵌套的），否则只给最外层。
  */
@@ -333,8 +321,7 @@ function parseEdges(own: string): PlanVizChildEdge[] {
  * 解析计划 XML（Executed/Estimated 同 schema——服务端实测两份输出的结构一致）。
  *
  * 内层计划（`<InnerPlans>`，逻辑/估计内层计划）与主计划同形，靠**字符区间**判定归属：
- * 混在一起会让"算子数/线程数/表访问"全部虚高（实测那份 10.7MB 文件里 844 个 Relation
- * 中有 243 段内层计划）。
+ * 混在一起会让"算子数/线程数/表访问"全部虚高（实测 844 个 Relation 中有 243 段内层计划）。
  */
 export function parsePlanVizXml(xml: string): PlanVizPlan {
   const planTag = /<Plan\s+([^>]*)>/.exec(xml)?.[1] ?? '';
@@ -462,10 +449,9 @@ function collectThreads(raw: string | undefined, into: Set<number>): void {
 /**
  * 整体执行时间（微秒）。
  *
- * **不能用根算子的含子耗时**：实测发现它可能远小于真实总时长——惰性物化与并行分支的工作
- * 发生在根算子的计时窗口之外（50KB 那份样例里根算子 0.99 ms，而时间轴跨度 42.7 ms）。
- * 时间轴跨度（最早 start → 最晚 end）才是与"墙上时钟"一致的口径，故以它为准，
- * 退路才是所有含子耗时的最大值。
+ * **不能用根算子的含子耗时**：实测它可能远小于真实总时长——惰性物化与并行分支的工作发生在根
+ * 算子的计时窗口之外（50KB 样例里根算子 0.99 ms，而时间轴跨度 42.7 ms）。时间轴跨度（最早 start
+ * → 最晚 end）才与"墙上时钟"一致，故以它为准；退路才是所有含子耗时的最大值。
  */
 export function totalInclusiveUs(plan: PlanVizPlan): number | undefined {
   if (plan.timelineStartUs !== undefined && plan.timelineEndUs !== undefined) {
@@ -606,10 +592,9 @@ function toSummary(o: PlanVizOperator, total: number | undefined): PlanVizOperat
 }
 
 /**
- * 文本树被截断时的说明（**绝不静默丢算子**）。指向**同一响应内**的落点：这棵树只在 raw=true 时渲染，
- * 读到这里时调用方已经带着 raw=true，"完整算子见 raw=true" 只会引发一次无意义的重复调用。
- * 但同一响应的 operators 栏自身也按 limit 截断（默认 200、上限 1000），文案不能承诺"完整算子"：
- * 全量明细本就无处可取，唯一完整的是计数 operatorCount（truncated 标注 operators 是否被截）。
+ * 文本树被截断时的说明（**绝不静默丢算子**）。树只在 raw=true 时渲染，读到这里时调用方已是 raw=true，
+ * 故不写"完整算子见 raw=true"（只会引发一次无意义的重复调用）。同一响应的 operators 栏自身也按
+ * limit 截断（默认 200、上限 1000），文案不能承诺"完整算子"——唯一完整的是计数 operatorCount。
  */
 const TREE_TRUNCATED_NOTE = '…（树已截断；算子清单见同响应 operators 栏，受 limit 截断，总数见 operatorCount）';
 
@@ -671,8 +656,8 @@ export interface PlanVizAnalysisContext {
 /**
  * 由 PlanViz 计划产出结论。
  *
- * 与 EXPLAIN 版结论的关键差别：这里有**实测值**，所以能给出 EXPLAIN 永远给不了的三类判断——
- * ① 瓶颈算子（谁真的慢、占整体多少）；② 实际行数与估计行数的偏离（统计信息是否陈旧）；
+ * 与 EXPLAIN 版结论的关键差别：这里有**实测值**，能给出 EXPLAIN 永远给不了的三类判断——
+ * ① 瓶颈算子（谁真的慢、占整体多少）；② 实际与估计行数的偏离（统计信息是否陈旧）；
  * ③ 真实并行度（用到了几个线程）。
  */
 export function analyzePlanVizPlan(plan: PlanVizPlan, ctx: PlanVizAnalysisContext): PlanConclusion {
@@ -694,10 +679,9 @@ export function analyzePlanVizPlan(plan: PlanVizPlan, ctx: PlanVizAnalysisContex
       : 0;
   const bottleneck = pickBottleneck(dominant, dominantObject, opShare, objShare);
 
-  // ① 瓶颈：**对象级含子耗时**与**算子级独占耗时**两条口径都要看，而且它们会背离——
-  //    实测那份 10.7MB 计划（1063 个算子、39 线程、整体 7.97 s）里时间高度集中：单个算子独占 7.95 s，
-  //    占整体 99.8%；而同时"独占合计/整体"是 584%（并行下各线程的独占耗时互相重叠、不可相加），
-  //    所以"独占占比低"这类判断只有在 Naive 合计都低于 10% 时才成立。两条口径都算、按占比取更显著的那个报。
+  // ① 瓶颈：**对象级含子耗时**与**算子级独占耗时**两条口径都要看，且它们会背离——实测大计划里
+  //    单个算子独占 7.95 s、占整体 99.8%，而"独占合计/整体"是 584%（并行下各线程独占耗时会重叠、
+  //    不可相加），所以"独占占比低"这类判断只有在 Naive 合计都低于 10% 时才成立。按占比取更显著者报。
   if (measured && total !== undefined && total > 0) {
     if (bottleneck?.kind === 'object') {
       const o = bottleneck.object;
@@ -742,8 +726,8 @@ export function analyzePlanVizPlan(plan: PlanVizPlan, ctx: PlanVizAnalysisContex
 
   if (!measured) {
     // Type="Executed" 但服务端没回传 ExecutionTime：它**不是**"估计版/未执行"。
-    // 旧文案在这条路径上建议"用 analyze=true 再执行一次"——用户正处在 analyze=true 上，
-    // 照做只会在库上把同一条语句再跑一遍（本服务自己以"避免重复执行"为设计原则）
+    // 这条路径上不能建议"用 analyze=true 再执行一次"——用户正处在 analyze=true 上，
+    // 照做只会在库上把同一条语句再跑一遍（本服务以"避免重复执行"为设计原则）
     const executed = plan.type === 'Executed';
     findings.push({
       level: 'info',
@@ -863,9 +847,9 @@ type Bottleneck =
   | { kind: 'operator'; share: number; operator: PlanVizOperator; exclusiveUs: number };
 
 /**
- * 挑瓶颈。两条口径都要够显著才有资格被叫作瓶颈，否则返回 undefined——
- * **宁可不说，也不报"瓶颈占 0%"**：实测症状就是 summary 印出"瓶颈是 ESX SEARCH（占 0%）"，
- * 而同一响应的 findings 说时间在别处，读的人只会去优化错的地方。
+ * 挑瓶颈：两条口径都要够显著才有资格被叫作瓶颈，否则返回 undefined——
+ * **宁可不说，也不报"瓶颈占 0%"**：实测症状是 summary 印出"瓶颈是 X（占 0%）"而 findings 说时间
+ * 在别处，读的人只会去优化错的地方。
  */
 function pickBottleneck(
   dominant: PlanVizOperator | undefined,

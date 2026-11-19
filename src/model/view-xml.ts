@@ -310,7 +310,7 @@ function parseOutputField(field: XmlNode, kind: 'attribute' | 'measure'): ViewOu
 
 function parseOutputList(root: XmlNode, section: string, kind: 'attribute' | 'measure'): ViewOutputField[] {
   const sec = root && typeof root === 'object' ? (root as Record<string, unknown>)[section] : undefined;
-  // 条目名兼容：本仓既有语料与 fixture 用 kind 名当条目元素（<attribute>/<measure>），
+  // 条目名兼容：本仓既有语料用 kind 名当条目元素（<attribute>/<measure>），
   // 真实方言也可能用 section 名的单数（<calculatedAttribute>/<calculatedMeasure>/<restrictedMeasure>）。
   // 只认一种名字时，另一种方言的整张列表恒为空 ⇒ 其字段增删/改名/类型变更对 diff 与判定完全不可见。
   // 两种名字都收（本仓无真实语料可证伪单数名假设，属防御性兼容），顺序固定（单数名先、kind 名后）保确定性；

@@ -1,24 +1,20 @@
 /**
- * 表存储画像服务（hana_table_storage 的落地实现）。
+ * 表存储画像服务（hana_table_storage）。
  *
- * ## 数据源与量级
- * - `SYS.M_CS_TABLES`——**一行是一个分区**（行数是"表数 × 分区数"的量级），
- *   所以一切查询必须先在 SQL 侧按 (SCHEMA_NAME, TABLE_NAME) 聚合再排序，否则取到的是
- *   "最大的分区"而不是"最大的表"。实测聚合查询约 1.3 秒。
- * - `SYS.M_TABLE_PERSISTENCE_STATISTICS`——**磁盘占用口径**（`DISK_SIZE`），行数与表数同量级。
- *   它只对 top-N 的结果按需二次查询，不参与主查询的 join（避免把两次全表扫描叠在一起）。
+ * 数据源：
+ * - `SYS.M_CS_TABLES`——**一行是一个分区**（行数 = 表数 × 分区数），查询必须先在 SQL 侧按
+ *   (SCHEMA_NAME, TABLE_NAME) 聚合再排序，否则取到的是"最大的分区"而非"最大的表"（实测聚合约 1.3 秒）。
+ * - `SYS.M_TABLE_PERSISTENCE_STATISTICS`——**磁盘占用口径**（`DISK_SIZE`）；只对 top-N 二次查询，
+ *   不与主查询 join（避免两次全表扫描叠加）。
  *
- * ## 三个易错的口径（都实测确认过）
- * 1. **`M_TABLES.TABLE_SIZE` 不是磁盘占用**：实测 `/BIC/AZDEMO001` 的 `TABLE_SIZE`
- *    与 `M_CS_TABLES` 的内存总量**完全相同**，是内存口径。磁盘占用只能取 `DISK_SIZE`。
- * 2. **热度用 `M_CS_TABLES.READ_COUNT/WRITE_COUNT`**，不用 `M_TABLE_STATISTICS.SELECT_COUNT`
- *    （后者实测非零读计数全为 0，未采集）。
- * 3. **碎片率是 delta 占总量之比**，且小表的比值是噪声（实测有不到 1 MiB 的表碎片率超过 50%），
- *    故 fragmentation 模式用 `minSizeMiB` 过滤——不设它，排行榜会被小表占满。
+ * 三个实测口径：
+ * 1. `M_TABLES.TABLE_SIZE` 不是磁盘占用（与 M_CS_TABLES 内存总量相同），磁盘只能取 `DISK_SIZE`；
+ * 2. 热度用 `M_CS_TABLES.READ_COUNT/WRITE_COUNT`（`M_TABLE_STATISTICS.SELECT_COUNT` 实测恒 0，未采集）；
+ * 3. 碎片率 = delta/总量，小表比值是噪声（不到 1 MiB 的表可超 50%），fragmentation 模式用
+ *    `minSizeMiB` 过滤，否则排行榜会被小表占满。
  *
- * ## 隐私/性能边界
- * `M_TABLE_PARTITIONS` 视图（逐分区的物理布局）实测单次查询 **13.6 秒**，故**不使用**；
- * 逐分区明细改从 `M_CS_TABLES` 取（实测 19 个分区 81ms），够用且快得多。
+ * 隐私/性能边界：`M_TABLE_PARTITIONS` 逐分区查询实测 13.6 秒，**不使用**；逐分区明细改从
+ * `M_CS_TABLES` 取（实测 19 个分区 81ms）。
  */
 
 import type { HanaPool } from '../core/hana-client.js';
@@ -48,20 +44,12 @@ export const ALL_MODES: readonly StorageMode[] = [
 ];
 
 /**
- * BW 表分类（来自 `M_TABLE_PARTITIONS` 的 `GROUP_TYPE`/`SUBTYPE`，实测为**表级**属性：
- * 全库范围内没有任何表出现两种分类）。
- *
- * 为什么需要它：同一个 BW 对象在 HANA 上是一组物理表，光看表名分不清谁是谁。
- * 实测的本类分类（按表数从多到少，具体数目随实例而变）：
- *   BW_DSO / ACTIVE      ← **aDSO 活动数据表**（业务上"真正的那张表"）
- *   BW_DSO / QUEUE       ← aDSO 入站队列（delta 侧，随时被清空）
- *   BW_DSO / CHANGE_LOG  ← aDSO 变更日志
- *   BW_PSA / PSA         ← 持久暂存区（delta 侧）
- *   BW_CUBE / FACT_IMO   ← InfoCube 事实表
- * 命名规律也在实测中确认：同一 aDSO 的物理表只差后缀（如活动表 `/BIC/AZDEMO_DSO012`、
- * 入站队列 `/BIC/AZDEMO_DSO0140`），光看表名分不清谁是谁。
- *
- * ⚠ **只看 `SUBTYPE` 是不够的**：入站队列与活动表可能同名不同后缀，必须靠分类区分。
+ * BW 表分类（`M_TABLE_PARTITIONS` 的 `GROUP_TYPE`/`SUBTYPE`，实测为**表级**属性：全库无表出现两种分类）。
+ * 同一个 BW 对象在 HANA 上是一组物理表，光看表名分不清谁是谁（如同一 aDSO 的活动表
+ * `/BIC/AZDEMO_DSO012` 与入站队列 `/BIC/AZDEMO_DSO0140`）：
+ *   BW_DSO / ACTIVE ← aDSO 活动数据表（业务上"真正的那张表"）；QUEUE ← 入站队列（delta 侧，随时清空）；
+ *   CHANGE_LOG ← 变更日志；BW_PSA / PSA ← 持久暂存区；BW_CUBE / FACT_IMO ← InfoCube 事实表。
+ * ⚠ 只看 `SUBTYPE` 不够：入站队列与活动表可能同名不同后缀，必须靠分类区分。
  */
 export interface BwClass {
   /** 如 BW_DSO / BW_PSA / BW_CUBE；非 BW 表为空串 */
@@ -148,14 +136,12 @@ export interface PartitionRow {
 }
 
 /**
- * 列级明细（column 模式返回）。来源 `M_CS_ALL_COLUMNS`（实测百万行量级）。
+ * 列级明细（column 模式）。来源 `M_CS_ALL_COLUMNS`（实测百万行量级）。
  *
- * ⚠ 该视图有一列 `COMPRESSION_RATIO_IN_PERCENTAGE`，**实测不能当"压缩质量"读**：
- * 实测出现过 361890% 这样的值。反推其口径为 `MEMORY_SIZE_IN_TOTAL ÷ UNCOMPRESSED_SIZE × 100`，
- * 而 `UNCOMPRESSED_SIZE` 在本版本大量为 NULL、非 NULL 时也远小于内存量。
- * 按"比值低=压缩差"建规则会全线误报。故这里只给**压缩类型**（那列取值干净：
- * DEFAULT / INDIRECT / SPARSE / RLE / CLUSTERED / PREFIXED）与实际内存量，
- * 让人自己看"同样的数据类型为什么这张表用 INDIRECT 而那张用 DEFAULT"。
+ * ⚠ `COMPRESSION_RATIO_IN_PERCENTAGE` **不能当"压缩质量"读**：实测出现过 361890% 这样的值
+ * （口径反推为 `MEMORY_SIZE_IN_TOTAL ÷ UNCOMPRESSED_SIZE × 100`，而 `UNCOMPRESSED_SIZE` 大量为
+ * NULL 且远小于内存量）。故只给**压缩类型**（取值干净：DEFAULT/INDIRECT/SPARSE/RLE/CLUSTERED/
+ * PREFIXED）与实际内存量，让人自己对照。
  */
 export interface ColumnRow {
   schema: string;
@@ -181,14 +167,11 @@ export interface ColumnRow {
 }
 
 /**
- * 索引级明细（index 模式返回）。来源 `M_CS_INDEXES`（实测十万行量级）。
+ * 索引级明细（index 模式）。来源 `M_CS_INDEXES`（实测十万行量级）。
  *
- * **为什么不给 `HASH_COLLISION_COUNT`**：实测该列全库只有 `-1` 一种取值（无一例外），
- * 在本版本没有信号，拿它判"索引碰撞"会恒为"正常"。索引的价值在内存开销上。
- *
- * **为什么带 `占表内存`**：实测有表的单个 INVERTED VALUE 索引内存与表自身内存同量级——
- * 只列表内存的表画像会漏掉这一整块，
- * 让人以为"这张表才占这么多内存"，实际连带索引要翻倍。
+ * **不给 `HASH_COLLISION_COUNT`**：实测该列全库只有 `-1`，没有信号。
+ * **带 `占表内存`**：实测有表的单个 INVERTED VALUE 索引内存与表自身同量级——只列表内存会漏掉
+ * 这一整块，让人以为"这张表才占这么多内存"。
  */
 export interface IndexRow {
   schema: string;
@@ -227,14 +210,9 @@ export interface StorageReport extends DiagnosticReportBase {
 }
 
 /*
- * 表级体量的单位：**MiB（2²⁰，来自 core/num.ts 的 MIB）**。
- *
- * 为什么是二进制单位：HANA Cockpit / HANA Studio 的容量显示全部是 1024 进制（实例级用 GiB，
- * 见 health.rules.ts 的 toGiB）。若这里用 MB(10⁶)，同一块内存会得到两个都"看起来合理"的数字，
- * 两者相差 4.9% —— 这种偏差不会报错，只会让人对着 Cockpit 反复核对。
- *
- * 为什么是 MiB 而不是 GiB：表级数据要保留小数分辨率。实测热度榜里大量表的体量在 0.2 MiB 量级，
- * 换算成 GiB 会变成 0.0002，排行与阈值都失去意义。**进制统一为 2 的幂，量级按数据尺度选**。
+ * 表级体量单位：**MiB（2²⁰，core/num.ts 的 MIB）**。HANA Cockpit/Studio 的容量显示全是 1024 进制
+ * （实例级用 GiB），用 MB(10⁶) 会得到两个相差 4.9% 却都"看起来合理"的数字。
+ * 用 MiB 不用 GiB：表级数据要保留小数分辨率（热度榜大量表在 0.2 MiB 量级，换算成 GiB 是 0.0002）。
  */
 
 /** 各口径的排序表达式（白名单映射，不接受外部拼接） */
@@ -245,7 +223,7 @@ const ORDER_BY: Record<StorageMode, string> = {
   hotness: 'READS DESC, WRITES DESC',
   partition: 'PARTS DESC, MEM_BYTES DESC',
   // column / index 不走表级主查询（各自有独立的聚合视图与排序），这两项仅为满足类型完备；
-  // 若将来有人让它们落到主查询路径，会立刻因为语义不对而被 review 发现。
+  // 若有人让它们落到主查询路径，语义不对会立刻暴露。
   column: 'MEM_BYTES DESC',
   index: 'MEM_BYTES DESC',
 };
@@ -352,11 +330,9 @@ async function queryTables(
  *   在数据层同为 bwClass=null，只有报告里说明了才不会把前者读成后者）
  *
  * **性能关键**：必须按 schema 分组、用 `SCHEMA_NAME = ? AND TABLE_NAME IN (...)` 查询。
- * 实测三种写法的代价（对同一批 20 张表）：
- *   SCHEMA_NAME = ? AND TABLE_NAME IN (...)   → 1.2 秒  ✅ 采用
- *   SCHEMA_NAME||'.'||TABLE_NAME IN (...)     → 8.1 秒  ❌ 拼接谓词让视图的剪枝失效
- *   (SCHEMA_NAME=? AND ...) OR (...) 多分片   → 5.6 秒  ❌
- * 全表 GROUP BY 更是要 9.7 秒。故只对**已选出的 topN 行**取，且排行榜类查询默认不取。
+ * 实测（20 张表）：该写法 1.2 秒；拼接谓词 `SCHEMA_NAME||'.'||TABLE_NAME IN (...)` 8.1 秒、
+ * 多分片 OR 5.6 秒、全表 GROUP BY 9.7 秒——这些视图不吃拼接谓词，剪枝会失效。
+ * 故只对**已选出的 topN 行**取，排行榜类查询默认不取。
  */
 async function attachBwClass(pool: HanaPool, rows: TableStorageRow[]): Promise<string[]> {
   if (rows.length === 0) return [];
@@ -476,15 +452,9 @@ async function queryPartitions(pool: HanaPool, schema: string, table: string): P
 }
 
 /**
- * column 模式：列级聚合查询。
- *
- * M_CS_ALL_COLUMNS 实测**百万行量级**（列 × 分区），必须 SQL 侧聚合 + LIMIT。
- *
- * 刻意**不返回 `COMPRESSION_RATIO_IN_PERCENTAGE`**：实测该列在本版本会产生 361890% 这种
- * 不可能的值（反推口径是 `MEMORY_SIZE_IN_TOTAL ÷ UNCOMPRESSED_SIZE × 100`，而
- * `UNCOMPRESSED_SIZE` 大量为 NULL 且远小于内存量）。返回它等于邀请调用方按错误的语义做判断。
- * 压缩相关信息改用 `COMPRESSION_TYPE`（取值干净：DEFAULT/INDIRECT/SPARSE/RLE/…）
- * 搭配实际内存量来表达——"同为 CLUSTD 列，一张用 DEFAULT 一张用 INDIRECT"才是可行动的线索。
+ * column 模式：列级聚合查询。`M_CS_ALL_COLUMNS` 实测**百万行量级**（列 × 分区），必须 SQL 侧聚合 + LIMIT。
+ * 刻意**不返回 `COMPRESSION_RATIO_IN_PERCENTAGE`**（口径不可靠，见 ColumnRow 头注）；压缩信息改用
+ * `COMPRESSION_TYPE` + 实际内存量表达——"同为 CLUSTD 列，一张用 DEFAULT 一张用 INDIRECT"才是线索。
  */
 async function queryColumns(pool: HanaPool, req: StorageRequest, limit: number): Promise<ColumnRow[]> {
   const conds: string[] = [];
@@ -538,14 +508,9 @@ async function queryColumns(pool: HanaPool, req: StorageRequest, limit: number):
 }
 
 /**
- * index 模式：索引级聚合查询。
- *
- * M_CS_INDEXES 实测**十万行量级**，其中 `INVERTED VALUE` 占绝大多数、合计**十 GiB 量级**
- * —— 列存表的隐式倒排索引是实例级内存的一块实质开销。
- *
- * 取完后用 `attachTableMemory` 补上所属表的内存，给出"索引占表内存的比例"。
- * 实测这个比例可达七成以上：有的表，其 INVERTED VALUE 索引内存与表自身内存同量级 ——
- * **只列表内存的表画像会把这张表的真实成本少算近一半。**
+ * index 模式：索引级聚合查询。`M_CS_INDEXES` 实测**十万行量级**，其中 `INVERTED VALUE` 占绝大多数、
+ * 合计**十 GiB 量级**——列存表的隐式倒排索引是实例级内存的一块实质开销。
+ * 取完后用 `attachTableMemory` 补所属表内存，给出"索引占表内存的比例"（实测可达七成以上）。
  */
 async function queryIndexes(pool: HanaPool, req: StorageRequest, limit: number): Promise<IndexRow[]> {
   const conds: string[] = [];
@@ -590,16 +555,11 @@ async function queryIndexes(pool: HanaPool, req: StorageRequest, limit: number):
 /**
  * 为索引行补上"所属表的内存"与"索引占表内存比"。
  *
- * **一次全表聚合，不做 per-schema 循环。** 实测（同一实例）：
- *   `M_CS_TABLES` 全表 GROUP BY                      1442 ms   ← 采用
- *   `M_CS_TABLES` WHERE SCHEMA_NAME = ? GROUP BY    6648 ms   ← 按 schema 反而慢 4.6 倍
- * 谓词非但没让视图剪枝，还更贵；而 top-N 的 200 个索引可横跨 26 个 schema，
- * 循环就是最多 26 次这样的查询。这与 `M_TABLE_PARTITIONS` 的"拼接谓词让剪枝失效"是同类现象：
- * **这些视图不吃谓词消减**。
- *
- * ⚠ 但别高估这里的收益：index 模式的整体耗时**不在这里**，而在 `M_CS_INDEXES` 自身的聚合
- * （实测 7.6 秒，与本函数无关）。单次全表聚合的价值是少掉最多 26 次往返与随之而来的连接池占用，
- * 不是把 9 秒变成 1 秒——**瓶颈在那个视图本身**。
+ * **一次全表聚合，不做 per-schema 循环。** 实测：`M_CS_TABLES` 全表 GROUP BY 1442 ms，
+ * 而 `WHERE SCHEMA_NAME = ?` GROUP BY 反而 6648 ms——谓词非但没剪枝还更贵；top-N 的 200 个索引
+ * 可横跨 26 个 schema，循环就是最多 26 次这样的查询（与 `M_TABLE_PARTITIONS` 的"拼接谓词让剪枝
+ * 失效"同类：这些视图不吃谓词消减）。
+ * ⚠ 别高估收益：index 模式的瓶颈在 `M_CS_INDEXES` 自身聚合（实测 7.6 秒），本函数只省往返与池占用。
  */
 async function attachTableMemory(pool: HanaPool, rows: IndexRow[]): Promise<void> {
   if (rows.length === 0) return;
@@ -634,7 +594,7 @@ async function attachTableMemory(pool: HanaPool, rows: IndexRow[]): Promise<void
  * 两条**形状不同**的路径，不要合并：
  *  - 表级口径（memory/disk/fragmentation/hotness/partition）走 M_CS_TABLES 聚合 + 二次补齐；
  *  - 下钻口径（column/index）单元不是"表"，各查自己的视图，**提前返回**。
- * disk 与 partition 另需更宽的候选集（前者防漏掉"内存小、落盘大"的表，后者防非活动表挤占名次），
+ * disk 与 partition 需要更宽的候选集（防漏"内存小、落盘大"的表；防非活动表挤占名次），
  * 故 baseLimit 按口径取值，不统一用 topN。
  */
 export async function runTableStorage(pool: HanaPool, req: StorageRequest): Promise<StorageReport> {
@@ -917,7 +877,7 @@ function buildSummary(req: StorageRequest, rows: TableStorageRow[], tableCount: 
     }
     default:
       // column / index 已在 runTableStorage 里提前返回，不会走到这里。
-      // 故意抛错而不是返回兜底文案：万一将来有人把下钻口径接到表级路径上，
+      // 故意抛错而不是返回兜底文案：万一有人把下钻口径接到表级路径上，
       // 应当立刻炸掉，而不是安静地给出一份"用表级数字描述列级结果"的错误摘要。
       // 抛 HanaBusinessError（而非裸 Error）：裸 Error 会被 withErrorEnvelope 归入"未知错误"，
       // 对外只剩「内部错误，详情见服务端日志」——这条明确可读的原因会被整体吞掉。
@@ -929,7 +889,7 @@ function buildSummary(req: StorageRequest, rows: TableStorageRow[], tableCount: 
 }
 
 /**
- * 校验 subtype 参数（工具层调用）——非法值给中文硬错误并列出合法值（工具面 schema 按 SSD §1.6 保持宽松）。
+ * 校验 subtype 参数（工具层调用）——非法值给中文硬错误并列出合法值（工具面 schema 保持宽松）。
  *
  * `explicit` 用于区分「未指定」与「显式指定」：调用方**不得**把未指定折叠成 'ACTIVE'
  * 后透传（那会让服务层的 subtypeExplicit 恒为 true，未分类/非 BW 表的放行分支不可达）——
@@ -946,7 +906,7 @@ export function normalizeSubtype(
   return { ok: true, value: up, explicit: true };
 }
 
-/** 校验 mode 参数（工具层调用）：非法值给中文硬错误并列出合法值（工具面 schema 按 SSD §1.6 保持宽松） */
+/** 校验 mode 参数（工具层调用）：非法值给中文硬错误并列出合法值（工具面 schema 保持宽松） */
 export function normalizeMode(mode?: string): { ok: true; value: StorageMode } | { ok: false; message: string } {
   if (!mode) return { ok: true, value: 'memory' };
   if (!ALL_MODES.includes(mode as StorageMode)) {

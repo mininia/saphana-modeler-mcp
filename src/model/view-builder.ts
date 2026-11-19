@@ -33,10 +33,9 @@ export interface MinCalcViewSpec {
 }
 
 /**
- * scenario 根节点的固定属性（六个）：图形化对象树与 SQL 字符串模板共用同一份值。
- * 两处各写一套时，任一处随 SPS 调整都会让 create(图形化) 与 create(SQL) 产出的根属性分叉——
- * 表现为激活被拒且难以归因。defaultClient/defaultLanguage 是激活期由 HANA 替换的占位符，
- * 其余值对齐 Studio 导出。
+ * scenario 根节点的固定属性（六个）：图形化对象树与 SQL 字符串模板共用同一份值——两处各写一套时，
+ * 任一处随 SPS 调整都会让两种 create 产出的根属性分叉（激活被拒且难以归因）。
+ * defaultClient/defaultLanguage 是激活期由 HANA 替换的占位符，其余值对齐 Studio 导出。
  */
 const SCENARIO_ROOT_ATTRS = {
   applyPrivilegeType: 'ANALYTIC_PRIVILEGE',

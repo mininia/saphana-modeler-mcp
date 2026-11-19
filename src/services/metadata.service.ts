@@ -24,21 +24,20 @@ import type {
  * - 表列表：SYS.TABLES（按当前用户权限过滤）
  * - 表列：SYS.TABLE_COLUMNS（SYS.COLUMNS 对该环境用户 258 不可用）
  *
- * 版本视角（VersionScope）贯穿本模块：**默认 active**（既有行为不变），只有调用方显式传
+ * 版本视角（VersionScope）贯穿本模块：**默认 active**，只有调用方显式传
  * version=inactive 才读写未激活侧；active 与 inactive 互不回退（inactive 查不到就报未找到）。
  */
 
 /**
  * 视图后缀的取值集合、按 kind 推导与 `IN (?,…)` 占位符拼装的唯一实现位于 `model/view-suffixes`
  * （叶子模块）：catalog.service 不能引用本模块——本模块依赖它导出的 closure，反向 import 会形成
- * 循环依赖，只有不依赖任何一方的模块才能被两侧共用。这里转出三个符号以保持本模块既有 import 面，
- * view-cache / preview-diagnose / repository.service 仍自本模块引用同一实现。
+ * 循环依赖，只有不依赖任何一方的模块才能被两侧共用。此处只做转出。
  */
 export { suffixInClause, suffixesOf, VIEW_SUFFIXES } from '../model/view-suffixes.js';
 
 /**
  * 「命中总数 + 本次上限 + 截断标记」的通用分页外壳。
- * K 为条目数组的对外字段名（objects/packages 等）：历史契约字段名不同，不能统一改名，
+ * K 为条目数组的对外字段名（objects/packages 等）：各工具契约字段名不同，不能统一改名，
  * 故这里只统一分页三件套与条目类型的拼装方式（见 runPaged）。
  */
 export type PagedResult<T, K extends string = 'items'> = {
@@ -65,7 +64,6 @@ async function runPaged<T, K extends string>(
 
 /** 仓库对象信息（本次读取的版本视角 + 该视角的元数据） */
 export interface ViewObjectInfo {
-  /** 仓库对象信息 */
   packageId: string;
   objectName: string;
   objectSuffix: string;
@@ -92,10 +90,9 @@ export interface ViewDefinitionResult {
 
 /**
  * 读取视图定义。kind 省略时按三个类型逐一匹配（取最新版本）。
- * version 默认 active=已激活版本；显式传 inactive 读未激活/挂起版本（读取源为
- * _SYS_REPO.INACTIVE_OBJECT）——该版本不存在时按「未找到」处理，**不回退读 active**。
- * format=json 返回解析后的结构化模型（含节点逻辑/公式/变量/输出字段）；
- * format=xml 返回原始 CDATA（备份/对比用）。
+ * version 默认 active=已激活版本；显式传 inactive 读未激活/挂起版本（_SYS_REPO.INACTIVE_OBJECT）
+ * ——该版本不存在时按「未找到」处理，**不回退读 active**。
+ * format=json 返回解析后的结构化模型；format=xml 返回原始 CDATA（备份/对比用）。
  */
 export async function getViewDefinition(
   pool: HanaPool,
@@ -364,15 +361,12 @@ export interface WhereUsedResult {
 /**
  * 血缘搜索：
  * - 数据源随 version 切换：active（默认）= ACTIVE_OBJECTCROSSREF；inactive = INACTIVE_OBJECTCROSSREF
- * - upstream：该对象引用了谁（FROM = 本对象）
- * - downstream：谁引用了该对象（TO = 本对象）
- * kind 省略时匹配三种视图类型。
- * 说明：active 侧 downstream 中 isRuntime=true 表示激活后的运行时目录视图（_SYS_BIC）对本仓库对象的引用；
- * inactive 侧没有运行时副本。
- *
- * `depth`（跳数，默认 1 = 单跳，upstream/downstream 两个兼容字段的形状不变）——depth>1 时在
- * 单跳结果之外追加 `closure`（多跳闭包，按方向拆分；visited-set 环防护；maxNodes 截断并置
- * truncated）；`asOf` 为构建时刻。
+ * - upstream：该对象引用了谁（FROM = 本对象）；downstream：谁引用了该对象（TO = 本对象）
+ * - active 侧 downstream 中 isRuntime=true 表示激活后的运行时目录视图（_SYS_BIC）对本仓库对象的
+ *   引用；inactive 侧没有运行时副本。
+ * - `depth` 默认 1 = 单跳（upstream/downstream 两个兼容字段形状不变）；depth>1 时在单跳结果之外
+ *   追加 `closure`（多跳闭包，按方向拆分；环防护；maxNodes 截断并置 truncated）；`asOf` 为构建时刻。
+ * - kind 省略时匹配三种视图类型。
  */
 export async function whereUsed(
   pool: HanaPool,
@@ -604,7 +598,7 @@ function isCastTypeName(text: string, index: number): boolean {
   return /(?:^|\W)AS$/i.test(text.slice(0, index).trimEnd());
 }
 
-/** 字段逻辑完整信息（ZDEMO008_CV001 的 ZDEMO_FLD_NEW 一类的计算字段） */
+/** 字段逻辑完整信息（计算字段的公式/脚本/源字段） */
 export interface FieldLogic {
   /** 字段基本信息 */
   field: {
@@ -655,7 +649,7 @@ export interface FormulaSource {
 }
 
 /**
- * 解析单个字段的完整逻辑（ZDEMO008_CV001 示例优化核心）：
+ * 解析单个字段的完整逻辑：
  * - 定位字段：输出字段 / 节点计算属性
  * - 同一字段 ID 多处出现时，优先带公式的匹配（节点计算属性 > 输出计算属性/度量 > 其他）
  * - 提取公式 + 引用的源字段（自动解析 "COLUMN" 引用）
@@ -1019,14 +1013,12 @@ async function fetchModelDescriptions(
 
 /**
  * 搜索仓库模型（视图定位用）：
- * - 来源随 version 切换：active（默认）= _SYS_REPO.ACTIVE_OBJECT；
- *   inactive = _SYS_REPO.INACTIVE_OBJECT（未激活/挂起版本，仅此类对象存在该行）
- * - `by`：name（默认，按 OBJECT_NAME 模糊匹配，UPPER 大小写不敏感）/ description（按 caption 文本模糊匹配，
- *   不解析设计时 XML）/ both（名称或描述任一命中）
+ * - 来源随 version 切换：active（默认）= _SYS_REPO.ACTIVE_OBJECT；inactive = INACTIVE_OBJECT
+ * - `by`：name（默认，按 OBJECT_NAME 模糊匹配，大小写不敏感）/ description（按 caption 文本模糊匹配，
+ *   不解析设计时 XML）/ both（任一命中）
  * - 结果始终附带 caption（TEXT_ID='caption'，LANG 可配）；description 过滤走 EXISTS，确保 count/明细
  *   都是对象数，不会因文本行重复
- * - 默认只搜三种视图类型（calculationview/attributeview/analyticview），排除 UI5 仓库资源
- * - kind 指定时只搜该类型；带截断（LIMIT）+ count，供 "Showing N of M" 提示
+ * - 默认只搜三种视图类型（排除 UI5 仓库资源）；kind 指定时只搜该类型；带截断（LIMIT）+ count
  * 典型用途：hana_metadata_list_fields 报"未找到视图"时，先用本工具按片段定位包名/对象名。
  */
 export async function searchObjects(
@@ -1454,10 +1446,9 @@ const DEFAULT_MAX_FIELD_CANDIDATES = 100;
 
 /**
  * 按字段搜索视图："谁的输出里含匹配字段"。
- * 实现口径：对候选视图**按需 parse** 设计时 XML（不做全量索引——候选逐个解析，成本由
- * maxCandidates 护栏），复用 `searchFields`（= list_fields 的同一实现）。
- * 候选集 = 所选版本视角的对象表（active 默认 / inactive）按 kind 过滤（可选 `pattern` 收窄对象名），
- * 按 (PACKAGE_ID, OBJECT_NAME) 排序取前 `maxCandidates` 条。
+ * 实现口径：对候选视图**按需 parse** 设计时 XML（不做全量索引，成本由 maxCandidates 护栏约束），
+ * 复用 `searchFields`（= list_fields 的同一实现）。候选集 = 所选版本视角的对象表按 kind 过滤
+ * （可选 `pattern` 收窄对象名），按 (PACKAGE_ID, OBJECT_NAME) 排序取前 `maxCandidates` 条。
  */
 export async function searchObjectsByField(
   pool: HanaPool,
@@ -1588,12 +1579,11 @@ const DEFAULT_MAX_LINEAGE_VIEWS = 50;
 
 /**
  * 字段级血缘：
- * - **downstream（主打）**：沿对象图下游闭包找候选视图（active=ACTIVE_OBJECTCROSSREF /
- *   inactive=INACTIVE_OBJECTCROSSREF），逐个按需 parse（走 `viewDefinitionCache`），
- *   在节点的输入映射里找 `mapping.source` == 被查字段的引用——回答"**谁用了这个字段**"；
- * - **upstream**：本视图内的字段逻辑（公式/脚本/源列/溯源），复用 `getFieldLogic` 的既有口径；
- * - 归因不到列的输入（Union 无 mappings、列名对齐）**另列** `nameAlignedConsumers`，不假装逐列命中。
- * - version 默认 active（既有行为）；显式 inactive 时种子定义、闭包、候选定义全部读未激活侧。
+ * - **downstream（主打）**：沿对象图下游闭包找候选视图（active/inactive 对应各自 OBJECTCROSSREF），
+ *   逐个按需 parse（走 `viewDefinitionCache`），在节点输入映射里找 `mapping.source` == 被查字段的引用；
+ * - **upstream**：本视图内的字段逻辑（公式/脚本/源列/溯源），复用 `getFieldLogic`；
+ * - 归因不到列的输入（Union 无 mappings、列名对齐）**另列** `nameAlignedConsumers`，不假装逐列命中；
+ * - version 默认 active；显式 inactive 时种子定义、闭包、候选定义全部读未激活侧。
  */
 export async function fieldLineage(
   pool: HanaPool,

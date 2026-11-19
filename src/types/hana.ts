@@ -24,12 +24,12 @@ export interface Envelope {
   data?: unknown;
   messages: HanaMessage[];
   /**
-   * 统一截断契约（P0-1）：只在**有 limit/cap 语义**时出现；无该字段 = 本次结果不存在"被截断"这回事。
+   * 统一截断契约：只在**有 limit/cap 语义**时出现；无该字段 = 本次结果不存在"被截断"这回事。
    * 构造与提升都在 core/result-info.ts 一处完成，工具 handler 不各自拼。
    */
   resultInfo?: ResultInfo;
   /**
-   * 合法空集（P0-2）：`success:true` + `empty:true`，并附 `messages` 里一条 `EMPTY_RESULT` 说明。
+   * 合法空集：`success:true` + `empty:true`，并附 `messages` 里一条 `EMPTY_RESULT` 说明。
    * 权限不可见/上游失败仍然是 `success:false`——空集不伪装成错误，错误也不伪装成空集。
    */
   empty?: true;
@@ -42,7 +42,7 @@ export interface Envelope {
    */
   clientId?: string;
   /**
-   * 进程级归因标签（`MCP_AGENT_LABEL`，P10-c）：标的是**服务端进程**（哪套部署 / 哪个代理实例），
+   * 进程级归因标签（`MCP_AGENT_LABEL`）：标的是**服务端进程**（哪套部署 / 哪个代理实例），
    * 与调用方身份（clientId）正交。未配置时该字段缺省——不产生恒为空的噪音字段。
    */
   agentLabel?: string;

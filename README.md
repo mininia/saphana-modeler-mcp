@@ -11,7 +11,9 @@ SAP HANA 经典 Modeler 能力的 MCP 服务器（TypeScript，Node >= 22.0.0）
 
 ## 功能概览
 
-| 分类 | 能力 | 工具 |
+下表最后一列是**能力 id**，不是 `tools/list` 中的工具：所有能力都经 `hana_tool_search` 选择、用 `hana_invoke` 执行（见「工具面」）。
+
+| 分类 | 能力 | 能力 id（经 hana_invoke 执行） |
 | --- | --- | --- |
 | 基础信息 | 版本信息（HANA 与本 MCP 服务自身版本）、用户权限与建模能力自检 | `hana_system_get_info`、`hana_check_privileges` |
 | 环境管理（多环境） | 环境列表、只读/可写标识、一次性 token 切换 | `hana_env_list`、`hana_env_switch` |
@@ -23,7 +25,7 @@ SAP HANA 经典 Modeler 能力的 MCP 服务器（TypeScript，Node >= 22.0.0）
 | 建模写操作 | 新建/激活/更新/删除计算视图、设计时+运行时校验 | `hana_view_create`、`hana_view_activate`、`hana_view_update`、`hana_view_delete`、`hana_view_validate`、`hana_view_check_actions` |
 | 仓库传输 | 包导出备份、设计时文件导入、变更列表 | `hana_repo_export`、`hana_repo_import`、`hana_repo_changelist` |
 | SQL 分析 | 可读分析结论；PlanViz 逐算子实测 | `hana_sql_analyze` |
-| SQL 执行 | 在 HANA 上直接执行 SQL（读/写/管理类）。**sql 组默认关闭**，需显式启用 | `hana_sql_execute` |
+| SQL 执行 | 在 HANA 上直接执行 SQL（默认 `select-only` 仅 SELECT 类；`HANA_SQL_ACCESS=readwrite` 才允许写/管理类）。**sql 组默认关闭**，需显式启用 | `hana_sql_execute` |
 
 ## 快速开始
 
@@ -57,7 +59,7 @@ node scripts/smoke-stdio.mjs   # 冒烟：握手 + 工具注册（无需真实 H
 | `HANA_HOST` / `HANA_PORT` | HANA 主机与 SQL 端口（端口必填，纯数字） |
 | `HANA_USER` / `HANA_PASSWORD` | 数据库用户名与密码 |
 
-单环境下 MDC 指定租户时需 `HANA_DB_NAME`；非 MDC 可省略。单环境缺失必填项时服务启动即失败。
+单环境指定 MDC 租户时填 `HANA_DB_NAME`；非 MDC 可省略。单环境缺失必填项时服务启动即失败。
 
 单环境下 `HANA_XS_PORT`（XS 设计时 REST 端口）**非必填，默认 8010**；非默认实例/租户请显式覆盖。
 
@@ -82,7 +84,7 @@ node scripts/smoke-stdio.mjs   # 冒烟：握手 + 工具注册（无需真实 H
 }
 ```
 
-**多 HANA 环境（可选）**：用 `HANA_<PARAM>_ENV_<XXXX>` 定义多个环境。连接参数按环境写（扁平 `HANA_HOST` 等会被忽略），`HOST/PORT/USER/PASSWORD` 每个环境必填；`HANA_TOOL_GROUPS` / `HANA_TOOL_DENY` / `HANA_WRITE_PACKAGES` / `HANA_READ_SCHEMA` / `HANA_SQL_ACCESS` 扁平写 = 共享，`_ENV_` 覆盖单个环境。**多环境的 entitlement（search + invoke）按当前环境编译，等价于多个单环境**。环境标识就是 `<XXXX>`（大小写不敏感），用 `hana_env_list` / `hana_env_switch` 切换；HTTP 用 `MCP_HTTP_CLIENT_ENVS` 绑定 Token。完整规则见 [CONFIG.md 的「多 HANA 环境」](CONFIG.md#多-hana-环境单进程单-active)。
+**多 HANA 环境（可选）**：用 `HANA_<PARAM>_ENV_<XXXX>` 定义多个环境。连接参数按环境写（扁平 `HANA_HOST` 等会被忽略），`HOST/PORT/USER/PASSWORD` 每个环境必填；`HANA_TOOL_GROUPS` / `HANA_TOOL_DENY` / `HANA_WRITE_PACKAGES` / `HANA_READ_SCHEMA` / `HANA_SQL_ACCESS` 扁平写 = 共享，`_ENV_` 覆盖单个环境。**多环境的 entitlement（search + invoke）按当前环境编译，等价于多个单环境**。环境标识就是 `<XXXX>`（大小写不敏感），用 `hana_env_list` / `hana_env_switch`（经 `hana_invoke` 执行）切换；HTTP 用 `MCP_HTTP_CLIENT_ENVS` 绑定 Token。完整规则见 [CONFIG.md 的「多 HANA 环境」](CONFIG.md#多-hana-环境单进程单-active)。
 
 多环境 `mcp.json` 示例（npx 启动，三个环境）：
 
@@ -135,7 +137,7 @@ node scripts/smoke-stdio.mjs   # 冒烟：握手 + 工具注册（无需真实 H
 
 ## 工具面：本体层选择 + 唯一执行入口
 
-`tools/list` 常驻且**只有两个**平台工具：
+`tools/list` **只有两个**平台工具（没有可见的具体能力或显式 deny 入口时，入口本身也不会出现）：
 
 | 工具 | 职责 |
 | --- | --- |
@@ -166,12 +168,13 @@ hana_tool_search({ "mode": "goal", "goal": "diagnose_preview_permission",
 - 集合内任一 id 未知/无权 → **整包拒绝**，与未知能力逐字同形。
 - 多环境下的**所有**调用需带 `contextToken`（`hana_tool_search` 回执签发；旧 `expectedEnvironment:{key,epoch}` 仍兼容一个版本）；切环境后旧 token 失效（`context_stale`）。
 - 预算护栏：`maxTools`（默认 12 / 硬上限 20）、`maxSchemaBytes`（默认 32KB/工具）、`maxResponseBytes`（默认 256KB）；超限给 `budget_exceeded`，不静默丢契约。
-- **可显式关闭 goal 模式**：`HANA_TOOL_SEARCH_GOAL=off` 时只保留 `discover`/`contract`，`mode=goal` 返回可恢复错误；工具面与 `hana_invoke` 不变，用于验证不走配方的选择路径。
+- 契约的 `policy` 预判：`bindings` 未覆盖写包/读 schema 时状态为 `partial`（演示参数不作为资源判定依据）；补 `bindings` 后按真实目标预判。
+- **可显式关闭 goal 模式**：`HANA_TOOL_SEARCH_GOAL=off` 时只保留 `discover`/`contract`，`mode=goal` 返回可恢复错误；工具面与 `hana_invoke` 不变。
 - **调用上下文**：推荐 `hana_invoke({ capability, args, contextToken })`；`expectedEnvironment` / `disclosure` 是兼容字段。
-- **审批固定启用**：`effects.destructive=true` 的能力在策略放行后返回 `input_required`，确认绑定 args/调用方/5 分钟过期；不再有 `HANA_APPROVAL` 开关。
+- **审批固定启用**：`effects.destructive=true` 的能力在策略放行后返回 `input_required`，确认绑定 args/调用方/5 分钟过期；无 `HANA_APPROVAL` 开关。
 - **SQL 访问模式**：`HANA_SQL_ACCESS=select-only`（默认）只允许 SELECT 类；`readwrite` 才允许 SQL 写；对象级 schema/对象访问由 HANA 账号权限决定。
 - 权限模型见 [CONFIG.md 的「权限参数（4 个 + SQL 模式）」](CONFIG.md#权限参数4-个--sql-模式)。
-- 多环境部署时 `hana_env_list` / `hana_env_switch` 经本体层发现与执行；单环境不可见。
+- 多环境部署时 `hana_env_list` / `hana_env_switch` 经本体层发现与执行（仍受分组/档案可达性约束）；单环境不可见。
 - 拒绝不泄漏存在性：未知能力、无权能力、平台入口自身目标**逐字同形**。
 - 工具分组与可见性规则见 [CONFIG.md 的「工具分组与可见性控制」](CONFIG.md#工具分组与可见性控制)；调用方档案见 [「调用方档案（MCP_PROFILES）」](CONFIG.md#调用方档案mcp_profiles)。
 
@@ -208,18 +211,18 @@ hana_tool_search({ "mode": "goal", "goal": "diagnose_preview_permission",
 
 ```
 src/
-  index.ts / http.ts / server.ts   入口、stdio/HTTP 传输、McpServer + 工具注册
+  index.ts / http.ts / server.ts   入口、stdio/HTTP 传输、McpServer、面计算与平台入口注册
   config/                          环境变量校验、权限策略与调用期闸门
   core/                            连接池、SQL 白名单、错误 envelope、日志脱敏、锁与信号量、XS REST
   model/                           视图类型、XML 解析/构造
   capabilities/                    能力清单（kind/effects/schema/本体契约）+ 平台入口
   rules/                           规则正文目录（按 id 查询）
   services/                        元数据/预览/仓库写/SQL 分析/稳定性诊断
-  tools/                           MCP 工具薄壳
+  tools/                           各能力 handler 与注册器（具体能力经 hana_invoke 派发）
   types/                           统一返回信封 Envelope
 ```
 
-每个工具统一返回信封 `{ success, data?, messages[], raw?, resultInfo?, empty? }`（HTTP 模式另带 `clientId`）：
+每次能力调用统一返回信封 `{ success, data?, messages[], raw?, resultInfo?, empty? }`（HTTP 模式另带 `clientId`）：
 协议级硬错误走 `isError` + 恢复提示；HANA 业务失败走 `success:false`；写路径 412/404 属业务信封。
 
 - `resultInfo`：截断契约（`returnedCount` / `totalAvailable?` / `truncated` / `truncationReason`）。没有该字段 = 不存在被截断。

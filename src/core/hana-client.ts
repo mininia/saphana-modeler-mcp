@@ -22,12 +22,10 @@ type HanaParameterList = HanaClientTypes.HanaParameterList;
 /**
  * hdbpipe workaround（Windows / @sap/hana-client 2.26.x）：
  *
- * 驱动在模块求值期调用 setupPipe()，对内部 IPC 管道 `\\.\pipe\hdbpipe.<pid>` 执行
- * `net.createConnection(...)`，但**只挂了 `data` 监听，没有挂 `error` 监听**。
- * 管道连接偶发 ETIMEDOUT 时会触发未捕获的 `error` 事件，直接杀掉整个 MCP server
- * （见 @sap/hana-client/lib/index.js 的 setupPipe）。这里在 require 驱动前给该端点的
- * socket 补一个 `error` 监听：记录并标记驱动不可用，process 不再崩溃。
- *
+ * 驱动在模块求值期对内部 IPC 管道 `\\.\pipe\hdbpipe.<pid>` 执行 `net.createConnection(...)`，
+ * 但**只挂了 `data` 监听，没有挂 `error` 监听**。管道连接偶发 ETIMEDOUT 时会触发未捕获的
+ * `error` 事件，直接杀掉整个 MCP server（见 @sap/hana-client/lib/index.js 的 setupPipe）。
+ * 这里在 require 驱动前给该端点的 socket 补一个 `error` 监听：记录并标记驱动不可用，进程不再崩溃。
  * 只影响 `hdbpipe` 端点，不改变其它 net 连接的语义。
  */
 let hanaClientPipeUnavailable: Error | undefined;
@@ -57,10 +55,7 @@ if (process.platform === 'win32') {
 const require = createRequire(import.meta.url);
 const hanaClient = require('@sap/hana-client') as typeof HanaClientTypes;
 
-/**
- * 已持有连接与结果集类型（供服务层声明签名用）。
- * 服务层不应直接 import 驱动：驱动交互集中在本模块，这里只把类型转出去。
- */
+/** 已持有连接与结果集类型（供服务层声明签名用；驱动交互集中在本模块，服务层不直接 import 驱动） */
 export type HanaConnection = HanaClientTypes.Connection;
 export type HanaStatement = HanaClientTypes.Statement;
 export type HanaResultSet = HanaClientTypes.ResultSet;
@@ -120,8 +115,7 @@ interface Waiter {
 
 /**
  * 「调用方给出的语句超时」判定：只有**有限正数**才启用带超时的执行路径。
- * 其余取值（undefined / 0 / 负数 / NaN / Infinity）一律按未给处理，保持既有 conn.exec 行为——
- * 把非法值当"超时 0ms"之类的静默改义会直接打断正常调用。
+ * 其余取值（undefined/0/负数/NaN/Infinity）按未给处理——把非法值当"超时 0ms"之类的静默改义会打断正常调用。
  */
 function positiveTimeoutMs(opts?: { timeoutMs?: number }): number | undefined {
   const t = opts?.timeoutMs;
@@ -129,13 +123,9 @@ function positiveTimeoutMs(opts?: { timeoutMs?: number }): number | undefined {
 }
 
 /**
- * 连接存活判定（同步）。
- *
- * 驱动 d.ts 只把 Connection.isValid 声明成回调形态（`isValid(fn?): void`），但运行期无参调用
- * 是**同步返回布尔**的（本机实测：未连接对象返回 false）——类型面缺这个同步重载，故在此用最小
- * 接口把运行期契约写清楚。
- * 判定自身抛错视同失效（宁可丢一条可疑连接，也不把失效连接循环复用）；
- * 没有 isValid 的对象（如测试替身）不做判定、按存活处理，保持既有行为。
+ * 连接存活判定（同步）。驱动 d.ts 只把 isValid 声明成回调形态，但运行期无参调用是**同步返回布尔**的
+ * （实测：未连接对象返回 false），故用最小接口写清运行期契约；判定抛错视同失效；
+ * 没有 isValid 的对象（测试替身）不做判定、按存活处理。
  */
 interface SyncValidConnection {
   isValid(): boolean;
@@ -155,8 +145,7 @@ export interface HanaPoolOptions {
   /** 连接并发上限（默认 POOL_MAX_DEFAULT=4；HANA_POOL_MAX） */
   max?: number;
   /**
-   * 池满时的排队上限（默认 POOL_MAX_WAITERS_DEFAULT=64；HANA_POOL_MAX_WAITERS）：
-   * 超出立即失败，防单客户端打满池后请求无限堆积
+   * 池满时的排队上限（默认 POOL_MAX_WAITERS_DEFAULT=64；HANA_POOL_MAX_WAITERS）：超出立即失败
    */
   maxWaiters?: number;
   /**
@@ -167,7 +156,7 @@ export interface HanaPoolOptions {
   /**
    * 写路径语句超时 ms（默认 SQL_TIMEOUT_MS_DEFAULT=60s；HANA_SQL_TIMEOUT_MS）。
    * **不**作为全局默认：hana_sql_analyze（最长 5 分钟）与元数据搜索（5–30s）是合法长语句，
-   * 全局设限会误杀它们——需要上限的调用点经 query/execute/execOn/callProcedure 的 opts 逐处传入。
+   * 全局设限会误杀它们——需要上限的调用点经各入口的 opts 逐处传入。
    */
   statementTimeoutMs?: number;
 }
@@ -175,17 +164,14 @@ export interface HanaPoolOptions {
 /**
  * 简单 HANA 连接池（@sap/hana-client 原生驱动）：
  * - 懒连接：首次 acquire 才建连
- * - 池满时请求排队等待，但有**队列上限与等待超时**（HTTP 多客户端下，无界排队会让一个客户端的
- *   慢查询把其他客户端全部挂死；有界排队把「挂死」变成可解释的失败）
+ * - 池满时请求排队等待，但有**队列上限与等待超时**（无界排队会让一个客户端的慢查询把其他客户端
+ *   全部挂死；有界排队把「挂死」变成可解释的失败）
  * - 暴露 query/execute/withConnection/execOn 入口，service 层只用这几个
- *   （另有**已持有连接**上的执行原语 execStreamingOn / execPreparedOn，见文件末尾：
- *   真执行任意语句、限量取行与超时都在那里落地，服务层同样不得自己碰驱动）
- * - **连接存活检查**：acquire 命中空闲连接、release 归还连接时都经 connectionAlive
- *   （驱动 conn.isValid）判定；失效连接 disconnect 后丢弃——不进空闲队列、也不转交等待者
- *   （否则之后每个取到它的请求都会在第一条语句上莫名失败）。已知能造成这种连接的一条路径是
- *   PlanViz 通道（`EXECUTE PLANVIZ STATEMENT ID` 传错 id 会被 HANA 直接断开；`QUERY_ID_RE`
- *   会在拼接执行语句前先做形状校验）；丢弃后有等待者时改为现建一条交接，
- *   池容量不因一条死连接被永久占掉。
+ *   （另有**已持有连接**上的执行原语 execStreamingOn / execPreparedOn，见文件末尾）
+ * - **连接存活检查**：acquire 命中空闲连接、release 归还连接时都经 connectionAlive 判定；
+ *   失效连接 disconnect 后丢弃——不进空闲队列、也不转交等待者（否则之后每个取到它的请求都会莫名失败）。
+ *   已知成因之一是 PlanViz 通道（`EXECUTE PLANVIZ STATEMENT ID` 传错 id 会被 HANA 直接断开；
+ *   `QUERY_ID_RE` 会先做形状校验）；丢弃后有等待者时改为现建一条交接，池容量不因死连接被占掉。
  */
 export class HanaPool {
   private readonly options: ConnectionOptions;
@@ -318,12 +304,9 @@ export class HanaPool {
   }
 
   /**
-   * 在**已持有连接**上执行一条语句（query / execute / execOn 三条入口共用的分派）：
-   * opts.timeoutMs 为有限正数时走 execPreparedOn（prepare/exec + stmt.setTimeout，结束即 drop），
-   * 否则保持既有的 conn.exec 一次往返。
-   *
-   * 两条路径的返回形状不同（超时路径恒为行数组；非超时路径 SELECT 给行数组、DDL/DML 给驱动结果
-   * 对象），按调用方声明的 T 收窄：query 传 T[]；execOn 的既有调用点把 T 声明成行数组类型。
+   * 在**已持有连接**上执行一条语句（query / execute / execOn 共用分派）：
+   * opts.timeoutMs 为有限正数时走 execPreparedOn（prepare/exec + setTimeout，结束即 drop），否则走 conn.exec。
+   * 两条路径返回形状不同（超时路径恒为行数组；非超时路径 DDL/DML 给驱动结果对象），按调用方声明的 T 收窄。
    */
   private async runOn<T>(
     conn: Connection,
@@ -340,8 +323,8 @@ export class HanaPool {
 
   /**
    * 执行查询并整体返回行（SELECT 语义；行数上限由调用方 SQL 保证）。
-   * opts.timeoutMs 给出有限正数时改走 execPreparedOn（prepare/exec + stmt.setTimeout + drop），
-   * 否则保持既有的 conn.exec 一次往返——**存量调用点不传第三参，行为与签名向后兼容**。
+   * opts.timeoutMs 为有限正数时改走 execPreparedOn（prepare/exec + setTimeout + drop），
+   * 否则走 conn.exec 一次往返。
    */
   async query<T = Record<string, unknown>>(
     sql: string,
@@ -362,16 +345,10 @@ export class HanaPool {
 
   /**
    * 在**已持有的连接**上执行一条语句（配合 withConnection 使用）。
+   * 用于需要在一段连贯会话里完成多步的操作（如 SQL 执行计划：EXPLAIN 写入后**立即**按语句名回读、用完删除）——
+   * query/execute 各自 acquire 一条连接，多步之间可能被别的请求插入或落到不同连接上，语义不连贯。
    *
-   * 为什么需要它：有些操作要在一段连贯的会话里完成多步（例如 SQL 执行计划：EXPLAIN 写入后**立即**
-   * 按语句名回读、用完再按名删除）。query/execute 各自 acquire 一条连接，多步之间可能被别的请求
-   * 插入，也可能落到不同连接上，语义就不连贯了。
-   *
-   * 带 opts.timeoutMs（有限正数）时改走 execPreparedOn：语句超时落到 stmt.setTimeout 且结束即 drop；
-   * 否则保持既有 conn.exec 行为。两种路径的运行时结果都是「行数组」（T 按既有调用点声明成行数组类型）。
-   *
-   * ⚠️ 持有 conn 期间**只能**走本方法，不可再调 query/execute：那会二次 acquire
-   * （并发下互相等池位直至 acquireTimeout 失败）。
+   * ⚠️ 持有 conn 期间**只能**走本方法，不可再调 query/execute：那会二次 acquire（并发下互相等池位直至超时）。
    */
   async execOn<T = Record<string, unknown>>(
     conn: Connection,
@@ -389,13 +366,10 @@ export class HanaPool {
    * - SQL 文本中 IN/OUT 全部写 ? 占位；绑定数组**只传 IN 参数**（OUT 参数不得入绑定数组，
    *   否则驱动报 "Too many parameters" code=-20013）；
    * - 执行成功后用 stmt.getParameterValue(i)（i 从 0 起）读回输出参数。
-   * 适配 HANA 内置过程（如 SYS.REPOSITORY_REST(IN BLOB, OUT BLOB)）。
    *
-   * opts.timeoutMs（有限正数）会设到语句上：REPOSITORY_REST 这类控制面调用一挂住就占着池位
-   * （池上限 4），几个这样的请求就足以让全部工具调用排队超时，必须可设上限。
-   *
-   * 说明：这里直接 prepare/exec 而不是走 conn.exec 封装——OUT 参数必须在 exec 完成后
-   * 从同一 stmt 上读回（getParameterValue），而 conn.exec 的回调只给行，拿不到语句对象。
+   * 这里直接 prepare/exec 而不是走 conn.exec 封装——OUT 参数必须在 exec 完成后从同一 stmt 上读回，
+   * 而 conn.exec 的回调只给行，拿不到语句对象。opts.timeoutMs 会设到语句上：控制面调用一挂住就
+   * 占着池位（池上限 4），几个这样的请求就足以让全部工具调用排队超时，必须可设上限。
    */
   async callProcedure(
     sql: string,
@@ -491,11 +465,10 @@ export class HanaPool {
 // ── 已持有连接上的执行原语 ────────────────────────────────────────
 //
 // 为什么这两个函数**必须**在这里（而不是各服务自己写）：Statement/ResultSet 是驱动原语，
-// 文件头已约定「驱动交互集中在本模块」。此前 sql-analyze.service 为了"真执行一条语句 + 限量取行"
-// 直接调 conn.prepare / stmt.setTimeout / stmt.execQuery / rs.next / rs.close ——
-// 那条路径（接受任意 SQL 文本并真执行）恰恰是最危险的一条，却绕过了本模块的全部护栏，
-// 且 close/drop 的清理只存在于那个调用点的 finally 里（另一处调用就漏一套）。
-// 收进本模块后：**护栏与驱动原语在同一处**，调用方只能整份拿走，拿不走半份。
+// 文件头已约定「驱动交互集中在本模块」。服务层若直接调 conn.prepare / stmt.setTimeout /
+// stmt.execQuery / rs.next / rs.close，那条接受任意 SQL 文本并真执行的路径就绕过了本模块的
+// 全部护栏，且 close/drop 的清理只存在于各调用点的 finally 里（漏一处就是资源泄漏）。
+// 本模块把**护栏与驱动原语放在同一处**：调用方只能整份拿走，拿不走半份。
 
 /**
  * 流式执行的护栏参数。**两个字段都必填**：真执行一条任意语句必须有时间上限与取行上限，
@@ -524,17 +497,16 @@ export interface ExecStreamingStats {
 }
 
 /**
- * 在**已持有的连接**上流式执行一条语句（配合 withConnection 使用，与 execOn 同为"已持有连接"用法）。
+ * 在**已持有的连接**上流式执行一条语句（配合 withConnection 使用）。
  *
  * 本方法自己保证的护栏（调用方**无法**绕过）：
- * - **超时**：opts.timeoutMs 经 stmt.setTimeout 生效（不设超时的执行会一直占着池位）；
- * - **取行上限**：最多 next 到 opts.maxRows 行即停止拉取，**提前关闭结果集**——
- *   一条没有 LIMIT 的 SELECT 足以把进程打爆，而调用方往往**不能**改写语句（改写就不是同一条语句了）；
- * - **不返回数据行**：行只计数、内容不读不放（要取数请走取数通道，本入口不成为数据出口）；
- * - **清理**：无论成功/失败/超时，finally 里 rs.close() + stmt.drop()，不留结果集与语句。
+ * - **超时**（stmt.setTimeout）与**取行上限**（取满 opts.maxRows 即**提前关闭结果集**——
+ *   一条没有 LIMIT 的 SELECT 足以把进程打爆，而调用方往往**不能**改写语句）；
+ * - **不返回数据行**：行只计数、内容不读不放（本入口不成为数据出口）；
+ * - **清理**：无论成功/失败/超时，finally 里 rs.close() + stmt.drop()。
  *
  * 用 ResultSet 流式取行而不是 conn.exec：后者把全部结果一次拉回内存。
- * prepare（语法/对象/权限）与 next 的错误都经 normalizeHanaError 归一后抛出。
+ * prepare 与 next 的错误都经 normalizeHanaError 归一后抛出。
  */
 export async function execStreamingOn(
   conn: Connection,
@@ -612,14 +584,9 @@ export async function execStreamingOn(
 /**
  * 在**已持有的连接**上准备并执行一条语句，整体取回结果行（`{CALL ...}` 之类的控制面调用）。
  *
- * 与 execOn 的分工：execOn 缺省走 conn.exec（一条语句一次往返）；给出 opts.timeoutMs 时
- * 与本方法同路径（prepare/exec + setTimeout）。本方法恒走 prepare/exec（可带绑定参数、可设语句超时），
- * 并在 finally 里 drop 语句——
- * 控制面调用一挂住就会占着池位（池上限 4），几个这样的请求足以让全部工具调用排队超时。
- *
- * prepare（语法 / 对象不存在 / 无权限都在这一阶段同步抛出）与 exec 的同步抛错都经
- * normalizeHanaError 归一后抛出（与 execStreamingOn 同口径）——不归一就会被调用方当成
- * "未知错误"包装掉，调用方只看到「内部错误」，code 与消息全丢。
+ * 本方法恒走 prepare/exec（可带绑定参数、可设语句超时），并在 finally 里 drop 语句——控制面调用
+ * 一挂住就会占着池位（池上限 4），几个这样的请求足以让全部工具调用排队超时。
+ * prepare 与 exec 的同步抛错都经 normalizeHanaError 归一后抛出——不归一就会被当成「内部错误」，code 与消息全丢。
  */
 export async function execPreparedOn<T = Record<string, unknown>>(
   conn: Connection,
@@ -662,8 +629,7 @@ export async function execPreparedOn<T = Record<string, unknown>>(
 //
 // 与 execStreamingOn 的分工：那一条路只计数、不返回数据行（SQL 分析只需要统计）；
 // 这里要把**列名 + 行**带回给调用方，因此额外承担：取行上限、累计字节上限、二进制单元格
-// base64 包装（含单格上限）、bigint 转字符串。超时/清理契约与 execStreamingOn 完全一致：
-// prepare 同步抛错归一化、finally 里 rs.close() + stmt.drop()。
+// base64 包装（含单格上限）、bigint 转字符串。超时/清理契约与 execStreamingOn 一致。
 
 /** `execLimitedOn` 的护栏参数（全部必填：任意 SQL 的执行必须有时间/行数/字节上限） */
 export interface ExecLimitedOptions {
@@ -752,13 +718,11 @@ function normalizeCell(value: unknown, maxCellBytes: number): { value: unknown; 
 /**
  * 在**已持有的连接**上流式执行一条 SELECT：返回列名 + 限量行。
  *
- * - 行数上限：取满 `maxRows` 后**再探测一次 next**（不读值）——据此区分“恰好 N 行”与“还有更多”；
- *   有更多则标记 truncated=true 并立刻关闭结果集；
- * - 字节上限：累计估算字节超过 `maxResultBytes` 时丢弃当前行并停止，标记 truncated（reason=max-bytes）；
+ * - 行数上限：取满 `maxRows` 后**再探测一次 next**（不读值），据此区分"恰好 N 行"与"还有更多"；
+ * - 字节上限：累计估算字节超过 `maxResultBytes` 时丢弃当前行并停止（reason=max-bytes）；
  * - 二进制：Buffer → `{ type:'binary', base64, bytes, truncated }`，单格超过 maxCellBytes 只带前缀；
  * - LOB：`getValuesCanBlock()` 为 true 时走异步取值，避免同步读取 LOB 阻塞事件循环；
- * - bigint → 字符串；Date → ISO 字符串；
- * - 清理：无论成功/失败/超时，finally 里 rs.close() + stmt.drop()。
+ * - bigint → 字符串；Date → ISO 字符串；清理：finally 里 rs.close() + stmt.drop()。
  */
 export async function execLimitedOn(
   conn: Connection,
@@ -934,12 +898,12 @@ function setAutoCommitAsync(conn: Connection, flag: boolean): Promise<void> {
 }
 
 /**
- * 在**同一条池连接**上执行一段事务：setAutoCommit(false) → fn → commit；
- * fn/commit 失败 → rollback；**finally 一定恢复 setAutoCommit(true)**——
- * 绝不能把 autoCommit=false 的连接还给池（下一个借用者会在不知情的情况下把写入挂在未提交事务里）。
+ * 在**同一条池连接**上执行一段事务：setAutoCommit(false) → fn → commit；fn/commit 失败 → rollback；
+ * **finally 一定恢复 setAutoCommit(true)**——绝不能把 autoCommit=false 的连接还给池
+ * （下一个借用者会在不知情的情况下把写入挂在未提交事务里）。
  *
  * 返回值带 `rolledBack` / `autoCommitRestored`：调用方必须如实回报（DDL 在 HANA 可能隐式提交，
- * 回滚不保证撤销其效果——这由服务层的回执文案说明，不在这里假装成功）。
+ * 回滚不保证撤销其效果）。
  */
 export async function withTransactionOn<T>(conn: Connection, fn: () => Promise<T>): Promise<TransactionOutcome<T>> {
   try {

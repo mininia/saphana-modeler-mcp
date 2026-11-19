@@ -56,7 +56,7 @@ function bearerTokenGuard(clients: HttpClientIdentity[]): RequestGuard {
   // sha256 摘要定长后 timingSafeEqual，防时序侧信道；摘要不回泄 token；token 原文不驻留在比对结构中
   const digests = clients.map((c) => ({
     clientId: c.clientId,
-    // 令牌只在这里比对；档案名（第三段）随身份进上下文，供调用期授权使用（P10-c）
+    // 令牌只在这里比对；档案名（第三段）随身份进上下文，供调用期授权使用
     ...(c.profileId ? { profileId: c.profileId } : {}),
     digest: createHash('sha256').update(c.token).digest(),
   }));
@@ -76,7 +76,7 @@ function bearerTokenGuard(clients: HttpClientIdentity[]): RequestGuard {
         token: '****',
         clientId: matched.clientId,
         scopes: [],
-        // extra 是 AuthInfo 的透传口袋：档案名随身份一路进请求上下文（P10-c）
+        // extra 是 AuthInfo 的透传口袋：档案名随身份一路进请求上下文
         extra: { transport: 'http', ...(matched.profileId ? { profileId: matched.profileId } : {}) },
       };
       return true;
@@ -138,7 +138,7 @@ export async function startHttpServer(
     if (!bodySizeGuard(req, res)) return;
     // 身份上下文：贯穿本次请求的全部异步续体（工具层/服务层/审计日志/envelope 均据此归因）
     const clientId = (req as AuthedRequest).auth?.clientId ?? ANONYMOUS_CLIENT_ID;
-    // 档案名（Token 第三段）：随身份进 ALS，供调用期授权按调用方收紧（P10-c）
+    // 档案名（Token 第三段）：随身份进 ALS，供调用期授权按调用方收紧
     const profileId = (req as AuthedRequest).auth?.extra?.profileId;
     // 环境绑定（多环境 HTTP）：按 Token→环境标识映射把本次请求钉在一个 runtime 上；
     // 无状态 HTTP 没有会话，进程级 active 不能代表某个客户端。
