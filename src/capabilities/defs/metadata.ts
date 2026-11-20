@@ -343,18 +343,21 @@ export const metadataCapabilities = {
     kind: 'read',
     effects: { plan: planTableColumns, destructive: false, idempotent: true, mutates: 'none' },
     routing: {
-      intent: '取指定表的列结构（列名/类型/长度/可空/默认值/注释）',
-      whenToUse: ['已知表名，查列定义'],
-      notFor: ['视图字段用 hana_metadata_list_fields；表不存在先用 hana_table_list 确认'],
+      intent: '取指定表/视图的列结构（列名/类型/长度/可空/默认值/注释）',
+      whenToUse: ['已知表名，查列定义', 'BW 视图（名含冒号）的列类型'],
+      notFor: [
+        '设计时 CV 的输出字段用 hana_metadata_list_fields；BW 底层视图的列类型用本工具',
+        '表不存在先用 hana_table_list 确认',
+      ],
       priority: 'primary',
       exampleArgs: { schema: 'SAPABAP1', table: '/BIC/AZDEMO001' },
     },
-    title: '获取表列结构',
+    title: '获取表/视图列结构',
     description:
-      '返回指定表的列结构：列名/位置/数据类型/长度/精度/可空/默认值/注释（来源：SYS.TABLE_COLUMNS）。表不存在或当前用户无权限时返回 isError，可先用 hana_table_list 确认可访问的表',
+      '返回指定表/视图的列结构：列名/位置/数据类型/长度/精度/可空/默认值/注释。先查 SYS.TABLE_COLUMNS，空则回退 SYS.VIEW_COLUMNS（BW 的 CALC 视图，如 0BW:... 只在这里）；对象不存在或当前用户无权限时返回 isError，可先用 hana_table_list 确认可访问的表',
     inputSchema: z.object({
       schema: tagResource(z.string().trim().describe('schema 名，如 SAPABAP1 / _SYS_BIC'), 'readSchema'),
-      table: z.string().describe('表名，如 /BIC/AZDEMO001'),
+      table: z.string().describe('表/视图名，如 /BIC/AZDEMO001 或 0BW:RS2HANA:QUERY:...PROJ_BNR（允许冒号）'),
       limit: z.number().int().min(1).max(500).default(200).describe('返回列数上限，默认 200，最大 500'),
     }),
     annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },

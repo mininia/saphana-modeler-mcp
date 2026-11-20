@@ -5,7 +5,7 @@ import { viewDefinitionCache } from '../model/view-cache.js';
 import { parseResourceUri } from './preview.derive.js';
 import { HanaBusinessError } from '../core/errors.js';
 import { clampLimit } from '../core/num.js';
-import { assertSafeRuntimeName, assertSchemaAllowed, listAllowedSchemas, quoteIdentifier } from '../core/sql.js';
+import { assertSafeCatalogName, assertSchemaAllowed, listAllowedSchemas, quoteIdentifier } from '../core/sql.js';
 import { suffixInClause, suffixesOf, VIEW_SUFFIXES } from '../model/view-suffixes.js';
 import { CROSSREF_TABLE, OBJECT_TABLE, OBJECT_TEXT_CONTENT_TABLE, type VersionScope } from '../model/view-scope.js';
 import { parseViewDefinition } from '../model/view-xml.js';
@@ -262,7 +262,13 @@ export type TableColumnsResult = PagedResult<ColumnInfo, 'columns'>;
 /** getTableColumns 的列数上限（clampLimit 的 hi）；回执 truncated 与 repository.service 的自动取列共用同一数值（单点定义） */
 export const TABLE_COLUMNS_LIMIT_MAX = 500;
 
-/** 表列结构（SYS.TABLE_COLUMNS）；回执带 count/limit/truncated，超 limit 不静默截断 */
+/**
+ * 表/视图列结构：先查 SYS.TABLE_COLUMNS，空则回退 SYS.VIEW_COLUMNS。
+ *
+ * 为什么需要回退：BW 的 `DATA_BASE_VIEW`（如 `0BW:RS2HANA:QUERY:...`）在目录里是
+ * `SYS.VIEWS.VIEW_TYPE='CALC'` 的视图，只出现在 SYS.VIEW_COLUMNS；只查 TABLE_COLUMNS 会让
+ * 这类上游的列类型不可得（模型只能猜精度）。目录/列名是本文件内的常量，用户值仍参数绑定。
+ */
 export async function getTableColumns(
   pool: HanaPool,
   schema: string,
@@ -270,55 +276,65 @@ export async function getTableColumns(
   opts: { limit?: number } = {},
 ): Promise<TableColumnsResult> {
   const limit = clampLimit(opts.limit, 200, 1, TABLE_COLUMNS_LIMIT_MAX);
-  // 纵深防御：schema 走白名单、表名做字符集校验（值仍参数绑定，此为第二道防线）
+  // 纵深防御：schema 走白名单、对象名做字符集校验（值仍参数绑定，此为第二道防线）。
+  // 目录查询允许 BW 冒号名；写路径仍用更严格的 assertSafeRuntimeName。
   assertSchemaAllowed(schema);
-  assertSafeRuntimeName(table, '表');
-  const page = await runPaged('columns', limit, {
-    count: async () => {
-      const countRow = await pool.query<{ C: number }>(
-        `SELECT COUNT(*) AS C FROM SYS.TABLE_COLUMNS WHERE SCHEMA_NAME = ? AND TABLE_NAME = ?`,
-        [schema, table],
-      );
-      return countRow[0]?.C ?? 0;
-    },
-    items: async () => {
-      const rows = await pool.query<{
-        COLUMN_NAME: string;
-        POSITION: number;
-        DATA_TYPE_NAME: string;
-        LENGTH: number | null;
-        SCALE: number | null;
-        IS_NULLABLE: string;
-        DEFAULT_VALUE: string | null;
-        COMMENTS: string | null;
-      }>(
-        `SELECT COLUMN_NAME, POSITION, DATA_TYPE_NAME, LENGTH, SCALE, IS_NULLABLE, DEFAULT_VALUE, COMMENTS
-         FROM SYS.TABLE_COLUMNS
-         WHERE SCHEMA_NAME = ? AND TABLE_NAME = ?
-         ORDER BY POSITION LIMIT ?`,
-        [schema, table, limit],
-      );
-      return rows.map((r) => ({
-        columnName: r.COLUMN_NAME,
-        position: r.POSITION,
-        dataTypeName: r.DATA_TYPE_NAME,
-        length: r.LENGTH,
-        scale: r.SCALE,
-        isNullable: r.IS_NULLABLE === 'TRUE',
-        defaultValue: r.DEFAULT_VALUE,
-        comments: r.COMMENTS,
-      }));
-    },
-  });
-  if (page.columns.length === 0) {
-    // 必须是 HanaBusinessError：裸 Error 会被 withErrorEnvelope 归入「内部错误」，
-    // 「表不存在 / 无权限」这类**调用方可据以修正**（换 schema、换表名）的原因会被吞掉。
-    throw new HanaBusinessError(
-      `未找到表 ${schema}/${table}（或当前用户无权限）。可用 hana_table_list 确认 schema 下可访问的表`,
-      'TABLE_NOT_FOUND',
-    );
-  }
-  return page;
+  assertSafeCatalogName(table, '表/视图');
+
+  const readFrom = async (
+    catalog: 'SYS.TABLE_COLUMNS' | 'SYS.VIEW_COLUMNS',
+    nameColumn: 'TABLE_NAME' | 'VIEW_NAME',
+  ): Promise<TableColumnsResult> =>
+    runPaged('columns', limit, {
+      count: async () => {
+        const countRow = await pool.query<{ C: number }>(
+          `SELECT COUNT(*) AS C FROM ${catalog} WHERE SCHEMA_NAME = ? AND ${nameColumn} = ?`,
+          [schema, table],
+        );
+        return countRow[0]?.C ?? 0;
+      },
+      items: async () => {
+        const rows = await pool.query<{
+          COLUMN_NAME: string;
+          POSITION: number;
+          DATA_TYPE_NAME: string;
+          LENGTH: number | null;
+          SCALE: number | null;
+          IS_NULLABLE: string;
+          DEFAULT_VALUE: string | null;
+          COMMENTS: string | null;
+        }>(
+          `SELECT COLUMN_NAME, POSITION, DATA_TYPE_NAME, LENGTH, SCALE, IS_NULLABLE, DEFAULT_VALUE, COMMENTS
+           FROM ${catalog}
+           WHERE SCHEMA_NAME = ? AND ${nameColumn} = ?
+           ORDER BY POSITION LIMIT ?`,
+          [schema, table, limit],
+        );
+        return rows.map((r) => ({
+          columnName: r.COLUMN_NAME,
+          position: r.POSITION,
+          dataTypeName: r.DATA_TYPE_NAME,
+          length: r.LENGTH,
+          scale: r.SCALE,
+          isNullable: r.IS_NULLABLE === 'TRUE',
+          defaultValue: r.DEFAULT_VALUE,
+          comments: r.COMMENTS,
+        }));
+      },
+    });
+
+  const tablePage = await readFrom('SYS.TABLE_COLUMNS', 'TABLE_NAME');
+  if (tablePage.columns.length > 0) return tablePage;
+  const viewPage = await readFrom('SYS.VIEW_COLUMNS', 'VIEW_NAME');
+  if (viewPage.columns.length > 0) return viewPage;
+
+  // 必须是 HanaBusinessError：裸 Error 会被 withErrorEnvelope 归入「内部错误」，
+  // 「表不存在 / 无权限」这类**调用方可据以修正**（换 schema、换表名）的原因会被吞掉。
+  throw new HanaBusinessError(
+    `未找到表/视图 ${schema}/${table}（或当前用户无权限）。可用 hana_table_list 确认 schema 下可访问的表；` +
+      'BW 视图（名含冒号）的列结构也可用本工具查询',
+    'TABLE_NOT_FOUND',
+  );
 }
 
 /**

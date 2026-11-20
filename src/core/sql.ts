@@ -29,6 +29,13 @@ const SAFE_NAME_RE = /^[A-Za-z0-9_$#.\-]+$/;
 const SAFE_RUNTIME_NAME_RE = /^[A-Za-z0-9_$#./\-]+$/;
 
 /**
+ * 目录查询对象名：在运行时字符集上额外允许 BW 对象名的冒号（如
+ * `0BW:RS2HANA:QUERY:ZMGF08R008_Q003.PROJ_BNR`）。只用于**按名查目录**
+ * （SYS.TABLE_COLUMNS / SYS.VIEW_COLUMNS），值仍参数绑定；引号/分号/空白依旧拒绝。
+ */
+const SAFE_CATALOG_NAME_RE = /^[A-Za-z0-9_$#./:\-]+$/;
+
+/**
  * 包名（packageId / 对象名）的**工具入参**字符集：字母/数字/_/./-。
  * 比 SAFE_NAME_RE 严格（不含 $ # /）——这是暴露给模型与外部调用方的契约，
  * 全仓 28 处 zod schema 共用此常量，避免各写一份导致规则漂移。
@@ -130,6 +137,19 @@ export function assertSafeRuntimeName(name: string, kind = '对象'): void {
 /** 纯判定版（不抛错）：运行时对象名（允许 /） */
 export function isSafeRuntimeName(name: string): boolean {
   return SAFE_RUNTIME_NAME_RE.test(name);
+}
+
+/**
+ * 校验目录查询对象名（表/视图）：在运行时字符集上允许 BW 的冒号。
+ * 仅供按名查目录使用；写路径/DDL 仍用 {@link assertSafeRuntimeName}。
+ */
+export function assertSafeCatalogName(name: string, kind = '对象'): void {
+  if (!SAFE_CATALOG_NAME_RE.test(name)) {
+    throw new HanaBusinessError(
+      `${kind}名 "${name}" 含非法字符（仅允许字母/数字/_/$/#/./-//:），已拒绝`,
+      'INVALID_OBJECT_NAME',
+    );
+  }
 }
 
 /** 工具入参口径的 schema 名校验（不以数字开头、限长 126） */

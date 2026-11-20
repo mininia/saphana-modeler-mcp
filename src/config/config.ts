@@ -51,7 +51,7 @@ function warnRemovedPermissionEnv(env: NodeJS.ProcessEnv): void {
   logger.warn(
     { ignored: found },
     '以下权限变量已移除，已忽略（不生效）：只读由 HANA_WRITE_PACKAGES 是否为空推导；' +
-      'SQL 由是否启用 sql 组控制；破坏性操作固定需要审批',
+      'SQL 由是否启用 sql 组控制；破坏性操作审批由 HANA_APPROVAL_POLICY 决定（默认 off；destructive 时仅 delete/import 确认）',
   );
 }
 import { DEFAULT_HTTP_HOST, DEFAULT_SSL_VALIDATE, DEFAULT_TLS } from './deployment.js';
@@ -196,6 +196,16 @@ const envSchema = z.object({
    * 例：HANA_TOOL_DENY="hana_data_preview_*" 关闭所有预览工具。
    */
   HANA_TOOL_DENY: z.string().default('').transform(splitList),
+  /**
+   * 破坏性操作审批策略（进程级，不允许 `_ENV_` 按环境覆盖）：
+   * - `off`（默认）：不逐次人工确认；需要审批的操作直接执行。
+   * - `destructive`：只对清单声明 `approval` 的能力/参数要求人工确认——
+   *   `hana_view_delete` / `hana_repo_import` 每次确认，`hana_view_update` 仅 changeset 含 delete 动作时确认；
+   *   客户端未声明 `elicitation` 时 fail-closed。
+   * `dryRun=true` 的只读预演在两种策略下都不触发审批。
+   * 旧名 `HANA_APPROVAL` 已移除并忽略（见 REMOVED_PERMISSION_ENV），不要与它混用。
+   */
+  HANA_APPROVAL_POLICY: z.preprocess(trimmedOrUnset, z.enum(['destructive', 'off']).default('off')),
   /**
    * 调用方档案定义：`name=kinds[:glob|glob][;name2=…]`，kinds 用 + 连接。
    * 例：MCP_PROFILES="analyst=read;dev=read+write:hana_view_*|hana_metadata_*;default=read"
@@ -584,7 +594,7 @@ export interface HanaConfig {
   access?: 'readwrite' | 'readonly';
   /** SQL 直接执行的访问模式（HANA_SQL_ACCESS；默认 select-only） */
   sqlAccess?: 'select-only' | 'readwrite';
-  /** 破坏性操作审批策略：固定为 destructive（不可配） */
+  /** 破坏性操作审批策略（来自 HANA_APPROVAL_POLICY；默认 off） */
   approvalPolicy: 'off' | 'destructive';
   /** 只读环境 SQL 策略：固定 select-only（要完全关闭 SQL 请不启用 sql 组） */
   readonlySql?: 'select-only' | 'deny';
@@ -872,9 +882,9 @@ function loadInternal(env: NodeJS.ProcessEnv): LoadedEnvironments {
     httpAllowAnonymous: parsed.MCP_HTTP_ALLOW_ANONYMOUS,
     connectionSources: dotenv.sources,
     connectionSourceMixed,
-    // 环境维度：只读由写包推导；审批固定为破坏性操作需确认；SQL 只读态固定 select-only。
+    // 环境维度：只读由写包推导；审批策略来自 HANA_APPROVAL_POLICY（默认 off）；SQL 只读态固定 select-only。
     access: (parsed.HANA_WRITE_PACKAGES?.length ?? 0) > 0 ? 'readwrite' : 'readonly',
-    approvalPolicy: 'destructive',
+    approvalPolicy: parsed.HANA_APPROVAL_POLICY,
     readonlySql: 'select-only',
     xsTls: parsed.HANA_XS_TLS,
   };

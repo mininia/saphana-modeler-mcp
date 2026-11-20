@@ -118,6 +118,18 @@ export async function validateCalculationView(
         norm.sqlState,
       );
     }
+    // SCRIPT_BASED（SQL 模式）视图的运行时模型解析不了：CHECK_CALCULATION_VIEW 不适用。
+    // 实测（SPS08）对一个已激活的 SQL 模式视图会抛 129，消息为 "Could not resolve scenario name"
+    // 或 "Failed to get CalcIndex"；运行时对象本身存在且可编译。把它报成“视图不一致”会让模型
+    // 反复激活/改一个没问题的视图。
+    if (/Could not resolve scenario name|Failed to get CalcIndex/i.test(norm.message)) {
+      throw new HanaBusinessError(
+        `视图 ${schema}/${viewName} 的运行时一致性校验未执行：CHECK_CALCULATION_VIEW 无法解析该视图的运行时 scenario/CalcIndex` +
+          '（SQL 模式 / SCRIPT_BASED 视图常见）。这不是视图不一致；请改用 hana_data_preview（或 SELECT ... LIMIT 0）验证运行时对象',
+        'VALIDATE_UNSUPPORTED',
+        norm.sqlState,
+      );
+    }
     throw new HanaBusinessError(`视图 ${schema}/${viewName} 一致性校验失败：${norm.message}`, norm.code, norm.sqlState);
   }
 }

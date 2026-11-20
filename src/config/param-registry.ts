@@ -223,6 +223,14 @@ export const PARAM_REGISTRY: readonly ParamSpec[] = [
     description: 'enables hana_tool_search goal mode (on/off)',
   },
   {
+    name: 'APPROVAL_POLICY',
+    envVar: 'HANA_APPROVAL_POLICY',
+    scope: 'process',
+    processGroup: 'capability',
+    defaultValue: 'off',
+    description: '人工审批策略（off 默认 / destructive：仅 delete/import 与 changeset delete 确认）',
+  },
+  {
     name: 'PROFILES',
     envVar: 'MCP_PROFILES',
     scope: 'process',

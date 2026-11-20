@@ -92,6 +92,13 @@ async function main(): Promise<void> {
   } else {
     logger.info({ writePackages: verdict.policy.resource.writePackages }, verdict.text);
   }
+  // 审批是安全边界：默认 off 时在启动摘要里可见；开启时说明覆盖范围。
+  logger.info(
+    { approvalPolicy: config.approvalPolicy },
+    config.approvalPolicy === 'off'
+      ? '人工审批：off（默认；delete/import 不逐次确认）。需要确认时设 HANA_APPROVAL_POLICY=destructive'
+      : '人工审批：destructive（仅 hana_view_delete / hana_repo_import，以及 changeset 含 delete 时确认）',
+  );
 
   // 池与超时参数按环境从各自 config 派生（见 EnvironmentManager 构造）；这里不再传全局选项。
   // 部署含义：max 是**每环境池大小**——N 个环境 × poolMax 是理论上限；连接仍懒建立，

@@ -32,7 +32,7 @@ The last column lists **capability ids**, not registered tools: every capability
 | Stability diagnostics | Instance health, session & blocking deep dive, table storage profile, historical trend | `hana_system_health`, `hana_system_activity`, `hana_table_storage`, `hana_system_trend` |
 | Package | Package list/tree, objects in a package, create package | `hana_package_list`, `hana_package_list_objects`, `hana_package_create` |
 | Metadata | Object search (name/description), field list, field logic, lineage | `hana_metadata_get_view`, `hana_metadata_search_objects`, `hana_metadata_list_fields`, `hana_metadata_get_field_logic`, `hana_metadata_where_used` |
-| Table catalog | Accessible table list, table comment search, column structure | `hana_table_list`, `hana_table_columns` |
+| Table catalog | Accessible table list, table comment search, table/view column structure (incl. BW CALC views) | `hana_table_list`, `hana_table_columns` |
 | Data preview | Activated-view preview (overall / node) + preview privilege diagnosis | `hana_data_preview`, `hana_data_preview_diagnose` |
 | Modeling write | Create/activate/update/delete calculation views, design-time + runtime validation | `hana_view_create`, `hana_view_activate`, `hana_view_update`, `hana_view_delete`, `hana_view_validate`, `hana_view_check_actions` |
 | Repository transport | Package export backup, design-time file import, change list | `hana_repo_export`, `hana_repo_import`, `hana_repo_changelist` |
@@ -111,6 +111,7 @@ Connection info is only allowed from environment variables / `mcp.json` `env` (*
 | `HANA_TOOL_GROUPS` | optional | Enabled groups (`read`/`write`/`admin`/`sql`) or capability ids/globs in one comma-separated list; **empty = read/write/admin enabled, `sql` off by default** | `read` / `read,sql` / `hana_view_*` |
 | `HANA_TOOL_DENY` | optional | Force-disabled capability ids/globs or group names (highest priority, overrides groups; comma-separated, supports `*`) | `hana_data_preview*` / `write` |
 | `HANA_TOOL_SEARCH_GOAL` | optional | Enable `hana_tool_search` goal mode, default `on`; `off` keeps `discover`/`contract` only (process-level) | `off` |
+| `HANA_APPROVAL_POLICY` | optional | Human-approval policy: `off` (default; no per-call confirmation) or `destructive` (only `hana_view_delete`, `hana_repo_import` and `hana_view_update` changesets containing a delete action require host `elicitation`) | `destructive` |
 | `HANA_SQL_ACCESS` | optional | `hana_sql_execute` access mode: `select-only` (default) or `readwrite`; `sql` group only controls visibility | `readwrite` |
 | `MCP_PROFILES` | optional | **Caller profiles** (`name=kinds[:glob\|glob][;…]`, kinds joined by `+`). Profiles can only *tighten* the deployment policy; defining any profile requires a `default` one | `analyst=read;dev=read+write:hana_view_*;default=read` |
 | `MCP_PROFILE` | optional | Profile used by this process (stdio) and by callers without a profile in their token; must be defined in `MCP_PROFILES` | `default` |
@@ -127,8 +128,8 @@ Connection info is only allowed from environment variables / `mcp.json` `env` (*
 
 > **Removed and ignored** (a startup warning is logged when present): `HANA_ACCESS`, `HANA_READONLY_SQL`,
 > `HANA_APPROVAL`, `HANA_TOOL_ALLOW`, `MCP_POLICY`. Read-only is derived from `HANA_WRITE_PACKAGES` (empty =
-> read-only), SQL statement classes from the `sql` group plus `HANA_SQL_ACCESS`, and approval for destructive
-> capabilities is always enforced.
+> read-only), SQL statement classes from the `sql` group plus `HANA_SQL_ACCESS`, and human approval
+> is controlled by `HANA_APPROVAL_POLICY` (default `off`; only delete/import and changeset deletes are gated when set to `destructive`).
 
 Minimal `mcp.json` (npx startup):
 
@@ -288,10 +289,14 @@ hana_tool_search({ "mode": "goal", "goal": "diagnose_preview_permission",
 - Budget guards: `maxTools` (default 12 / hard 20), `maxSchemaBytes` (default 32KB/tool), `maxResponseBytes` (default 256KB); exceeding them returns `budget_exceeded` instead of silently dropping contracts.
 - Contract `policy` preview: when `bindings` do not cover write-package/read-schema keys, `policy.status` is `partial` (demo values are not judged); pass `bindings` for a real-target preview.
 - **Goal mode can be turned off explicitly**: `HANA_TOOL_SEARCH_GOAL=off` keeps `discover`/`contract` only; `mode=goal` returns a recoverable error. The tool surface and `hana_invoke` are unchanged.
+- **Approval posture travels with discovery**: every `discover`/`contract`/`goal` response carries `data.approval` with `policy`, `clientSupportsElicitation` and `destructiveWrites` (`confirm_via_host` / `allowed_without_confirmation` / `blocked`); the default `off` yields `allowed_without_confirmation`; `destructive` without elicitation yields `blocked` (delete/import are refused before dispatch, while `dryRun=true` previews still work).
 - **Call envelope**: `contextToken` is the preferred field; `expectedEnvironment` and `disclosure:{policyRev,manifestRev}`
   remain accepted for one version as compatibility fields (stale disclosure → `policy_stale`/`manifest_stale`).
-- **Approval is always on**: a capability with `effects.destructive=true` that policy allows returns `input_required`;
-  the confirmation binds the args/caller/environment and expires after 5 minutes. There is no `HANA_APPROVAL` switch.
+- **Approval (off by default)**: `HANA_APPROVAL_POLICY=off` (default) does not ask per call. When set to `destructive`,
+  only `hana_view_delete`, `hana_repo_import`, and `hana_view_update` changesets containing a delete action return
+  `input_required`; the confirmation binds the args/caller/environment and expires after 5 minutes. The host must
+  declare `elicitation`; without it the call fails closed and is not dispatched. `dryRun=true` previews are zero-write
+  and never require approval.
 
 | What | How |
 |---|---|
@@ -419,9 +424,11 @@ Beyond the basic facts, `hana_system_get_info` returns two **on-demand** items:
 
 Business capabilities + 8 `hana_view_update#<op>` operation aliases (route-only; never registered as tools). The two
 platform tools carry annotations (`readOnlyHint` / `idempotentHint`); for capabilities, the contract exposes
-`effects` (`mutates` / `destructive` / `idempotent`) and the server itself enforces approval for destructive ones
-(requiring the host to declare `elicitation`; otherwise the call fails closed without dispatching). `hana_env_switch`
-is a control capability with its own token/epoch/confirm handshake and is not subject to approval.
+`effects` (`mutates` / `destructive` / `idempotent`) and the contract exposes the approval requirement separately
+(`approval` / `approval_conditional`). Approval is off by default; when `HANA_APPROVAL_POLICY=destructive`, only
+`hana_view_delete`, `hana_repo_import` and changesets containing a delete action require host `elicitation`
+(otherwise the call fails closed without dispatching). `dryRun=true` previews never require approval.
+`hana_env_switch` is a control capability with its own token/epoch/confirm handshake and is not subject to approval.
 Multi-environment deployments additionally offer two control capabilities (`hana_env_list`, `hana_env_switch`),
 which disappear entirely in single-environment mode.
 
@@ -441,7 +448,7 @@ which disappear entirely in single-environment mode.
 | `hana_metadata_get_field_logic` | `insights` | read-only | Single-field calculation logic: formula text, referenced source fields & lineage, SQLScript source; with `includeUsage`, adds **field-level downstream lineage** (who consumes this field, scan budget `usageMaxViews`; name-aligned consumers listed separately); `version` applies to both field logic and lineage |
 | `hana_metadata_where_used` | `insights` | read-only | Lineage/dependency: upstream (who it depends on) / downstream (who depends on it, incl. runtime refs); `depth` multi-hop closure (default 1; `all` is capped by maxNodes, carrying `depthReached`/`truncated`/`asOf`); `version=inactive` reads the unactivated lineage (`INACTIVE_OBJECTCROSSREF`) |
 | `hana_table_list` | `discovery` | read-only | Accessible tables under a given schema; `by=name` (default, case-sensitive) / `comment` (case-insensitive) / `both`, optional `tableType` (ROW/COLUMN/VIRTUAL) |
-| `hana_table_columns` | `discovery` | read-only | Table column structure (name/type/length/precision/nullable/comment) |
+| `hana_table_columns` | `discovery` | read-only | Table/view column structure (name/type/length/precision/nullable/comment); BW CALC views (names with colons) are read via `SYS.VIEW_COLUMNS` fallback |
 | `hana_data_preview` | `data` | read-only (node preview creates a transient `_SYS_BIC` view) | Activated-view data preview: overall direct / node intermediate-view / XML-derived — three channels, supports filtering & input parameters; permission-class failures auto-attach a diagnostic report |
 | `hana_data_preview_diagnose` | `data` | read-only | Data-preview privilege diagnosis: focuses on analytic-privilege protection and upstream data-source reachability, gives blocking points & grant suggestions |
 | `hana_view_create` | `modeling` | write | Create a calculation view within a writable package — two forms: the graphical minimal form (single Projection + single source table full-column passthrough) and **SQL mode** (`mode=sql` + `script`/`scriptColumns`; see `npm run verify:sql-mode`); XS REST write path |
@@ -450,7 +457,7 @@ which disappear entirely in single-environment mode.
 | `hana_task_get` | `modeling` | read-only | Poll an async task submitted by `hana_view_update(async=true)`: status ∈ working/completed/failed/cancelled, progress, and the terminal `result` (a receipt envelope identical in shape to the sync call). Tasks are visible only to **their own caller** and live in-process (a server restart drops them) |
 | `hana_task_cancel` | `modeling` | write | Request cancellation of a running task: takes effect at an **action boundary** (the current action is never interrupted), stops subsequent actions and runs the same **reverse-order compensation** as a failure (executed items return to their pre-batch state; report carries `raw.code=changeset_cancelled`). Terminal tasks cannot be cancelled (honest receipt, no error) |
 | `hana_view_delete` | `modeling` | write | Delete a design-time calculation view (DELETE + If-Match optimistic lock; an already-missing object returns machine-readable `OBJECT_NOT_FOUND`; recommend querying where_used first) |
-| `hana_view_validate` | `modeling` | write | Dual-mode: design=pre-activation validation (simulates activating a temp copy, original object unaffected); runtime=consistency check on an activated view (SYS.CHECK_CALCULATION_VIEW) |
+| `hana_view_validate` | `modeling` | write | Dual-mode: design=pre-activation validation (simulates activating a temp copy, original object unaffected); runtime=consistency check on an activated view (SYS.CHECK_CALCULATION_VIEW). SQL-mode/SCRIPT_BASED views return `VALIDATE_UNSUPPORTED` (not an inconsistency; use preview instead) |
 | `hana_view_check_actions` | `modeling` | write | Query the list of actions supported by the CHECK procedure |
 | `hana_package_create` | `modeling` | write | Create a package/directory (XS REST: POST /base/file/<pkg>/; target must be within writable package scope) |
 | `hana_repo_export` | `modeling` | admin | Export a package as zip (XS REST Transfer API; saveTo to disk or return base64) |

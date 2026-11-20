@@ -72,6 +72,7 @@
 | `HANA_TOOL_GROUPS` | 启用的工具**组名或能力 glob**（同一列表）；空 = read/write/admin，sql 默认关闭 | 空（read/write/admin） | `read` / `read,hana_sql_execute` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
 | `HANA_TOOL_DENY` | 强制禁用的工具名/组名 glob（优先级最高） | — | `hana_data_preview*` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
 | `HANA_TOOL_SEARCH_GOAL` | 是否启用 `hana_tool_search` 的 goal 模式（配方） | on | `off` | 进程级·能力面 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
+| `HANA_APPROVAL_POLICY` | 人工审批策略：`off`（默认，不逐次确认）/ `destructive`（仅 `hana_view_delete`、`hana_repo_import` 与 changeset delete 需要宿主 `elicitation` 确认） | off | `destructive` | 进程级·能力面 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
 | `MCP_PROFILES` | 调用方档案表（只能收紧部署策略；配了必须定义 default） | — | `analyst=read;dev=read+write:hana_view_*;default=read` | 进程级·能力面 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
 | `MCP_PROFILE` | stdio / 无档案身份的默认档案名 | default | `default` | 进程级·能力面 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
 | `LOG_LEVEL` | 进程日志级别 | info | `debug` | 进程级·运行时 | 生效（可选） | 仅进程级 | 不可用（启动报错） |
@@ -219,7 +220,7 @@ HANA_ENV_SWITCHABLE=DEV,UAT,PROD
 
 - **只读/可写（非 SQL 能力）**：由 `HANA_WRITE_PACKAGES` 是否为空推导。空 = 只拦 `persistent`，`transient` 与纯读放行。
 - **SQL 模式**：由 `HANA_SQL_ACCESS` 独立决定，**与全局写包无关**。`select-only` 只允许 SELECT 类；`readwrite` 才允许 DML/DDL/管理类。对象级 schema/对象访问由 HANA 账号权限决定。
-- **审批固定启用**：`effects.destructive=true` 的能力在策略放行后**固定**走一次人工确认（`input_required`），无配置开关。确认由宿主发起，客户端须声明 `elicitation`（2025：initialize；2026：每请求 envelope）；未声明时服务端直接返回硬错误、不派发（不会静默放行）。控制面 `hana_env_switch` 自带 token/epoch/confirm 两段确认，不属于审批范围。
+- **人工审批（默认关闭）**：`HANA_APPROVAL_POLICY=off`（默认）不逐次确认；设为 `destructive` 时，只有 `hana_view_delete`、`hana_repo_import`，以及 `hana_view_update` 的 `changeset` 含 `delete` 动作，要求宿主 `elicitation`（2025：initialize；2026：每请求 envelope）人工确认；客户端未声明时服务端直接返回硬错误、不派发（不会静默放行）。`dryRun=true` 的零写入预演在任何策略下都不触发审批。控制面 `hana_env_switch` 自带 token/epoch/confirm 两段确认，不属于审批范围。
 - **档案**：`MCP_PROFILES` / `MCP_PROFILE` 仍是可选高级项；档案只能在上述参数范围内收紧。
 
 **已移除、忽略（不生效）**：`HANA_ACCESS`、`HANA_READONLY_SQL`、`HANA_APPROVAL`、`HANA_TOOL_ALLOW`、`MCP_POLICY`（前两者的 `_ENV_` 变体同样识别）。出现时只记一条启动 warn，不阻断启动。

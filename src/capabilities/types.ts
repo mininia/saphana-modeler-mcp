@@ -228,6 +228,14 @@ export interface Capability<S extends z.ZodType = z.ZodType> {
   kind: ToolKind;
   effects: CapabilityEffects;
   /**
+   * 人工审批要求（与 `effects.destructive` 解耦）：
+   * - `'always'`：每次调用都要确认（如 delete / import）；
+   * - 函数：按本次 `args` 判定（如 changeset 里含 delete 动作）；
+   * - 省略：不需要审批（如普通 update / SQL 执行）。
+   * 仅在部署开启审批（`HANA_APPROVAL_POLICY=destructive`）时生效；`dryRun=true` 仍直接放行。
+   */
+  approval?: 'always' | ((args: Record<string, unknown>) => boolean);
+  /**
    * **平台入口**：常驻 `tools/list` 的极简入口（仅 `hana_tool_search` / `hana_invoke`）。
    *
    * 平台入口不参与分组、档案、资源与环境判定；它们本身不执行任何 HANA 操作：

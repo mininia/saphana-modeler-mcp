@@ -31,6 +31,7 @@ import { evaluate } from '../config/evaluate.js';
 import { registerDisclosure } from '../config/disclosure-registry.js';
 import { issueContextToken } from '../config/context-token.js';
 import { policyFromConfig } from '../config/preflight.js';
+import { approvalStateForClient, clientSupportsElicitation } from '../config/approval.js';
 import { capabilityInputSchema } from '../config/environment-policy.js';
 import { currentEnvironmentRuntime } from '../core/environment-context.js';
 import { currentIdentity } from '../core/request-context.js';
@@ -237,8 +238,11 @@ export function registerToolSearchTools(server: McpServer, ctx: ToolContext): vo
   }
 
   const regCap = capabilityRegistrar(server, ctx);
-  const handler: CapabilityHandler<typeof CAP.hana_tool_search.inputSchema> = async (rawArgs) => {
+  const handler: CapabilityHandler<typeof CAP.hana_tool_search.inputSchema> = async (rawArgs, serverCtx) => {
     const args = rawArgs as ToolSearchArgs;
+    // 审批姿态是**本连接**的属性（客户端是否声明 elicitation），与能力/环境无关：
+    // 每次发现/契约回执都带一份，模型不必等到第一次写失败才知道破坏性写会被拒。
+    const approval = approvalStateForClient(ctx.config.approvalPolicy, clientSupportsElicitation(server, serverCtx));
     const pre = validateToolSearchArgs(args);
     if (pre) {
       return badArgs(
@@ -285,6 +289,7 @@ export function registerToolSearchTools(server: McpServer, ctx: ToolContext): vo
         contextToken,
         total: candidates.length,
         candidates,
+        approval,
         next: 'mode=contract, tools=[候选 id] 获取完整契约',
         notes: [
           'discover 只给候选卡，不含 inputSchema；选定后一次 contract 取完整契约。',
@@ -304,7 +309,14 @@ export function registerToolSearchTools(server: McpServer, ctx: ToolContext): vo
         );
       }
       const resolved = resolveRequestedTools(new Set(ids), requested);
-      if ('error' in resolved) return badArgs(resolved.error);
+      if ('error' in resolved) {
+        return badArgs(
+          requested.length > 1
+            ? `${resolved.error}集合契约整包 fail-closed：任一 id 不可见（不存在/未开放）都会整体拒绝；` +
+                '请拆成单个 contract，或先用 discover 确认可用 id。'
+            : resolved.error,
+        );
+      }
 
       const bindings = args.bindings ?? {};
       const maxSchemaBytes = args.maxSchemaBytes ?? TOOL_SEARCH_LIMITS.maxSchemaBytesDefault;
@@ -370,6 +382,7 @@ export function registerToolSearchTools(server: McpServer, ctx: ToolContext): vo
         manifestRev: manifest,
         environment: environmentField(ctx, new Set(ids)),
         tools,
+        approval,
         policy: { status: preview.status, context: pContext, blockers: preview.blockers },
         notes: [
           '工具面未改变：回执里的 call.via 恒为 hana_invoke；执行请调 hana_invoke({capability,args,contextToken})。',
@@ -522,6 +535,7 @@ export function registerToolSearchTools(server: McpServer, ctx: ToolContext): vo
       environment: environmentField(ctx, new Set(ids)),
       steps,
       tools,
+      approval,
       policy: { status: preview.status, context: pContext, blockers: preview.blockers },
       notes: [
         'Recipe 是 AI-managed：服务端只给建议路径与契约，不替 AI 执行整条工作流。',
