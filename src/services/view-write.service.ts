@@ -19,11 +19,20 @@ import type { HanaConfig } from '../config/config.js';
 import { type ScriptedCalcViewSpec, buildMinCalcViewXml, buildScriptedCalcViewXml } from '../model/view-builder.js';
 import { type ViewDiff, diffViewDefinitions } from '../model/view-diff.js';
 import {
+  type AddAggregationSpec,
+  type AddProjectionSpec,
+  type AddRankSpec,
+  type AutoLayoutSpec,
   type FullXmlGuardResult,
   type OutputFieldKind,
   type SetScriptSpec,
+  addAggregationToViewXml,
   addCalculatedColumnToViewXml,
   addJoinToViewXml,
+  addProjectionToViewXml,
+  addRankToViewXml,
+  addUnionToViewXml,
+  autoLayoutViewXml,
   chooseDefaultJoinFields,
   dropFieldFromViewXml,
   getJoinTargetAttrs,
@@ -80,18 +89,29 @@ export interface CreateCalcViewInput {
   description?: string;
   /**
    * 视图形态：
-   * - projection（默认）：图形化最小形态 = 单 Projection 节点 + 单个表/视图数据源（source 必填）；
+   * - projection（默认）：图形化最小形态 = 单 Projection 节点；初始源可为物理表或 CV，
+   *   并可通过 operations 追加 join/union/projection/aggregation/rank 节点。
    * - sql：SQL 模式 = 单个 SqlScriptView 节点 + <definition> SQL（scripted 必填，source 不使用）。
    */
   mode?: 'projection' | 'sql';
-  /** 源：表/视图（schema 经白名单）+ 列（缺省自动取全列）；mode=projection 时必填 */
+  /** 源：**物理表**（schema+name）或 **CV**（packageId+objectName），二选一；mode=projection 时必填 */
   source?: {
-    schema: string;
-    name: string;
-    /** 显式指定映射列（仅需 columnName，dataTypeName 用于度量判定；缺省取表全列） */
+    /** 物理表源（与 packageId/objectName 二选一） */
+    schema?: string;
+    name?: string;
+    /** CV 初始源（与 schema/name 二选一）：生成 CALCULATION_VIEW + resourceUri */
+    packageId?: string;
+    objectName?: string;
+    /** 显式指定映射列（仅需 columnName，dataTypeName 用于度量判定；缺省取源列目录） */
     columns?: Array<{ columnName: string; dataTypeName?: string }>;
     measureMode?: 'SUM_NUMERIC' | 'ALL_ATTRIBUTES';
   };
+  /**
+   * 图形化 create 的声明式操作（复用 hana_view_update 的 operations）：在内存中应用到刚生成的
+   * 基础 XML 后再一次性 PUT。典型用途：CV 初始源 + 多个 add_join 一条调用闭合。
+   * mode=sql 不接受。
+   */
+  operations?: ViewUpdateOperation[];
   /** SQL 模式：SQL 脚本 + 输出列清单（mode=sql 时必填；对象名/描述取自本次创建的入参） */
   scripted?: Omit<ScriptedCalcViewSpec, 'objectName' | 'description'>;
   /** 激活开关：true=写后立即尝试激活；false/缺省=仅写设计时对象 */
@@ -152,6 +172,8 @@ export interface CreateCalcViewResult {
   warnings?: string[];
   /** 视图形态：projection（图形化最小形态）/ sql（SQL 模式，单 SqlScriptView） */
   mode?: 'projection' | 'sql';
+  /** 图形化 create 的 operations 逐条应用明细（仅当入参带 operations 时出现） */
+  operationsResult?: AppliedOperationResult[];
   /** 激活后的行探测（probeRows>0 且对象已激活时才有） */
   rowProbe?: RowProbe;
   /** 写入回执的新基线（写响应头 ETag；可能缺省——响应头没给就不补读拼装，语义见 etagSource） */
@@ -317,7 +339,7 @@ const AUTO_COLUMN_LIMIT = TABLE_COLUMNS_LIMIT_MAX;
  */
 async function resolveColumns(
   pool: HanaPool,
-  source: NonNullable<CreateCalcViewInput['source']>,
+  source: { schema: string; name: string; columns?: Array<{ columnName: string; dataTypeName?: string }> },
 ): Promise<{
   columns: Array<{ columnName: string; dataTypeName?: string }>;
   truncated: boolean;
@@ -359,6 +381,20 @@ async function resolveColumns(
  * view_update 的声明式操作补丁（op=add_join：给当前视图追加一个 join；op=set_script：替换 SQL 模式脚本；
  * op=set_description：改视图描述/显示名——只动展示属性，不碰结构）
  */
+/**
+ * add_join 的带出字段：
+ * - 字符串 = 字段名，按 join 源视图的输出分类自动判定属性/度量；
+ * - 对象 = 显式声明（kind=measure 需给 aggregationType，缺省 sum）。
+ */
+export type JoinOutputFieldInput =
+  | string
+  | {
+      id: string;
+      kind?: 'attribute' | 'measure';
+      aggregationType?: string;
+      description?: string;
+    };
+
 export interface AddJoinOperation {
   op: 'add_join';
   /** join 源视图（仓库对象；BW query 视图/普通 CV/AV 均可，只读即可） */
@@ -369,7 +405,40 @@ export interface AddJoinOperation {
   /** join 条件：leftField=当前输出节点已有字段；rightField=源视图字段（可不同名，自动重命名接线） */
   conditions: Array<{ leftField: string; rightField: string }>;
   /** 要透出到输出的源视图字段；缺省=源视图全部可见属性 − join 条件字段 − 左侧已有字段 */
-  fields?: string[];
+  fields?: JoinOutputFieldInput[];
+}
+
+/** op=add_aggregation：在输出链尾追加 Aggregation 节点（重建列集合为 groupBy + measures） */
+export interface AddAggregationOperation extends AddAggregationSpec {
+  op: 'add_aggregation';
+}
+
+/** op=add_projection：在输出链尾追加 Projection 节点（可重命名节点列，输出字段 id 不变） */
+export interface AddProjectionOperation extends AddProjectionSpec {
+  op: 'add_projection';
+}
+
+/** op=add_rank：在输出链尾追加 Rank 节点（每组取前 threshold 条） */
+export interface AddRankOperation extends AddRankSpec {
+  op: 'add_rank';
+}
+
+/** op=add_union：在输出链尾追加 Union 节点（右输入为源视图的 Projection） */
+export interface AddUnionOperation {
+  op: 'add_union';
+  /** 右侧源视图（仓库对象；只读即可） */
+  sourcePackageId: string;
+  sourceObjectName: string;
+  /**
+   * 输出字段对齐：id=当前输出字段，rightField=源视图字段（缺省同名）。
+   * 省略 = 当前输出节点的全部基础属性/度量按同名字段对齐（源视图须同名）。
+   */
+  fields?: Array<{ id: string; rightField?: string }>;
+}
+
+/** op=auto_layout：按节点 DAG 自动分层重写 <layout><shapes>（纯展示，不影响激活） */
+export interface AutoLayoutOperation extends AutoLayoutSpec {
+  op: 'auto_layout';
 }
 
 /** op=set_script：替换 SQL 模式视图（SqlScriptView）的脚本与输出列（模型零 XML） */
@@ -392,6 +461,11 @@ export interface SetDescriptionOperation {
 
 export type ViewUpdateOperation =
   | AddJoinOperation
+  | AddUnionOperation
+  | AddProjectionOperation
+  | AddAggregationOperation
+  | AddRankOperation
+  | AutoLayoutOperation
   | SetScriptOperation
   | SetDescriptionOperation
   | RenameFieldOperation
@@ -463,6 +537,54 @@ export interface AddJoinOperationResult {
   fieldSelectionNote?: string;
 }
 
+/** 单条 add_union 操作的应用明细 */
+export interface AddUnionOperationResult {
+  op: 'add_union';
+  source: { packageId: string; objectName: string; kind: string; resourceUri: string };
+  /** 原输出节点（union 左输入） */
+  previousFinalNode: string;
+  /** 新输出节点 */
+  newUnionNode: string;
+  /** 右侧源视图的投影节点 */
+  newProjectionNode: string;
+  dataSourceId: string;
+  mappings: Array<{ id: string; rightField: string }>;
+}
+
+/** 单条 add_projection 操作的应用明细 */
+export interface AddProjectionOperationResult {
+  op: 'add_projection';
+  previousFinalNode: string;
+  newProjectionNode: string;
+  fields: Array<{ id: string; source: string }>;
+}
+
+/** 单条 add_aggregation 操作的应用明细 */
+export interface AddAggregationOperationResult {
+  op: 'add_aggregation';
+  previousFinalNode: string;
+  newAggregationNode: string;
+  groupBy: string[];
+  measures: Array<{ field: string; aggregationType: string }>;
+}
+
+/** 单条 add_rank 操作的应用明细 */
+export interface AddRankOperationResult {
+  op: 'add_rank';
+  previousFinalNode: string;
+  newRankNode: string;
+  partitionBy: string[];
+  orderBy: Array<{ field: string; direction?: string }>;
+  threshold: number;
+}
+
+/** 单条 auto_layout 操作的应用明细（纯展示） */
+export interface AutoLayoutOperationResult {
+  op: 'auto_layout';
+  nodeCount: number;
+  layerCount: number;
+}
+
 /** 单条 set_script 操作的应用明细 */
 export interface SetScriptOperationResult {
   op: 'set_script';
@@ -529,6 +651,11 @@ export interface SetVariableOperationResult {
 /** 任一 operation 的应用明细（按 op 判别） */
 export type AppliedOperationResult =
   | AddJoinOperationResult
+  | AddUnionOperationResult
+  | AddProjectionOperationResult
+  | AddAggregationOperationResult
+  | AddRankOperationResult
+  | AutoLayoutOperationResult
   | SetScriptOperationResult
   | SetDescriptionOperationResult
   | RenameFieldOperationResult
@@ -1358,6 +1485,44 @@ async function applyViewUpdateOperations(
       const r = setVariableInViewXml(currentXml, op);
       applied.push({ op: 'set_variable', variableId: r.variableId, changed: r.changed });
       currentXml = r.xml;
+    } else if (op.op === 'add_union') {
+      const r = await applyAddUnionOperation(pool, op, currentXml);
+      applied.push(r.result);
+      currentXml = r.xml;
+    } else if (op.op === 'add_projection') {
+      const r = addProjectionToViewXml(currentXml, op);
+      applied.push({
+        op: 'add_projection',
+        previousFinalNode: r.previousFinalNodeId,
+        newProjectionNode: r.newProjectionNodeId,
+        fields: op.fields.map((f) => ({ id: f.id, source: f.source ?? f.id })),
+      });
+      currentXml = r.xml;
+    } else if (op.op === 'add_aggregation') {
+      const r = addAggregationToViewXml(currentXml, op);
+      applied.push({
+        op: 'add_aggregation',
+        previousFinalNode: r.previousFinalNodeId,
+        newAggregationNode: r.newAggregationNodeId,
+        groupBy: [...op.groupBy],
+        measures: op.measures.map((m) => ({ ...m })),
+      });
+      currentXml = r.xml;
+    } else if (op.op === 'add_rank') {
+      const r = addRankToViewXml(currentXml, op);
+      applied.push({
+        op: 'add_rank',
+        previousFinalNode: r.previousFinalNodeId,
+        newRankNode: r.newRankNodeId,
+        partitionBy: [...op.partitionBy],
+        orderBy: op.orderBy.map((o) => ({ ...o })),
+        threshold: op.threshold,
+      });
+      currentXml = r.xml;
+    } else if (op.op === 'auto_layout') {
+      const r = autoLayoutViewXml(currentXml, op);
+      applied.push({ op: 'auto_layout', nodeCount: r.nodeCount, layerCount: r.layerCount });
+      currentXml = r.xml;
     } else {
       const r = await applyAddJoinOperation(pool, op, currentXml);
       applied.push(r.result);
@@ -1395,7 +1560,7 @@ async function applyAddJoinOperation(
     assertSafeRuntimeName(c.rightField, 'join 条件右字段');
   }
   for (const f of op.fields ?? []) {
-    assertSafeRuntimeName(f, '带出字段');
+    assertSafeRuntimeName(typeof f === 'string' ? f : f.id, '带出字段');
   }
   const joinType = op.joinType ?? 'leftOuter';
   const target = getJoinTargetAttrs(currentXml);
@@ -1413,6 +1578,21 @@ async function applyAddJoinOperation(
     );
   }
   const sourceAttrById = new Map(sourceAttrs.map((a) => [a.id, a]));
+  // 源视图输出分类（属性/度量）：带出字段缺省按源视图的语义判定，显式 kind 必须与之一致
+  // （度量的 aggregationType 是 logicalModel 的输出分类，不是 Join 节点的属性）。
+  const sourceFieldKindById = new Map<string, 'attribute' | 'measure'>();
+  const sourceFieldById = new Map<string, { id: string; description?: string }>();
+  const registerSourceFields = (list: typeof sourceAttrs, kind: 'attribute' | 'measure'): void => {
+    for (const f of list) {
+      sourceFieldById.set(f.id, f);
+      sourceFieldKindById.set(f.id, kind);
+    }
+  };
+  registerSourceFields(sourceAttrs, 'attribute');
+  registerSourceFields(source.definition.outputs.calculatedAttributes, 'attribute');
+  registerSourceFields(source.definition.outputs.measures, 'measure');
+  registerSourceFields(source.definition.outputs.calculatedMeasures, 'measure');
+  registerSourceFields(source.definition.outputs.restrictedMeasures, 'measure');
   const uriSegment = KIND_URI_SEGMENT[sourceKind];
   if (!uriSegment) {
     throw new HanaBusinessError(`join 源类型 ${sourceKind} 不受支持（仅 calculationview/attributeview/analyticview）`);
@@ -1445,32 +1625,59 @@ async function applyAddJoinOperation(
   // 「带出字段重复」本层**不判**（唯一硬拒在 view-edit）。**不去重**：重复字段是要报错的输入，
   // 静默收敛会让「带了却少带」无从察觉（与变更集载荷「静默忽略比报错更难查」同一口径）。
   const conditionRightFields = op.conditions.map((c) => c.rightField);
-  let fieldIds: string[];
+  interface ResolvedJoinField {
+    id: string;
+    kind: 'attribute' | 'measure';
+    aggregationType?: string;
+    description?: string;
+  }
+  let joinFields: ResolvedJoinField[];
   let fieldSelectionNote: string | undefined;
   if (op.fields && op.fields.length > 0) {
-    for (const f of op.fields) {
-      if (!sourceAttrById.has(f)) {
+    joinFields = op.fields.map((raw): ResolvedJoinField => {
+      const spec = typeof raw === 'string' ? { id: raw } : raw;
+      const id = spec.id;
+      const sourceKindOfField = sourceFieldKindById.get(id);
+      if (!sourceKindOfField) {
         throw new HanaBusinessError(
-          `带出字段 "${f}" 不存在于 join 源 ${op.sourceObjectName}。可用字段：${sourceAttrs.map((a) => a.id).join(', ')}`,
+          `带出字段 "${id}" 不存在于 join 源 ${op.sourceObjectName}。` +
+            `可用字段：${[...sourceFieldKindById.keys()].join(', ')}`,
         );
       }
-      if (conditionRightFields.includes(f)) {
+      if (conditionRightFields.includes(id)) {
         throw new HanaBusinessError(
-          `带出字段 "${f}" 同时是 join 条件右字段：该字段已通过条件映射进入 join，无需重复带出`,
+          `带出字段 "${id}" 同时是 join 条件右字段：该字段已通过条件映射进入 join，无需重复带出`,
         );
       }
-      if (target.attributes.includes(f)) {
+      if (target.attributes.includes(id)) {
         throw new HanaBusinessError(
-          `带出字段 "${f}" 与当前视图已有字段同名（输出节点 ${target.nodeId}），会产生冲突；请去除该字段`,
+          `带出字段 "${id}" 与当前视图已有字段同名（输出节点 ${target.nodeId}），会产生冲突；请去除该字段`,
         );
       }
-    }
-    fieldIds = [...op.fields];
+      const kind = typeof raw === 'string' || raw.kind === undefined ? sourceKindOfField : raw.kind;
+      if (kind !== sourceKindOfField) {
+        throw new HanaBusinessError(
+          `带出字段 "${id}" 在 join 源中是${sourceKindOfField === 'measure' ? '度量' : '属性'}，` +
+            `不能按${kind === 'measure' ? '度量' : '属性'}声明；请去掉 kind 或改为 "${sourceKindOfField}"`,
+        );
+      }
+      return {
+        id,
+        kind,
+        aggregationType: kind === 'measure' && typeof raw === 'object' ? raw.aggregationType : undefined,
+        description: (typeof raw === 'object' ? raw.description : undefined) ?? sourceFieldById.get(id)?.description,
+      };
+    });
   } else {
-    fieldIds = chooseDefaultJoinFields(sourceAttrs, conditionRightFields, target.attributes);
+    const ids = chooseDefaultJoinFields(sourceAttrs, conditionRightFields, target.attributes);
+    joinFields = ids.map((id) => ({
+      id,
+      kind: 'attribute' as const,
+      description: sourceAttrById.get(id)?.description,
+    }));
     fieldSelectionNote =
-      `fields 未指定：已自动带出源视图可见属性中可新增的 ${fieldIds.length} 个字段` +
-      `（排除 join 条件字段与左侧已有字段；hidden 字段不带出）`;
+      `fields 未指定：已自动带出源视图可见属性中可新增的 ${ids.length} 个字段` +
+      `（排除 join 条件字段与左侧已有字段；hidden 字段不带出；度量需显式列出）`;
   }
 
   const sourceResourceUri = `/${source.object.packageId}/${uriSegment}/${source.object.objectName}`;
@@ -1479,7 +1686,7 @@ async function applyAddJoinOperation(
     sourceResourceUri,
     joinType,
     conditions: op.conditions,
-    fields: fieldIds.map((id) => ({ id, description: sourceAttrById.get(id)?.description })),
+    fields: joinFields,
   });
 
   return {
@@ -1503,9 +1710,105 @@ async function applyAddJoinOperation(
       },
       addedOutputFields: edit.addedOutputFields.map((f) => ({
         ...f,
-        description: sourceAttrById.get(f.id)?.description,
+        description: sourceFieldById.get(f.id)?.description,
       })),
       ...(fieldSelectionNote ? { fieldSelectionNote } : {}),
+    },
+  };
+}
+
+/**
+ * 应用一条 add_union 操作（读源视图定义 + 确定性变换；不写库）：
+ * 左输入=当前输出节点，右输入=源视图的 Projection；输出字段按 id 对齐（右字段可不同名）。
+ */
+async function applyAddUnionOperation(
+  pool: HanaPool,
+  op: AddUnionOperation,
+  currentXml: string,
+): Promise<{ xml: string; result: AddUnionOperationResult }> {
+  assertSafeObjectName(op.sourcePackageId, 'union 源包');
+  assertSafeObjectName(op.sourceObjectName, 'union 源视图');
+  for (const f of op.fields ?? []) {
+    assertSafeRuntimeName(f.id, 'union 输出字段');
+    if (f.rightField !== undefined) assertSafeRuntimeName(f.rightField, 'union 右字段');
+  }
+  const target = getJoinTargetAttrs(currentXml);
+  const def = parseViewDefinition(currentXml, 'calculationview');
+  const baseFields = [
+    ...def.outputs.attributes
+      .filter((f) => f.sourceObject === target.nodeId)
+      .map((f) => ({ id: f.id, kind: 'attribute' as const })),
+    ...def.outputs.measures
+      .filter((f) => f.sourceObject === target.nodeId)
+      .map((f) => ({ id: f.id, kind: 'measure' as const })),
+  ];
+  if (baseFields.length === 0) {
+    throw new HanaBusinessError(`视图 ${target.nodeId} 没有可对齐的基础输出字段，无法追加 union`);
+  }
+  const source = await getViewDefinition(pool, op.sourcePackageId, op.sourceObjectName);
+  const sourceKind = source.definition?.kind ?? source.object.objectSuffix;
+  if (!source.definition) {
+    throw new HanaBusinessError(`union 源 ${op.sourcePackageId}/${op.sourceObjectName} 无可解析定义（无 CDATA）`);
+  }
+  const uriSegment = KIND_URI_SEGMENT[sourceKind];
+  if (!uriSegment) {
+    throw new HanaBusinessError(`union 源类型 ${sourceKind} 不受支持（仅 calculationview/attributeview/analyticview）`);
+  }
+  const sourceOutputIds = new Set<string>([
+    ...source.definition.outputs.attributes.map((f) => f.id),
+    ...source.definition.outputs.calculatedAttributes.map((f) => f.id),
+    ...source.definition.outputs.measures.map((f) => f.id),
+    ...source.definition.outputs.calculatedMeasures.map((f) => f.id),
+    ...source.definition.outputs.restrictedMeasures.map((f) => f.id),
+  ]);
+  const requested =
+    op.fields && op.fields.length > 0 ? op.fields : baseFields.map((f) => ({ id: f.id, rightField: f.id }));
+  const seen = new Set<string>();
+  const mappings = requested.map((f) => {
+    if (!baseFields.some((x) => x.id === f.id)) {
+      throw new HanaBusinessError(
+        `union 输出字段 "${f.id}" 不是当前输出节点 ${target.nodeId} 的基础输出字段。` +
+          `可用字段：${baseFields.map((x) => x.id).join(', ')}`,
+      );
+    }
+    if (seen.has(f.id)) throw new HanaBusinessError(`union 输出字段 "${f.id}" 重复`);
+    seen.add(f.id);
+    const rightField = f.rightField ?? f.id;
+    if (!sourceOutputIds.has(rightField)) {
+      throw new HanaBusinessError(
+        `union 右字段 "${rightField}" 不存在于源视图 ${op.sourceObjectName}。` +
+          `可用字段：${[...sourceOutputIds].join(', ')}`,
+      );
+    }
+    return { id: f.id, rightField };
+  });
+  const missing = baseFields.filter((f) => !seen.has(f.id)).map((f) => f.id);
+  if (missing.length > 0) {
+    throw new HanaBusinessError(`union 会重建输出节点的列集合，全部基础输出字段都必须对齐：${missing.join(', ')}`);
+  }
+  const sourceFields = [...new Set(mappings.map((m) => m.rightField))];
+  const sourceResourceUri = `/${source.object.packageId}/${uriSegment}/${source.object.objectName}`;
+  const edit = addUnionToViewXml(currentXml, {
+    sourceId: source.object.objectName,
+    sourceResourceUri,
+    sourceFields,
+    mappings,
+  });
+  return {
+    xml: edit.xml,
+    result: {
+      op: 'add_union',
+      source: {
+        packageId: source.object.packageId,
+        objectName: source.object.objectName,
+        kind: sourceKind,
+        resourceUri: sourceResourceUri,
+      },
+      previousFinalNode: edit.previousFinalNodeId,
+      newUnionNode: edit.newUnionNodeId,
+      newProjectionNode: edit.newProjectionNodeId,
+      dataSourceId: edit.newDataSourceId,
+      mappings,
     },
   };
 }
@@ -1545,6 +1848,8 @@ export async function createCalculationView(
   const columnWarnings: string[] = [];
   /** projection 分支实际使用的 measureMode（0 度量时的回执文案要按它区分原因，不许再建议"用 SUM_NUMERIC 重建"） */
   let measureModeUsed: 'SUM_NUMERIC' | 'ALL_ATTRIBUTES' | undefined;
+  /** CV 初始源的 resourceUri（物理表源不设置） */
+  let sourceResourceUri: string | undefined;
   if (mode === 'sql') {
     // SQL 模式：单 SqlScriptView + <definition> SQL，输出列由调用方声明（datatype 必填）
     if (!input.scripted) {
@@ -1559,16 +1864,70 @@ export async function createCalculationView(
     measureCount = input.scripted.columns.filter((c) => c.isMeasure === true).length;
   } else {
     if (!input.source) {
-      throw new HanaBusinessError('mode=projection 需要提供 source（schema + name），或改用 mode=sql');
+      throw new HanaBusinessError(
+        'mode=projection 需要提供 source（物理表 schema+name，或 CV packageId+objectName），或改用 mode=sql',
+      );
     }
-    assertSchemaAllowed(input.source.schema);
-    const resolved = await resolveColumns(pool, input.source);
+    const src = input.source;
+    const hasCvSource = src.packageId !== undefined || src.objectName !== undefined;
+    let resolvedSource: {
+      schema: string;
+      name: string;
+      columns?: Array<{ columnName: string; dataTypeName?: string }>;
+      measureMode?: 'SUM_NUMERIC' | 'ALL_ATTRIBUTES';
+    };
+    let sourceLabel: string;
+    if (hasCvSource) {
+      // CV 初始源：生成 CALCULATION_VIEW + resourceUri。先读源定义确认类型与存在性；
+      // 运行时列目录取 _SYS_BIC 的 SYS.VIEW_COLUMNS（getTableColumns 的 VIEW_COLUMNS 回退）。
+      if (!src.packageId || !src.objectName) {
+        throw new HanaBusinessError(
+          'CV 初始源需要同时提供 source.packageId 与 source.objectName（与物理表 source.schema/source.name 二选一）',
+        );
+      }
+      assertSafeObjectName(src.packageId, '源包');
+      assertSafeObjectName(src.objectName, '源视图');
+      const sourceDef = await getViewDefinition(pool, src.packageId, src.objectName);
+      const sourceKind = sourceDef.definition?.kind ?? sourceDef.object.objectSuffix;
+      if (sourceKind !== 'calculationview') {
+        throw new HanaBusinessError(
+          `CV 初始源 ${src.packageId}/${src.objectName} 的类型是 ${sourceKind}；当前只支持 calculationview 作为初始源`,
+        );
+      }
+      const uriSegment = KIND_URI_SEGMENT[sourceKind];
+      if (!uriSegment) {
+        throw new HanaBusinessError(`CV 初始源类型 ${sourceKind} 不受支持`);
+      }
+      sourceResourceUri = `/${src.packageId}/${uriSegment}/${src.objectName}`;
+      resolvedSource = {
+        schema: '_SYS_BIC',
+        name: `${src.packageId}/${src.objectName}`,
+        columns: src.columns,
+        measureMode: src.measureMode,
+      };
+      sourceLabel = `CV ${src.packageId}/${src.objectName}`;
+    } else {
+      if (!src.schema || !src.name) {
+        throw new HanaBusinessError(
+          '物理表初始源需要同时提供 sourceSchema 与 sourceName（或改用 CV 源 sourcePackageId/sourceObjectName）',
+        );
+      }
+      resolvedSource = {
+        schema: src.schema,
+        name: src.name,
+        columns: src.columns,
+        measureMode: src.measureMode,
+      };
+      sourceLabel = `${src.schema}/${src.name}`;
+    }
+    assertSchemaAllowed(resolvedSource.schema);
+    const resolved = await resolveColumns(pool, resolvedSource);
     const columns = resolved.columns;
     // 显式列中类型未解析（元数据目录被 500 列上限截断，无法确认列是否存在）：如实进回执 warnings，
     // 并说明它对度量判定的影响（缺类型 = 非数值 ⇒ SUM_NUMERIC 下不计入度量）
     if (resolved.unresolvedTypes.length > 0) {
       columnWarnings.push(
-        `显式列 ${resolved.unresolvedTypes.join(', ')} 的类型未能从 ${input.source.schema}/${input.source.name} 列目录解析` +
+        `显式列 ${resolved.unresolvedTypes.join(', ')} 的类型未能从 ${sourceLabel} 列目录解析` +
           `（目录超过 ${AUTO_COLUMN_LIMIT} 列上限被截断，无法确认列是否存在）：这些列按「非数值」参与度量判定；` +
           '如需要它们在 SUM_NUMERIC 下成为度量，请先确认源表列类型',
       );
@@ -1576,17 +1935,18 @@ export async function createCalculationView(
     if (resolved.truncated) {
       // 源表列数超上限时只映射前 500 列——绝不按「全列」口径静默建视图（缺列要到查询出数才暴露）
       columnWarnings.push(
-        `源表 ${input.source.schema}/${input.source.name} 的列数超过自动取列上限（${AUTO_COLUMN_LIMIT}）：` +
+        `源 ${sourceLabel} 的列数超过自动取列上限（${AUTO_COLUMN_LIMIT}）：` +
           `本次仅映射前 ${AUTO_COLUMN_LIMIT} 列（measureCount 也只按这些列统计）；` +
           '需要完整列清单请显式传 columns（或改用 mode=sql 指定输出列）',
       );
     }
-    const measureMode = input.source.measureMode ?? 'ALL_ATTRIBUTES';
+    const measureMode = resolvedSource.measureMode ?? 'ALL_ATTRIBUTES';
     xml = buildMinCalcViewXml({
       objectName: input.objectName,
       description: input.description,
-      schema: input.source.schema,
-      table: input.source.name,
+      schema: resolvedSource.schema,
+      table: resolvedSource.name,
+      ...(sourceResourceUri ? { resourceUri: sourceResourceUri } : {}),
       columns: columns.map((c) => ({ columnName: c.columnName, dataTypeName: c.dataTypeName })),
       measureMode,
     });
@@ -1598,12 +1958,30 @@ export async function createCalculationView(
     measureModeUsed = measureMode;
   }
 
+  // 图形化 create 的声明式操作：在内存里应用到基础 XML，最后一次性 PUT（不产生中间对象）。
+  let operationsResult: AppliedOperationResult[] | undefined;
+  if (input.operations !== undefined && input.operations.length > 0) {
+    if (mode !== 'projection') {
+      throw new HanaBusinessError('operations 仅适用于 projection/graphical 模式；mode=sql 不接受 operations');
+    }
+    const applied = await applyViewUpdateOperations(pool, input.operations, xml);
+    xml = applied.xml;
+    operationsResult = applied.applied;
+    // 度量数按最终 XML 重算（add_join 可能从源视图带入度量）；回执与激活提示必须与最终定义一致。
+    const finalDef = parseViewDefinition(xml);
+    measureCount =
+      finalDef.outputs.measures.length +
+      finalDef.outputs.calculatedMeasures.length +
+      finalDef.outputs.restrictedMeasures.length;
+  }
+
   const result: CreateCalcViewResult = {
     object: { packageId: input.packageId, objectName: input.objectName, objectSuffix: 'calculationview' },
     xml,
     wrote: false,
     measureCount,
     mode,
+    ...(operationsResult !== undefined ? { operationsResult } : {}),
     ...(columnWarnings.length > 0 ? { warnings: columnWarnings } : {}),
   };
   if (measureCount === 0) {

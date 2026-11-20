@@ -10,7 +10,12 @@
 - `hana_view_update` 的 `dryRun=true` 只读预演不再触发审批（零写入，原本被审批闸门挡住导致预演也不可用）。
 - `hana_system_get_info` 与 `hana_tool_search`（discover/contract/goal）新增 `approval` 块（策略/客户端 elicitation/实际姿态）；审批不可用时的硬错误明确指向「部署侧能力缺失，不要在调用侧检索或改配置」，并提示 `dryRun` 预演。
 - `hana_table_columns` 支持 BW CALC 视图：名称允许冒号（值仍参数绑定），`SYS.TABLE_COLUMNS` 为空时回退 `SYS.VIEW_COLUMNS`；`hana_view_validate` runtime 对 SQL 模式视图返回 `VALIDATE_UNSUPPORTED`（不再误报一致性失败）。
-- 契约集合整包拒绝时提示拆成单个 contract。
+- 契约集合整包拒绝时提示拆成单个 contract；`hana_view_create` 描述明确禁止在用户要求可视化时静默改用 SQL 模式。
+- `hana_view_create` 图形化模式（`graphical` 是 `projection` 的别名）支持 **CV 初始源**（`sourcePackageId/sourceObjectName` → `CALCULATION_VIEW` + `resourceUri`）与 `operations` 一次调用闭合；ZSMECBI 实机验证：ZMDMAR001 初始源 + Q003/Q002 两个 join，active，3 度量，测试对象已删除。
+- 图形化节点组合：`operations` 新增 `add_union` / `add_projection` / `add_aggregation` / `add_rank` / `auto_layout`；`add_join` 的带出字段支持显式 `kind=measure`——属性/度量是 logicalModel 的输出分类、不是 join 节点的属性，源视图的 calculatedMeasure（如 Q003 的 `PRICE_STD`）可直接带入。
+- `auto_layout`（Auto Layout / auto-layer）：按节点 DAG 最长路径自动分层，重写顶层 `<layout><shapes>`（含 `Output` MeasureGroup 形状）；纯展示、幂等，不碰节点/字段/接线，不影响激活。节点追加后新节点在 Studio 里不再叠在一起。
+- ZSMECBI 实机验证（2026-11-20）：ZMDMAR001 初始源 + Q003 join 带入 `PRICE_STD`（measure, max）+ aggregation 按物料/工厂/库存地点聚合 → **active，4 度量**；union（同构源）+ rank + projection + auto_layout 链 → **active，全部节点与 Output 形状齐全**；测试对象已删除（18 项断言）。
+- 限制：`add_aggregation` / `add_union` / `add_projection` 会重建输出节点列集合，要求调用方显式覆盖全部基础输出字段；计算/限制度量的映射不在这些节点的自动迁移范围（走 XML 全量通道）。CV 初始源只能引用 `_SYS_BIC` 运行时视图实际暴露的列。
 
 ## 1.5.1 - 2026-11-19
 

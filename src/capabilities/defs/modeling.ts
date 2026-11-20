@@ -48,6 +48,31 @@ function changesetHasDelete(args: Record<string, unknown>): boolean {
   );
 }
 
+/**
+ * 图形化节点追加的字段形状（add_join / add_aggregation / add_projection / add_union / add_rank 共用口径）。
+ * 关键建模事实：属性/度量是 **logicalModel 的输出分类**，不是节点类型的属性——Join/Union 节点只承载列，
+ * Aggregation 决定聚合方式，Rank 决定取行；节点组合起来才是一个图形化视图。
+ */
+const VIEW_NODE_OUTPUT_FIELD_SCHEMA = z.object({
+  id: z.string().min(1).max(128).describe('输出字段 id（logicalModel 名）'),
+  kind: z
+    .enum(['attribute', 'measure'])
+    .optional()
+    .describe('输出分类：缺省按源视图的输出分类推断；attribute=维度，measure=度量'),
+  aggregationType: z
+    .string()
+    .max(30)
+    .optional()
+    .describe('kind=measure 时的聚合方式（缺省 sum，如 sum/count/min/max/avg）'),
+  description: z.string().max(200).optional().describe('字段描述（缺省取源字段描述）'),
+});
+
+/** add_join 的带出字段：字符串=按源视图输出分类自动判定；对象=显式声明 */
+const VIEW_JOIN_FIELD_SCHEMA = z.union([
+  z.string().min(1).max(128).describe('源视图字段名（按源视图的属性/度量分类自动判定）'),
+  VIEW_NODE_OUTPUT_FIELD_SCHEMA,
+]);
+
 /** SQL 模式输出列（create 的 scriptColumns 与 update 的 set_script.columns 共用一份，避免约束漂移）。 */
 const SCRIPT_COLUMN_SCHEMA = z.object({
   name: z.string().min(1).max(128).describe('输出列别名（与脚本 SELECT 的别名一致）'),
@@ -74,25 +99,33 @@ const SCRIPT_COLUMN_SCHEMA = z.object({
 /** 视图描述（create 顶层与 changeset create 动作共用） */
 const VIEW_DESCRIPTION_FIELD = z.string().max(200).describe('视图描述（默认取对象名）');
 
-/** 视图形态（projection/sql） */
+/** 视图形态（graphical/projection 与 sql；graphical 是 projection 的别名） */
 const VIEW_MODE_ENUM = z
-  .enum(['projection', 'sql'])
+  .enum(['graphical', 'projection', 'sql'])
+  .transform((m) => (m === 'graphical' ? 'projection' : m))
   .describe(
-    '视图形态：projection=单 Projection + 单源表（需 sourceSchema/sourceName）；sql=SQL 模式（需 script + scriptColumns）',
+    '视图形态：graphical=可视化/图形化（projection 的同义值；基础为单 Projection 节点，' +
+      '可通过 operations 组合 join/union/projection/aggregation/rank 节点）；sql=SQL 模式（需 script + scriptColumns）',
   );
 
 /**
- * 源表/视图所在 schema。
+ * 物理表源的 schema（hana_view_create 另有 CV 源参数 sourcePackageId/sourceObjectName）。
  * 不在参数层打 readSchema 标签：仅 mode=projection 消费，打标会误拦「SQL 模式带残留 sourceSchema」的合法调用；
  * 读取范围由规划器按模式声明。.trim() 在声明侧归一，保证闸门与服务层判定同一个值。
  */
 const VIEW_SOURCE_SCHEMA_FIELD = z
   .string()
   .trim()
-  .describe('mode=projection：源表/视图所在 schema，如 SAPABAP1（须在白名单内）');
+  .describe(
+    'mode=projection 的物理表源：schema，如 SAPABAP1（须在白名单内）。hana_view_create 也支持 CV 源 sourcePackageId/sourceObjectName（本 changeset 动作仅物理表）',
+  );
 
-/** 源表/视图名 */
-const VIEW_SOURCE_NAME_FIELD = z.string().describe('mode=projection：源表/视图名');
+/** 源物理表名 / CV 输出列 */
+const VIEW_SOURCE_NAME_FIELD = z
+  .string()
+  .describe(
+    'mode=projection 的物理表源：物理表名（服务端读它的列目录，如 T000）。hana_view_create 也支持 CV 源 sourcePackageId/sourceObjectName（本 changeset 动作仅物理表）',
+  );
 
 /** 度量策略 */
 const VIEW_MEASURE_MODE_ENUM = z
@@ -148,10 +181,90 @@ const VIEW_UPDATE_OPERATIONS_SCHEMA = z
           .max(10)
           .describe('join 条件（1~10 组），如 [{leftField:"0MATERIAL", rightField:"ZDEMO_MAT"}]'),
         fields: z
-          .array(z.string())
+          .array(VIEW_JOIN_FIELD_SCHEMA)
           .max(100)
           .optional()
-          .describe('要透出的源视图字段；省略=自动带出全部新增属性（推荐省略）'),
+          .describe(
+            '要透出的源视图字段：字符串按源视图的属性/度量分类自动判定；对象可显式声明 kind=measure 与' +
+              ' aggregationType。省略=自动带出全部新增属性（度量需显式列出）',
+          ),
+      }),
+      z.object({
+        op: z.literal('add_union').describe('操作类型：在输出链尾追加 union（右输入=源视图的 Projection）'),
+        sourcePackageId: zPackageId('union 源视图的包名（只读即可），如 system-local.bw.bw2hana.query.zdemo01r014'),
+        sourceObjectName: zObjectName('union 源视图对象名（不含包名）'),
+        fields: z
+          .array(
+            z.object({
+              id: z.string().min(1).max(128).describe('当前输出字段 id（必须已存在）'),
+              rightField: z.string().min(1).max(128).optional().describe('源视图字段（缺省同名）'),
+            }),
+          )
+          .max(100)
+          .optional()
+          .describe('输出字段对齐；省略=当前全部基础输出字段按同名字段对齐（源视图须同名）'),
+      }),
+      z.object({
+        op: z
+          .literal('add_projection')
+          .describe('操作类型：在输出链尾追加 projection（可重命名节点列，输出字段 id 不变）'),
+        fields: z
+          .array(
+            z.object({
+              id: z.string().min(1).max(128).describe('输出字段 id（logicalModel 名，必须已存在）'),
+              source: z
+                .string()
+                .min(1)
+                .max(128)
+                .optional()
+                .describe('上游列名（缺省同名；不同=在投影节点里重命名该节点列）'),
+            }),
+          )
+          .min(1)
+          .max(100)
+          .describe('投影字段；必须覆盖当前全部基础输出字段'),
+      }),
+      z.object({
+        op: z
+          .literal('add_aggregation')
+          .describe('操作类型：在输出链尾追加 aggregation（重建列集合为分组维度 + 度量聚合）'),
+        groupBy: z
+          .array(z.string().min(1).max(128))
+          .max(100)
+          .default([])
+          .describe('分组维度（当前输出属性；必须覆盖全部输出属性，空=全局聚合）'),
+        measures: z
+          .array(
+            z.object({
+              field: z.string().min(1).max(128).describe('当前输出度量字段'),
+              aggregationType: z.string().min(1).max(30).default('sum').describe('聚合方式（sum/max/avg 等）'),
+            }),
+          )
+          .max(100)
+          .default([])
+          .describe('度量及聚合方式（必须覆盖当前全部输出度量）'),
+      }),
+      z.object({
+        op: z.literal('add_rank').describe('操作类型：在输出链尾追加 rank（每组按排序取前 N 条）'),
+        partitionBy: z.array(z.string().min(1).max(128)).min(1).max(50).describe('分组字段（PARTITION BY）'),
+        orderBy: z
+          .array(
+            z.object({
+              field: z.string().min(1).max(128).describe('排序字段'),
+              direction: z.enum(['ASC', 'DESC']).default('ASC').describe('排序方向，默认 ASC'),
+            }),
+          )
+          .min(1)
+          .max(50)
+          .describe('排序字段与方向'),
+        threshold: z.number().int().min(1).max(1000000).describe('每组保留前 N 条'),
+      }),
+      z.object({
+        op: z
+          .literal('auto_layout')
+          .describe('操作类型：按节点 DAG 自动分层重写布局（Auto Layout / auto-layer；纯展示，不影响激活）'),
+        columnGap: z.number().int().min(40).max(1000).optional().describe('同层横向间距（默认 120）'),
+        rowGap: z.number().int().min(30).max(1000).optional().describe('同层节点纵向间距（默认 90）'),
       }),
       z.object({
         op: z.literal('set_script').describe('操作类型：替换 SQL 模式视图的脚本与输出列'),
@@ -284,7 +397,7 @@ const CHANGESET_ACTION_SCHEMA = z.object({
     })
     .optional()
     .describe(
-      'action=create + mode=projection：源表/视图（与 hana_view_create 的 sourceSchema/sourceName/columns/measureMode 同义）',
+      'action=create + mode=projection：源物理表（当前实现；与 hana_view_create 的 sourceSchema/sourceName/columns/measureMode 同义）',
     ),
   scripted: z
     .object({
@@ -304,17 +417,31 @@ const baseModelingCapabilities = {
     routing: {
       intent: '在仓库中新建 Calculation View（projection / SQL 模式）',
       whenToUse: ['用户明确要新建视图', '需要零 XML 的 SQL 模式建视图'],
-      notFor: ['修改已有视图用 hana_view_update，不要 delete+重建'],
+      notFor: [
+        '修改已有视图用 hana_view_update，不要 delete+重建',
+        '用户明确要可视化 CV 时不要静默改用 SQL 模式；用 graphical/projection + 初始源 + 节点 operations（join/union/projection/aggregation/rank），或先与用户确认',
+      ],
       priority: 'primary',
       requires: '目标包在 HANA_WRITE_PACKAGES 可写范围内',
-      exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV009', mode: 'projection' },
+      constraints: [
+        '初始源二选一：物理表（sourceSchema/sourceName）或 CV（sourcePackageId/sourceObjectName）；不要同时给',
+        'CV 初始源必须已激活；默认按 _SYS_BIC 的 SYS.VIEW_COLUMNS 取可见列，隐藏 Join 键用 sourceColumns 显式给列名/类型',
+        'operations 仅用于 graphical/projection；节点只追加、不会移除 create 时的初始源；用户给的字段清单必须逐一落实，源字段缺失时先与用户确认',
+      ],
+      exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV009', mode: 'graphical' },
     },
     title: '新建 Calculation View（计算视图）',
     // SQL 方言、实测边界与并发解释见规则 sql_mode / activation_measure / write_transport / write_receipt。
     description:
-      '在仓库中新建一个 Calculation View，mode 二选一：\n' +
-      '① projection（默认）：单 Projection 节点 + 单源表透传——需 sourceSchema/sourceName（可选 columns/measureMode）；\n' +
+      '在仓库中新建一个 Calculation View，mode 三选一（graphical 是 projection 的别名）：\n' +
+      '① graphical/projection（默认）：单 Projection 节点；源二选一——物理表（sourceSchema/sourceName）或 CV（sourcePackageId/sourceObjectName）；' +
+      '可带 operations（与 hana_view_update 同义：add_join / add_union / add_projection / add_aggregation / add_rank / auto_layout），' +
+      '在内存中应用到基础 XML 后一次性 PUT，适合「CV 初始源 + 节点组合」一条调用闭合。\n' +
       '② sql：SQL 模式（Scripted Calculation View）——需 script + scriptColumns。按 SQL 建视图一律用它，模型零 XML。\n' +
+      '如果用户明确要求「可视化/图形化 CV」，优先用 graphical/projection + 初始源 + 节点 operations；' +
+      '图形化视图由 join/union/projection/aggregation/rank 等节点组合而成，属性/度量是 logicalModel 的输出分类，' +
+      '不是 join 节点的属性。不要静默改成 SQL 模式。' +
+      'CV 初始源默认按 _SYS_BIC 的 SYS.VIEW_COLUMNS 取可见列；隐藏 Join 键用 sourceColumns 显式给列名/类型。\n' +
       '安全约束：可写包由 HANA_WRITE_PACKAGES 限定（留空=拒写 boundary_off）；同名对象已存在时拒绝覆盖。\n' +
       '回执：activated（写入后实测状态）、activationErrors/activationDetail（激活失败完整明细，无需再调 hana_view_validate）、rowProbe（0 行附排查提示）。\n' +
       'SQL 方言、scriptColumns↔VAR_OUT 与 ≥1 度量要求、通道差异见 rules=sql_mode,activation_measure,write_transport,write_receipt。',
@@ -325,6 +452,24 @@ const baseModelingCapabilities = {
       mode: VIEW_MODE_ENUM.default('projection'),
       sourceSchema: VIEW_SOURCE_SCHEMA_FIELD.optional(),
       sourceName: VIEW_SOURCE_NAME_FIELD.optional(),
+      sourcePackageId: zPackageId(
+        'mode=projection 的 CV 初始源：源 CV 包名（只读即可），如 system-local.bw.bw2hana.query.zmgf08r008；与 sourceSchema/sourceName 二选一',
+      ).optional(),
+      sourceObjectName: zObjectName(
+        'mode=projection 的 CV 初始源：源 CV 对象名（不含包名），如 ZMGF08R008_Q003；与 sourceSchema/sourceName 二选一',
+      ).optional(),
+      sourceColumns: z
+        .array(SCRIPT_COLUMN_SCHEMA)
+        .max(600)
+        .optional()
+        .describe(
+          'CV 初始源的显式输出列（name/dataType；省略=按 _SYS_BIC 的 SYS.VIEW_COLUMNS 取可见列）。' +
+            '源 CV 的隐藏 Join 键不在 VIEW_COLUMNS 里时，用本字段显式给出列名与类型',
+        ),
+      operations: VIEW_UPDATE_OPERATIONS_SCHEMA.optional().describe(
+        '图形化 create 的声明式操作（与 hana_view_update 的 operations 同义）：在内存中应用到刚生成的基础 XML 后再一次性 PUT；' +
+          '典型用途：CV 初始源 + join/union/projection/aggregation/rank 节点组合，最后 auto_layout 一次闭合。mode=sql 不接受',
+      ),
       script: VIEW_SCRIPT_FIELD.optional(),
       scriptColumns: VIEW_SCRIPT_COLUMNS_FIELD.optional(),
       measureMode: VIEW_MEASURE_MODE_ENUM.default('SUM_NUMERIC'),
