@@ -192,26 +192,38 @@ export function planViewCreate(args: Record<string, unknown>): WritePlan {
     }
     p.steps.push('按本环境方言生成设计时 XML（SCRIPT_BASED + definition + viewAttribute datatype）');
   } else {
-    // sourceSchema/sourcePackageId 只在非 sql 模式被消费——读取范围**按模式**声明（声明层对混合模式的参数
-    // 不打标签，见 defs/modeling 的 VIEW_SOURCE_SCHEMA_FIELD）：mode=sql 时顺手填了白名单外残留值的合法调用
-    // 不该被闸门误拦。与 changeset 的 create/projection 分支同一口径；缺源参数的调用会被 handler 拒绝，
-    // 但仍如实声明读取意图（fail-closed 方向，与既有闸门口径一致）。
-    if (sourcePkg) {
-      add(p.readPackages, sourcePkg);
-      p.steps.push(`读取 CV 初始源 ${sourcePkg}/${sourceObj ?? '?'} 的定义与 _SYS_BIC 列结构`);
-    } else {
-      add(p.readSchemas, schema);
-      if (schema && source) {
-        p.steps.push(`读取源 ${schema}.${source} 的列定义（按类型区分属性/度量）`);
+    const graph = asObj(args.graph);
+    if (graph) {
+      const graphSources = Array.isArray(graph.sources) ? graph.sources : [];
+      for (const raw of graphSources) {
+        const s = asObj(raw);
+        if (s?.type === 'calculationview') add(p.readPackages, asStr(s.packageId));
+        else if (s?.type === 'table') add(p.readSchemas, asStr(s.schema));
       }
-    }
-    const operations = Array.isArray(args.operations) ? args.operations : [];
-    if (operations.length > 0) {
-      // 节点追加类的源视图是跨包只读引用；复用 update 规划器的扫描口径，避免 create 路径漏声明。
-      const opPlan = planViewUpdate(args);
-      add(p.readPackages, ...opPlan.readPackages);
-      add(p.readSchemas, ...opPlan.readSchemas);
-      p.steps.push(`在内存中应用 ${operations.length} 条 operations（含节点源跨包只读引用）后再一次性写入`);
+      const nodeCount = Array.isArray(graph.nodes) ? graph.nodes.length : 0;
+      p.steps.push(`按 graph 构建 ${graphSources.length} 个源、${nodeCount} 个模块实例（拓扑排序后一次写入）`);
+    } else {
+      // sourceSchema/sourcePackageId 只在非 sql 模式被消费——读取范围**按模式**声明（声明层对混合模式的参数
+      // 不打标签，见 defs/modeling 的 VIEW_SOURCE_SCHEMA_FIELD）：mode=sql 时顺手填了白名单外残留值的合法调用
+      // 不该被闸门误拦。与 changeset 的 create/projection 分支同一口径；缺源参数的调用会被 handler 拒绝，
+      // 但仍如实声明读取意图（fail-closed 方向，与既有闸门口径一致）。
+      if (sourcePkg) {
+        add(p.readPackages, sourcePkg);
+        p.steps.push(`读取 CV 初始源 ${sourcePkg}/${sourceObj ?? '?'} 的定义与 _SYS_BIC 列结构`);
+      } else {
+        add(p.readSchemas, schema);
+        if (schema && source) {
+          p.steps.push(`读取源 ${schema}.${source} 的列定义（按类型区分属性/度量）`);
+        }
+      }
+      const operations = Array.isArray(args.operations) ? args.operations : [];
+      if (operations.length > 0) {
+        // 视图级 op（set_script 等）的源引用复用 update 规划器的扫描口径，避免 create 路径漏声明。
+        const opPlan = planViewUpdate(args);
+        add(p.readPackages, ...opPlan.readPackages);
+        add(p.readSchemas, ...opPlan.readSchemas);
+        p.steps.push(`在内存中应用 ${operations.length} 条 operations 后再一次性写入`);
+      }
     }
   }
   p.steps.push('生成并写入设计时 XML（XS REST PUT）');
@@ -279,6 +291,17 @@ export function planViewUpdate(args: Record<string, unknown>): WritePlan {
   });
 
   const xml = asStr(args.xml);
+  const graph = asObj(args.graph);
+  if (graph) {
+    const graphSources = Array.isArray(graph.sources) ? graph.sources : [];
+    for (const raw of graphSources) {
+      const s = asObj(raw);
+      if (s?.type === 'calculationview') add(p.readPackages, asStr(s.packageId));
+      else if (s?.type === 'table') add(p.readSchemas, asStr(s.schema));
+    }
+    const nodeCount = Array.isArray(graph.nodes) ? graph.nodes.length : 0;
+    p.steps.push(`graph 增量合并：${graphSources.length} 个源、${nodeCount} 个模块实例（按 id 合并，未提及的保留）`);
+  }
   if (xml) {
     add(p.readPackages, ...scanXmlPackageRefs(xml));
     // 全量 XML 里的基表数据源 schemaName 是**静态可解析**的读取面——只扫 resourceUri 时
@@ -319,7 +342,13 @@ export function planViewUpdate(args: Record<string, unknown>): WritePlan {
   // 故对象级集合**完全由 actions 并集构成**——把顶层目标也算成"将写入"会在批外对象上造出幽灵写声明。
   const outerRefs = csActions
     ? { reads: [] as ObjectRef[], writes: [] as ObjectRef[], uncertain: [] as string[] }
-    : objectRefsOfUpdate({ packageId: pkg ?? '', objectName: objectArg ?? '', xml, operations: ops });
+    : objectRefsOfUpdate({
+        packageId: pkg ?? '',
+        objectName: objectArg ?? '',
+        xml,
+        operations: ops,
+        graph: asObj(args.graph),
+      });
   let writes: ObjectRef[] = [...outerRefs.writes];
   let reads: ObjectRef[] = [...outerRefs.reads];
   // 共享扫描件的降级出口：解析不出的引用（缺半边源坐标 / 非视图形态的 resourceUri）逐条进 uncertain，

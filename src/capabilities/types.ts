@@ -218,7 +218,7 @@ export interface CapabilityEffects {
  * 派发时的路由参数也由它在服务端校验（客户端拿到的 JSON Schema 只是便利，不是校验层）。
  */
 export interface Capability<S extends z.ZodType = z.ZodType> {
-  /** 能力 id：工具级 = 工具名原样；操作级 = `<工具>#<op>`（如 hana_view_update#add_join） */
+  /** 能力 id：工具级 = 工具名原样；操作级 = `<工具>#<op>`（如 hana_view_update#auto_layout） */
   id: string;
   /** 对模型可见的入口工具名（恒等于 id 前缀）：工具级 = id 本身；操作级 = 父工具名 */
   module: string;

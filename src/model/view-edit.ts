@@ -254,7 +254,7 @@ function logicalModelHasMeasures(lmContent: string): boolean {
 }
 
 /** 含度量的 CV 根 dataCategory 必须是 CUBE（本环境 SPS08 实测；否则激活 40117 "No measures defined"） */
-function ensureCubeDataCategory(xml: string): string {
+export function ensureCubeDataCategory(xml: string): string {
   const open = /<Calculation:scenario\b[^>]*>/.exec(xml);
   if (!open) return xml;
   const tag = open[0];
@@ -1081,6 +1081,17 @@ interface Section {
   indent: string;
   /** append 模式的插入点：闭标签独占一行时取行首（块与子元素对齐），否则取闭标签处 */
   appendAt: number;
+}
+
+/** 供图编辑（view-graph）整段替换三个结构段：dataSources / calculationViews / logicalModel。 */
+export function replaceGraphSections(
+  xml: string,
+  sections: { dataSources: string; calculationViews: string; logicalModel: string },
+): string {
+  let out = replaceSection(xml, 'dataSources', { kind: 'replace', text: sections.dataSources });
+  out = replaceSection(out, 'calculationViews', { kind: 'replace', text: sections.calculationViews });
+  out = replaceSection(out, 'logicalModel', { kind: 'replace', text: sections.logicalModel });
+  return out;
 }
 
 /**

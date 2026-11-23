@@ -43,18 +43,13 @@
  * 依赖方向：声明层叶子——只 import core/errors（未知 id 以中文硬错误暴露，与工具层错误口径一致），
  * 不做 I/O、不 import services/tools（同 src/rules/index.ts 的约定）。
  *
- * 覆盖范围：13 个 op 全量声明（清单见 `ViewOpId`）。
+ * 覆盖范围：8 个 op 全量声明（清单见 `ViewOpId`）。
  */
 
 import { HanaBusinessError } from '../core/errors.js';
 
 /** 操作 id（冻结）：`hana_view_update.operations` 可用的 op 判别式。与工具面 schema 的 discriminatedUnion 一一对应 */
 export type ViewOpId =
-  | 'add_join'
-  | 'add_union'
-  | 'add_projection'
-  | 'add_aggregation'
-  | 'add_rank'
   | 'auto_layout'
   | 'set_script'
   | 'set_description'
@@ -95,70 +90,6 @@ export interface ViewOpDeclaration {
 
 /** 全量 op 声明（只读；顺序 = 列示顺序，不构成契约）。每条的依据是变换实现（model/view-edit.ts）与实测结论（view-diff / migrate.rules） */
 export const VIEW_OPS: readonly ViewOpDeclaration[] = [
-  {
-    // 依据（addJoinToViewXml）：新增 <DataSource>（读源视图定义 → 跨包只读引用）+ Projection/Join 节点；
-    // 重接 logicalModel 全部 keyMapping/measureMapping 的 columnObjectName（机械重挂，diff 里表现为既有
-    // 输出字段的 sourceObject 变化）；追加新的输出属性。「只增不改既有解析」⇒ 实测判非破坏；
-    // 但结构面（数据源/节点接线/输出字段）全被触碰 ⇒ destructive=true（口径见头注 1）。
-    id: 'add_join',
-    title: '加 join',
-    summary: '追加一个 join：读源视图定义，新增数据源/节点/输出字段并把输出重挂到新 join 节点',
-    effects: { destructive: true, touchesOutputFields: true, touchesMapping: true, dataSourceRefs: 'read' },
-    params: ['sourcePackageId', 'sourceObjectName', 'joinType', 'conditions', 'fields'],
-    detail:
-      '仅图形化（非 SCRIPT_BASED）单输出链状视图可变换（锚点唯一才动手）；leftField 必须已存在于当前输出节点，' +
-      '带出字段不得与既有字段重名；源视图只读即可（可跨包）。带出字段默认只带属性；度量需显式列出并可通过对象形式' +
-      '声明 kind=measure/aggregationType（属性与度量是 logicalModel 的输出分类，不是 join 节点的属性）。' +
-      '实测口径：良性形态（仅新增 + 机械重挂且 passThrough 成立）判非破坏。',
-  },
-  {
-    // 依据（addUnionToViewXml）：新增 DataSource + 右侧 Projection + Union 节点，重接 logicalModel；
-    // 输出字段集合不变（按 id 对齐），但节点接线/数据源面被触碰 ⇒ destructive=true、touchesOutputFields=false。
-    id: 'add_union',
-    title: '加 union',
-    summary: '追加 union 节点：读源视图定义，右输入为新 Projection，输出字段按 id 对齐',
-    effects: { destructive: true, touchesOutputFields: false, touchesMapping: true, dataSourceRefs: 'read' },
-    params: ['sourcePackageId', 'sourceObjectName', 'fields'],
-    detail:
-      '仅图形化单输出链状视图；全部基础输出字段都必须对齐（未列出的字段会被拒绝），右字段可不同名；' +
-      '右输入是源视图的 Projection，属性/度量按左侧 logicalModel 语义保持不变。',
-  },
-  {
-    // 依据（addProjectionToViewXml）：新增 Projection 节点并重接 logicalModel；可重命名节点列，
-    // 输出字段 id 不变（只有 columnName 重指向）⇒ touchesMapping=true、touchesOutputFields=false。
-    id: 'add_projection',
-    title: '加 projection',
-    summary: '追加 projection 节点：重建节点列（可重命名），输出字段 id 不变',
-    effects: { destructive: true, touchesOutputFields: false, touchesMapping: true, dataSourceRefs: 'none' },
-    params: ['fields'],
-    detail:
-      '仅图形化单输出链状视图；必须覆盖当前全部基础输出字段；来源列不同名时在投影节点内重命名，' +
-      'logicalModel 的 keyMapping/measureMapping 随之重接。',
-  },
-  {
-    // 依据（addAggregationToViewXml）：新增 Aggregation 节点并重接 logicalModel；输出字段集合不变，
-    // 但聚合语义/节点接线改变 ⇒ destructive=true、touchesOutputFields=false。
-    id: 'add_aggregation',
-    title: '加 aggregation',
-    summary: '追加 aggregation 节点：按 groupBy 聚合度量（重建节点列集合）',
-    effects: { destructive: true, touchesOutputFields: false, touchesMapping: true, dataSourceRefs: 'none' },
-    params: ['groupBy', 'measures'],
-    detail:
-      '仅图形化单输出链状视图；全部基础输出字段都必须显式声明为分组维度或度量，' +
-      'logicalModel 的 measure aggregationType 同步更新；含度量视图的根 dataCategory 须为 CUBE。',
-  },
-  {
-    // 依据（addRankToViewXml）：新增 Rank 节点并重接 logicalModel；节点列集合与输出字段不变，
-    // 只改变取行口径 ⇒ destructive=true、touchesOutputFields=false。
-    id: 'add_rank',
-    title: '加 rank',
-    summary: '追加 rank 节点：按 partitionBy 分组、orderBy 排序，每组取前 threshold 条',
-    effects: { destructive: true, touchesOutputFields: false, touchesMapping: true, dataSourceRefs: 'none' },
-    params: ['partitionBy', 'orderBy', 'threshold'],
-    detail:
-      '仅图形化单输出链状视图；节点列集合与输出字段不变，只重接 logicalModel；' +
-      'partitionBy/orderBy 字段必须已存在于当前输出节点。',
-  },
   {
     // 依据（autoLayoutViewXml）：只重写顶层 <layout><shapes>，不碰 dataSources/calculationViews/
     // logicalModel；纯展示 ⇒ destructive=false、三个结构位全 false、无跨对象引用。

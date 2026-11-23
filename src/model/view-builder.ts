@@ -59,7 +59,7 @@ function scenarioRootAttrsObject(): Record<string, string> {
 }
 
 /** 共享固定属性 → 字符串模板形态（` k="v"` 串；值均为无实体字符的常量，无需转义） */
-function scenarioRootAttrsXml(): string {
+export function scenarioRootAttrsXml(): string {
   return Object.entries(SCENARIO_ROOT_ATTRS)
     .map(([k, v]) => ` ${k}="${v}"`)
     .join('');

@@ -45,6 +45,17 @@ import {
 } from '../model/view-edit.js';
 import { type ViewDefinition, isNumericType } from '../model/view-types.js';
 import { parseViewDefinition } from '../model/view-xml.js';
+import {
+  type GraphPatch,
+  type GraphSourceSpec,
+  type GraphSpec,
+  type ResolvedSource,
+  buildGraphViewXml,
+  mergeGraphIntoViewXml,
+  mergeGraphPatch,
+  parseGraphFromViewXml,
+  resolveGraph,
+} from '../model/view-graph.js';
 import { type ClosureResult, type GraphEdge, impact } from './catalog.service.js';
 import {
   type BreakingAssessment,
@@ -55,7 +66,7 @@ import {
 import { TABLE_COLUMNS_LIMIT_MAX, currentSchema, getTableColumns, getViewDefinition } from './metadata.service.js';
 import { slicePage } from './preview.service.js';
 import { assertSqlReadScopes } from './read-scope.service.js';
-import { getViewOp } from './view-ops.rules.js';
+import { getViewOp, type ViewOpId } from './view-ops.rules.js';
 import {
   type ActivationDetail,
   type RepoRestResponse,
@@ -112,6 +123,13 @@ export interface CreateCalcViewInput {
    * mode=sql 不接受。
    */
   operations?: ViewUpdateOperation[];
+  /**
+   * 图形化模块图（sources + nodes + output）：从零构建计算视图。
+   * 与 source* / operations 互斥；节点按 id/inputs 声明，同一模块可实例化多次。
+   */
+  graph?: GraphSpec;
+  /** graph 构建后是否写自动布局（默认 true） */
+  layout?: boolean;
   /** SQL 模式：SQL 脚本 + 输出列清单（mode=sql 时必填；对象名/描述取自本次创建的入参） */
   scripted?: Omit<ScriptedCalcViewSpec, 'objectName' | 'description'>;
   /** 激活开关：true=写后立即尝试激活；false/缺省=仅写设计时对象 */
@@ -806,7 +824,7 @@ export async function updateCalculationView(
   pool: HanaPool,
   packageId: string,
   objectName: string,
-  input: { xml?: string; operations?: ViewUpdateOperation[] },
+  input: { xml?: string; operations?: ViewUpdateOperation[]; graph?: GraphPatch; layout?: boolean },
   opts: {
     ifMatch?: string;
     activate?: boolean;
@@ -822,9 +840,13 @@ export async function updateCalculationView(
   assertWritePackageAllowed(packageId, objectName);
   assertSafeObjectName(objectName, '视图');
   const hasOperations = input.operations !== undefined && input.operations.length > 0;
-  if (hasOperations && input.xml) throw new HanaBusinessError('xml 与 operations 二选一，请勿同时提供');
-  if (!hasOperations && !input.xml) {
-    throw new HanaBusinessError('需要提供 xml（全量 XML 更新）或 operations（声明式操作补丁）之一');
+  const hasGraph = input.graph !== undefined;
+  const modeCount = Number(hasOperations) + Number(input.xml !== undefined) + Number(hasGraph);
+  if (modeCount > 1) throw new HanaBusinessError('xml / operations / graph 三选一，请勿同时提供');
+  if (modeCount === 0) {
+    throw new HanaBusinessError(
+      '需要提供 xml（全量 XML 更新）、operations（声明式操作补丁）或 graph（模块图增量合并）之一',
+    );
   }
   // 入口统一归一：显式传空串/纯空白不能当「有基线」——否则会静默退化成「无 If-Match 写」，
   // 且因 ifMatch !== undefined 而不产生 updateNote（「是否带 If-Match」与「无基线」的说明字段必须同口径）。
@@ -870,6 +892,21 @@ export async function updateCalculationView(
         // diff 基线与变换基线同源（设计时当前内容）；operations 分支无需额外读取
         beforeXml = designTimeXml;
         xml = updatedXml;
+      } else if (hasGraph) {
+        // graph 增量合并：以设计时当前内容为基线，按 id 合并 sources/nodes，重建结构段后走同一写路径。
+        const designTimeXml = await rest.fileContent(packageId, designFile);
+        if (!designTimeXml || designTimeXml.trim() === '') {
+          throw new HanaBusinessError(`视图 ${packageId}/${objectName} 无设计时内容，无法应用 graph`);
+        }
+        const parsed = parseGraphFromViewXml(designTimeXml);
+        const merged = mergeGraphPatch(parsed, input.graph!);
+        const resolvedSources = await resolveGraphSources(pool, merged.sources);
+        const mergedXml = mergeGraphIntoViewXml(designTimeXml, input.graph!, resolvedSources, {
+          layout: input.layout !== false,
+        });
+        xmlVerification = guardFullXmlUpdate(mergedXml, objectName);
+        beforeXml = designTimeXml;
+        xml = mergedXml;
       } else {
         // 全量通道护栏：解析性 + scenario id 一致性 + logicalModel 重接线（手工改 XML 两大高频事故，激活前拦下）
         xmlVerification = guardFullXmlUpdate(input.xml!, objectName);
@@ -1435,7 +1472,7 @@ async function applyViewUpdateOperations(
   for (const op of operations) {
     // 未知 op id 的兜底（工具层 zod 之外的脚本/内部调用）：getViewOp 未命中即抛中文硬错误并列出合法值；
     // 不加这一道，拼错的 id 会落进链尾的 add_join 分支被当 add_join 处理。
-    getViewOp(op.op);
+    getViewOp(op.op as ViewOpId);
     // 按 op 分派：add_join 读源视图定义后接线；其余 op 都只改当前视图自身（无跨包读取），
     // 口径面对（set_attribute_filter / set_variable）同样零跨对象访问——读取范围声明是空的。
     if (op.op === 'set_script') {
@@ -1814,6 +1851,73 @@ async function applyAddUnionOperation(
 }
 
 /**
+ * 解析模块图的 source 字段（属性/度量分类）：
+ * - table：SYS.TABLE_COLUMNS / VIEW_COLUMNS（getTableColumns），数值类型=度量；
+ * - calculationview：读设计时定义，按 attributes/measures/calculated/restricted 分类。
+ * 纯读，不写库；同一批内按声明顺序解析。
+ */
+async function resolveGraphSources(pool: HanaPool, sources: readonly GraphSourceSpec[]): Promise<ResolvedSource[]> {
+  const out: ResolvedSource[] = [];
+  for (const spec of sources) {
+    if (spec.type === 'table') {
+      assertSafeRuntimeName(spec.name, '图源表');
+      assertSchemaAllowed(spec.schema);
+      const page = await getTableColumns(pool, spec.schema, spec.name, { limit: AUTO_COLUMN_LIMIT });
+      out.push({
+        spec,
+        fields: page.columns.map((c) => {
+          const numeric = isNumericType(c.dataTypeName);
+          return {
+            id: c.columnName,
+            kind: numeric ? ('measure' as const) : ('attribute' as const),
+            ...(numeric ? { aggregationType: 'sum' } : {}),
+            ...(c.comments ? { description: c.comments } : {}),
+            dataType: c.dataTypeName,
+          };
+        }),
+      });
+      continue;
+    }
+    assertSafeObjectName(spec.packageId, '图源包');
+    assertSafeObjectName(spec.objectName, '图源视图');
+    const def = await getViewDefinition(pool, spec.packageId, spec.objectName);
+    if (!def.definition) {
+      throw new HanaBusinessError(`图源 ${spec.packageId}/${spec.objectName} 无可解析定义（无 CDATA）`);
+    }
+    const segment = KIND_URI_SEGMENT[def.definition.kind];
+    if (!segment) {
+      throw new HanaBusinessError(
+        `图源类型 ${def.definition.kind} 不受支持（仅 calculationview/attributeview/analyticview）`,
+      );
+    }
+    const fields = new Map<string, ResolvedSource['fields'][number]>();
+    const add = (list: typeof def.definition.outputs.attributes, kind: 'attribute' | 'measure'): void => {
+      for (const f of list) {
+        if (!fields.has(f.id)) {
+          fields.set(f.id, {
+            id: f.id,
+            kind,
+            ...(kind === 'measure' && f.aggregationType ? { aggregationType: f.aggregationType } : {}),
+            ...(f.description ? { description: f.description } : {}),
+          });
+        }
+      }
+    };
+    add(def.definition.outputs.attributes, 'attribute');
+    add(def.definition.outputs.calculatedAttributes, 'attribute');
+    add(def.definition.outputs.measures, 'measure');
+    add(def.definition.outputs.calculatedMeasures, 'measure');
+    add(def.definition.outputs.restrictedMeasures, 'measure');
+    out.push({
+      spec,
+      fields: [...fields.values()],
+      resourceUri: `/${def.object.packageId}/${segment}/${def.object.objectName}`,
+    });
+  }
+  return out;
+}
+
+/**
  * 新建 Calculation View：
  * 1. 校验包（写边界由 HANA_WRITE_PACKAGES 配置）/对象名/源 schema
  * 2. 检查对象不存在
@@ -1850,7 +1954,19 @@ export async function createCalculationView(
   let measureModeUsed: 'SUM_NUMERIC' | 'ALL_ATTRIBUTES' | undefined;
   /** CV 初始源的 resourceUri（物理表源不设置） */
   let sourceResourceUri: string | undefined;
-  if (mode === 'sql') {
+  if (input.graph) {
+    if (mode === 'sql') throw new HanaBusinessError('graph 仅用于 graphical/projection 模式；mode=sql 不接受');
+    if (input.source) throw new HanaBusinessError('graph 与 source* 互斥；图源请写在 graph.sources 中');
+    if (input.operations !== undefined && input.operations.length > 0) {
+      throw new HanaBusinessError('graph 与 operations 互斥；节点组合请写在 graph.nodes 中');
+    }
+    const resolvedSources = await resolveGraphSources(pool, input.graph.sources);
+    const resolved = resolveGraph(resolvedSources, input.graph.nodes, input.graph.output, input.graph.outputFields);
+    xml = buildGraphViewXml(input.objectName, input.description ?? input.objectName, resolved, {
+      layout: input.layout !== false,
+    });
+    measureCount = resolved.outputFields.filter((f) => f.kind === 'measure').length;
+  } else if (mode === 'sql') {
     // SQL 模式：单 SqlScriptView + <definition> SQL，输出列由调用方声明（datatype 必填）
     if (!input.scripted) {
       throw new HanaBusinessError('mode=sql 需要提供 scripted（script + columns），或改用 mode=projection');
