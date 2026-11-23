@@ -33,6 +33,21 @@ export const DELETE_MIGRATION_DECLARATIONS = MIGRATION_DECLARATIONS.filter(
   (d): d is 'acknowledge_dependents' => d === 'acknowledge_dependents',
 );
 
+/**
+ * hana_view_update 的审批谓词：**只有 changeset 里的 delete 动作**按删除处理，需要人工确认。
+ * 单对象 operations/xml（含字段/节点改造）不触发审批；参数在闸门前已过 schema，
+ * 这里只做纯读取，缺字段/形状不符一律 false（不会误放行 delete）。
+ */
+function changesetHasDelete(args: Record<string, unknown>): boolean {
+  const changeset = args['changeset'];
+  if (changeset === null || typeof changeset !== 'object') return false;
+  const actions = (changeset as { actions?: unknown }).actions;
+  if (!Array.isArray(actions)) return false;
+  return actions.some(
+    (action) => action !== null && typeof action === 'object' && (action as { action?: unknown }).action === 'delete',
+  );
+}
+
 /** SQL 模式输出列（create 的 scriptColumns 与 update 的 set_script.columns 共用一份，避免约束漂移）。 */
 const SCRIPT_COLUMN_SCHEMA = z.object({
   name: z.string().min(1).max(128).describe('输出列别名（与脚本 SELECT 的别名一致）'),
@@ -345,21 +360,22 @@ const baseModelingCapabilities = {
     effects: { plan: planViewValidate, destructive: false, idempotent: true, mutates: 'transient' },
     routing: {
       intent: '校验计算视图一致性（激活前设计时 / 运行时）',
-      whenToUse: ['改完或激活前做 CheckResult 校验', '对已激活运行时视图做一致性校验'],
-      notFor: ['只是预览数据用 hana_data_preview'],
+      whenToUse: ['改完或激活前做 CheckResult 校验', '对已激活的图形化视图做一致性校验'],
+      notFor: ['只是预览数据用 hana_data_preview', 'SQL 模式视图的 runtime 校验不适用，改用 hana_data_preview'],
       priority: 'primary',
       exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV008', target: 'design' },
       returns: [
         'CheckResult 编译明细（成功/失败与具体错误）',
         'design 模式临时副本写后即删；清理失败回执 tempResidue',
         'runtime 模式校验已激活视图一致性',
+        'SQL 模式 / SCRIPT_BASED 视图返回 VALIDATE_UNSUPPORTED（不是视图不一致）',
       ],
     },
     title: '校验计算视图一致性',
     description:
       '双模式校验：\n' +
       'target=design（默认）：对可写包内设计时对象做激活前校验——临时副本 _CHKTMP 触发服务端激活检查（CheckResult 带编译明细）后删除，原对象激活状态不受影响；副本名带短哈希（总长 ≤29），与真实对象重名时本次拒绝执行（不删不改）；清理未完成时回执 tempResidue（对象名+原因），需人工清理，不静默。\n' +
-      'target=runtime：对已激活的运行时计算视图做一致性校验（SYS.CHECK_CALCULATION_VIEW，需 schema+viewName，如 _SYS_BIC + "ZDEMO.ZDEMO_MKC/ZDEMO03_CV003"）。\n' +
+      'target=runtime：对已激活的运行时计算视图做一致性校验（SYS.CHECK_CALCULATION_VIEW，需 schema+viewName，如 _SYS_BIC + "ZDEMO.ZDEMO_MKC/ZDEMO03_CV003"）。SQL 模式 / SCRIPT_BASED 视图可能返回 VALIDATE_UNSUPPORTED（CHECK 过程无法解析其 scenario）；这不是视图不一致，改用 hana_data_preview 或 SELECT ... LIMIT 0 验证运行时对象。\n' +
       '激活前建议先 design 校验，激活后可用 runtime 复检；支持的动作清单用 hana_view_check_actions 查询。',
     inputSchema: z.object({
       target: z
@@ -443,6 +459,8 @@ const baseModelingCapabilities = {
     category: 'modeling',
     kind: 'write',
     effects: { plan: planViewUpdate, destructive: true, idempotent: false, mutates: 'persistent' },
+    // 审批只覆盖 changeset 的 delete 动作；普通 update（含 operations/xml）不确认。
+    approval: changesetHasDelete,
     routing: {
       intent: '更新已有 Calculation View（声明式 operations / 全量 XML / 变更集）',
       whenToUse: ['修改已有视图（默认走 operations）', '需要 dryRun 预演破坏性变更'],
@@ -573,6 +591,8 @@ const baseModelingCapabilities = {
     category: 'modeling',
     kind: 'write',
     effects: { plan: planViewDelete, destructive: true, idempotent: false, mutates: 'persistent' },
+    // 删除不可恢复：审批开启时每次都要确认。
+    approval: 'always',
     routing: {
       intent: '删除可写包下的 Calculation View 设计时对象',
       whenToUse: ['用户明确要求删除对象'],

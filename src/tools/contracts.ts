@@ -97,8 +97,10 @@ export function accessProfileOf(cap: Capability, multiEnv = false): AccessProfil
   if (mutation === 'persistent') checks.push('environment_write');
   if (multiEnv && cap.platform !== true) checks.push('expected_environment');
   if (cap.kind === 'sql') checks.push('sql_policy');
+  // 审批与风险分级解耦：只有清单显式声明 approval 的能力才出现审批检查。
+  if (cap.approval === 'always') checks.push('approval');
+  else if (typeof cap.approval === 'function') checks.push('approval_conditional');
   const risk = operationalRiskOf(cap);
-  if (risk === 'destructive') checks.push('approval');
   return {
     authorizationClass: cap.kind,
     mutation,

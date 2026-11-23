@@ -115,6 +115,8 @@ export const packageCapabilities = {
     category: 'modeling',
     kind: 'admin',
     effects: { plan: planRepoImport, destructive: true, idempotent: false, mutates: 'persistent' },
+    // 导入即激活，overwrite=true 会覆盖；审批开启时每次都要确认。
+    approval: 'always',
     routing: {
       intent: '把本地设计时文件导入仓库（导入即激活）',
       whenToUse: ['从 zip/xml 恢复或迁移新对象'],

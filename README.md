@@ -20,7 +20,7 @@ SAP HANA 经典 Modeler 能力的 MCP 服务器（TypeScript，Node >= 22.0.0）
 | 稳定性诊断 | 实例体检、会话与阻塞深潜、表存储画像、历史趋势 | `hana_system_health`、`hana_system_activity`、`hana_table_storage`、`hana_system_trend` |
 | 包 | 包清单/包树、包内对象、新建包 | `hana_package_list`、`hana_package_list_objects`、`hana_package_create` |
 | 元数据 | 对象搜索（名称/描述）、字段清单、字段逻辑、血缘 | `hana_metadata_get_view`、`hana_metadata_search_objects`、`hana_metadata_list_fields`、`hana_metadata_get_field_logic`、`hana_metadata_where_used` |
-| 表目录 | 可访问表清单、表注释搜索、列结构 | `hana_table_list`、`hana_table_columns` |
+| 表目录 | 可访问表清单、表注释搜索、表/视图列结构（含 BW CALC 视图） | `hana_table_list`、`hana_table_columns` |
 | 数据预览 | 已激活视图预览（整体/节点）+ 数据预览权限诊断 | `hana_data_preview`、`hana_data_preview_diagnose` |
 | 建模写操作 | 新建/激活/更新/删除计算视图、设计时+运行时校验 | `hana_view_create`、`hana_view_activate`、`hana_view_update`、`hana_view_delete`、`hana_view_validate`、`hana_view_check_actions` |
 | 仓库传输 | 包导出备份、设计时文件导入、变更列表 | `hana_repo_export`、`hana_repo_import`、`hana_repo_changelist` |
@@ -170,8 +170,9 @@ hana_tool_search({ "mode": "goal", "goal": "diagnose_preview_permission",
 - 预算护栏：`maxTools`（默认 12 / 硬上限 20）、`maxSchemaBytes`（默认 32KB/工具）、`maxResponseBytes`（默认 256KB）；超限给 `budget_exceeded`，不静默丢契约。
 - 契约的 `policy` 预判：`bindings` 未覆盖写包/读 schema 时状态为 `partial`（演示参数不作为资源判定依据）；补 `bindings` 后按真实目标预判。
 - **可显式关闭 goal 模式**：`HANA_TOOL_SEARCH_GOAL=off` 时只保留 `discover`/`contract`，`mode=goal` 返回可恢复错误；工具面与 `hana_invoke` 不变。
+- **审批姿态随发现回执下发**：`discover`/`contract`/`goal` 的 `data.approval` 给出 `policy`、`clientSupportsElicitation` 与 `destructiveWrites`（`confirm_via_host` / `allowed_without_confirmation` / `blocked`）；默认 `off` → `allowed_without_confirmation`；`destructive` + 无 elicitation → `blocked`（delete/import 会在派发前被拒，`dryRun=true` 预演不受影响）。
 - **调用上下文**：推荐 `hana_invoke({ capability, args, contextToken })`；`expectedEnvironment` / `disclosure` 是兼容字段。
-- **审批固定启用**：`effects.destructive=true` 的能力在策略放行后返回 `input_required`，确认绑定 args/调用方/5 分钟过期；无 `HANA_APPROVAL` 开关。宿主须声明 `elicitation`，未声明时直接返回硬错误、不派发；`hana_env_switch` 自带 token/epoch/confirm，不在审批范围。
+- **人工审批（默认关闭）**：`HANA_APPROVAL_POLICY=off`（默认）不逐次确认；设为 `destructive` 时，只有 `hana_view_delete`、`hana_repo_import` 与 `hana_view_update` 的 changeset delete 需要宿主 `elicitation` 确认，未声明时直接返回硬错误、不派发。`dryRun=true` 的零写入预演永不触发审批；`hana_env_switch` 自带 token/epoch/confirm，不在审批范围。
 - **SQL 访问模式**：`HANA_SQL_ACCESS=select-only`（默认）只允许 SELECT 类；`readwrite` 才允许 SQL 写；对象级 schema/对象访问由 HANA 账号权限决定。
 - 权限模型见 [CONFIG.md 的「权限参数（4 个 + SQL 模式）」](CONFIG.md#权限参数4-个--sql-模式)。
 - 多环境部署时 `hana_env_list` / `hana_env_switch` 经本体层发现与执行（仍受分组/档案可达性约束）；单环境不可见。

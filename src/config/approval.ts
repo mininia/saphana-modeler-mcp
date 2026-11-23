@@ -5,7 +5,9 @@
  * 审批结果绑定**能力 + 参数摘要 + 调用方 + 环境 + 过期时间**（HMAC 签名的 requestState）；
  * 参数或身份变化、状态过期 → 重新请求，不复用旧同意。
  *
- * 破坏性能力一旦策略允许就必须经过一次人工确认（无开关）；审批不是授权：`authorizeCall` 仍先判策略。
+ * 审批只覆盖真正需要的少数能力（delete / import；update 的 changeset delete 动作单独判定），
+ * 由 `HANA_APPROVAL_POLICY` 控制：默认 `off`（不逐次确认），`destructive` 时对上述能力要求人工确认。
+ * 审批不是授权：`authorizeCall` 仍先判策略。`dryRun=true` 的零写入预演不触发审批。
  *
  * **能力前提**：`elicitation/create` 需要客户端在 initialize（2025 协议）或每请求 envelope
  * （2026 协议）里声明 `elicitation`。未声明的客户端无法完成人工确认——服务端不能代替宿主，
@@ -130,9 +132,22 @@ function decodeState(
   }
 }
 
-/** 当前部署的审批策略（固定为 destructive；参数保留用于测试/兼容）。 */
-export function approvalRequired(capability: Capability, policy: ApprovalPolicy | undefined): boolean {
-  return policy === 'destructive' && capability.effects.destructive === true;
+/**
+ * 当前部署的审批策略与本次调用是否需要审批。
+ *
+ * 审批要求来自能力声明 `approval`（与 `effects.destructive` 解耦）：delete / import 恒需确认，
+ * update 仅在 changeset 含 delete 动作时确认，SQL 执行不确认。`HANA_APPROVAL_POLICY=off`（默认）
+ * 时整层跳过；`destructive` 时按上述声明逐次判定。`dryRun=true` 的零写入预演不触发审批。
+ */
+export function approvalRequired(
+  capability: Capability,
+  args: Record<string, unknown>,
+  policy: ApprovalPolicy | undefined,
+): boolean {
+  if (policy !== 'destructive') return false;
+  if (capability.approval === 'always') return true;
+  if (typeof capability.approval === 'function') return capability.approval(args) === true;
+  return false;
 }
 
 /**
@@ -161,8 +176,47 @@ export function clientSupportsElicitation(
 }
 
 /**
+ * 破坏性写面向当前客户端的实际姿态（供 hana_system_get_info 等披露面使用）：
+ * - confirm_via_host：策略要求人工确认，且客户端声明了 elicitation；
+ * - allowed_without_confirmation：部署未开启审批（HANA_APPROVAL_POLICY=off，默认）；
+ * - blocked：策略要求审批，但客户端无法承载 elicitation（fail-closed）。
+ */
+export type DestructiveWritePosture = 'confirm_via_host' | 'allowed_without_confirmation' | 'blocked';
+
+export interface ApprovalState {
+  policy: ApprovalPolicy;
+  clientSupportsElicitation: boolean;
+  destructiveWrites: DestructiveWritePosture;
+  /** 可操作说明（只描述事实与安全替代路径，不提供策略绕过方法） */
+  hint?: string;
+}
+
+export function approvalStateForClient(policy: ApprovalPolicy | undefined, clientCanElicit: boolean): ApprovalState {
+  if (policy !== 'destructive') {
+    return {
+      policy: 'off',
+      clientSupportsElicitation: clientCanElicit,
+      destructiveWrites: 'allowed_without_confirmation',
+      hint: '人工审批未开启（默认）：删除/导入等需要审批的操作不逐次确认。',
+    };
+  }
+  if (clientCanElicit) {
+    return { policy: 'destructive', clientSupportsElicitation: true, destructiveWrites: 'confirm_via_host' };
+  }
+  return {
+    policy: 'destructive',
+    clientSupportsElicitation: false,
+    destructiveWrites: 'blocked',
+    hint:
+      '当前客户端未声明 elicitation/form 能力：需要审批的操作（hana_view_delete / hana_repo_import 等）会在执行前被拒；' +
+      'dryRun=true 的只读预演不受影响。请让操作者改用支持 elicitation 的宿主。',
+  };
+}
+
+/**
  * 策略放行后的审批闸门：
- * - 未启用/非破坏性 → undefined（放行）；
+ * - 未开启审批 / 本次调用无审批要求 → undefined（放行）；
+ * - `dryRun=true` → undefined（零写入预演，不需要人工确认；见下）；
  * - 已有**匹配当前参数/身份/未过期**的同意 → undefined（放行）；
  * - 客户端未声明 elicitation → 硬错误（无法发起人工确认，调用不执行）；
  * - 否则返回 `input_required`（宿主/人工确认）。
@@ -177,7 +231,10 @@ export function approvalGate(
   /** 调用方从连接/请求能力声明算出的“客户端能收 elicitation”；省略视为能（SDK 仍会兜底拒绝） */
   clientCanElicit = true,
 ): ApprovalGateResult | undefined {
-  if (!approvalRequired(capability, policy)) return undefined;
+  if (!approvalRequired(capability, args, policy)) return undefined;
+  // dryRun 是零写入预演（当前仅 view_update 声明）：审批只约束真实写入，预演不请求人工确认。
+  // 与 dispatchAuthorized 的审计口径同源——dryRun 成功记 allowed + dryRun:true，不记 completed。
+  if (args['dryRun'] === true) return undefined;
   const principal = principalId ?? currentIdentity()?.clientId ?? '(stdio)';
   const runtime = currentEnvironmentRuntime();
   const env = envArg ?? { key: runtime?.envKey ?? 'DEFAULT', epoch: runtime?.epoch ?? 1 };
@@ -201,7 +258,9 @@ export function approvalGate(
     );
     return mcpErrorText(
       `无法请求人工确认（当前客户端未声明 elicitation/form 能力）：破坏性操作 ${capability.id}（${target}）未执行`,
-      '审批由宿主发起，服务端不能代替。请改用声明 elicitation 能力的 MCP 客户端/宿主后重试；不要重复调用同一参数组合。',
+      '审批由宿主发起，服务端不能代替。请让操作者改用声明 elicitation 能力的 MCP 客户端/宿主后重试；' +
+        'dryRun=true 的只读预演不需要审批，可先做结构 diff。不要重复同一参数组合，' +
+        '也不要检索或修改本机安装/配置文件——这是部署侧的能力缺失，不是可在调用侧修复的参数问题。',
     );
   }
   logger.info(
