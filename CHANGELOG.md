@@ -9,10 +9,14 @@
 - 修复 `hana_env_switch` 在未声明 `elicitation` 的客户端上永远无法切换：控制面切换改为非破坏性（不写 HANA、可再次切回，确认由一次性 `switchToken` + epoch/from + `confirm` 完成），不再要求宿主审批。
 - 审批闸门在派发前检查客户端是否声明表单式 `elicitation`（2025 initialize / 2026 每请求 envelope）：未声明时返回明确硬错误且不派发（审计记 `failed/approval_unsupported`），不再把无法满足的 `input_required` 交给 SDK 变成晦涩的协议层失败。
 - 新增 `HANA_APPROVAL_POLICY`（默认 `off`；显式 `destructive` 开启）：审批只覆盖 `hana_view_delete`、`hana_repo_import` 与 `hana_view_update` changeset 含 delete 动作；默认不逐次确认，无法承载 `elicitation` 的宿主（如 DSH）不再被卡死。
-- `hana_view_update` 的 `dryRun=true` 只读预演不再触发审批（零写入，原本被审批闸门挡住导致预演也不可用）。
-- `hana_system_get_info` 与 `hana_tool_search`（discover/contract/goal）新增 `approval` 块（策略/客户端 elicitation/实际姿态）；审批不可用时的硬错误明确指向「部署侧能力缺失，不要在调用侧检索或改配置」，并提示 `dryRun` 预演。
+- `hana_view_update` 的 `dryRun=true` 只读预演不再触发审批（零写入）；`hana_system_get_info` 与 `hana_tool_search`（discover/contract/goal）新增 `approval` 块（策略/客户端 elicitation/实际姿态）。
 - `hana_table_columns` 支持 BW CALC 视图：名称允许冒号（值仍参数绑定），`SYS.TABLE_COLUMNS` 为空时回退 `SYS.VIEW_COLUMNS`；`hana_view_validate` runtime 对 SQL 模式视图返回 `VALIDATE_UNSUPPORTED`（不再误报一致性失败）。
-- 契约集合整包拒绝时提示拆成单个 contract。
+- 契约集合整包拒绝时提示拆成单个 contract；`hana_view_create` 描述明确禁止在用户要求可视化时静默改用 SQL 模式。
+- **破坏性变更**：图形化节点组合改为 **graph 模块图**（`sources` + `nodes` + `output`）——`hana_view_create` / `hana_view_update` 直接收 graph；节点按 id/inputs 接线，同一模块可实例化多遍（Join_1/Join_2 都是 join），服务端拓扑排序后一次写入。
+- `hana_view_update` 的 graph 是**增量补丁**：按 id 合并 sources/nodes（未提及的保留），`remove` 删除，`output` / `outputFields` / `removeOutputFields` 可改；保留描述/变量等非图段，默认重写自动布局。
+- 移除 operations 公开的 `add_join` / `add_union` / `add_projection` / `add_aggregation` / `add_rank` 操作级别名（节点渲染器内化到 graph）；operations 仅保留 8 个视图级 op（`auto_layout` / `set_script` / `set_description` / `rename_field` / `drop_field` / `add_calculated_column` / `set_attribute_filter` / `set_variable`）。
+- `auto_layout`（Auto Layout / auto-layer）：按节点 DAG 最长路径自动分层，重写顶层 `<layout><shapes>`（含 `Output` MeasureGroup 形状）；纯展示、幂等，不影响激活；graph 构建/合并默认调用它。
+- 限制：graph update 改变 output 且 logicalModel 含计算/限制度量时拒绝；graph 更新不支持 `DATA_BASE_VIEW` 源；CV 初始源只能引用 `_SYS_BIC` 运行时视图实际暴露的列。
 
 ## 1.5.0 - 2026-11-19
 

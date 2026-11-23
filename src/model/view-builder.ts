@@ -7,7 +7,8 @@ import { CHAR_TYPES, isNumericType } from './view-types.js';
  * 视图 XML 生成器：
  * 生成 HANA 2.0 经典的 Calculation:scenario（BiModelCalculation.ecore）设计时 XML。
  * 两种形态：
- * - 图形化最小形态（buildMinCalcViewXml）：单 Projection 节点 + 单个表数据源（全列透传）+ logicalModel 输出；
+ * - 图形化最小形态（buildMinCalcViewXml）：单 Projection 节点 + 单个**物理表**数据源（当前实现；
+ *   HANA 图形化视图本身支持 CALCULATION_VIEW 源，本工具待扩展）+ logicalModel 输出；
  * - SQL 模式（buildScriptedCalcViewXml）：单 SqlScriptView 节点（<definition> SQL）+ logicalModel 输出。
  * 生成的 XML 必须能被 view-xml.ts 的 parseViewDefinition 正确解析（round-trip 单测保证）。
  */
@@ -21,6 +22,12 @@ export interface MinCalcViewSpec {
   schema: string;
   /** 源表名 */
   table: string;
+  /**
+   * CV 初始源：设置后 DataSource 生成 `type="CALCULATION_VIEW"` + `<resourceUri>`，
+   * schema/table 仅用于校验与错误文案（实际引用由 resourceUri 决定）。
+   * 例：`/system-local.bw.bw2hana.query.zdemo01r014/calculationviews/ZDEMO01R014_Q017`。
+   */
+  resourceUri?: string;
   /**
    * 源表列（列名 + 类型名）。
    * 刻意保持内联形状，不用 metadata.service 的 ColumnInfo：调用方是把查到的列映射成
@@ -52,7 +59,7 @@ function scenarioRootAttrsObject(): Record<string, string> {
 }
 
 /** 共享固定属性 → 字符串模板形态（` k="v"` 串；值均为无实体字符的常量，无需转义） */
-function scenarioRootAttrsXml(): string {
+export function scenarioRootAttrsXml(): string {
   return Object.entries(SCENARIO_ROOT_ATTRS)
     .map(([k, v]) => ` ${k}="${v}"`)
     .join('');
@@ -122,13 +129,21 @@ export function buildMinCalcViewXml(spec: MinCalcViewSpec): string {
   const measureSet = new Set(measures);
   const attributes = columns.filter((c) => !measureSet.has(c.columnName)).map((c) => c.columnName);
 
-  const dataSource = {
-    '@_id': dsId,
-    '@_type': 'DATA_BASE_TABLE',
-    // 注意：fast-xml-parser 会把字符串 'true' 序列化为无值布尔属性，须用大写 'TRUE' 才输出 ="TRUE"
-    viewAttributes: { '@_allViewAttributes': 'TRUE' },
-    columnObject: { '@_schemaName': schema, '@_columnObjectName': table },
-  };
+  const dataSource = spec.resourceUri
+    ? {
+        '@_id': dsId,
+        '@_type': 'CALCULATION_VIEW',
+        // 与 add_join 的 DataSource 同形：CV 源用 resourceUri 引用（绝对路径），不用 columnObject。
+        viewAttributes: { '@_allViewAttributes': 'TRUE' },
+        resourceUri: spec.resourceUri,
+      }
+    : {
+        '@_id': dsId,
+        '@_type': 'DATA_BASE_TABLE',
+        // 注意：fast-xml-parser 会把字符串 'true' 序列化为无值布尔属性，须用大写 'TRUE' 才输出 ="TRUE"
+        viewAttributes: { '@_allViewAttributes': 'TRUE' },
+        columnObject: { '@_schemaName': schema, '@_columnObjectName': table },
+      };
 
   // 目标字段序：属性在前、度量在后（解析器只 care 映射关系，顺序不影响正确性）
   const allFields = [...attributes, ...measures];
@@ -373,16 +388,38 @@ export function logicalModelAttributeXml(
   return lines.join('\n');
 }
 
-/** 单个 logicalModel <measure> 元素（度量列；order 接在属性之后） */
-function scriptedMeasureXml(c: NormalizedScriptedColumn, order: number, nodeId: string, indent: string): string {
-  const id = escapeXmlAttr(c.name);
-  return (
-    `${indent}  <measure id="${id}" order="${String(order)}"` +
-    ` aggregationType="${escapeXmlAttr(c.aggregationType)}" measureType="simple">\n` +
-    `${indent}    <descriptions defaultDescription="${escapeXmlAttr(c.description)}"/>\n` +
-    `${indent}    <measureMapping columnObjectName="${escapeXmlAttr(nodeId)}" columnName="${id}"/>\n` +
-    `${indent}  </measure>`
+/**
+ * 单个 logicalModel <measure> 元素（度量列；order 接在属性之后）。
+ *
+ * 单一实现：SQL 模式 create / set_script 重建输出段，与 operations 的节点追加（add_join 带度量、
+ * add_aggregation）共用——两处各写一份时，元素属性集（aggregationType/measureType/描述）会只落一边。
+ * description 缺省时不写 <descriptions>（追加字段可以没有描述）。
+ */
+export function logicalModelMeasureXml(
+  id: string,
+  order: number,
+  sourceObject: string,
+  aggregationType: string,
+  description?: string,
+  indent = '    ',
+): string {
+  const lines = [
+    `${indent}  <measure id="${escapeXmlAttr(id)}" order="${String(order)}"` +
+      ` aggregationType="${escapeXmlAttr(aggregationType)}" measureType="simple">`,
+  ];
+  if (description !== undefined) {
+    lines.push(`${indent}    <descriptions defaultDescription="${escapeXmlAttr(description)}"/>`);
+  }
+  lines.push(
+    `${indent}    <measureMapping columnObjectName="${escapeXmlAttr(sourceObject)}" columnName="${escapeXmlAttr(id)}"/>`,
+    `${indent}  </measure>`,
   );
+  return lines.join('\n');
+}
+
+/** SQL 模式列 → logicalModel <measure>（保持既有 SQL 产出字节不变，描述恒写出） */
+function scriptedMeasureXml(c: NormalizedScriptedColumn, order: number, nodeId: string, indent: string): string {
+  return logicalModelMeasureXml(c.name, order, nodeId, c.aggregationType, c.description, indent);
 }
 
 /** logicalModel 的 <attributes> 与 <baseMeasures> 段（输出字段与类型；属性在前、度量在后） */

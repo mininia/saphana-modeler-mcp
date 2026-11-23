@@ -2,7 +2,7 @@ import type { RuleObject } from './index.js';
 import { VIEW_OPS } from '../services/view-ops.rules.js';
 
 /**
- * 视图操作集（operations 通道的 8 个 op）与异步任务规则。
+ * 视图操作集（operations 通道的 13 个 op）与异步任务规则。
  *
  * op 的方言/守卫口径以 src/services/view-ops.rules.ts 的 detail 为单一事实源——本规则**引用**它生成，
  * 不复制（op 增删时本规则自动跟随，避免第二份清单漂移）。
@@ -18,7 +18,7 @@ export const viewOpsRules: readonly RuleObject[] = [
     id: 'view_ops',
     title: 'operations 的 8 个声明式 op 与各自守卫',
     detail: [
-      'hana_view_update 的三方式之一（与 xml / changeset 三选一）：operations = 声明式操作补丁数组',
+      'hana_view_update 的四方式之一（与 graph / xml / changeset 四选一）：operations = 视图级声明式操作补丁数组',
       '（1~10 条，按序应用；可单发一个 op，便于模型零 XML 完成常见改造）。8 个 op：',
       ...viewOpsCatalog(),
       '',
@@ -29,6 +29,13 @@ export const viewOpsRules: readonly RuleObject[] = [
       '  即便有下游也放行；口径类 op（set_attribute_filter / set_variable）按"行集合/参数语义变化"判破坏；',
       '- 每条的 effect 声明在 src/services/view-ops.rules.ts（destructive / 触碰面 / 数据源引用），',
       '  与工具 schema 的一致性由单测机械钉住。',
+      '- 节点组合（join/union/projection/aggregation/rank）**不走 operations**：用 hana_view_create / hana_view_update 的',
+      '  `graph` 参数（sources + nodes + output）。graph 按节点 id/inputs 声明模块实例，同一模块可用多遍；',
+      '  operations 只保留视图级 op（auto_layout / set_script / 字段改名 / 计算列 / 过滤器 / 变量等）。',
+      '  属性与度量是 logicalModel 的输出分类，不是 join 节点的属性；graph 的 aggregation 节点负责聚合语义。',
+      '- 人工审批默认关闭（HANA_APPROVAL_POLICY=off）；设为 destructive 时只有 hana_view_delete / hana_repo_import，',
+      '  以及 changeset 含 delete 动作时需要确认；先看 hana_tool_search / hana_system_get_info 回执的 approval 块，',
+      '  dryRun=true 的零写入预演不受影响（不触发审批）。',
       '',
       '各 op 的方言与守卫要点（实现细节，报错时按这里的口径给指引）：',
       ...VIEW_OPS.map((op) => `· ${op.id}：${op.detail ?? op.summary}`),

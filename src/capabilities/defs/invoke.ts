@@ -60,7 +60,7 @@ export const invokeCapabilities = {
       whenToUse: [
         '已通过 hana_tool_search 拿到能力 id 与完整契约',
         '按 goal 配方的 steps[] 逐步执行',
-        '操作级别名（如 hana_view_update#add_join）也经本入口',
+        '操作级别名（如 hana_view_update#auto_layout）也经本入口',
       ],
       notFor: [
         '不要凭记忆猜能力 id：先 hana_tool_search(discover/contract)',

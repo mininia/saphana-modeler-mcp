@@ -2,6 +2,7 @@ import { HanaBusinessError } from '../core/errors.js';
 import { escapeXmlAttr } from '../core/xml.js';
 import {
   logicalModelAttributeXml,
+  logicalModelMeasureXml,
   normalizeScriptedColumns,
   scenarioDataCategory,
   scriptedOutputSectionsXml,
@@ -32,6 +33,22 @@ export interface JoinConditionSpec {
 /** 要透出到视图输出的源字段（不含 join 条件字段） */
 export interface JoinFieldSpec {
   id: string;
+  /**
+   * 输出分类：attribute（默认）或 measure。
+   * 属性/度量是 logicalModel 的输出分类，不是节点类型的属性——Join/Union 节点都只是列，
+   * 由 logicalModel 决定它对外是维度还是度量。
+   */
+  kind?: 'attribute' | 'measure';
+  /** kind=measure 时的聚合方式（缺省 sum） */
+  aggregationType?: string;
+  description?: string;
+}
+
+/** 节点追加时新增输出字段的统一声明（logicalModel 视角） */
+export interface OutputFieldSpec {
+  id: string;
+  kind: 'attribute' | 'measure';
+  aggregationType?: string;
   description?: string;
 }
 
@@ -189,16 +206,122 @@ export function guardFullXmlUpdate(xml: string, objectName: string): FullXmlGuar
   };
 }
 
+/** logicalModel 追加字段的返回明细（order 为 logicalModel 全局顺序号） */
+interface AddedOutputField {
+  id: string;
+  order: number;
+  kind: 'attribute' | 'measure';
+}
+
 /**
- * 往 logicalModel 的 <attributes> 段追加输出属性块（单点实现，add_join / add_calculated_column 两处 op 共用）。
- * 三形态兼容（Studio 逐行排版 / 自闭合空段 / **单行紧凑 XML**——最后一类是本服务生成器的产出：
- * 漏了它，「刚 create 出来的视图」就加不了字段）与锚点唯一性断言都委托 replaceSection 承担：
- * 「找段 + 锚点唯一 + 自闭合 + 缩进」规则只有那一份实现，散落成第二份必然各自漂移。
- * 属性块的渲染器共用 view-builder 的 logicalModelAttributeXml（同一形状不在两处声明）。
+ * 给 logicalModel 追加输出字段（单点实现：add_join / add_union 的新增字段都走这里）。
+ * 属性进 <attributes>、度量进 <baseMeasures>；order 从现有最大值续号。
+ * 三形态兼容（Studio 逐行排版 / 自闭合空段 / 单行紧凑 XML）交给 replaceSection——
+ * 「找段 + 锚点唯一 + 自闭合 + 缩进」只有那一份实现。
  */
-function appendLogicalModelAttribute(lmContent: string, blocks: string[]): string {
-  if (blocks.length === 0) return lmContent;
-  return replaceSection(lmContent, 'attributes', { kind: 'append', block: blocks.join('\n') });
+function appendOutputFieldsToLm(
+  lmContent: string,
+  fields: readonly OutputFieldSpec[],
+  nodeId: string,
+): { content: string; added: AddedOutputField[] } {
+  if (fields.length === 0) return { content: lmContent, added: [] };
+  const maxOrder = [...lmContent.matchAll(/order="(\d+)"/g)].reduce((m, x) => Math.max(m, Number(x[1])), 0);
+  const added: AddedOutputField[] = [];
+  const attrBlocks: string[] = [];
+  const measureBlocks: string[] = [];
+  fields.forEach((f, i) => {
+    const order = maxOrder + i + 1;
+    added.push({ id: f.id, order, kind: f.kind });
+    if (f.kind === 'measure') {
+      measureBlocks.push(logicalModelMeasureXml(f.id, order, nodeId, f.aggregationType ?? 'sum', f.description));
+    } else {
+      attrBlocks.push(logicalModelAttributeXml(f.id, order, nodeId, f.description));
+    }
+  });
+  let content = lmContent;
+  if (attrBlocks.length > 0) {
+    content = replaceSection(content, 'attributes', { kind: 'append', block: attrBlocks.join('\n') });
+  }
+  if (measureBlocks.length > 0) {
+    content = replaceSection(content, 'baseMeasures', { kind: 'append', block: measureBlocks.join('\n') });
+  }
+  return { content, added };
+}
+
+/** 视图是否含度量（logicalModel 的 <measure>；<measureMapping> 不是度量声明） */
+function logicalModelHasMeasures(lmContent: string): boolean {
+  return /<measure\b/.test(lmContent);
+}
+
+/** 含度量的 CV 根 dataCategory 必须是 CUBE（本环境 SPS08 实测；否则激活 40117 "No measures defined"） */
+export function ensureCubeDataCategory(xml: string): string {
+  const open = /<Calculation:scenario\b[^>]*>/.exec(xml);
+  if (!open) return xml;
+  const tag = open[0];
+  const next = /\bdataCategory="/.test(tag)
+    ? tag.replace(/\bdataCategory="[^"]*"/, 'dataCategory="CUBE"')
+    : tag.replace(/^<Calculation:scenario\b/, '<Calculation:scenario dataCategory="CUBE"');
+  return xml.slice(0, open.index) + next + xml.slice(open.index + tag.length);
+}
+
+/** 图形化节点变换的共同前置：非 SQL 模式（SQL 模式输出由脚本决定，加节点编译不过） */
+function assertGraphicalForOp(xml: string, op: string): void {
+  assertWritableXmlDeclaration(xml);
+  if (/calculationScenarioType="SCRIPT_BASED"/.test(xml)) {
+    throw new HanaBusinessError(
+      `该视图为 SQL 模式（SCRIPT_BASED）：其输出由脚本决定，不支持 op=${op}。` +
+        `请把逻辑写进脚本并用 op=set_script 替换，或走 xml 全量通道改造`,
+    );
+  }
+}
+
+interface AppendNodeSpec {
+  /** 变换前 logicalModel 指向的输出节点（新节点的左输入） */
+  previousFinalNodeId: string;
+  /** 新节点 id（成为新的输出节点） */
+  newNodeId: string;
+  /** 新节点 XML 块（可含多个节点，按插入顺序追加到 <calculationViews>） */
+  nodeBlock: string;
+  /** 需要追加到 <dataSources> 的新数据源块 */
+  dataSourceBlock?: string;
+  /** 新增的输出字段（join/union）；其余节点类型只重接线、不新增字段 */
+  addedFields?: readonly OutputFieldSpec[];
+  /** 新增字段含度量时把根 dataCategory 归一到 CUBE */
+  cubeIfMeasure?: boolean;
+}
+
+/**
+ * 节点追加 + logicalModel 重接线的共同实现（add_join / add_union / add_projection /
+ * add_aggregation / add_rank 共用）：
+ * - 节点块追加到 <calculationViews>（可带一个数据源块）；
+ * - logicalModel 的 id 与全部 columnObjectName="旧节点" 重挂到新节点；
+ * - 新增输出字段按 kind 进 <attributes>/<baseMeasures>。
+ * 锚点手术在**插入后的最新文本**上重新定位 logicalModel（位置已偏移），与各 op 的既有约定一致。
+ */
+function appendNodeAndRewire(
+  xml: string,
+  spec: AppendNodeSpec,
+): { xml: string; addedOutputFields: AddedOutputField[] } {
+  let out = xml;
+  if (spec.dataSourceBlock) {
+    out = replaceSection(out, 'dataSources', { kind: 'append', block: spec.dataSourceBlock });
+  }
+  out = replaceSection(out, 'calculationViews', { kind: 'append', block: spec.nodeBlock });
+
+  const span = logicalModelSpan(out);
+  const rewired = span.content
+    .split(`columnObjectName="${spec.previousFinalNodeId}"`)
+    .join(`columnObjectName="${spec.newNodeId}"`);
+  const { content, added } = appendOutputFieldsToLm(rewired, spec.addedFields ?? [], spec.newNodeId);
+  out = out.slice(0, span.contentStart) + content + out.slice(span.contentEnd);
+  // id 在开标签上（span 内容之外）：内容重排后单独替换。宽容匹配开标签 id 前的其他属性，
+  // 口径与 guardFullXmlUpdate 一致——严格形态漏配时 id 不重接线，而 columnObjectName 却已全改，
+  // 会静默产出「声明 id 与映射目标不一致」的 XML
+  out = out.replace(/<logicalModel[^>]*\bid="[^"]+"/, `<logicalModel id="${spec.newNodeId}"`);
+  if (spec.cubeIfMeasure && (added.some((f) => f.kind === 'measure') || logicalModelHasMeasures(content))) {
+    out = ensureCubeDataCategory(out);
+  }
+  return { xml: out, addedOutputFields: added };
 }
 
 /**
@@ -334,27 +457,20 @@ export function addJoinToViewXml(xml: string, spec: AddJoinSpec): AddJoinEditRes
   ].join('\n');
 
   // ── 锚点手术（每步断言锚点唯一，打不准就整体失败）────────────────────────
-  let out = xml;
   // 同 id 同 resourceUri 的源已存在 ⇒ 复用（见上面的 DataSource id 冲突守卫），不重复新增
-  if (!existingSource) out = replaceSection(out, 'dataSources', { kind: 'append', block: dataSourceBlock });
-  out = replaceSection(out, 'calculationViews', { kind: 'append', block: `${projectionBlock}\n${joinBlock}` });
-
-  // logicalModel 重接线（在插入后的最新文本上重新定位，位置已因插入而偏移）：
-  // id → 新 join 节点；全部 columnObjectName="旧节点" → 新节点
-  // （columnObjectName 同时出现在 keyMapping 与 measureMapping，一并重接线）
-  const lmSpan = logicalModelSpan(out);
-  const maxOrder = [...lmSpan.content.matchAll(/order="(\d+)"/g)].reduce((m, x) => Math.max(m, Number(x[1])), 0);
-  const addedOutputFields = spec.fields.map((f, i) => ({ id: f.id, order: maxOrder + i + 1 }));
-  const attrBlocks = spec.fields.map((f, i) => logicalModelAttributeXml(f.id, maxOrder + i + 1, joinId, f.description));
-  const rewiredLm = appendLogicalModelAttribute(
-    lmSpan.content.split(`columnObjectName="${finalNodeId}"`).join(`columnObjectName="${joinId}"`),
-    attrBlocks,
-  );
-  out = out.slice(0, lmSpan.contentStart) + rewiredLm + out.slice(lmSpan.contentEnd);
-  // id 在开标签上（span 内容之外）：内容重排后单独替换。宽容匹配开标签 id 前的其他属性，
-  // 口径与 guardFullXmlUpdate 一致——严格形态漏配时 id 不重接线，而 columnObjectName 却已全改，
-  // 会静默产出「声明 id 与映射目标不一致」的 XML
-  out = out.replace(/<logicalModel[^>]*\bid="[^"]+"/, `<logicalModel id="${joinId}"`);
+  const { xml: out, addedOutputFields } = appendNodeAndRewire(xml, {
+    previousFinalNodeId: finalNodeId,
+    newNodeId: joinId,
+    nodeBlock: `${projectionBlock}\n${joinBlock}`,
+    dataSourceBlock: existingSource ? undefined : dataSourceBlock,
+    addedFields: spec.fields.map((f) => ({
+      id: f.id,
+      kind: f.kind ?? 'attribute',
+      aggregationType: f.aggregationType,
+      description: f.description,
+    })),
+    cubeIfMeasure: true,
+  });
 
   return {
     xml: out,
@@ -363,8 +479,595 @@ export function addJoinToViewXml(xml: string, spec: AddJoinSpec): AddJoinEditRes
     newProjectionNodeId: projectionId,
     newDataSourceId: spec.sourceId,
     joinAttributeNames: spec.conditions.map((c) => c.leftField),
-    addedOutputFields,
+    addedOutputFields: addedOutputFields.map(({ id, order }) => ({ id, order })),
   };
+}
+
+/* ── 图形化节点组合：Union / Projection / Aggregation / Rank ────────────────
+ * 图形化 Calculation View 的数据流由 Join / Union / Projection / Aggregation / Rank 等节点组合而成。
+ * 属性与度量不是节点类型的属性——Join/Union 节点只承载列，logicalModel 决定哪一列对外是维度或度量；
+ * Aggregation 决定聚合方式，Rank 决定取行。以下变换都复用 appendNodeAndRewire 的「节点追加 +
+ * logicalModel 重接线」单点实现，与 add_join 同一套锚点手术口径。
+ */
+
+/** logicalModel 中映射到当前输出节点的基础字段（属性/度量分开；计算/限制度量无法机械迁移） */
+interface MappedOutputFields {
+  attributes: Array<{ id: string; description?: string; sourceColumn?: string }>;
+  measures: Array<{ id: string; description?: string; sourceColumn?: string; aggregationType?: string }>;
+  unsupported: string[];
+}
+
+function mappedOutputFields(xml: string, finalNodeId: string): MappedOutputFields {
+  const def = parseViewDefinition(xml, 'calculationview');
+  const mapped = (f: { sourceObject?: string }): boolean => f.sourceObject === finalNodeId;
+  return {
+    attributes: def.outputs.attributes.filter(mapped).map((f) => ({
+      id: f.id,
+      description: f.description,
+      sourceColumn: f.sourceColumn,
+    })),
+    measures: def.outputs.measures.filter(mapped).map((f) => ({
+      id: f.id,
+      description: f.description,
+      sourceColumn: f.sourceColumn,
+      aggregationType: f.aggregationType,
+    })),
+    unsupported: [
+      ...def.outputs.calculatedAttributes,
+      ...def.outputs.calculatedMeasures,
+      ...def.outputs.restrictedMeasures,
+    ]
+      .filter(mapped)
+      .map((f) => f.id),
+  };
+}
+
+/** 节点追加类 op 的共同前置校验：单输出链状图形化视图，且不把计算字段留成悬空映射 */
+function nodeAppendTarget(xml: string, op: string): { finalNodeId: string; nodeFields: string[] } {
+  assertGraphicalForOp(xml, op);
+  const target = getJoinTargetAttrs(xml);
+  const mapped = mappedOutputFields(xml, target.nodeId);
+  if (mapped.unsupported.length > 0) {
+    throw new HanaBusinessError(
+      `输出节点 ${target.nodeId} 上有计算/限制度量映射：${mapped.unsupported.join(', ')}；` +
+        `op=${op} 只重接基础属性/度量，无法机械迁移计算字段。请改用 xml 全量通道`,
+    );
+  }
+  return { finalNodeId: target.nodeId, nodeFields: target.attributes };
+}
+
+function outputMappingBlock(target: string, source: string): string {
+  return (
+    `        <mapping xsi:type="Calculation:AttributeMapping"` +
+    ` target="${escapeXmlAttr(target)}" source="${escapeXmlAttr(source)}"/>`
+  );
+}
+
+/** DataSource id 冲突守卫（add_join / add_union 共用）：同 id 同 URI 复用，同 id 不同 URI 拒绝 */
+function assertDataSourceIdAvailable(xml: string, sourceId: string, resourceUri: string): boolean {
+  const def = parseViewDefinition(xml, 'calculationview');
+  const existing = def.dataSources.find((d) => d.id === sourceId);
+  if (existing && (existing.resourceUri ?? '') !== resourceUri) {
+    throw new HanaBusinessError(
+      `数据源 id "${sourceId}" 已存在于文档中且指向不同对象（现有 resourceUri：` +
+        `${existing.resourceUri ?? '（未声明）'}；本次：${resourceUri}）——` +
+        `同一文档内数据源 id 必须唯一，拒绝变换。请改用其他源视图，或走 xml 全量通道自行处理 id 冲突`,
+    );
+  }
+  return existing !== undefined;
+}
+
+export interface AggregationMeasureSpec {
+  /** 输出度量字段 id（必须已映射到当前输出节点） */
+  field: string;
+  /** 聚合方式：sum/count/min/max/avg 等 */
+  aggregationType: string;
+}
+
+export interface AddAggregationSpec {
+  /** 分组维度（当前输出节点上的属性；可以为空 = 全局聚合） */
+  groupBy: string[];
+  /** 度量及聚合方式（必须覆盖当前全部输出度量） */
+  measures: AggregationMeasureSpec[];
+}
+
+export interface AddAggregationEditResult {
+  xml: string;
+  previousFinalNodeId: string;
+  newAggregationNodeId: string;
+}
+
+/**
+ * 追加 Aggregation 节点：重建节点列集合为「groupBy + measures」，并重接 logicalModel。
+ * 与 add_join 的「只增不改」不同，Aggregation 会改变输出节点的列集合——因此要求逻辑输出的
+ * **全部**基础属性/度量都被显式覆盖，否则重接后会留下悬空映射（激活必失败）。
+ */
+export function addAggregationToViewXml(xml: string, spec: AddAggregationSpec): AddAggregationEditResult {
+  const { finalNodeId, nodeFields } = nodeAppendTarget(xml, 'add_aggregation');
+  const mapped = mappedOutputFields(xml, finalNodeId);
+  if (spec.groupBy.length === 0 && spec.measures.length === 0) {
+    throw new HanaBusinessError('add_aggregation 至少需要 groupBy 或 measures 之一（两者都空 = 无操作）');
+  }
+  const attrIds = new Set(mapped.attributes.map((a) => a.id));
+  const measureIds = new Set(mapped.measures.map((m) => m.id));
+  const seenGroup = new Set<string>();
+  for (const g of spec.groupBy) {
+    if (!attrIds.has(g)) {
+      throw new HanaBusinessError(
+        `groupBy 字段 "${g}" 不是输出节点 ${finalNodeId} 上的输出属性。可用属性：${[...attrIds].join(', ')}`,
+      );
+    }
+    if (seenGroup.has(g)) throw new HanaBusinessError(`groupBy 字段 "${g}" 重复`);
+    seenGroup.add(g);
+  }
+  const seenMeasure = new Set<string>();
+  for (const m of spec.measures) {
+    if (!measureIds.has(m.field)) {
+      throw new HanaBusinessError(
+        `measures 字段 "${m.field}" 不是输出节点 ${finalNodeId} 上的输出度量。可用度量：${[...measureIds].join(', ')}`,
+      );
+    }
+    if (seenMeasure.has(m.field)) throw new HanaBusinessError(`measures 字段 "${m.field}" 重复`);
+    seenMeasure.add(m.field);
+  }
+  const missing = [
+    ...mapped.attributes.filter((a) => !seenGroup.has(a.id)).map((a) => a.id),
+    ...mapped.measures.filter((m) => !seenMeasure.has(m.id)).map((m) => m.id),
+  ];
+  if (missing.length > 0) {
+    throw new HanaBusinessError(
+      `add_aggregation 会重建输出节点的列集合：全部输出字段都必须显式声明分组/聚合方式，` +
+        `否则 logicalModel 会留下悬空映射。未覆盖：${missing.join(', ')}`,
+    );
+  }
+  // 输出列 = groupBy + measures；同一列不能既是维度又是度量
+  const outFields = [...spec.groupBy, ...spec.measures.map((m) => m.field)];
+  if (new Set(outFields).size !== outFields.length) {
+    throw new HanaBusinessError('add_aggregation 的输出列重复（同一字段不能既是分组维度又是度量）');
+  }
+  for (const f of outFields) {
+    if (!nodeFields.includes(f)) {
+      throw new HanaBusinessError(`输出列 "${f}" 不在输出节点 ${finalNodeId} 的 viewAttributes 中，拒绝变换`);
+    }
+  }
+  const nodeIds = parseViewDefinition(xml, 'calculationview').nodes.map((n) => n.id);
+  const aggregationId = `Aggregation_${nextNodeNumber(nodeIds, 'Aggregation')}`;
+  const block = [
+    `    <calculationView xsi:type="Calculation:AggregationView" id="${aggregationId}">`,
+    `      <descriptions/>`,
+    `      <viewAttributes>`,
+    // 本环境激活方言（对齐 ZDEMO_MAT 的真实 XML）：度量在 viewAttribute 上带 aggregationType，
+    // 不再输出 aggregateBy/measureMapping（后者是读侧兼容方言，激活器会报 unknown tag）。
+    ...spec.groupBy.map((f) => `        <viewAttribute id="${escapeXmlAttr(f)}"/>`),
+    ...spec.measures.map(
+      (m) =>
+        `        <viewAttribute id="${escapeXmlAttr(m.field)}" aggregationType="${escapeXmlAttr(m.aggregationType)}"/>`,
+    ),
+    `      </viewAttributes>`,
+    `      <calculatedViewAttributes/>`,
+    `      <input node="#${escapeXmlAttr(finalNodeId)}">`,
+    ...outFields.map((f) => outputMappingBlock(f, f)),
+    `      </input>`,
+    `    </calculationView>`,
+  ].join('\n');
+
+  const { xml: out0 } = appendNodeAndRewire(xml, {
+    previousFinalNodeId: finalNodeId,
+    newNodeId: aggregationId,
+    nodeBlock: block,
+  });
+  // logicalModel 的 measure aggregationType 必须与聚合节点一致，否则语义层与数据流各说一套
+  const span = logicalModelSpan(out0);
+  let content = span.content;
+  for (const m of spec.measures) {
+    const tagRe = new RegExp(`<measure\\b[^>]*\\bid="${escapeRegExp(m.field)}"[^>]*>`);
+    content = content.replace(tagRe, (tag) =>
+      /\baggregationType="[^"]*"/.test(tag)
+        ? tag.replace(/\baggregationType="[^"]*"/, `aggregationType="${escapeXmlAttr(m.aggregationType)}"`)
+        : tag.replace(/^<measure\b/, `<measure aggregationType="${escapeXmlAttr(m.aggregationType)}"`),
+    );
+  }
+  const out = out0.slice(0, span.contentStart) + content + out0.slice(span.contentEnd);
+  return { xml: out, previousFinalNodeId: finalNodeId, newAggregationNodeId: aggregationId };
+}
+
+export interface RankOrderSpec {
+  field: string;
+  direction?: 'ASC' | 'DESC';
+}
+
+export interface AddRankSpec {
+  /** 分组字段（ROW_NUMBER 的 PARTITION BY） */
+  partitionBy: string[];
+  /** 排序字段（每组取前 threshold 条） */
+  orderBy: RankOrderSpec[];
+  threshold: number;
+}
+
+export interface AddRankEditResult {
+  xml: string;
+  previousFinalNodeId: string;
+  newRankNodeId: string;
+}
+
+/** 追加 Rank 节点（每组取前 N 条）：节点列集合与输出字段不变，只重接 logicalModel。 */
+export function addRankToViewXml(xml: string, spec: AddRankSpec): AddRankEditResult {
+  const { finalNodeId, nodeFields } = nodeAppendTarget(xml, 'add_rank');
+  if (spec.partitionBy.length === 0) throw new HanaBusinessError('add_rank 需要至少 1 个 partitionBy 字段');
+  if (spec.orderBy.length === 0) throw new HanaBusinessError('add_rank 需要至少 1 个 orderBy 字段');
+  if (!Number.isInteger(spec.threshold) || spec.threshold < 1) {
+    throw new HanaBusinessError(`add_rank 的 threshold 必须是 ≥1 的整数（收到 ${String(spec.threshold)}）`);
+  }
+  const fieldSet = new Set(nodeFields);
+  for (const [key, vals] of [
+    ['partitionBy', spec.partitionBy],
+    ['orderBy', spec.orderBy.map((o) => o.field)],
+  ] as const) {
+    const seen = new Set<string>();
+    for (const v of vals) {
+      if (!fieldSet.has(v)) {
+        throw new HanaBusinessError(
+          `${key} 字段 "${v}" 不存在于输出节点 ${finalNodeId}（现有列：${nodeFields.join(', ')}）`,
+        );
+      }
+      if (seen.has(v)) throw new HanaBusinessError(`${key} 字段 "${v}" 重复`);
+      seen.add(v);
+    }
+  }
+  const nodeIds = parseViewDefinition(xml, 'calculationview').nodes.map((n) => n.id);
+  const rankId = `Rank_${nextNodeNumber(nodeIds, 'Rank')}`;
+  const block = [
+    `    <calculationView xsi:type="Calculation:RankView" id="${rankId}">`,
+    `      <descriptions/>`,
+    `      <viewAttributes>`,
+    ...nodeFields.map((f) => `        <viewAttribute id="${escapeXmlAttr(f)}"/>`),
+    `      </viewAttributes>`,
+    `      <calculatedViewAttributes/>`,
+    `      <input node="#${escapeXmlAttr(finalNodeId)}">`,
+    ...nodeFields.map((f) => outputMappingBlock(f, f)),
+    `      </input>`,
+    `      <windowFunction>`,
+    ...spec.partitionBy.map(
+      (p) => `        <partitionViewAttributeName>${escapeXmlAttr(p)}</partitionViewAttributeName>`,
+    ),
+    ...spec.orderBy.map(
+      (o) => `        <order byViewAttributeName="${escapeXmlAttr(o.field)}" direction="${o.direction ?? 'ASC'}"/>`,
+    ),
+    `        <rankThreshold><value>${String(spec.threshold)}</value></rankThreshold>`,
+    `      </windowFunction>`,
+    `    </calculationView>`,
+  ].join('\n');
+  const { xml: out } = appendNodeAndRewire(xml, {
+    previousFinalNodeId: finalNodeId,
+    newNodeId: rankId,
+    nodeBlock: block,
+  });
+  return { xml: out, previousFinalNodeId: finalNodeId, newRankNodeId: rankId };
+}
+
+export interface ProjectionFieldSpec {
+  /** 输出字段 id（logicalModel 名；必须已映射到当前输出节点） */
+  id: string;
+  /** 上游列名（缺省 = id；给出且不同 = 在投影节点里重命名该列） */
+  source?: string;
+}
+
+export interface AddProjectionSpec {
+  fields: ProjectionFieldSpec[];
+}
+
+export interface AddProjectionEditResult {
+  xml: string;
+  previousFinalNodeId: string;
+  newProjectionNodeId: string;
+}
+
+/**
+ * 追加 Projection 节点：把当前输出节点的列按 fields 重新投影（可重命名节点列，输出字段 id 不变）。
+ * 与 add_aggregation 相同，投影会重建节点列集合，因此要求覆盖当前全部基础输出字段。
+ */
+export function addProjectionToViewXml(xml: string, spec: AddProjectionSpec): AddProjectionEditResult {
+  const { finalNodeId, nodeFields } = nodeAppendTarget(xml, 'add_projection');
+  const mapped = mappedOutputFields(xml, finalNodeId);
+  if (spec.fields.length === 0) throw new HanaBusinessError('add_projection 需要至少 1 个字段');
+  const baseIds = new Set([...mapped.attributes.map((a) => a.id), ...mapped.measures.map((m) => m.id)]);
+  const seen = new Set<string>();
+  for (const f of spec.fields) {
+    if (!baseIds.has(f.id)) {
+      throw new HanaBusinessError(`字段 "${f.id}" 不是输出节点 ${finalNodeId} 上的输出属性/度量`);
+    }
+    if (seen.has(f.id)) throw new HanaBusinessError(`字段 "${f.id}" 重复`);
+    seen.add(f.id);
+    const source = f.source ?? f.id;
+    if (!nodeFields.includes(source)) {
+      throw new HanaBusinessError(`字段 "${f.id}" 的来源列 "${source}" 不存在于输出节点 ${finalNodeId}`);
+    }
+  }
+  const missing = [...baseIds].filter((id) => !seen.has(id));
+  if (missing.length > 0) {
+    throw new HanaBusinessError(`add_projection 会重建输出节点的列集合，全部输出字段都必须保留：${missing.join(', ')}`);
+  }
+  const nodeIds = parseViewDefinition(xml, 'calculationview').nodes.map((n) => n.id);
+  const projectionId = `Projection_${nextNodeNumber(nodeIds, 'Projection')}`;
+  const block = [
+    `    <calculationView xsi:type="Calculation:ProjectionView" id="${projectionId}">`,
+    `      <descriptions/>`,
+    `      <viewAttributes>`,
+    ...spec.fields.map((f) => `        <viewAttribute id="${escapeXmlAttr(f.id)}"/>`),
+    `      </viewAttributes>`,
+    `      <calculatedViewAttributes/>`,
+    `      <input node="#${escapeXmlAttr(finalNodeId)}">`,
+    ...spec.fields.map((f) => outputMappingBlock(f.id, f.source ?? f.id)),
+    `      </input>`,
+    `    </calculationView>`,
+  ].join('\n');
+  const { xml: out0 } = appendNodeAndRewire(xml, {
+    previousFinalNodeId: finalNodeId,
+    newNodeId: projectionId,
+    nodeBlock: block,
+  });
+  const renames = spec.fields.filter((f) => (f.source ?? f.id) !== f.id);
+  if (renames.length === 0) {
+    return { xml: out0, previousFinalNodeId: finalNodeId, newProjectionNodeId: projectionId };
+  }
+  const span = logicalModelSpan(out0);
+  let content = span.content;
+  for (const f of renames) {
+    const oldColumn = f.source!;
+    const openRe = new RegExp(`<(attribute|measure)\\b[^>]*\\bid="${escapeRegExp(f.id)}"`);
+    const m = openRe.exec(content);
+    if (!m) throw new HanaBusinessError(`logicalModel 中找不到输出字段 "${f.id}" 的声明，无法重接来源列`);
+    const tagName = m[1];
+    const blockEnd = content.indexOf(`</${tagName}>`, m.index);
+    if (blockEnd < 0) throw new HanaBusinessError(`logicalModel 输出字段 "${f.id}" 未闭合，拒绝变换`);
+    const block = content.slice(m.index, blockEnd);
+    const needle = `columnName="${oldColumn}"`;
+    if (!block.includes(needle)) {
+      throw new HanaBusinessError(
+        `输出字段 "${f.id}" 的来源列不是 "${oldColumn}"，无法按 add_projection 的映射重接（拒绝猜测）`,
+      );
+    }
+    content =
+      content.slice(0, m.index) +
+      block.split(needle).join(`columnName="${escapeXmlAttr(f.id)}"`) +
+      content.slice(blockEnd);
+  }
+  const out = out0.slice(0, span.contentStart) + content + out0.slice(span.contentEnd);
+  return { xml: out, previousFinalNodeId: finalNodeId, newProjectionNodeId: projectionId };
+}
+
+export interface UnionFieldMapping {
+  /** 输出字段 id（当前输出节点上的属性/度量） */
+  id: string;
+  /** 右侧源视图上的字段名（可与左侧不同名，在 union 输入映射里对齐） */
+  rightField: string;
+}
+
+export interface AddUnionSpec {
+  /** 右侧源视图的 DataSource id（一般 = 源对象名） */
+  sourceId: string;
+  sourceResourceUri: string;
+  /** 右侧投影节点要携带的源视图列（原始列名） */
+  sourceFields: string[];
+  /** 输出字段 ← 右字段（左侧同名字段） */
+  mappings: UnionFieldMapping[];
+}
+
+export interface AddUnionEditResult {
+  xml: string;
+  previousFinalNodeId: string;
+  newUnionNodeId: string;
+  newProjectionNodeId: string;
+  newDataSourceId: string;
+}
+
+/**
+ * 追加 Union 节点：左输入 = 当前输出节点，右输入 = 右侧源视图的 Projection。
+ * Union 的输出列集合沿用左侧全部基础输出字段（按 id 对齐右侧字段），因此不新增 logicalModel 字段。
+ */
+export function addUnionToViewXml(xml: string, spec: AddUnionSpec): AddUnionEditResult {
+  const { finalNodeId, nodeFields } = nodeAppendTarget(xml, 'add_union');
+  const mapped = mappedOutputFields(xml, finalNodeId);
+  if (spec.mappings.length === 0) throw new HanaBusinessError('add_union 至少需要 1 个字段映射');
+  const baseIds = new Set([...mapped.attributes.map((a) => a.id), ...mapped.measures.map((m) => m.id)]);
+  const sourceFieldSet = new Set(spec.sourceFields);
+  if (sourceFieldSet.size !== spec.sourceFields.length) {
+    throw new HanaBusinessError('add_union 的 sourceFields 含重复列名');
+  }
+  const seenOut = new Set<string>();
+  const seenRight = new Set<string>();
+  for (const m of spec.mappings) {
+    if (!baseIds.has(m.id)) {
+      throw new HanaBusinessError(`union 输出字段 "${m.id}" 不是输出节点 ${finalNodeId} 上的输出属性/度量`);
+    }
+    if (seenOut.has(m.id)) throw new HanaBusinessError(`union 输出字段 "${m.id}" 重复`);
+    seenOut.add(m.id);
+    if (seenRight.has(m.rightField)) throw new HanaBusinessError(`union 右字段 "${m.rightField}" 重复`);
+    seenRight.add(m.rightField);
+    if (!sourceFieldSet.has(m.rightField)) {
+      throw new HanaBusinessError(`union 右字段 "${m.rightField}" 不在 sourceFields 中，拒绝生成悬空映射`);
+    }
+    if (!nodeFields.includes(m.id)) {
+      throw new HanaBusinessError(`union 左字段 "${m.id}" 不在输出节点 ${finalNodeId} 的 viewAttributes 中`);
+    }
+  }
+  const missing = [...baseIds].filter((id) => !seenOut.has(id));
+  if (missing.length > 0) {
+    throw new HanaBusinessError(`add_union 会重建输出节点的列集合，全部输出字段都必须保留：${missing.join(', ')}`);
+  }
+  const existingSource = assertDataSourceIdAvailable(xml, spec.sourceId, spec.sourceResourceUri);
+  const nodeIds = parseViewDefinition(xml, 'calculationview').nodes.map((n) => n.id);
+  const projectionId = `Projection_${nextNodeNumber(nodeIds, 'Projection')}`;
+  const unionId = `Union_${nextNodeNumber(nodeIds, 'Union')}`;
+  const dataSourceBlock = [
+    `    <DataSource id="${escapeXmlAttr(spec.sourceId)}" type="CALCULATION_VIEW">`,
+    `      <viewAttributes allViewAttributes="true"/>`,
+    `      <resourceUri>${escapeXmlAttr(spec.sourceResourceUri)}</resourceUri>`,
+    `    </DataSource>`,
+  ].join('\n');
+  const rightProjectionBlock = [
+    `    <calculationView xsi:type="Calculation:ProjectionView" id="${projectionId}">`,
+    `      <descriptions/>`,
+    `      <viewAttributes>`,
+    ...spec.sourceFields.map((f) => `        <viewAttribute id="${escapeXmlAttr(f)}"/>`),
+    `      </viewAttributes>`,
+    `      <calculatedViewAttributes/>`,
+    `      <input node="#${escapeXmlAttr(spec.sourceId)}">`,
+    ...spec.sourceFields.map((f) => outputMappingBlock(f, f)),
+    `      </input>`,
+    `    </calculationView>`,
+  ].join('\n');
+  const unionBlock = [
+    `    <calculationView xsi:type="Calculation:UnionView" id="${unionId}">`,
+    `      <descriptions/>`,
+    `      <viewAttributes>`,
+    ...spec.mappings.map((m) => `        <viewAttribute id="${escapeXmlAttr(m.id)}"/>`),
+    `      </viewAttributes>`,
+    `      <calculatedViewAttributes/>`,
+    `      <input node="#${escapeXmlAttr(finalNodeId)}">`,
+    ...spec.mappings.map((m) => outputMappingBlock(m.id, m.id)),
+    `      </input>`,
+    `      <input node="#${escapeXmlAttr(projectionId)}">`,
+    ...spec.mappings.map((m) => outputMappingBlock(m.id, m.rightField)),
+    `      </input>`,
+    `    </calculationView>`,
+  ].join('\n');
+  const { xml: out } = appendNodeAndRewire(xml, {
+    previousFinalNodeId: finalNodeId,
+    newNodeId: unionId,
+    nodeBlock: `${rightProjectionBlock}\n${unionBlock}`,
+    dataSourceBlock: existingSource ? undefined : dataSourceBlock,
+  });
+  return {
+    xml: out,
+    previousFinalNodeId: finalNodeId,
+    newUnionNodeId: unionId,
+    newProjectionNodeId: projectionId,
+    newDataSourceId: spec.sourceId,
+  };
+}
+
+/* ── 自动布局（Auto Layout / auto-layer）──────────────────────────────
+ * HANA Studio 的 Auto Layout 是编辑器端动作，仓库侧没有可调的 API；落库结果就是设计时 XML
+ * 的顶层 <layout><shapes>。本变换按节点 DAG 的最长路径分层生成形状坐标：纯展示，不碰
+ * dataSources / calculationViews / logicalModel，激活不受影响。
+ */
+
+export interface AutoLayoutSpec {
+  /** 同层横向间距（默认 120） */
+  columnGap?: number;
+  /** 同层节点纵向间距（默认 90） */
+  rowGap?: number;
+}
+
+export interface AutoLayoutEditResult {
+  xml: string;
+  /** 参与布局的 calculationView 节点数 */
+  nodeCount: number;
+  /** 分层数 */
+  layerCount: number;
+}
+
+/**
+ * 按节点 DAG 自动分层重写顶层 `<layout><shapes>`。
+ * 分层规则：无节点输入的节点为第 0 层；其余节点 = max(上游节点层) + 1。
+ * 同层按节点树原顺序自上而下排列；输出节点正上方生成 `Output`（MeasureGroup）形状。
+ */
+export function autoLayoutViewXml(xml: string, spec: AutoLayoutSpec = {}): AutoLayoutEditResult {
+  assertGraphicalForOp(xml, 'auto_layout');
+  const def = parseViewDefinition(xml, 'calculationview');
+  if (def.nodes.length === 0) throw new HanaBusinessError('视图没有图形化节点，无法自动布局');
+  const lmId = logicalModelDeclaredId(xml);
+  if (!lmId) throw new HanaBusinessError('XML 中缺少 <logicalModel id="…"> 声明，无法确定输出节点，拒绝自动布局');
+  if (!def.nodes.some((n) => n.id === lmId)) {
+    throw new HanaBusinessError(`logicalModel 指向的输出节点 "${lmId}" 不存在于节点树，拒绝自动布局`);
+  }
+  const columnGap = spec.columnGap ?? 120;
+  const rowGap = spec.rowGap ?? 90;
+  if (!Number.isInteger(columnGap) || columnGap < 40) {
+    throw new HanaBusinessError(`columnGap 必须是 ≥40 的整数（收到 ${String(spec.columnGap)}）`);
+  }
+  if (!Number.isInteger(rowGap) || rowGap < 30) {
+    throw new HanaBusinessError(`rowGap 必须是 ≥30 的整数（收到 ${String(spec.rowGap)}）`);
+  }
+
+  const nodeById = new Map(def.nodes.map((n) => [n.id, n]));
+  const layerOf = new Map<string, number>();
+  const visiting = new Set<string>();
+  const layerFor = (id: string): number => {
+    const node = nodeById.get(id);
+    if (!node) return -1; // 数据源 / 外部引用：在节点层之前
+    const cached = layerOf.get(id);
+    if (cached !== undefined) return cached;
+    if (visiting.has(id)) throw new HanaBusinessError(`节点图存在环（经过 ${id}），无法自动布局`);
+    visiting.add(id);
+    let layer = 0;
+    for (const input of node.inputs) {
+      layer = Math.max(layer, layerFor(input.node.replace(/^#/, '')) + 1);
+    }
+    visiting.delete(id);
+    layerOf.set(id, layer);
+    return layer;
+  };
+  for (const n of def.nodes) layerFor(n.id);
+
+  const byLayer = new Map<number, string[]>();
+  for (const n of def.nodes) {
+    const layer = layerOf.get(n.id) ?? 0;
+    const list = byLayer.get(layer) ?? [];
+    list.push(n.id);
+    byLayer.set(layer, list);
+  }
+  const pos = new Map<string, { x: number; y: number }>();
+  for (const [layer, ids] of byLayer) {
+    ids.forEach((id, i) => pos.set(id, { x: 40 + layer * columnGap, y: 40 + i * rowGap }));
+  }
+  const output = pos.get(lmId)!;
+  const shapeBlocks: string[] = [
+    '      <shape expanded="true" modelObjectName="Output" modelObjectNameSpace="MeasureGroup">',
+    `        <upperLeftCorner x="${output.x}" y="${Math.max(10, output.y - 60)}"/>`,
+    '        <rectangleSize height="0" width="0"/>',
+    '      </shape>',
+  ];
+  for (const n of def.nodes) {
+    const p = pos.get(n.id)!;
+    shapeBlocks.push(
+      `      <shape expanded="true" modelObjectName="${escapeXmlAttr(n.id)}" modelObjectNameSpace="CalculationView">`,
+      `        <upperLeftCorner x="${p.x}" y="${p.y}"/>`,
+      '        <rectangleSize height="-1" width="-1"/>',
+      '      </shape>',
+    );
+  }
+  const block = ['  <layout>', '    <shapes>', ...shapeBlocks, '    </shapes>', '  </layout>'].join('\n');
+  const out = replaceTopLevelLayout(xml, block);
+  return { xml: out, nodeCount: def.nodes.length, layerCount: byLayer.size };
+}
+
+/**
+ * 替换顶层 <layout>（logicalModel 之后的那一个；privateDataFoundation 里还有一个同名段）。
+ * 没有顶层 layout 时插在根闭标签之前——生成器产出的最小视图就没有 layout。
+ */
+function replaceTopLevelLayout(xml: string, block: string): string {
+  const lmEnd = xml.indexOf('</logicalModel>');
+  if (lmEnd < 0) throw new HanaBusinessError('XML 中找不到 </logicalModel>，无法定位顶层 layout');
+  const start = xml.indexOf('<layout', lmEnd);
+  if (start >= 0) {
+    const lineStart = xml.lastIndexOf('\n', start) + 1;
+    const prefix = xml.slice(lineStart, start);
+    // 从行首连同缩进一起替换：否则每跑一次就多叠一层缩进（幂等性靠这里）
+    const from = prefix.trim() === '' ? lineStart : start;
+    const openEnd = xml.indexOf('>', start);
+    if (openEnd < 0) throw new HanaBusinessError('XML 中 <layout> 未闭合，拒绝自动布局');
+    if (xml.slice(start, openEnd + 1).endsWith('/>')) {
+      return xml.slice(0, from) + block + xml.slice(openEnd + 1);
+    }
+    const close = xml.indexOf('</layout>', openEnd + 1);
+    if (close < 0) throw new HanaBusinessError('XML 中 <layout> 未闭合，拒绝自动布局');
+    return xml.slice(0, from) + block + xml.slice(close + '</layout>'.length);
+  }
+  const rootClose = xml.lastIndexOf('</Calculation:scenario>');
+  if (rootClose < 0) throw new HanaBusinessError('XML 中找不到 </Calculation:scenario>，无法插入 layout');
+  return xml.slice(0, rootClose) + `${block}\n` + xml.slice(rootClose);
 }
 
 /** 标签段的定位结果（定位逻辑全仓一份，见 replaceSection） */
@@ -378,6 +1081,17 @@ interface Section {
   indent: string;
   /** append 模式的插入点：闭标签独占一行时取行首（块与子元素对齐），否则取闭标签处 */
   appendAt: number;
+}
+
+/** 供图编辑（view-graph）整段替换三个结构段：dataSources / calculationViews / logicalModel。 */
+export function replaceGraphSections(
+  xml: string,
+  sections: { dataSources: string; calculationViews: string; logicalModel: string },
+): string {
+  let out = replaceSection(xml, 'dataSources', { kind: 'replace', text: sections.dataSources });
+  out = replaceSection(out, 'calculationViews', { kind: 'replace', text: sections.calculationViews });
+  out = replaceSection(out, 'logicalModel', { kind: 'replace', text: sections.logicalModel });
+  return out;
 }
 
 /**
@@ -992,9 +1706,10 @@ export function addCalculatedColumnToViewXml(xml: string, spec: AddCalculatedCol
   const lm = logicalModelSpan(xml);
   const maxOrder = [...lm.content.matchAll(/order="(\d+)"/g)].reduce((m, x) => Math.max(m, Number(x[1])), 0);
   const order = maxOrder + 1;
-  const newLm = appendLogicalModelAttribute(lm.content, [
-    logicalModelAttributeXml(spec.name, order, nodeId, spec.description),
-  ]);
+  const newLm = replaceSection(lm.content, 'attributes', {
+    kind: 'append',
+    block: logicalModelAttributeXml(spec.name, order, nodeId, spec.description),
+  });
 
   // 两处替换都在原文档上算好（节点块在前、logicalModel 在后），**从后往前**落，避免下标漂移
   const edits = [

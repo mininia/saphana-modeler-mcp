@@ -107,6 +107,12 @@ export function registerModelingTools(server: McpServer, ctx: ToolContext): void
       mode,
       sourceSchema,
       sourceName,
+      sourcePackageId,
+      sourceObjectName,
+      sourceColumns,
+      operations,
+      graph,
+      layout,
       script,
       scriptColumns,
       measureMode,
@@ -115,19 +121,102 @@ export function registerModelingTools(server: McpServer, ctx: ToolContext): void
       columns,
       probeRows,
     }) => {
-      // mode=sql 与 projection 的必填项不同：schema 层做不出条件必填，这里给可恢复错误
-      if (mode === 'sql' && (!script || !scriptColumns || scriptColumns.length === 0)) {
-        return mcpErrorText(
-          'mode=sql 需要同时提供 script（SQL 脚本）与 scriptColumns（输出列清单，含 dataType）。',
-          '输出列的类型无法从 SQL 文本推断，必须逐个给出；若只想按源表全列透传，请改用 mode=projection',
-        );
+      // mode=sql 与 graphical/projection 的必填项不同：schema 层做不出条件必填，这里给可恢复错误
+      const hasTableSource = sourceSchema !== undefined || sourceName !== undefined;
+      const hasCvSource = sourcePackageId !== undefined || sourceObjectName !== undefined;
+      if (mode === 'sql') {
+        if (!script || !scriptColumns || scriptColumns.length === 0) {
+          return mcpErrorText(
+            'mode=sql 需要同时提供 script（SQL 脚本）与 scriptColumns（输出列清单，含 dataType）。',
+            '输出列的类型无法从 SQL 文本推断，必须逐个给出；若只想按源表全列透传，请改用 mode=graphical',
+          );
+        }
+        if (
+          hasTableSource ||
+          hasCvSource ||
+          sourceColumns !== undefined ||
+          (operations?.length ?? 0) > 0 ||
+          graph !== undefined
+        ) {
+          return mcpErrorText(
+            'mode=sql 不接受 sourceSchema/sourceName、sourcePackageId/sourceObjectName、sourceColumns、operations 或 graph。',
+            'SQL 模式直接用 script 里的 FROM 引用源；需要图形化源/join 请改用 mode=graphical',
+          );
+        }
+      } else if (graph !== undefined) {
+        if (
+          hasTableSource ||
+          hasCvSource ||
+          sourceColumns !== undefined ||
+          columns !== undefined ||
+          (operations?.length ?? 0) > 0
+        ) {
+          return mcpErrorText(
+            'graph 与 source*/sourceColumns/columns/operations 互斥：模块图的源与节点都写在 graph 中。',
+            '用 graph.sources 声明物理表/CV 源，graph.nodes 声明 join/union 等模块实例；不要同时给 sourceSchema/sourceName 或 operations',
+          );
+        }
+      } else {
+        if (hasTableSource && hasCvSource) {
+          return mcpErrorText(
+            '初始源二选一：物理表（sourceSchema/sourceName）与 CV（sourcePackageId/sourceObjectName）不能同时提供。',
+            'CV 作为初始源用 sourcePackageId/sourceObjectName；物理表用 sourceSchema/sourceName',
+          );
+        }
+        if (!hasTableSource && !hasCvSource) {
+          return mcpErrorText(
+            'mode=graphical/projection 需要初始源：物理表给 sourceSchema/sourceName，或用 CV 给 sourcePackageId/sourceObjectName。',
+            '若目标是按 SQL 逻辑建模，请改用 mode=sql（给 script + scriptColumns）',
+          );
+        }
+        if (hasCvSource && (!sourcePackageId || !sourceObjectName)) {
+          return mcpErrorText(
+            'CV 初始源需要同时提供 sourcePackageId 与 sourceObjectName。',
+            '两者缺一无法定位源 CV；也可改用物理表 sourceSchema/sourceName',
+          );
+        }
+        if (hasTableSource && (!sourceSchema || !sourceName)) {
+          return mcpErrorText(
+            '物理表初始源需要同时提供 sourceSchema 与 sourceName。',
+            '两者缺一无法定位源表；也可改用 CV 源 sourcePackageId/sourceObjectName',
+          );
+        }
+        if (hasTableSource && sourceColumns !== undefined) {
+          return mcpErrorText('sourceColumns 仅用于 CV 初始源；物理表源请用 columns（列名清单，类型由服务端回查）。');
+        }
+        if (hasCvSource && sourceColumns !== undefined && columns !== undefined) {
+          return mcpErrorText(
+            'CV 初始源的 columns 与 sourceColumns 二选一：columns 只给列名（类型查 _SYS_BIC），sourceColumns 显式给类型。',
+          );
+        }
       }
-      if (mode === 'projection' && (!sourceSchema || !sourceName)) {
-        return mcpErrorText(
-          'mode=projection 需要提供 sourceSchema 与 sourceName。',
-          '若目标是按 SQL 逻辑建模，请改用 mode=sql（给 script + scriptColumns）',
-        );
-      }
+      const source =
+        mode === 'sql' || graph !== undefined
+          ? undefined
+          : hasCvSource
+            ? {
+                packageId: sourcePackageId!,
+                objectName: sourceObjectName!,
+                measureMode,
+                ...(sourceColumns !== undefined
+                  ? {
+                      columns: sourceColumns.map((c) => ({
+                        columnName: c.name,
+                        dataTypeName: c.dataType,
+                      })),
+                    }
+                  : columns !== undefined
+                    ? { columns: columns.map((c) => ({ columnName: c })) }
+                    : {}),
+              }
+            : {
+                schema: sourceSchema!,
+                name: sourceName!,
+                measureMode,
+                // 工具面 columns 是列名字符串数组：类型由服务层按列名回查源表列目录补齐。
+                // 缺类型会让默认 SUM_NUMERIC 下 0 度量、视图无法激活。
+                ...(columns !== undefined ? { columns: columns.map((c) => ({ columnName: c })) } : {}),
+              };
       const envelope: Envelope = await withErrorEnvelope(() =>
         createCalculationView(ctx.config, ctx.pool, {
           packageId,
@@ -136,16 +225,12 @@ export function registerModelingTools(server: McpServer, ctx: ToolContext): void
           mode,
           ...(mode === 'sql'
             ? { scripted: { script: script!, columns: scriptColumns! } }
-            : {
-                source: {
-                  schema: sourceSchema!,
-                  name: sourceName!,
-                  measureMode,
-                  // 工具面 columns 是列名字符串数组：类型由服务层按列名回查源表列目录补齐。
-                  // 缺类型会让默认 SUM_NUMERIC 下 0 度量、视图无法激活。
-                  columns: columns?.map((c) => ({ columnName: c })),
-                },
-              }),
+            : graph !== undefined
+              ? { graph, layout }
+              : { source: source! }),
+          ...(operations !== undefined && operations.length > 0
+            ? { operations: operations.map((op) => (op.op === 'set_script' ? normalizeSetScriptOp(op) : op)) }
+            : {}),
           activate,
           transport,
           probeRows,
@@ -198,6 +283,8 @@ export function registerModelingTools(server: McpServer, ctx: ToolContext): void
     objectName,
     xml,
     operations,
+    graph,
+    layout,
     changeset,
     ifMatch,
     activate,
@@ -206,22 +293,23 @@ export function registerModelingTools(server: McpServer, ctx: ToolContext): void
     migration,
     async: runAsync,
   }) => {
-    // 三选一（xml / operations / changeset）：入口即拒，服务层的断言保留为纵深防御。
+    // 四选一（xml / operations / graph / changeset）：入口即拒，服务层的断言保留为纵深防御。
     const provided = [
       xml !== undefined ? 'xml' : undefined,
       operations && operations.length > 0 ? 'operations' : undefined,
+      graph !== undefined ? 'graph' : undefined,
       changeset !== undefined ? 'changeset' : undefined,
     ].filter((x): x is string => x !== undefined);
     if (provided.length > 1) {
       return mcpErrorText(
-        `xml / operations / changeset 三选一，请勿同时提供（本次同时收到：${provided.join(' + ')}）`,
-        '单对象改造用 operations（推荐）或 xml；多对象批次用 changeset（单次调用内闭合，失败逆序补偿）',
+        `xml / operations / graph / changeset 四选一，请勿同时提供（本次同时收到：${provided.join(' + ')}）`,
+        '节点组合用 graph（增量合并）；字段/脚本/描述用 operations；全量改造用 xml；多对象批次用 changeset',
       );
     }
     if (provided.length === 0) {
       return mcpErrorText(
-        '需要提供 xml（全量 XML 更新）、operations（声明式操作补丁，推荐）或 changeset（多对象变更集）之一',
-        `单对象用 operations 免读写 XML（加 join / 改 SQL）；多对象批次用 changeset（actions 上限 ${CHANGESET_MAX_ACTIONS}）`,
+        '需要提供 graph（模块图增量合并）、operations（视图级操作补丁）、xml（全量 XML）或 changeset（多对象变更集）之一',
+        `节点组合用 graph；单对象字段/脚本改动用 operations；多对象批次用 changeset（actions 上限 ${CHANGESET_MAX_ACTIONS}）`,
       );
     }
     // async 只与 changeset 组合：静默忽略会制造「已提交任务」的错觉，显式拒绝并指路
@@ -241,6 +329,7 @@ export function registerModelingTools(server: McpServer, ctx: ToolContext): void
         probeRows !== undefined && probeRows !== DEFAULT_PROBE_ROWS ? 'probeRows' : undefined,
         dryRun === true ? 'dryRun=true' : undefined,
         migration !== undefined ? 'migration' : undefined,
+        layout !== undefined ? 'layout' : undefined,
       ].filter((x): x is string => x !== undefined);
       if (inapplicable.length > 0) {
         return mcpErrorText(
@@ -299,7 +388,11 @@ export function registerModelingTools(server: McpServer, ctx: ToolContext): void
         packageId,
         objectName,
         // 命名归一：工具面叫 scriptColumns，内部 view-edit spec 叫 columns——差异只在这一个边界。
-        { xml, operations: operations?.map((op) => (op.op === 'set_script' ? normalizeSetScriptOp(op) : op)) },
+        {
+          xml,
+          operations: operations?.map((op) => (op.op === 'set_script' ? normalizeSetScriptOp(op) : op)),
+          ...(graph !== undefined ? { graph, layout } : {}),
+        },
         // dryRun/migration 的判定一律在服务层；工具层只做 strategy 的合法性收窄。
         { ifMatch, activate, probeRows, dryRun, migration: mig.value },
       ),

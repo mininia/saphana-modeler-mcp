@@ -139,7 +139,7 @@ function collectXmlSchemaNames(node: unknown, schemas: string[], unscanned: stri
   for (const value of Object.values(obj)) collectXmlSchemaNames(value, schemas, unscanned);
 }
 
-/** 声明式操作补丁的入参形状（结构见 hana_view_update 的 operations schema：add_join / set_script） */
+/** 声明式操作补丁的入参形状（结构见 hana_view_update 的 operations schema：节点追加 / set_script 等） */
 interface DeclarativeOp {
   op?: unknown;
   sourcePackageId?: unknown;
@@ -173,11 +173,13 @@ export function planViewCreate(args: Record<string, unknown>): WritePlan {
   const object = objectArg ?? '(未指定对象名)';
   const schema = asStr(args.sourceSchema);
   const source = asStr(args.sourceName);
+  const sourcePkg = asStr(args.sourcePackageId);
+  const sourceObj = asStr(args.sourceObjectName);
   const script = asStr(args.script);
   // 与服务层同一判定：mode 缺省即 projection（此时 script 会被忽略，计划也不该按 SQL 模式描述）
   const isSqlMode = args.mode === 'sql';
-  // 写包（packageId）由**参数声明**派生，此处不再重复声明；源 schema 的读取范围见下方非 sql 分支
-  // （按模式声明——无条件打标签会让 mode=sql 的合法调用被白名单外残留值误拦）
+  // 写包（packageId）由**参数声明**派生，此处不再重复声明；源 schema/包与 operations 的读取范围见下方
+  // 非 sql 分支（按模式声明——无条件打标签会让 mode=sql 的合法调用被白名单外残留值误拦）
   p.steps.push(
     isSqlMode
       ? `在包 ${pkg ?? '(未指定)'} 新建 SQL 模式设计时 Calculation View ${object}（单 SqlScriptView + <definition>）`
@@ -190,13 +192,38 @@ export function planViewCreate(args: Record<string, unknown>): WritePlan {
     }
     p.steps.push('按本环境方言生成设计时 XML（SCRIPT_BASED + definition + viewAttribute datatype）');
   } else {
-    // sourceSchema 只在非 sql 模式被消费——读取范围**按模式**声明（声明层对混合模式的参数不打标签，
-    // 见 defs/modeling 的 VIEW_SOURCE_SCHEMA_FIELD）：mode=sql 时顺手填了白名单外残留值的合法调用
-    // 不该被闸门误拦。与 changeset 的 create/projection 分支同一口径；缺 sourceName 的调用会被
-    // handler 参数校验拒绝，但仍如实声明读取意图（fail-closed 方向，与既有闸门口径一致）。
-    add(p.readSchemas, schema);
-    if (schema && source) {
-      p.steps.push(`读取源 ${schema}.${source} 的列定义（按类型区分属性/度量）`);
+    const graph = asObj(args.graph);
+    if (graph) {
+      const graphSources = Array.isArray(graph.sources) ? graph.sources : [];
+      for (const raw of graphSources) {
+        const s = asObj(raw);
+        if (s?.type === 'calculationview') add(p.readPackages, asStr(s.packageId));
+        else if (s?.type === 'table') add(p.readSchemas, asStr(s.schema));
+      }
+      const nodeCount = Array.isArray(graph.nodes) ? graph.nodes.length : 0;
+      p.steps.push(`按 graph 构建 ${graphSources.length} 个源、${nodeCount} 个模块实例（拓扑排序后一次写入）`);
+    } else {
+      // sourceSchema/sourcePackageId 只在非 sql 模式被消费——读取范围**按模式**声明（声明层对混合模式的参数
+      // 不打标签，见 defs/modeling 的 VIEW_SOURCE_SCHEMA_FIELD）：mode=sql 时顺手填了白名单外残留值的合法调用
+      // 不该被闸门误拦。与 changeset 的 create/projection 分支同一口径；缺源参数的调用会被 handler 拒绝，
+      // 但仍如实声明读取意图（fail-closed 方向，与既有闸门口径一致）。
+      if (sourcePkg) {
+        add(p.readPackages, sourcePkg);
+        p.steps.push(`读取 CV 初始源 ${sourcePkg}/${sourceObj ?? '?'} 的定义与 _SYS_BIC 列结构`);
+      } else {
+        add(p.readSchemas, schema);
+        if (schema && source) {
+          p.steps.push(`读取源 ${schema}.${source} 的列定义（按类型区分属性/度量）`);
+        }
+      }
+      const operations = Array.isArray(args.operations) ? args.operations : [];
+      if (operations.length > 0) {
+        // 视图级 op（set_script 等）的源引用复用 update 规划器的扫描口径，避免 create 路径漏声明。
+        const opPlan = planViewUpdate(args);
+        add(p.readPackages, ...opPlan.readPackages);
+        add(p.readSchemas, ...opPlan.readSchemas);
+        p.steps.push(`在内存中应用 ${operations.length} 条 operations 后再一次性写入`);
+      }
     }
   }
   p.steps.push('生成并写入设计时 XML（XS REST PUT）');
@@ -257,13 +284,24 @@ export function planViewUpdate(args: Record<string, unknown>): WritePlan {
       );
     } else if (sp) {
       add(p.readPackages, sp);
-      p.steps.push(`应用操作 ${i + 1}（${kind}）：join 源 ${sp}/${so ?? '?'} —— 跨包只读引用`);
+      p.steps.push(`应用操作 ${i + 1}（${kind}）：源视图 ${sp}/${so ?? '?'} —— 跨包只读引用`);
     } else {
       p.steps.push(`应用操作 ${i + 1}（${kind}）`);
     }
   });
 
   const xml = asStr(args.xml);
+  const graph = asObj(args.graph);
+  if (graph) {
+    const graphSources = Array.isArray(graph.sources) ? graph.sources : [];
+    for (const raw of graphSources) {
+      const s = asObj(raw);
+      if (s?.type === 'calculationview') add(p.readPackages, asStr(s.packageId));
+      else if (s?.type === 'table') add(p.readSchemas, asStr(s.schema));
+    }
+    const nodeCount = Array.isArray(graph.nodes) ? graph.nodes.length : 0;
+    p.steps.push(`graph 增量合并：${graphSources.length} 个源、${nodeCount} 个模块实例（按 id 合并，未提及的保留）`);
+  }
   if (xml) {
     add(p.readPackages, ...scanXmlPackageRefs(xml));
     // 全量 XML 里的基表数据源 schemaName 是**静态可解析**的读取面——只扫 resourceUri 时
@@ -304,7 +342,13 @@ export function planViewUpdate(args: Record<string, unknown>): WritePlan {
   // 故对象级集合**完全由 actions 并集构成**——把顶层目标也算成"将写入"会在批外对象上造出幽灵写声明。
   const outerRefs = csActions
     ? { reads: [] as ObjectRef[], writes: [] as ObjectRef[], uncertain: [] as string[] }
-    : objectRefsOfUpdate({ packageId: pkg ?? '', objectName: objectArg ?? '', xml, operations: ops });
+    : objectRefsOfUpdate({
+        packageId: pkg ?? '',
+        objectName: objectArg ?? '',
+        xml,
+        operations: ops,
+        graph: asObj(args.graph),
+      });
   let writes: ObjectRef[] = [...outerRefs.writes];
   let reads: ObjectRef[] = [...outerRefs.reads];
   // 共享扫描件的降级出口：解析不出的引用（缺半边源坐标 / 非视图形态的 resourceUri）逐条进 uncertain，
@@ -756,7 +800,9 @@ export function planTableList(args: Record<string, unknown>): WritePlan {
 export function planTableColumns(args: Record<string, unknown>): WritePlan {
   const schema = asStr(args.schema);
   const table = asStr(args.table) ?? '?';
-  return narrativePlan('hana_table_columns', [`读取 ${schema ?? '?'}.${table} 的列结构（SYS.TABLE_COLUMNS）`]);
+  return narrativePlan('hana_table_columns', [
+    `读取 ${schema ?? '?'}.${table} 的列结构（SYS.TABLE_COLUMNS，空则 SYS.VIEW_COLUMNS）`,
+  ]);
 }
 
 /**

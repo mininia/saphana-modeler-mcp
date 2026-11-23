@@ -74,25 +74,33 @@ const SCRIPT_COLUMN_SCHEMA = z.object({
 /** 视图描述（create 顶层与 changeset create 动作共用） */
 const VIEW_DESCRIPTION_FIELD = z.string().max(200).describe('视图描述（默认取对象名）');
 
-/** 视图形态（projection/sql） */
+/** 视图形态（graphical/projection 与 sql；graphical 是 projection 的别名） */
 const VIEW_MODE_ENUM = z
-  .enum(['projection', 'sql'])
+  .enum(['graphical', 'projection', 'sql'])
+  .transform((m) => (m === 'graphical' ? 'projection' : m))
   .describe(
-    '视图形态：projection=单 Projection + 单源表（需 sourceSchema/sourceName）；sql=SQL 模式（需 script + scriptColumns）',
+    '视图形态：graphical=可视化/图形化（projection 的同义值；用 graph 声明 join/union/projection/aggregation/rank 模块实例，' +
+      '无 graph 时为单 Projection + 初始源）；sql=SQL 模式（需 script + scriptColumns）',
   );
 
 /**
- * 源表/视图所在 schema。
+ * 物理表源的 schema（hana_view_create 另有 CV 源参数 sourcePackageId/sourceObjectName）。
  * 不在参数层打 readSchema 标签：仅 mode=projection 消费，打标会误拦「SQL 模式带残留 sourceSchema」的合法调用；
  * 读取范围由规划器按模式声明。.trim() 在声明侧归一，保证闸门与服务层判定同一个值。
  */
 const VIEW_SOURCE_SCHEMA_FIELD = z
   .string()
   .trim()
-  .describe('mode=projection：源表/视图所在 schema，如 SAPABAP1（须在白名单内）');
+  .describe(
+    'mode=projection 的物理表源：schema，如 SAPABAP1（须在白名单内）。hana_view_create 也支持 CV 源 sourcePackageId/sourceObjectName（本 changeset 动作仅物理表）',
+  );
 
-/** 源表/视图名 */
-const VIEW_SOURCE_NAME_FIELD = z.string().describe('mode=projection：源表/视图名');
+/** 源物理表名 / CV 输出列 */
+const VIEW_SOURCE_NAME_FIELD = z
+  .string()
+  .describe(
+    'mode=projection 的物理表源：物理表名（服务端读它的列目录，如 T000）。hana_view_create 也支持 CV 源 sourcePackageId/sourceObjectName（本 changeset 动作仅物理表）',
+  );
 
 /** 度量策略 */
 const VIEW_MEASURE_MODE_ENUM = z
@@ -123,6 +131,128 @@ const VIEW_COLUMNS_FIELD = z
   );
 
 /**
+ * 图形化模块图（graph）：sources + nodes（模块实例）+ output。
+ * 与过程式 add_* 操作不同：节点实例由 id 标识、按 inputs 接线，同一模块可实例化多次
+ * （Join_1 / Join_2 都是 join）；服务端拓扑排序后一次构建。
+ */
+const GRAPH_SOURCE_SCHEMA = z.discriminatedUnion('type', [
+  z.object({
+    id: z.string().min(1).max(128).describe('源 id（在 graph 内唯一）'),
+    type: z.literal('table').describe('物理表源'),
+    schema: z.string().min(1).max(128).describe('schema（须在 HANA_READ_SCHEMA 内）'),
+    name: z.string().min(1).max(128).describe('表名'),
+  }),
+  z.object({
+    id: z.string().min(1).max(128).describe('源 id（在 graph 内唯一）'),
+    type: z.literal('calculationview').describe('计算视图源'),
+    packageId: zPackageId('CV 源包名（只读即可）'),
+    objectName: zObjectName('CV 源对象名'),
+  }),
+]);
+
+const GRAPH_OUTPUT_FIELD_SCHEMA = z.object({
+  id: z.string().min(1).max(128).describe('输出字段 id（必须在输出节点上）'),
+  kind: z.enum(['attribute', 'measure']).optional().describe('输出分类；缺省继承输出节点的列分类'),
+  aggregationType: z.string().max(30).optional().describe('度量聚合方式（缺省 sum）'),
+  description: z.string().max(200).optional().describe('字段描述'),
+});
+
+const GRAPH_NODE_SCHEMA = z.discriminatedUnion('type', [
+  z.object({
+    id: z.string().min(1).max(128).describe('模块实例 id，如 P_MAT / Join_1（在 graph 内唯一）'),
+    type: z.literal('projection'),
+    input: z.string().min(1).max(128).describe('输入 source/node id'),
+    fields: z.array(z.string().min(1).max(128)).min(1).max(600).describe('输出列'),
+    mappings: z
+      .array(z.object({ id: z.string().min(1).max(128), source: z.string().min(1).max(128) }))
+      .max(600)
+      .optional()
+      .describe('输出列 ← 输入列重命名；缺省同名'),
+  }),
+  z.object({
+    id: z.string().min(1).max(128),
+    type: z.literal('join'),
+    inputs: z.tuple([z.string().min(1).max(128), z.string().min(1).max(128)]).describe('[左输入, 右输入]'),
+    joinType: z.enum(['inner', 'leftOuter', 'rightOuter', 'fullOuter']).default('leftOuter'),
+    conditions: z
+      .array(
+        z.object({
+          leftField: z.string().min(1).max(128).describe('左输入字段'),
+          rightField: z.string().min(1).max(128).describe('右输入字段（可不同名）'),
+        }),
+      )
+      .min(1)
+      .max(10),
+    fields: z.array(z.string().min(1).max(128)).min(1).max(600).describe('join 节点输出列'),
+  }),
+  z.object({
+    id: z.string().min(1).max(128),
+    type: z.literal('union'),
+    inputs: z.array(z.string().min(1).max(128)).min(2).max(20).describe('输入 source/node id（≥2）'),
+    fields: z.array(z.string().min(1).max(128)).min(1).max(600).describe('union 输出列'),
+    mappings: z
+      .array(
+        z.object({
+          id: z.string().min(1).max(128),
+          sources: z.array(z.string().min(1).max(128)).min(2).max(20).describe('按 inputs 顺序给出的源字段'),
+        }),
+      )
+      .max(600)
+      .optional()
+      .describe('各输入的重命名映射；缺省同名'),
+  }),
+  z.object({
+    id: z.string().min(1).max(128),
+    type: z.literal('aggregation'),
+    input: z.string().min(1).max(128),
+    groupBy: z.array(z.string().min(1).max(128)).max(100).default([]).describe('分组维度（属性）'),
+    measures: z
+      .array(
+        z.object({
+          field: z.string().min(1).max(128),
+          aggregationType: z.string().min(1).max(30).default('sum'),
+        }),
+      )
+      .min(1)
+      .max(100)
+      .describe('度量及聚合方式'),
+  }),
+  z.object({
+    id: z.string().min(1).max(128),
+    type: z.literal('rank'),
+    input: z.string().min(1).max(128),
+    partitionBy: z.array(z.string().min(1).max(128)).min(1).max(50),
+    orderBy: z
+      .array(
+        z.object({
+          field: z.string().min(1).max(128),
+          direction: z.enum(['ASC', 'DESC']).default('ASC'),
+        }),
+      )
+      .min(1)
+      .max(50),
+    threshold: z.number().int().min(1).max(1000000),
+  }),
+]);
+
+const GRAPH_SCHEMA = z.object({
+  sources: z.array(GRAPH_SOURCE_SCHEMA).min(1).max(50).describe('源（物理表 / CV）'),
+  nodes: z.array(GRAPH_NODE_SCHEMA).min(1).max(100).describe('模块实例（按 id/inputs 接线，可重复使用同一模块）'),
+  output: z.string().min(1).max(128).describe('输出节点 id'),
+  outputFields: z.array(GRAPH_OUTPUT_FIELD_SCHEMA).max(600).optional().describe('输出字段；缺省=输出节点的全部列'),
+});
+
+/** graph 增量补丁：按 id 合并 sources/nodes；remove 删除；output/outputFields 可改 */
+const GRAPH_PATCH_SCHEMA = z.object({
+  sources: z.array(GRAPH_SOURCE_SCHEMA).max(50).optional().describe('新增/替换的源（按 id 合并，未提及的保留）'),
+  nodes: z.array(GRAPH_NODE_SCHEMA).max(100).optional().describe('新增/替换的模块实例（按 id 合并，未提及的保留）'),
+  remove: z.array(z.string().min(1).max(128)).max(100).optional().describe('要删除的 source/node id（仍被引用则拒绝）'),
+  output: z.string().min(1).max(128).optional().describe('新的输出节点 id；省略=保持现有输出'),
+  outputFields: z.array(GRAPH_OUTPUT_FIELD_SCHEMA).max(600).optional().describe('新增/覆盖输出字段（按 id 合并）'),
+  removeOutputFields: z.array(z.string().min(1).max(128)).max(600).optional().describe('要删除的输出字段 id'),
+});
+
+/**
  * 声明式操作补丁（operations）：hana_view_update 单对象通道与 changeset 的 update 动作共用一份。
  * 可选性与 describe 由使用处加；op 全集与 effect 见 services/view-ops.rules.ts（VIEW_OPS）。
  */
@@ -130,28 +260,11 @@ const VIEW_UPDATE_OPERATIONS_SCHEMA = z
   .array(
     z.discriminatedUnion('op', [
       z.object({
-        op: z.literal('add_join').describe('操作类型：追加一个 join'),
-        sourcePackageId: zPackageId('join 源视图的包名（只读即可），如 system-local.bw.bw2hana.query.zdemo01r014'),
-        sourceObjectName: zObjectName('join 源视图对象名（不含包名），如 ZDEMO01R014_Q017'),
-        joinType: z
-          .enum(['inner', 'leftOuter', 'rightOuter', 'fullOuter'])
-          .default('leftOuter')
-          .describe('join 类型，默认 leftOuter'),
-        conditions: z
-          .array(
-            z.object({
-              leftField: z.string().min(1).describe('当前输出节点上的字段（必须已存在）'),
-              rightField: z.string().min(1).describe('源视图上的字段（可与左侧不同名，自动接线）'),
-            }),
-          )
-          .min(1)
-          .max(10)
-          .describe('join 条件（1~10 组），如 [{leftField:"0MATERIAL", rightField:"ZDEMO_MAT"}]'),
-        fields: z
-          .array(z.string())
-          .max(100)
-          .optional()
-          .describe('要透出的源视图字段；省略=自动带出全部新增属性（推荐省略）'),
+        op: z
+          .literal('auto_layout')
+          .describe('操作类型：按节点 DAG 自动分层重写布局（Auto Layout / auto-layer；纯展示，不影响激活）'),
+        columnGap: z.number().int().min(40).max(1000).optional().describe('同层横向间距（默认 120）'),
+        rowGap: z.number().int().min(30).max(1000).optional().describe('同层节点纵向间距（默认 90）'),
       }),
       z.object({
         op: z.literal('set_script').describe('操作类型：替换 SQL 模式视图的脚本与输出列'),
@@ -284,7 +397,7 @@ const CHANGESET_ACTION_SCHEMA = z.object({
     })
     .optional()
     .describe(
-      'action=create + mode=projection：源表/视图（与 hana_view_create 的 sourceSchema/sourceName/columns/measureMode 同义）',
+      'action=create + mode=projection：源物理表（当前实现；与 hana_view_create 的 sourceSchema/sourceName/columns/measureMode 同义）',
     ),
   scripted: z
     .object({
@@ -302,19 +415,34 @@ const baseModelingCapabilities = {
     kind: 'write',
     effects: { plan: planViewCreate, destructive: false, idempotent: false, mutates: 'persistent' },
     routing: {
-      intent: '在仓库中新建 Calculation View（projection / SQL 模式）',
-      whenToUse: ['用户明确要新建视图', '需要零 XML 的 SQL 模式建视图'],
-      notFor: ['修改已有视图用 hana_view_update，不要 delete+重建'],
+      intent: '在仓库中新建 Calculation View（graph 模块图 / SQL 模式）',
+      whenToUse: [
+        '用户明确要新建视图',
+        '用 join/union/projection/aggregation/rank 模块组合计算视图',
+        '需要零 XML 的 SQL 模式建视图',
+      ],
+      notFor: [
+        '修改已有视图用 hana_view_update，不要 delete+重建',
+        '用户明确要可视化 CV 时不要静默改用 SQL 模式；用 graph（sources + nodes + output）声明模块图，或先与用户确认',
+      ],
       priority: 'primary',
       requires: '目标包在 HANA_WRITE_PACKAGES 可写范围内',
-      exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV009', mode: 'projection' },
+      constraints: [
+        'graph 与 source*/operations 互斥：模块图把源和节点都写在 graph 里；不走 graph 时才用 sourceSchema/sourceName 或 sourcePackageId/sourceObjectName 的单 Projection 形态',
+        'graph.nodes 按 id/inputs 接线，同一模块可实例化多次（Join_1/Join_2 都是 join）；服务端拓扑排序后一次写入',
+        'CV 源必须已激活；table 源按 SYS.TABLE_COLUMNS/VIEW_COLUMNS 取列，数值类型=度量',
+      ],
+      exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV009', mode: 'graphical' },
     },
     title: '新建 Calculation View（计算视图）',
     // SQL 方言、实测边界与并发解释见规则 sql_mode / activation_measure / write_transport / write_receipt。
     description:
-      '在仓库中新建一个 Calculation View，mode 二选一：\n' +
-      '① projection（默认）：单 Projection 节点 + 单源表透传——需 sourceSchema/sourceName（可选 columns/measureMode）；\n' +
+      '在仓库中新建一个 Calculation View，mode 三选一（graphical 是 projection 的别名）：\n' +
+      '① graphical/projection（默认）：用 graph 声明模块图（sources + nodes + output）——join/union/projection/aggregation/rank 都是模块实例，' +
+      '按 id/inputs 接线，同一模块可用多遍；服务端拓扑排序后一次性构建（自动布局默认开启）。' +
+      '不使用 graph 时退化为「单 Projection + 初始源」：物理表（sourceSchema/sourceName）或 CV（sourcePackageId/sourceObjectName）。\n' +
       '② sql：SQL 模式（Scripted Calculation View）——需 script + scriptColumns。按 SQL 建视图一律用它，模型零 XML。\n' +
+      '如果用户明确要求「可视化/图形化 CV」，优先用 graph；属性/度量是 logicalModel 的输出分类，不是 join 节点的属性。不要静默改成 SQL 模式。\n' +
       '安全约束：可写包由 HANA_WRITE_PACKAGES 限定（留空=拒写 boundary_off）；同名对象已存在时拒绝覆盖。\n' +
       '回执：activated（写入后实测状态）、activationErrors/activationDetail（激活失败完整明细，无需再调 hana_view_validate）、rowProbe（0 行附排查提示）。\n' +
       'SQL 方言、scriptColumns↔VAR_OUT 与 ≥1 度量要求、通道差异见 rules=sql_mode,activation_measure,write_transport,write_receipt。',
@@ -325,6 +453,29 @@ const baseModelingCapabilities = {
       mode: VIEW_MODE_ENUM.default('projection'),
       sourceSchema: VIEW_SOURCE_SCHEMA_FIELD.optional(),
       sourceName: VIEW_SOURCE_NAME_FIELD.optional(),
+      sourcePackageId: zPackageId(
+        'mode=projection 的 CV 初始源：源 CV 包名（只读即可），如 system-local.bw.bw2hana.query.zdemo01r014；与 sourceSchema/sourceName 二选一',
+      ).optional(),
+      sourceObjectName: zObjectName(
+        'mode=projection 的 CV 初始源：源 CV 对象名（不含包名），如 ZDEMO01R014_Q017；与 sourceSchema/sourceName 二选一',
+      ).optional(),
+      sourceColumns: z
+        .array(SCRIPT_COLUMN_SCHEMA)
+        .max(600)
+        .optional()
+        .describe(
+          'CV 初始源的显式输出列（name/dataType；省略=按 _SYS_BIC 的 SYS.VIEW_COLUMNS 取可见列）。' +
+            '源 CV 的隐藏 Join 键不在 VIEW_COLUMNS 里时，用本字段显式给出列名与类型',
+        ),
+      operations: VIEW_UPDATE_OPERATIONS_SCHEMA.optional().describe(
+        '图形化 create 的视图级声明式操作（如 auto_layout / set_description / set_script）：在内存中应用到基础 XML 后再一次性 PUT；' +
+          '节点组合（join/union/projection/aggregation/rank）请写在 graph 中，不要用逐个 add_*。mode=sql 不接受',
+      ),
+      graph: GRAPH_SCHEMA.optional().describe(
+        '图形化模块图：sources + nodes（模块实例）+ output。与 source*/operations 互斥；节点按 id/inputs 接线，同一模块可实例化多次；' +
+          '服务端拓扑排序后一次构建，默认写自动布局',
+      ),
+      layout: z.boolean().optional().describe('graph 构建后是否写自动布局（默认 true）'),
       script: VIEW_SCRIPT_FIELD.optional(),
       scriptColumns: VIEW_SCRIPT_COLUMNS_FIELD.optional(),
       measureMode: VIEW_MEASURE_MODE_ENUM.default('SUM_NUMERIC'),
@@ -462,34 +613,41 @@ const baseModelingCapabilities = {
     // 审批只覆盖 changeset 的 delete 动作；普通 update（含 operations/xml）不确认。
     approval: changesetHasDelete,
     routing: {
-      intent: '更新已有 Calculation View（声明式 operations / 全量 XML / 变更集）',
-      whenToUse: ['修改已有视图（默认走 operations）', '需要 dryRun 预演破坏性变更'],
+      intent: '更新已有 Calculation View（graph 增量合并 / 视图级 operations / 全量 XML / 变更集）',
+      whenToUse: [
+        '修改已有视图的模块图（join/union 等）用 graph',
+        '改字段/脚本/描述用 operations',
+        '需要 dryRun 预演破坏性变更',
+      ],
       notFor: ['新建用 hana_view_create；不要 delete+重建'],
       priority: 'primary',
       requires: '目标包在 HANA_WRITE_PACKAGES 可写范围内',
       exampleArgs: {
         packageId: 'ZDEMO.ZDEMO_MGF',
         objectName: 'ZDEMO02_CV008',
-        operations: [{ op: 'set_description', description: '示例描述' }],
+        graph: { nodes: [{ id: 'P1', type: 'projection', input: 'S1', fields: ['A'] }] },
       },
       returns: [
+        'graph 模式：重建后的结构段与实测激活状态（增量合并，未提及节点保留）',
         'operations 模式：每条操作的应用明细 + 实测激活状态',
         'dryRun=true：mode=dryRun + 结构 diff/影响半径/breaking，零写入',
         '412 冲突：raw.conflict 带当前 ETag/版本；changeset 逐项 report',
       ],
     },
-    title: '更新 Calculation View（声明式 operations / 全量 XML / 变更集）',
-    // 以下为契约锁定项（改描述时勿删）：三方式互斥、关键参数名、migration 合法值、机读码全集、
+    title: '更新 Calculation View（graph / 视图级 operations / 全量 XML / 变更集）',
+    // 以下为契约锁定项（改描述时勿删）：四方式互斥、关键参数名、migration 合法值、机读码全集、
     // 回执字段名、零写入语义。
     description:
-      '更新已有 Calculation View，三种方式三选一（互斥）：\n' +
-      '① operations（推荐）：声明式操作补丁 op=' +
+      '更新已有 Calculation View，四种方式四选一（互斥）：\n' +
+      '① graph（节点组合推荐）：模块图增量补丁——按 id 合并 sources/nodes（未提及的保留），remove 删除，output/outputFields 可改；' +
+      '服务端重建 dataSources/calculationViews/logicalModel 后走原 PUT 路径，默认重写自动布局；\n' +
+      '② operations：视图级声明式操作 op=' +
       VIEW_OPS.map((o) => o.id).join(' / ') +
       '，服务端读取当前定义并确定性变换后走原 PUT 路径——模型零 XML，返回每条操作的应用明细与实测激活状态；\n' +
-      '② xml：完整设计时 XML 全量覆盖（复杂改造用；写入前有服务端护栏，通过后返回 xmlVerification 摘要）；\n' +
-      `③ changeset：多对象变更集（动作上限 ${CHANGESET_MAX_ACTIONS}，单次调用内闭合）——整体预检不通过则整批拒绝、零写入；` +
+      '③ xml：完整设计时 XML 全量覆盖（复杂改造用；写入前有服务端护栏，通过后返回 xmlVerification 摘要）；\n' +
+      `④ changeset：多对象变更集（动作上限 ${CHANGESET_MAX_ACTIONS}，单次调用内闭合）——整体预检不通过则整批拒绝、零写入；` +
       '任一项失败即逆序补偿；partial=true 时逐项枚举状态（含 notExecuted），绝不把部分完成包装成 success。\n' +
-      '①② 都走 XS REST PUT + If-Match ETag 乐观锁：基线读 → 内容读 → PUT 在同一进程内锁临界区完成。\n' +
+      '①②③ 都走 XS REST PUT + If-Match ETag 乐观锁：基线读 → 内容读 → PUT 在同一进程内锁临界区完成。\n' +
       '关键参数：ifMatch（省略=自动取；基于更早读取的内容覆盖时必须显式传）、activate、probeRows（默认 10）、' +
       'dryRun=true（只读预演：结构 diff + 影响半径 + 破坏性判定，零写入，回执 mode=dryRun）、' +
       'migration.strategy（破坏性变更的显式承担声明，合法值 cast / preserve_column / move / acknowledge_dependents；' +
@@ -512,10 +670,15 @@ const baseModelingCapabilities = {
           .string()
           .min(1)
           .optional()
-          .describe('方式一：完整设计时 XML 全量覆盖（与 operations 二选一；常规加 join / 改 SQL 优先用 operations）'),
+          .describe('方式三：完整设计时 XML 全量覆盖（与 operations/graph 三选一；复杂改造用）'),
         operations: VIEW_UPDATE_OPERATIONS_SCHEMA.optional().describe(
-          '方式二（推荐）：声明式操作补丁（与 xml 二选一）；服务端确定性变换，模型零 XML',
+          '方式二：视图级声明式操作补丁（与 xml/graph 三选一）；节点组合请走 graph，不要逐个 add_*',
         ),
+        graph: GRAPH_PATCH_SCHEMA.optional().describe(
+          '方式三：模块图增量补丁（与 xml/operations 三选一）——按 id 合并 sources/nodes（未提及的保留），remove 删除，' +
+            'output/outputFields 可改；服务端重建结构段后走同一 PUT 路径，默认重写自动布局',
+        ),
+        layout: z.boolean().optional().describe('graph 合并后是否重写自动布局（默认 true）'),
         changeset: z
           .object({
             actions: z
@@ -547,7 +710,7 @@ const baseModelingCapabilities = {
           .boolean()
           .default(false)
           .describe(
-            'true=只读预演（零写入）：读当前设计时定义 → 应用 operations/xml → 结构 diff → 影响半径 → 破坏性判定；不 PUT、不激活、不 probe，回执带 mode=dryRun',
+            'true=只读预演（零写入）：读当前设计时定义 → 应用 graph/operations/xml → 结构 diff → 影响半径 → 破坏性判定；不 PUT、不激活、不 probe，回执带 mode=dryRun',
           ),
         async: z
           .boolean()
@@ -578,7 +741,7 @@ const baseModelingCapabilities = {
           ctx.addIssue({
             code: 'custom',
             message:
-              '非 changeset 模式下必须提供 packageId 与 objectName（xml/operations 单对象通道的目标对象）；' +
+              '非 changeset 模式下必须提供 packageId 与 objectName（graph/operations/xml 单对象通道的目标对象）；' +
               'changeset 模式下这两个参数被忽略，请把目标写在各自的 action 上',
           });
         }

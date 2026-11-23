@@ -6,8 +6,8 @@
  * - 计划面：planViewOpAlias 把入参还原成父工具的一次 operations 调用，交给父规划器。
  *
  * 条目标 routeOnly: true：可发现、可授权，但永不注册为工具——调用方式：
- *   hana_invoke({ capability: "hana_view_update#add_join", args: { packageId, objectName, … } })
- * 与 hana_invoke({ capability: "hana_view_update", args: { …, operations: [{ op: "add_join", … }] } })
+ *   hana_invoke({ capability: "hana_view_update#auto_layout", args: { packageId, objectName, … } })
+ * 与 hana_invoke({ capability: "hana_view_update", args: { …, operations: [{ op: "auto_layout", … }] } })
  * 完全等价（同一 handler、同一闸门；审批按 op 的 destructive 声明）。
  */
 
@@ -18,11 +18,7 @@ import { VIEW_OPS } from '../../services/view-ops.rules.js';
 
 /** 操作级别名的 canonical 示例载荷（只用于契约披露的 call/canonicalCall；不参与执行）。 */
 const ALIAS_EXAMPLE_PAYLOAD: Record<string, Record<string, unknown>> = {
-  add_join: {
-    sourcePackageId: 'ZDEMO.ZDEMO_MGF',
-    sourceObjectName: 'SRC_CV',
-    conditions: [{ leftField: 'A', rightField: 'B' }],
-  },
+  auto_layout: { columnGap: 120, rowGap: 90 },
   set_script: { script: 'SELECT 1 AS A FROM DUMMY', scriptColumns: [{ name: 'A', dataType: 'INTEGER' }] },
   set_description: { description: '示例描述' },
   rename_field: { field: 'FIELD_A', newName: 'FIELD_B' },

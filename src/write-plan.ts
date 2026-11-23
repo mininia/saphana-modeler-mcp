@@ -230,6 +230,7 @@ export function objectRefsOfUpdate(input: {
   objectName: string;
   xml?: string;
   operations?: unknown[];
+  graph?: { sources?: Array<{ type?: unknown; packageId?: unknown; objectName?: unknown }> };
 }): { reads: ObjectRef[]; writes: ObjectRef[]; uncertain: string[] } {
   const writes: ObjectRef[] = [];
   const reads: ObjectRef[] = [];
@@ -237,6 +238,21 @@ export function objectRefsOfUpdate(input: {
   const pkg = nonEmptyStr(input.packageId);
   const objectName = nonEmptyStr(input.objectName);
   if (pkg && objectName) writes.push({ packageId: pkg, objectName });
+  if (input.graph && Array.isArray(input.graph.sources)) {
+    input.graph.sources.forEach((raw, i) => {
+      if (raw?.type !== 'calculationview') return;
+      const sp = nonEmptyStr(raw.packageId);
+      const so = nonEmptyStr(raw.objectName);
+      if (sp && so) {
+        reads.push({ packageId: sp, objectName: so });
+        return;
+      }
+      uncertain.push(
+        `graph.sources[${i}] 是 calculationview 但只给出包名/对象名之一` +
+          `（packageId=${sp ?? '(缺)'}、objectName=${so ?? '(缺)'}）：无法解析为对象级引用，不参与批内相交检测（不猜）`,
+      );
+    });
+  }
   if (typeof input.xml === 'string') {
     const scanned = scanXmlObjectRefsWithUnresolved(input.xml);
     reads.push(...scanned.refs);
