@@ -100,30 +100,6 @@ export const ERROR_CODES: readonly ErrorCodeSpec[] = [
     remediation: '为该环境配置非空的 HANA_WRITE_PACKAGES（或切到可写环境）；临时对象与纯读不受影响。',
   },
   {
-    code: 'env_assertion_missing',
-    category: 'environment',
-    summary: '多环境调用缺少上下文令牌/环境断言',
-    remediation: '传入 hana_tool_search 回执里的 contextToken（旧写法：当前环境标识 + epoch）。',
-  },
-  {
-    code: 'env_assertion_mismatch',
-    category: 'environment',
-    summary: '环境断言与当前环境不一致',
-    remediation: '先确认是否忘了切回；用 hana_env_list 查看当前环境后重新取 contextToken。',
-  },
-  {
-    code: 'env_epoch_missing',
-    category: 'environment',
-    summary: '多环境调用缺少 epoch',
-    remediation: '重新调用 hana_tool_search 取 contextToken（旧写法：传入 hana_env_list 返回的 epoch）。',
-  },
-  {
-    code: 'env_epoch_stale',
-    category: 'environment',
-    summary: '环境代际已过期',
-    remediation: '重新调用 hana_tool_search / hana_env_list 取当前代际后重试；旧披露不可复用。',
-  },
-  {
     code: 'env_switch_disabled',
     category: 'environment',
     summary: '环境切换未启用',
@@ -249,25 +225,14 @@ export const ERROR_CODES: readonly ErrorCodeSpec[] = [
     code: 'context_stale',
     category: 'authorization',
     summary: 'contextToken 已过期，或身份/环境/代际/策略/清单已变化',
-    remediation: '重新调用 hana_tool_search（discover/contract/goal）获取新 contextToken；切环境后必须重新获取。',
+    remediation: '重新调用 hana_tool_search（contract/goal）获取新 contextToken；切环境后必须重新获取。',
   },
   {
-    code: 'disclosure_stale',
+    code: 'capability_not_disclosed',
     category: 'authorization',
-    summary: '旧披露包已过期、不属于本次调用或属于其它工具',
-    remediation: '重新调用 hana_tool_search 披露，或改用 contextToken。',
-  },
-  {
-    code: 'policy_stale',
-    category: 'authorization',
-    summary: '披露包的策略代际与当前策略不一致',
-    remediation: '重新调用 hana_tool_search 披露（策略/档案/环境已变化）。',
-  },
-  {
-    code: 'manifest_stale',
-    category: 'authorization',
-    summary: '披露包的能力清单代际与当前清单不一致',
-    remediation: '重新披露；服务端可能已升级。',
+    summary: 'contextToken 绑定的披露集合不包含目标能力',
+    remediation:
+      '先 hana_tool_search({mode:"contract", tools:[目标能力]}) 取完整契约与新的 contextToken，再调用 hana_invoke。',
   },
   {
     code: 'schema_not_allowed',

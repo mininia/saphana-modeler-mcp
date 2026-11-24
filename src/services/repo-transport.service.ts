@@ -59,7 +59,7 @@ function isSafePackageName(packageId: string): boolean {
  * - 白名单为空 → 本服务层不限制（fail-open，配置未填时的默认）；端到端空白名单 = 声明写包的调用
  *   被闸门拒绝（两层口径见 config/write-boundary.ts 文件头）
  * - 白名单非空 → 包名须等于某配置包，或以其为前缀（包名 = 配置包 或 包名以「配置包.」开头）
- *   例：配置 ["ZDEMO","ZDEMO.ZDEMO_SD"] → ZDEMO / ZDEMO.X / ZDEMO.ZDEMO_SD / ZDEMO.ZDEMO_SD.SUB 放行，
+ *   例：配置 ["ZDEMO","ZDEMO.ZDEMO02"] → ZDEMO / ZDEMO.X / ZDEMO.ZDEMO02 / ZDEMO.ZDEMO02.SUB 放行，
  *       OTHER / OTHER.X 拒绝（既不等于配置项，也不以其加「.」开头）。
  * 所有写路径（新建/更新/删除/激活/校验/导入/建包）都经本函数，故审计日志挂在此处：
  * HTTP 模式下多个客户端共享同一 HANA 技术账号，仓库侧（_SYS_REPO 的 OWNER/ACTIVATED_BY）

@@ -46,7 +46,7 @@ export const ALL_MODES: readonly StorageMode[] = [
 /**
  * BW 表分类（`M_TABLE_PARTITIONS` 的 `GROUP_TYPE`/`SUBTYPE`，实测为**表级**属性：全库无表出现两种分类）。
  * 同一个 BW 对象在 HANA 上是一组物理表，光看表名分不清谁是谁（如同一 aDSO 的活动表
- * `/BIC/AZDEMO_DSO012` 与入站队列 `/BIC/AZDEMO_DSO0140`）：
+ * `/BIC/AZDEMO19` 与入站队列 `/BIC/AZDEMO20`）：
  *   BW_DSO / ACTIVE ← aDSO 活动数据表（业务上"真正的那张表"）；QUEUE ← 入站队列（delta 侧，随时清空）；
  *   CHANGE_LOG ← 变更日志；BW_PSA / PSA ← 持久暂存区；BW_CUBE / FACT_IMO ← InfoCube 事实表。
  * ⚠ 只看 `SUBTYPE` 不够：入站队列与活动表可能同名不同后缀，必须靠分类区分。
@@ -56,7 +56,7 @@ export interface BwClass {
   groupType: string;
   /** 如 ACTIVE / QUEUE / CHANGE_LOG / PSA / FACT_IMO；非 BW 表为空串 */
   subtype: string;
-  /** BW 对象名（aDSO/PSA/Cube 的业务名），如 ZDEMO_DSO01 */
+  /** BW 对象名（aDSO/PSA/Cube 的业务名），如 ZDEMO19 */
   object: string;
 }
 
@@ -804,7 +804,7 @@ export async function runTableStorage(pool: HanaPool, req: StorageRequest): Prom
   };
 }
 
-/** BW 分类的可读后缀，如「（aDSO 活动表 ZDEMO_DSO01）」 */
+/** BW 分类的可读后缀，如「（aDSO 活动表 ZDEMO19）」 */
 function describeClass(t: TableStorageRow | undefined): string {
   const c = t?.bwClass;
   if (!c || (!c.groupType && !c.subtype)) return '';

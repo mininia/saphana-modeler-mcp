@@ -91,7 +91,7 @@ Connection info is only allowed from environment variables / `mcp.json` `env` (*
 | `HANA_SSL_VALIDATE` | optional | Validate certificate under TLS, default `true`; set `false` for self-signed certs | `true` |
 | `HANA_TIMEZONE` | optional | Process timezone (sets `TZ`, affecting log timestamps and local-time semantics); **not pushed down to the HANA session**. Default `Asia/Shanghai` | `Asia/Shanghai` |
 | `HANA_READ_SCHEMA` | optional | Extra queryable schemas (comma-separated, appended to built-in allowlist) | `SAPABAP1,OTHER_SCHEMA` |
-| `HANA_WRITE_PACKAGES` | optional | Writable repository package prefixes (comma-separated, incl. sub-packages). **Empty = write boundary not enabled**: requests that declare write packages are hard-blocked by the runtime gate with `boundary_off` (writing requires an explicit configuration; only the service layer is fail-open — see the write-boundary note below); when set, only configured packages and their sub-packages are writable | `ZDEMO1,ZDEMO2.ZDEMO_SD` |
+| `HANA_WRITE_PACKAGES` | optional | Writable repository package prefixes (comma-separated, incl. sub-packages). **Empty = write boundary not enabled**: requests that declare write packages are hard-blocked by the runtime gate with `boundary_off` (writing requires an explicit configuration; only the service layer is fail-open — see the write-boundary note below); when set, only configured packages and their sub-packages are writable | `ZDEMO1,ZDEMO2.ZDEMO02` |
 | `HANA_XS_PORT` | optional | XS Classic design-time REST port; **defaults to `8010`** (override for non-default instances/tenants; it is still not derived from the instance number) | `8000` |
 | `HANA_XS_TLS` | optional | Use HTTPS for the XS write channel, default `false` (plaintext; isolate at the network level) | `true` |
 | `HANA_XS_BASE_PATH` | optional | XS design-time REST base path, default `/sap/hana/xs/dt/base` | — |
@@ -191,7 +191,7 @@ Multi-environment `mcp.json` example (npx startup, three environments):
 > `HANA_WRITE_PACKAGES`: here only DEV has written packages (`readwrite`), so UAT and PROD are read-only.
 > A non-default XS port is configured via `HANA_XS_PORT_ENV_<XXXX>`; in HTTP mode,
 > `MCP_HTTP_CLIENT_ENVS` binds tokens to environments. Every call carries the `contextToken` returned by
-> `hana_tool_search` (or, for one version, `expectedEnvironment:{key,epoch}`).
+> `hana_tool_search` (from a `contract`/`goal` disclosure).
 
 > **Switching in stdio is process-wide**: it affects only subsequent calls; in-flight calls and submitted tasks stay on their original environment. Concurrent agents share one active environment — prefer one process per environment.
 
@@ -275,23 +275,22 @@ For fixed workflows use `goal`:
 
 ```jsonc
 hana_tool_search({ "mode": "goal", "goal": "diagnose_preview_permission",
-                   "bindings": { "packageId": "ZDEMO", "objectName": "ZDEMO_CV_SDR008" } })
+                   "bindings": { "packageId": "ZDEMO", "objectName": "ZDEMO17" } })
 ```
 
 - `call.via` in contracts and `steps[].via` in recipes are always `hana_invoke`.
 - **Permission/preview failures (258/2950)**: obtain the `diagnose_preview_permission` recipe first (root object `derived`, upstream objects `direct`), then execute its steps; do not guess parameters or use `hana_data_preview` as a permission probe.
 - If **any** id in the set is unknown/not entitled, the whole package is rejected verbatim like an unknown capability.
-- **All** multi-env calls must carry the `contextToken` returned by `hana_tool_search`:
+- **Every** `hana_invoke` call must carry the `contextToken` returned by `hana_tool_search` (`contract`/`goal`):
   `hana_invoke({ capability, args, contextToken })`. The token binds profile/client/environment/epoch/policy/manifest
-  and expires after 10 minutes; after switching environments (or changing policy/manifest) the old token is stale
-  (`context_stale`) — fetch a new one. For one version, the old `expectedEnvironment:{key,epoch}` at the
-  `hana_invoke` top level (or inside `args`) is still accepted.
+  **and the disclosed tool set**: only capabilities from the issuing response's `tools[]` can execute
+  (`discover` tokens are empty — skipping disclosure yields `capability_not_disclosed`). It expires after 10 minutes;
+  after switching environments or needing another capability, fetch a new token (`context_stale`).
 - Budget guards: `maxTools` (default 12 / hard 20), `maxSchemaBytes` (default 32KB/tool), `maxResponseBytes` (default 256KB); exceeding them returns `budget_exceeded` instead of silently dropping contracts.
 - Contract `policy` preview: when `bindings` do not cover write-package/read-schema keys, `policy.status` is `partial` (demo values are not judged); pass `bindings` for a real-target preview.
 - **Goal mode can be turned off explicitly**: `HANA_TOOL_SEARCH_GOAL=off` keeps `discover`/`contract` only; `mode=goal` returns a recoverable error. The tool surface and `hana_invoke` are unchanged.
 - **Approval posture travels with discovery**: every `discover`/`contract`/`goal` response carries `data.approval` with `policy`, `clientSupportsElicitation` and `destructiveWrites` (`confirm_via_host` / `allowed_without_confirmation` / `blocked`); the default `off` yields `allowed_without_confirmation`; `destructive` without elicitation yields `blocked` (delete/import are refused before dispatch, while `dryRun=true` previews still work).
-- **Call envelope**: `contextToken` is the preferred field; `expectedEnvironment` and `disclosure:{policyRev,manifestRev}`
-  remain accepted for one version as compatibility fields (stale disclosure → `policy_stale`/`manifest_stale`).
+- **Call envelope**: exactly `{ capability, args, contextToken }`; there are no legacy environment/disclosure fields.
 - **Approval (off by default)**: `HANA_APPROVAL_POLICY=off` (default) does not ask per call. When set to `destructive`,
   only `hana_view_delete`, `hana_repo_import`, and `hana_view_update` changesets containing a delete action return
   `input_required`; the confirmation binds the args/caller/environment and expires after 5 minutes. The host must
@@ -432,7 +431,7 @@ platform tools carry annotations (`readOnlyHint` / `idempotentHint`); for capabi
 Multi-environment deployments additionally offer two control capabilities (`hana_env_list`, `hana_env_switch`),
 which disappear entirely in single-environment mode.
 
-> **These capabilities are not on the registered surface**: `tools/list` holds only `hana_tool_search` + `hana_invoke`, and every row below is reached via `hana_tool_search` (discover/contract) → `hana_invoke({ capability, args })`. The id in this table is both the capability id and the value for `hana_invoke`'s `capability` field. The **Category** column is metadata for discovery only — it creates no entry point.
+> **These capabilities are not on the registered surface**: `tools/list` holds only `hana_tool_search` + `hana_invoke`, and every row below is reached via `hana_tool_search` (discover → contract) → `hana_invoke({ capability, args, contextToken })`. The id in this table is both the capability id and the value for `hana_invoke`'s `capability` field. The **Category** column is metadata for discovery only — it creates no entry point.
 
 | Capability id | Category | Type | Description |
 | --- | --- | --- |
@@ -489,7 +488,7 @@ Categories are **discovery metadata only**: `hana_tool_search({ mode: 'discover'
 
 > **Field-logic receipts come from the view definition** — attribute-column formulas/types included: `hasFormula` in `hana_metadata_list_fields` and `formula` / `sourceColumns` in `hana_metadata_get_field_logic` are populated from the definition.
 
-> **Write-operation safety boundary**: the writable-package scope for write capabilities (create/activate/update/delete/package_create/import) is controlled by `HANA_WRITE_PACKAGES` — **empty = write boundary not enabled**: requests that declare write packages are **hard-blocked** by the runtime gate with `boundary_off` ("to write you must configure one"); when set, only configured packages and their sub-packages are writable (e.g. `ZDEMO1,ZDEMO2.ZDEMO_SD` allows ZDEMO1, ZDEMO1.X, ZDEMO2.ZDEMO_SD, ZDEMO2.ZDEMO_SD.SUB, rejects others).
+> **Write-operation safety boundary**: the writable-package scope for write capabilities (create/activate/update/delete/package_create/import) is controlled by `HANA_WRITE_PACKAGES` — **empty = write boundary not enabled**: requests that declare write packages are **hard-blocked** by the runtime gate with `boundary_off` ("to write you must configure one"); when set, only configured packages and their sub-packages are writable (e.g. `ZDEMO1,ZDEMO2.ZDEMO02` allows ZDEMO1, ZDEMO1.X, ZDEMO2.ZDEMO02, ZDEMO2.ZDEMO02.SUB, rejects others).
 > Only the **service** layer is fail-open (`assertWritePackageAllowed` passes when the allowlist is empty) — scripts/internal calls do not go through the tool-layer gate and are not stopped by `boundary_off`.
 > Same-name objects are rejected from overwrite; update/delete/activate carry If-Match optimistic locking (the known exceptions for create/import — no server-side guard across processes — are in "Transports → Concurrency & locking").
 >

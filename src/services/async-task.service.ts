@@ -160,8 +160,8 @@ export function submitChangesetTask(
   void (runtime ? runWithEnvironment(runtime, run) : run());
   return submissionOf(
     record,
-    '任务已在后台执行（本响应不代表任何写入结果）。用 hana_task_get({taskId}) 轮询状态；' +
-      '要停止用 hana_task_cancel({taskId})——取消在动作边界生效并触发与失败相同的逆序补偿。' +
+    '任务已在后台执行（本响应不代表任何写入结果）。轮询：先 contract hana_task_get 取 token，再 hana_invoke({capability:"hana_task_get", args:{taskId}, contextToken})；' +
+      '要停止用 hana_task_cancel（同样先 contract）——取消在动作边界生效并触发与失败相同的逆序补偿。' +
       `任务状态在进程内：服务重启即失效；终态任务约保留 ${TERMINAL_TTL_MINUTES} 分钟（注册表饱和时` +
       '最旧的终态会被提前清理），之后该 taskId 按「未知任务」处理。',
   );
@@ -194,7 +194,7 @@ export function submitBackgroundTask(owner: string, spec: BackgroundTaskSpec): T
   void (runtime ? runWithEnvironment(runtime, run) : run());
   return submissionOf(
     record,
-    '任务已在后台执行（本响应不代表执行结果）。用 hana_task_get({taskId}) 轮询状态与终态 result。' +
+    '任务已在后台执行（本响应不代表执行结果）。轮询：先 contract hana_task_get 取 token，再 hana_invoke({capability:"hana_task_get", args:{taskId}, contextToken}) 取状态与终态 result。' +
       (spec.kind === 'sql_analyze' || spec.kind === 'sql_execute'
         ? '取消对**已开始执行的 SQL 无法生效**：语句会跑完并如实返回结果，终态会说明取消未生效。'
         : '要停止用 hana_task_cancel({taskId})。') +

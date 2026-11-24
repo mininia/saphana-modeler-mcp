@@ -140,7 +140,7 @@ export interface AnalyticPrivilegeStatus {
 export interface StructuredPrivilegeEntry {
   /** 层级中对象所在 schema（通常是 _SYS_BIC 或其上游） */
   schemaName?: string;
-  /** 层级中对象名（如 "ZDEMO.ZDEMO_MGF/ZDEMO02_CV008"） */
+  /** 层级中对象名（如 "ZDEMO.ZDEMO01/ZDEMO11"） */
   objectName?: string;
   privilegeSchemaName?: string;
   privilegeName?: string;

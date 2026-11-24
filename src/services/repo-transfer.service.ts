@@ -244,7 +244,7 @@ export async function importObjectViaRest(
   let fileName = input.fileName;
   if (input.content !== undefined) {
     if (!fileName)
-      throw new HanaBusinessError('内联内容导入必须提供 fileName（目标文件名，如 ZDEMO_CV_X.calculationview）');
+      throw new HanaBusinessError('内联内容导入必须提供 fileName（目标文件名，如 ZDEMO16.calculationview）');
     content = input.content;
   } else if (input.filePath) {
     const abs = resolveLocalPath(input.filePath, 'filePath');

@@ -21,7 +21,6 @@ import {
 } from '../capabilities/types.js';
 import { activeProfile, profileAllows, type CallerProfile } from '../config/profiles.js';
 import { compilePolicySnapshot } from '../config/policy-snapshot.js';
-import { capabilityInputSchema } from '../config/environment-policy.js';
 import type { HanaConfig } from '../config/config.js';
 import { currentIdentity } from '../core/request-context.js';
 import { matchGlob, shouldRegisterTool, toolFilterOf, type ToolFilterConfig } from './groups.js';
@@ -172,14 +171,8 @@ function zodDescription(field: unknown): string | undefined {
  * 能力的参数面（发现/契约辅助）：名字 + 必填 + 粗类型 + 参数说明。
  * 不返回完整 schema（那是 `hana_tool_search(mode=contract)` 的收益）。
  */
-export function paramDetailsOf(
-  cap: Capability,
-  multiEnv = false,
-  mode: 'args' | 'envelope' = 'envelope',
-): ParamDetail[] {
-  // 契约默认走信封：expectedEnvironment/expectedEpoch 不在 args 里。
-  const schema = capabilityInputSchema(cap, multiEnv, mode);
-  const shape = (schema as unknown as { shape?: Record<string, unknown> }).shape;
+export function paramDetailsOf(cap: Capability): ParamDetail[] {
+  const shape = (cap.inputSchema as unknown as { shape?: Record<string, unknown> }).shape;
   if (!shape) return [];
   return Object.entries(shape).map(([name, field]) => {
     let required = false;
@@ -195,8 +188,8 @@ export function paramDetailsOf(
 }
 
 /** 必填参数名（契约的 required 快捷字段；与 paramDetailsOf 同源） */
-export function requiredParamsOf(cap: Capability, multiEnv = false, mode: 'args' | 'envelope' = 'envelope'): string[] {
-  return paramDetailsOf(cap, multiEnv, mode)
+export function requiredParamsOf(cap: Capability): string[] {
+  return paramDetailsOf(cap)
     .filter((p) => p.required)
     .map((p) => p.name);
 }

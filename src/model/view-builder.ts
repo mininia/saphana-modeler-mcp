@@ -14,7 +14,7 @@ import { CHAR_TYPES, isNumericType } from './view-types.js';
  */
 
 export interface MinCalcViewSpec {
-  /** 对象名（不含包名），如 ZDEMO_CV_TEST001 */
+  /** 对象名（不含包名），如 ZDEMO15 */
   objectName: string;
   /** 视图描述 */
   description?: string;
@@ -25,7 +25,7 @@ export interface MinCalcViewSpec {
   /**
    * CV 初始源：设置后 DataSource 生成 `type="CALCULATION_VIEW"` + `<resourceUri>`，
    * schema/table 仅用于校验与错误文案（实际引用由 resourceUri 决定）。
-   * 例：`/system-local.bw.bw2hana.query.zdemo01r014/calculationviews/ZDEMO01R014_Q017`。
+   * 例：`/system-local.bw.bw2hana.query.zdemo18/calculationviews/ZDEMO18`。
    */
   resourceUri?: string;
   /**

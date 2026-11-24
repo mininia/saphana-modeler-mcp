@@ -30,7 +30,7 @@ const SAFE_RUNTIME_NAME_RE = /^[A-Za-z0-9_$#./\-]+$/;
 
 /**
  * 目录查询对象名：在运行时字符集上额外允许 BW 对象名的冒号（如
- * `0BW:RS2HANA:QUERY:ZDEMO01R014_Q017.PROJ_BNR`）。只用于**按名查目录**
+ * `0BW:RS2HANA:QUERY:ZDEMO18.ZDEMO_FLD03`）。只用于**按名查目录**
  * （SYS.TABLE_COLUMNS / SYS.VIEW_COLUMNS），值仍参数绑定；引号/分号/空白依旧拒绝。
  */
 const SAFE_CATALOG_NAME_RE = /^[A-Za-z0-9_$#./:\-]+$/;

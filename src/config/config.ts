@@ -252,7 +252,7 @@ const envSchema = z.object({
       if (invalid.length > 0) {
         throw new Error(
           `HANA_WRITE_PACKAGES 含非法包名：${invalid.join(', ')}。合法形式为点分段的仓库包路径` +
-            '（大写字母/数字/下划线/连字符，如 ZDEMO 或 ZDEMO.ZDEMO_SD）。' +
+            '（大写字母/数字/下划线/连字符，如 ZDEMO 或 ZDEMO.ZDEMO02）。' +
             '请给出至少一个合法的可写包前缀；填 * 等通配符无效，而整体留空会让写工具被闸门拦下（见该项说明）',
         );
       }

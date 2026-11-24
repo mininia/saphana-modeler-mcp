@@ -329,7 +329,7 @@ function collectDataSourceChanges(diff: ViewDiff, items: BreakingItem[]): void {
  * 脚本文本变化 + 下游有引用 ⇒ 破坏；不解析 SQL（不做「脚本引用的源集合」比较）。
  *
  * 为什么不复用现有扫描件：write-plan 的 scanSqlSchemaRefs 只抽 **schema**、抽不出被引用的对象，
- * 而实测的漂移形态常是**同 schema 换表**（`FROM ZDEMO_SIGN.HEADER` → `FROM ZDEMO_SIGN.ITEM`
+ * 而实测的漂移形态常是**同 schema 换表**（`FROM ZDEMO_TAB.HEADER` → `FROM ZDEMO_TAB.ITEM`
  * 实测 schema 集合不变）——只比 schema 集合等于把这行漂移继续放行；逐对象抽取器现写一份 = 第二份
  * 表名扫描器（write-plan 是单点实现）。故不解析 SQL：任何脚本文本变化都按语义漂移要求显式声明
  * （fail-closed——宁过不漏），WHERE/格式类良性变更也会命中，这是保守口径的明示代价。

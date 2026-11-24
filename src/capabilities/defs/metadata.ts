@@ -93,7 +93,7 @@ export const metadataCapabilities = {
       whenToUse: ['理解视图逻辑/数据源/节点结构', '需要 XML 备份或全量 update'],
       notFor: ['只看字段清单用 hana_metadata_list_fields', '权限/预览失败用 hana_data_preview_diagnose'],
       priority: 'primary',
-      exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV008' },
+      exampleArgs: { packageId: 'ZDEMO.ZDEMO01', objectName: 'ZDEMO11' },
       returns: [
         'data.view 为结构化定义（数据源/节点/字段/变量）',
         'data.xml 为仓库原始设计时 XML',
@@ -107,8 +107,8 @@ export const metadataCapabilities = {
       '选择指引：理解逻辑/字段用 json；要用 hana_view_update 的 xml 全量方式改造时才读 xml；加 join 类修改优先直接用 operations。kind 省略时自动匹配三种视图类型。\n' +
       '只看字段用 hana_metadata_list_fields；看单字段逻辑用 hana_metadata_get_field_logic；按片段定位包名/对象名用 hana_metadata_search_objects。',
     inputSchema: z.object({
-      packageId: zReadPackageId('包名，层级用 . 分隔，如 ZDEMO.ZDEMO_MGF'),
-      objectName: zObjectName('视图对象名，如 ZDEMO02_CV008'),
+      packageId: zReadPackageId('包名，层级用 . 分隔，如 ZDEMO.ZDEMO01'),
+      objectName: zObjectName('视图对象名，如 ZDEMO11'),
       kind: VIEW_KIND.optional().describe('视图类型；省略时自动匹配三种类型'),
       format: z.enum(['json', 'xml']).default('json').describe('返回格式：json=结构化定义；xml=仓库原始设计时 XML'),
       version: VERSION_SCOPE.default('active').describe(
@@ -128,7 +128,7 @@ export const metadataCapabilities = {
       whenToUse: ['只有对象名片段、不知道包名', '按注释或字段找对象'],
       notFor: ['已知 packageId+objectName 时直接 get_view/list_fields'],
       priority: 'primary',
-      exampleArgs: { pattern: 'ZDEMO02_CV', by: 'name', category: 'model' },
+      exampleArgs: { pattern: 'ZDEMO11', by: 'name', category: 'model' },
       returns: ['model=objects；目录类别=items；all=groups+counts', 'limit 为每类上限（默认 20）'],
     },
     preflight: (args) => {
@@ -184,7 +184,7 @@ export const metadataCapabilities = {
       whenToUse: ['回答有哪些字段/有没有某字段', '拿字段 ID 后再看计算逻辑'],
       notFor: ['看单字段计算逻辑用 hana_metadata_get_field_logic'],
       priority: 'primary',
-      exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV008' },
+      exampleArgs: { packageId: 'ZDEMO.ZDEMO01', objectName: 'ZDEMO11' },
       returns: ['data.fields[] 字段 ID/描述/类型/聚合/来源/是否带逻辑', '不分页；字段数受对象定义限制'],
     },
     preflight: (args) => {
@@ -201,8 +201,8 @@ export const metadataCapabilities = {
       '列出视图字段清单：字段 ID、中文描述、类型（属性/度量）、聚合方式、来源（节点.列）、是否带计算逻辑。默认只列输出字段；pattern 按字段 ID 片段过滤，exact=true 精确匹配。version 默认 active，可传 inactive。\n' +
       '回答「有哪些字段/有没有某字段」用它；拿到字段 ID 后用 hana_metadata_get_field_logic 看完整计算逻辑。',
     inputSchema: z.object({
-      packageId: zReadPackageId('包名，层级用 . 分隔，如 ZDEMO.ZDEMO_SD'),
-      objectName: zObjectName('视图对象名，如 ZDEMO008_CV001'),
+      packageId: zReadPackageId('包名，层级用 . 分隔，如 ZDEMO.ZDEMO02'),
+      objectName: zObjectName('视图对象名，如 ZDEMO13'),
       pattern: z.string().optional().describe('字段 ID 过滤片段（如 ZDEMO_FLD）；省略=全部字段'),
       exact: z.boolean().default(false).describe('true=按字段 ID 精确匹配（pattern 必填）'),
       kind: VIEW_KIND.optional().describe('视图类型；省略时自动匹配三种类型'),
@@ -224,7 +224,7 @@ export const metadataCapabilities = {
       whenToUse: ['字段来源/计算逻辑', '字段级下游血缘（includeUsage=true）'],
       notFor: ['视图级依赖用 hana_metadata_where_used', '字段 ID 不确定先用 hana_metadata_list_fields'],
       priority: 'primary',
-      exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV008', fieldId: 'MATERIAL' },
+      exampleArgs: { packageId: 'ZDEMO.ZDEMO01', objectName: 'ZDEMO11', fieldId: 'MATERIAL' },
       returns: [
         'data.logic：公式原文/源字段/节点溯源/字段元数据',
         'includeUsage=true 时附字段级下游血缘（受 usageMaxViews 约束）',
@@ -237,8 +237,8 @@ export const metadataCapabilities = {
       '回答「某字段怎么算的」用它，一次调用聚焦单字段。字段级下游血缘用 includeUsage=true（口径见 rules=metadata_graph）。\n' +
       '边界：来源映射看 hana_metadata_list_fields 的 source；视图级依赖看 hana_metadata_where_used；字段 ID 不确定时先用 list_fields 模糊搜索。',
     inputSchema: z.object({
-      packageId: zReadPackageId('包名，层级用 . 分隔，如 ZDEMO.ZDEMO_SD'),
-      objectName: zObjectName('视图对象名，如 ZDEMO008_CV001'),
+      packageId: zReadPackageId('包名，层级用 . 分隔，如 ZDEMO.ZDEMO02'),
+      objectName: zObjectName('视图对象名，如 ZDEMO13'),
       fieldId: z
         .string()
         .min(1)
@@ -274,7 +274,7 @@ export const metadataCapabilities = {
       whenToUse: ['改/删前查影响面', '找视图的上游数据源'],
       notFor: ['字段级逻辑用 hana_metadata_get_field_logic'],
       priority: 'primary',
-      exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV008', direction: 'both' },
+      exampleArgs: { packageId: 'ZDEMO.ZDEMO01', objectName: 'ZDEMO11', direction: 'both' },
       returns: [
         'data.upstream[]/downstream[]：packageId/objectName/objectSuffix/refType/isRuntime',
         'depth>1 时 closure 带跳数口径；truncated 表示达到上限',
@@ -286,7 +286,7 @@ export const metadataCapabilities = {
       'version 默认 active（ACTIVE_OBJECTCROSSREF）；inactive 查未激活/有挂起改动版本的血缘（INACTIVE_OBJECTCROSSREF，与 active 互不回退）。\n' +
       '多跳波及面用 depth>1；返回口径（isRuntime、closure/depthReached/truncated/asOf）与使用时机见 rules=metadata_graph。',
     inputSchema: z.object({
-      packageId: zReadPackageId('包名，层级用 . 分隔，如 ZDEMO.ZDEMO_MKC'),
+      packageId: zReadPackageId('包名，层级用 . 分隔，如 ZDEMO.ZDEMO03'),
       objectName: zObjectName('视图对象名'),
       kind: VIEW_KIND.optional().describe('视图类型；省略时匹配三种类型'),
       version: VERSION_SCOPE.default('active').describe(
@@ -357,7 +357,7 @@ export const metadataCapabilities = {
       '返回指定表/视图的列结构：列名/位置/数据类型/长度/精度/可空/默认值/注释。先查 SYS.TABLE_COLUMNS，空则回退 SYS.VIEW_COLUMNS（BW 的 CALC 视图，如 0BW:... 只在这里）；对象不存在或当前用户无权限时返回 isError，可先用 hana_table_list 确认可访问的表',
     inputSchema: z.object({
       schema: tagResource(z.string().trim().describe('schema 名，如 SAPABAP1 / _SYS_BIC'), 'readSchema'),
-      table: z.string().describe('表/视图名，如 /BIC/AZDEMO001 或 0BW:RS2HANA:QUERY:...PROJ_BNR（允许冒号）'),
+      table: z.string().describe('表/视图名，如 /BIC/AZDEMO001 或 0BW:RS2HANA:QUERY:...ZDEMO_FLD03（允许冒号）'),
       limit: z.number().int().min(1).max(500).default(200).describe('返回列数上限，默认 200，最大 500'),
     }),
     annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },

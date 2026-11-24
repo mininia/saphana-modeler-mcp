@@ -432,7 +432,7 @@ const baseModelingCapabilities = {
         'graph.nodes 按 id/inputs 接线，同一模块可实例化多次（Join_1/Join_2 都是 join）；服务端拓扑排序后一次写入',
         'CV 源必须已激活；table 源按 SYS.TABLE_COLUMNS/VIEW_COLUMNS 取列，数值类型=度量',
       ],
-      exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV009', mode: 'graphical' },
+      exampleArgs: { packageId: 'ZDEMO.ZDEMO01', objectName: 'ZDEMO12', mode: 'graphical' },
     },
     title: '新建 Calculation View（计算视图）',
     // SQL 方言、实测边界与并发解释见规则 sql_mode / activation_measure / write_transport / write_receipt。
@@ -448,16 +448,16 @@ const baseModelingCapabilities = {
       'SQL 方言、scriptColumns↔VAR_OUT 与 ≥1 度量要求、通道差异见 rules=sql_mode,activation_measure,write_transport,write_receipt。',
     inputSchema: z.object({
       packageId: zWritePackageId('目标包名；须在 HANA_WRITE_PACKAGES 可写范围内（如 ZDEMO 或 ZDEMO.SUB）'),
-      objectName: zObjectName('新视图对象名（不含包名），如 ZDEMO_CV_TEST001'),
+      objectName: zObjectName('新视图对象名（不含包名），如 ZDEMO15'),
       description: VIEW_DESCRIPTION_FIELD.optional(),
       mode: VIEW_MODE_ENUM.default('projection'),
       sourceSchema: VIEW_SOURCE_SCHEMA_FIELD.optional(),
       sourceName: VIEW_SOURCE_NAME_FIELD.optional(),
       sourcePackageId: zPackageId(
-        'mode=projection 的 CV 初始源：源 CV 包名（只读即可），如 system-local.bw.bw2hana.query.zdemo01r014；与 sourceSchema/sourceName 二选一',
+        'mode=projection 的 CV 初始源：源 CV 包名（只读即可），如 system-local.bw.bw2hana.query.zdemo18；与 sourceSchema/sourceName 二选一',
       ).optional(),
       sourceObjectName: zObjectName(
-        'mode=projection 的 CV 初始源：源 CV 对象名（不含包名），如 ZDEMO01R014_Q017；与 sourceSchema/sourceName 二选一',
+        'mode=projection 的 CV 初始源：源 CV 对象名（不含包名），如 ZDEMO18；与 sourceSchema/sourceName 二选一',
       ).optional(),
       sourceColumns: z
         .array(SCRIPT_COLUMN_SCHEMA)
@@ -514,7 +514,7 @@ const baseModelingCapabilities = {
       whenToUse: ['改完或激活前做 CheckResult 校验', '对已激活的图形化视图做一致性校验'],
       notFor: ['只是预览数据用 hana_data_preview', 'SQL 模式视图的 runtime 校验不适用，改用 hana_data_preview'],
       priority: 'primary',
-      exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV008', target: 'design' },
+      exampleArgs: { packageId: 'ZDEMO.ZDEMO01', objectName: 'ZDEMO11', target: 'design' },
       returns: [
         'CheckResult 编译明细（成功/失败与具体错误）',
         'design 模式临时副本写后即删；清理失败回执 tempResidue',
@@ -526,7 +526,7 @@ const baseModelingCapabilities = {
     description:
       '双模式校验：\n' +
       'target=design（默认）：对可写包内设计时对象做激活前校验——临时副本 _CHKTMP 触发服务端激活检查（CheckResult 带编译明细）后删除，原对象激活状态不受影响；副本名带短哈希（总长 ≤29），与真实对象重名时本次拒绝执行（不删不改）；清理未完成时回执 tempResidue（对象名+原因），需人工清理，不静默。\n' +
-      'target=runtime：对已激活的运行时计算视图做一致性校验（SYS.CHECK_CALCULATION_VIEW，需 schema+viewName，如 _SYS_BIC + "ZDEMO.ZDEMO_MKC/ZDEMO03_CV003"）。SQL 模式 / SCRIPT_BASED 视图可能返回 VALIDATE_UNSUPPORTED（CHECK 过程无法解析其 scenario）；这不是视图不一致，改用 hana_data_preview 或 SELECT ... LIMIT 0 验证运行时对象。\n' +
+      'target=runtime：对已激活的运行时计算视图做一致性校验（SYS.CHECK_CALCULATION_VIEW，需 schema+viewName，如 _SYS_BIC + "ZDEMO.ZDEMO03/ZDEMO14"）。SQL 模式 / SCRIPT_BASED 视图可能返回 VALIDATE_UNSUPPORTED（CHECK 过程无法解析其 scenario）；这不是视图不一致，改用 hana_data_preview 或 SELECT ... LIMIT 0 验证运行时对象。\n' +
       '激活前建议先 design 校验，激活后可用 runtime 复检；支持的动作清单用 hana_view_check_actions 查询。',
     inputSchema: z.object({
       target: z
@@ -541,7 +541,7 @@ const baseModelingCapabilities = {
       viewName: z
         .string()
         .optional()
-        .describe('runtime 模式：运行时视图名，如 "ZDEMO.ZDEMO_MKC/ZDEMO03_CV003"（包路径/对象名）'),
+        .describe('runtime 模式：运行时视图名，如 "ZDEMO.ZDEMO03/ZDEMO14"（包路径/对象名）'),
       action: z
         .enum(['CHECK_CONSISTENCY'])
         .default('CHECK_CONSISTENCY')
@@ -587,7 +587,7 @@ const baseModelingCapabilities = {
       notFor: ['写入/导入即激活的场景不要重复激活'],
       priority: 'primary',
       requires: '目标包在 HANA_WRITE_PACKAGES 可写范围内',
-      exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV008' },
+      exampleArgs: { packageId: 'ZDEMO.ZDEMO01', objectName: 'ZDEMO11' },
       returns: [
         '激活结果 + 编译错误明细（失败不误报成功）',
         '412 并发冲突按机读回执返回',
@@ -623,8 +623,8 @@ const baseModelingCapabilities = {
       priority: 'primary',
       requires: '目标包在 HANA_WRITE_PACKAGES 可写范围内',
       exampleArgs: {
-        packageId: 'ZDEMO.ZDEMO_MGF',
-        objectName: 'ZDEMO02_CV008',
+        packageId: 'ZDEMO.ZDEMO01',
+        objectName: 'ZDEMO11',
         graph: { nodes: [{ id: 'P1', type: 'projection', input: 'S1', fields: ['A'] }] },
       },
       returns: [
@@ -762,7 +762,7 @@ const baseModelingCapabilities = {
       notFor: ['修改已有视图不要 delete+重建（用 hana_view_update）'],
       priority: 'advanced',
       requires: '目标包在 HANA_WRITE_PACKAGES 可写范围内；有下游引用需 migration.strategy=acknowledge_dependents',
-      exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV008' },
+      exampleArgs: { packageId: 'ZDEMO.ZDEMO01', objectName: 'ZDEMO11' },
     },
     title: '删除 Calculation View（设计时对象）',
     description:

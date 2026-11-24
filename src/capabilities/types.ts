@@ -27,7 +27,7 @@ import type { WritePlan } from '../write-plan.js';
 export type ToolKind = 'read' | 'write' | 'admin' | 'sql';
 
 /**
- * HANA 侧副作用口径（环境只读闸门 / expectedEnvironment / 审计终态的唯一事实源）。
+ * HANA 侧副作用口径（环境只读闸门 / contextToken / 审计终态的唯一事实源）。
  * 只描述 HANA 侧：本地文件写入与进程内控制面算 none。
  * - none：纯读；
  * - transient：只建可回收临时对象（_SYS_BIC 中间视图、_CHKTMP）；
@@ -244,7 +244,8 @@ export interface Capability<S extends z.ZodType = z.ZodType> {
    *
    * 可见性由 `config/policy-snapshot.ts` 统一编译：未显式 deny ∧ 至少一个具体能力
    * 在 entitlement 内。平台入口不构成绕过本体层的执行捷径：
-   * 它要求调用方先给出能力 id，而能力 id 只能从 `hana_tool_search` 得到。
+   * `hana_invoke` 必须携带 contract/goal 回执签发的 contextToken，且 token 的披露集合
+   * 不包含目标能力时在参数校验前就被拒绝（`capability_not_disclosed`）。
    */
   platform?: true;
   /**

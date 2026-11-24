@@ -255,7 +255,7 @@ export function registerModelingTools(server: McpServer, ctx: ToolContext): void
     }
     if (!viewName) {
       return mcpErrorText(
-        'runtime 模式需要 viewName（形如 「ZDEMO.ZDEMO_MKC/ZDEMO03_CV003」）。',
+        'runtime 模式需要 viewName（形如 「ZDEMO.ZDEMO03/ZDEMO14」）。',
         '要校验设计时对象请改传 target=design 并给 packageId + objectName',
       );
     }

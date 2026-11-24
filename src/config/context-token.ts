@@ -2,9 +2,11 @@
  * 上下文令牌（`contextToken`）——把调用期的环境断言与披露上下文收成一个不可伪造的字符串。
  *
  * `hana_tool_search` 在回执中签发，`hana_invoke` 执行时回传；令牌绑定调用方、环境、epoch、
- * 策略代际与清单代际：
+ * 策略代际、清单代际，以及**本次披露的能力集合**（`t`）：
  * - 服务端只验签与比较代际，不需要会话/registry；
- * - 客户端无法伪造环境、epoch、policyRev、manifestRev；
+ * - 客户端无法伪造环境、epoch、policyRev、manifestRev 或披露集合；
+ * - `hana_invoke` 只能执行 `t` 内的能力：discover 的 token 为空（候选不可直接执行），
+ *   contract/goal 的 token 才包含可执行能力；
  * - 令牌**不是授权凭证**：每次调用仍过 `authorizeCall`，它只证明「这份策略上下文还新鲜」。
  *
  * 进程内随机密钥：重启即失效（重新获取即可）；多副本 HTTP 需共享密钥。
@@ -30,6 +32,8 @@ export interface ContextTokenPayload {
   pr: string;
   /** manifestRev */
   mr: string;
+  /** 本次披露的能力集合（排序去重；discover 为空 = 不授予任何可执行能力） */
+  t: string[];
   /** 过期时间（毫秒时间戳） */
   x: number;
 }
@@ -51,6 +55,8 @@ export interface IssueContextTokenInput {
   epoch: number;
   policyRev: string;
   manifestRev: string;
+  /** 本次披露的能力集合；discover 传空数组（候选不等于可执行） */
+  toolIds: readonly string[];
   /** 测试注入；默认 Date.now() */
   now?: number;
   /** 测试/特殊部署可调；默认 {@link CONTEXT_TOKEN_TTL_MS} */
@@ -68,6 +74,7 @@ export function issueContextToken(input: IssueContextTokenInput): string {
     n: input.epoch,
     pr: input.policyRev,
     mr: input.manifestRev,
+    t: [...new Set(input.toolIds)].sort(),
     x: now + (input.ttlMs ?? CONTEXT_TOKEN_TTL_MS),
   };
   const body = b64url(Buffer.from(JSON.stringify(payload), 'utf8'));
@@ -101,8 +108,15 @@ function isValidPayload(value: unknown): value is ContextTokenPayload {
     typeof p['n'] === 'number' &&
     typeof p['pr'] === 'string' &&
     typeof p['mr'] === 'string' &&
+    Array.isArray(p['t']) &&
+    p['t'].every((id) => typeof id === 'string') &&
     typeof p['x'] === 'number'
   );
+}
+
+/** 令牌是否包含该能力（discover 的 token 为空集：候选不等于可执行）。 */
+export function tokenDiscloses(payload: ContextTokenPayload, capabilityId: string): boolean {
+  return payload.t.includes(capabilityId);
 }
 
 /**

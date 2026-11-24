@@ -14,8 +14,7 @@ import { INVOKE_SCHEMA } from '../capabilities/defs/invoke.js';
 import { blockedCallResult, dispatchAuthorized } from '../config/authorize.js';
 import { policyFromConfig } from '../config/preflight.js';
 import { approvalGate, clientSupportsElicitation } from '../config/approval.js';
-import { capabilityInputSchema, type EnvironmentAssertion } from '../config/environment-policy.js';
-import { verifyContextToken } from '../config/context-token.js';
+import { tokenDiscloses, verifyContextToken } from '../config/context-token.js';
 import type { CallerProfile } from '../config/profiles.js';
 import { BLOCKED_PREFIX, mcpErrorText } from '../core/errors.js';
 import { logger } from '../core/logger.js';
@@ -74,10 +73,8 @@ function blockAuditPayload(
  * 参数错误回执即完整契约：模型不必再调一次 tool_search，也不会因为只看到
  * “参数不符合 schema” 而继续换工具/猜参数名。
  */
-function schemaErrorHint(target: Capability, args: unknown, multiEnv: boolean): string {
-  const runtime = currentEnvironmentRuntime();
-  const environment = multiEnv && runtime ? { key: runtime.envKey, epoch: runtime.epoch } : undefined;
-  const { contract } = buildContract(target, { multiEnv, ...(environment ? { environment } : {}) });
+function schemaErrorHint(target: Capability, args: unknown): string {
+  const { contract } = buildContract(target, {});
   const record =
     typeof args === 'object' && args !== null && !Array.isArray(args) ? (args as Record<string, unknown>) : {};
   const passed = Object.keys(record);
@@ -101,26 +98,19 @@ function schemaErrorHint(target: Capability, args: unknown, multiEnv: boolean): 
     ...(contract.requires ? { requires: contract.requires } : {}),
     ...(contract.returns ? { returns: contract.returns } : {}),
     call: contract.call,
-    ...(environment ? { currentEnvironment: environment.key, currentEpoch: environment.epoch } : {}),
     ...(unexpectedArgs.length > 0 ? { unexpectedArgs } : {}),
     got: Object.fromEntries(passed.map((name) => [name, summarize(record[name])])),
   };
   return (
     `该能力的完整契约（参数卡）：\n\`\`\`json\n${JSON.stringify(card, null, 2)}\n\`\`\`\n` +
-    '按 required/inputSchema/exampleArgs 修正后重新调用 hana_invoke({capability, args})；不要猜参数名。'
+    '按 required/inputSchema/exampleArgs 修正后重新调用 hana_invoke({capability, args, contextToken})；不要猜参数名。'
   );
 }
 
 /** 注册唯一执行入口。必须先于各能力模块登记，目标 handler 才能全部入表。 */
 export function registerInvokeTools(server: McpServer, ctx: ToolContext): void {
   const regCap = capabilityRegistrar(server, ctx);
-  const handler: CapabilityHandler<typeof INVOKE_SCHEMA> = async (
-    { capability, args, expectedEnvironment, disclosure, disclosureId, contextToken },
-    serverCtx,
-  ) => {
-    // 令牌优先：带 token 时由 token 校验环境/代际/策略/清单，旧 disclosure 字段不再参与。
-    const disclosureCtx =
-      contextToken !== undefined ? undefined : (disclosure ?? (disclosureId ? { id: disclosureId } : undefined));
+  const handler: CapabilityHandler<typeof INVOKE_SCHEMA> = async ({ capability, args, contextToken }, serverCtx) => {
     const identity = currentIdentity();
     // profile 随 entitlement 一并解析：目标分支的 authorizeCall 直接复用，不二次推导回退规则
     const { ids, profile } = entitlementOf(ctx, identity);
@@ -133,45 +123,46 @@ export function registerInvokeTools(server: McpServer, ctx: ToolContext): void {
     }
 
     // 服务端按目标能力的 schema 校验（客户端 schema 只是便利，不是校验层）。
-    // 环境断言：contextToken 优先；旧调用把 expectedEnvironment/expectedEpoch 放在 args 里——
-    // 剥出来按信封处理，兼容但不写入 args。
+    // contextToken 必填：绑定调用方/环境/epoch/策略/清单与本次披露的能力集合。
+    // （协议层 schema 已强制；这里兜住绕过 SDK 的直调，避免空 token 进入验签。）
+    if (typeof contextToken !== 'string' || contextToken.length === 0) {
+      logger.warn(blockAuditPayload(ctx, identity, profile, target.id, ['context_stale']), 'capability-audit');
+      return mcpErrorText(
+        `${BLOCKED_PREFIX}（context_stale: missing），请求未执行`,
+        `先 hana_tool_search({mode:"contract", tools:["${target.id}"]}) 取完整契约与 contextToken，再调用 hana_invoke。`,
+      );
+    }
     const runtime = currentEnvironmentRuntime();
-    const multiEnv = ctx.manager?.multiEnv === true;
-    const tokenVerdict =
-      contextToken !== undefined
-        ? verifyContextToken(contextToken, {
-            profileId: profile?.id ?? '(empty)',
-            ...(identity?.clientId ? { clientId: identity.clientId } : {}),
-            envKey: runtime?.multiEnv ? runtime.envKey : 'DEFAULT',
-            epoch: runtime?.epoch ?? 1,
-            policyRev: policyRevOf(ctx.config, toolFilterOf(ctx.config, ctx.toolFilter), profile, runtime),
-            manifestRev: manifestRev(),
-          })
-        : undefined;
-    if (tokenVerdict !== undefined && !tokenVerdict.ok) {
+    const tokenVerdict = verifyContextToken(contextToken, {
+      profileId: profile?.id ?? '(empty)',
+      ...(identity?.clientId ? { clientId: identity.clientId } : {}),
+      envKey: runtime?.multiEnv ? runtime.envKey : 'DEFAULT',
+      epoch: runtime?.epoch ?? 1,
+      policyRev: policyRevOf(ctx.config, toolFilterOf(ctx.config, ctx.toolFilter), profile, runtime),
+      manifestRev: manifestRev(),
+    });
+    if (!tokenVerdict.ok) {
       logger.warn(blockAuditPayload(ctx, identity, profile, target.id, ['context_stale']), 'capability-audit');
       return mcpErrorText(
         `${BLOCKED_PREFIX}（context_stale: ${tokenVerdict.reason}），请求未执行`,
-        '请重新调用 hana_tool_search（discover/contract/goal）获取最新 contextToken；切换环境后必须重新获取。',
+        '请重新调用 hana_tool_search（contract/goal）获取最新 contextToken；切换环境后必须重新获取。',
+      );
+    }
+    // 披露集合校验：token 绑定签发它的 tool_search 回执里的能力集合。
+    // 跳过 contract/goal（或使用 discover 的空集 token）在 schema 之前拒绝——
+    // 先选择、再披露、后执行是本体层的调用顺序，不靠模型自觉。
+    if (!tokenDiscloses(tokenVerdict.payload, target.id)) {
+      logger.warn(
+        blockAuditPayload(ctx, identity, profile, target.id, ['capability_not_disclosed']),
+        'capability-audit',
+      );
+      return mcpErrorText(
+        `${BLOCKED_PREFIX}（capability_not_disclosed）：本次披露不包含 ${target.id}，请求未执行`,
+        `先 hana_tool_search({mode:"contract", tools:["${target.id}"]}) 取完整契约与新的 contextToken，再按回执调用 hana_invoke。`,
       );
     }
     const rawArgs = { ...(args ?? {}) } as Record<string, unknown>;
-    let envAssertion: EnvironmentAssertion | undefined = tokenVerdict?.ok
-      ? { key: tokenVerdict.payload.e, epoch: tokenVerdict.payload.n }
-      : expectedEnvironment;
-    if (rawArgs['expectedEnvironment'] !== undefined || rawArgs['expectedEpoch'] !== undefined) {
-      const legacyKey = typeof rawArgs['expectedEnvironment'] === 'string' ? rawArgs['expectedEnvironment'] : undefined;
-      const legacyEpoch = typeof rawArgs['expectedEpoch'] === 'number' ? rawArgs['expectedEpoch'] : undefined;
-      if (!envAssertion && (legacyKey !== undefined || legacyEpoch !== undefined)) {
-        envAssertion = {
-          ...(legacyKey !== undefined ? { key: legacyKey } : {}),
-          ...(legacyEpoch !== undefined ? { epoch: legacyEpoch } : {}),
-        };
-      }
-      delete rawArgs['expectedEnvironment'];
-      delete rawArgs['expectedEpoch'];
-    }
-    const parsed = capabilityInputSchema(target, multiEnv, 'envelope').safeParse(rawArgs);
+    const parsed = target.inputSchema.safeParse(rawArgs);
     if (!parsed.success) {
       // 审计不能缺席：schema 失败也是按目标能力的拒绝。
       logger.warn(blockAuditPayload(ctx, identity, profile, target.id, ['input_schema_invalid']), 'capability-audit');
@@ -179,14 +170,14 @@ export function registerInvokeTools(server: McpServer, ctx: ToolContext): void {
         .slice(0, 5)
         .map((i) => `${i.path.join('.') || '(根)'}: ${i.message}`)
         .join('；');
-      return mcpErrorText(`参数不符合 ${target.id} 的 schema：${issues}`, schemaErrorHint(target, rawArgs, multiEnv));
+      return mcpErrorText(`参数不符合 ${target.id} 的 schema：${issues}`, schemaErrorHint(target, rawArgs));
     }
 
     // 跨字段预检：schema 通过但业务约束不成立（如 by=name 缺 pattern、勘察/视图目标混用）。
     const preflight = target.preflight?.(parsed.data);
     if (preflight) {
       logger.warn(blockAuditPayload(ctx, identity, profile, target.id, ['input_schema_invalid']), 'capability-audit');
-      const card = schemaErrorHint(target, rawArgs, multiEnv);
+      const card = schemaErrorHint(target, rawArgs);
       return mcpErrorText(
         `参数不符合 ${target.id} 的调用约束：${preflight.issues.join('；')}`,
         preflight.hint ? `${preflight.hint}\n${card}` : card,
@@ -202,12 +193,6 @@ export function registerInvokeTools(server: McpServer, ctx: ToolContext): void {
         profile,
         agentLabel: ctx.config.agentLabel,
         via: 'hana_invoke',
-        policyRevExtras: {
-          readonlySql: runtime?.config.readonlySql ?? ctx.config.readonlySql ?? 'select-only',
-          approvalPolicy: ctx.config.approvalPolicy,
-        },
-        ...(envAssertion ? { envAssertion } : {}),
-        ...(disclosureCtx ? { disclosure: disclosureCtx } : {}),
       },
       async () => {
         // 派发到原始 handler（闸门已在执行壳里按目标能力跑过；不走 SDK callTool 以免二次过闸）
@@ -238,6 +223,6 @@ export function registerInvokeTools(server: McpServer, ctx: ToolContext): void {
 
 /** 保留导出：测试与调用方按同一句话断言未知/无权同形 */
 export function invokeContractCard(): string {
-  const { contract } = buildContract(CAP.hana_invoke, { multiEnv: false });
+  const { contract } = buildContract(CAP.hana_invoke, {});
   return `hana_invoke 的完整契约：\n\`\`\`json\n${JSON.stringify(contract, null, 2)}\n\`\`\``;
 }

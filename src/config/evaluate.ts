@@ -6,11 +6,11 @@
  * - `preview`：不写审计、不派发、不连 HANA；
  * - `enforce`：由 `authorizeCall` 包装为「evaluate + 审计 + blocked 回执」。
  *
- * 判定顺序固定：能力（entitlement/profile）→ 资源（写包/schema）→ 环境（只读/断言/代际）。
- * SQL 规则层（select-only/deny）与审批不在本函数内。
+ * 判定顺序固定：能力（entitlement/profile）→ 资源（写包/schema）→ 环境（只读）。
+ * 环境标识/代际由 contextToken 在入口校验；SQL 规则层（select-only/deny）与审批不在本函数内。
  */
 
-import { manifestRev, planFor } from '../capabilities/manifest.js';
+import { planFor } from '../capabilities/manifest.js';
 import { planReadless } from '../capabilities/planners.js';
 import type { Capability } from '../capabilities/types.js';
 import { BLOCKED_PREFIX } from '../core/errors.js';
@@ -20,9 +20,7 @@ import type { Grant, Policy, Verdict } from './preflight.js';
 import { assembleVerdict, checkDeployment, runPreflight } from './preflight.js';
 import { profileAllows, type CallerProfile } from './profiles.js';
 import { isPackageAllowed } from './write-boundary.js';
-import { environmentGrants, type EnvironmentAssertion } from './environment-policy.js';
-import { policyRevFromPolicy } from './policy-snapshot.js';
-import { isDisclosureCurrent } from './disclosure-registry.js';
+import { environmentGrants } from './environment-policy.js';
 import type { EnvironmentRuntime } from './environment-runtime.js';
 
 export type EvaluateMode = 'preview' | 'enforce';
@@ -42,12 +40,6 @@ export interface EvaluationInput {
   args: Record<string, unknown>;
   mode: EvaluateMode;
   runtime?: EnvironmentRuntime;
-  /** 调用信封里的环境断言；省略时回退 args.expectedEnvironment/expectedEpoch */
-  envAssertion?: EnvironmentAssertion;
-  /** 调用信封里的披露上下文：只做一致性检查（不是授权凭证） */
-  disclosure?: { id?: string; policyRev?: string; manifestRev?: string };
-  /** rev 的补充输入（readonlySql/approvalPolicy；与披露侧同一 rev 材料） */
-  policyRevExtras?: { readonlySql?: string; approvalPolicy?: string };
   /** preview 侧可声明置信度（如 goal 步骤含未解析引用时为 deferred） */
   confidence?: 'full' | 'partial' | 'deferred';
 }
@@ -154,60 +146,6 @@ function checksOf(verdict: Verdict): EvaluateChecks {
 }
 
 /**
- * 披露上下文一致性检查：policyRev / manifestRev 不匹配 → 拒绝。
- * `disclosure.id` 只做日志关联（它是整包/集合哈希，单工具路由无法重算），不在此校验。
- */
-function disclosureGrants(
-  disclosure: EvaluationInput['disclosure'],
-  capability: Capability,
-  policy: Policy,
-  profile: CallerProfile | undefined,
-  runtime: EnvironmentRuntime | undefined,
-  extras?: { readonlySql?: string; approvalPolicy?: string },
-): Grant[] {
-  if (!disclosure) return [];
-  const out: Grant[] = [];
-  const currentManifest = manifestRev();
-  const currentPolicyRev = policyRevFromPolicy(policy, profile, runtime, extras);
-  if (disclosure.id !== undefined) {
-    const currentEnv = {
-      envKey: runtime?.multiEnv ? runtime.envKey : 'DEFAULT',
-      epoch: runtime?.epoch ?? 1,
-      policyRev: currentPolicyRev,
-      manifestRev: currentManifest,
-    };
-    if (!isDisclosureCurrent(disclosure.id, capability.id, currentEnv)) {
-      out.push({
-        dimension: 'environment',
-        subject: 'disclosureId',
-        code: 'disclosure_stale',
-        severity: 'block',
-        message: `${BLOCKED_PREFIX}：披露包已过期或不属于本次调用（工具/环境/代际/策略任一不一致），请重新披露。`,
-      });
-    }
-  }
-  if (disclosure.manifestRev !== undefined && disclosure.manifestRev !== currentManifest) {
-    out.push({
-      dimension: 'environment',
-      subject: 'manifestRev',
-      code: 'manifest_stale',
-      severity: 'block',
-      message: `${BLOCKED_PREFIX}：披露包的能力清单代际已过期，请重新披露。`,
-    });
-  }
-  if (disclosure.policyRev !== undefined && disclosure.policyRev !== currentPolicyRev) {
-    out.push({
-      dimension: 'environment',
-      subject: 'policyRev',
-      code: 'policy_stale',
-      severity: 'block',
-      message: `${BLOCKED_PREFIX}：披露包的策略代际已过期，请重新披露。`,
-    });
-  }
-  return out;
-}
-
-/**
  * 对一个能力调用做统一判定。未登记能力返回 `status:'unknown'`（不规划、不泄漏入参形状）。
  */
 export function evaluate(input: EvaluationInput): EvaluationResult {
@@ -250,8 +188,7 @@ export function evaluate(input: EvaluationInput): EvaluationResult {
     ],
     extraGrants: [
       ...checkProfileGrants(capability, plan, profile, (policy.profiles?.size ?? 0) > 0),
-      ...environmentGrants(capability, args, runtime, input.envAssertion),
-      ...disclosureGrants(input.disclosure, capability, policy, profile, runtime, input.policyRevExtras),
+      ...environmentGrants(capability, runtime),
     ],
   });
 

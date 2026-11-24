@@ -43,7 +43,7 @@ export const previewCapabilities = {
         '视图预览需 packageId+objectName；基表勘察需 schema+table',
         '权限/可达性验证用 diagnose；不要用本工具逐个预览上游（SELECT * 投影全部列，宽视图即使 limit=1 也可能很慢）',
       ],
-      exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV008', limit: 5 },
+      exampleArgs: { packageId: 'ZDEMO.ZDEMO01', objectName: 'ZDEMO11', limit: 5 },
       returns: [
         '视图预览：data.columns + data.rows（默认前 10/100 行）',
         '基表勘察：逐列画像，统计只基于采样行',
@@ -85,8 +85,8 @@ export const previewCapabilities = {
         .max(2000)
         .default(SAMPLE_ROWS_DEFAULT)
         .describe('勘察模式：采样行数（统计口径，非全表统计），默认 200'),
-      packageId: zReadPackageId('预览模式：包名，层级用 . 分隔，如 ZDEMO.ZDEMO_MGF').optional(),
-      objectName: zObjectName('预览模式：视图对象名，如 ZDEMO02_CV008').optional(),
+      packageId: zReadPackageId('预览模式：包名，层级用 . 分隔，如 ZDEMO.ZDEMO01').optional(),
+      objectName: zObjectName('预览模式：视图对象名，如 ZDEMO11').optional(),
       kind: VIEW_KIND.optional().describe('预览模式：视图类型；省略时自动匹配三种类型'),
       node: z
         .string()
@@ -136,7 +136,7 @@ export const previewCapabilities = {
         'SQL 执行计划/性能用 hana_sql_analyze（只读环境不可用）',
       ],
       priority: 'primary',
-      exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV008', channel: 'derived' },
+      exampleArgs: { packageId: 'ZDEMO.ZDEMO01', objectName: 'ZDEMO11', channel: 'derived' },
       returns: [
         'data.brief：结论/上游不可达/分析权限/结构化权限',
         'verbose=true 才返回完整 checks/privileges 明细',
@@ -158,8 +158,8 @@ export const previewCapabilities = {
       '若所有能建模的根因都通过但运行时仍 258/2950，会明确报「未建模根因」并给 Authorization Dependency Viewer / owner GRANT OPTION / SQL SECURITY 等下一步。\n' +
       '注意：根对象权限类失败时，hana_data_preview 已自动附完整诊断；上游逐个确认仍用本工具。',
     inputSchema: z.object({
-      packageId: zReadPackageId('视图包名，层级用 . 分隔，如 ZDEMO.ZDEMO_MGF'),
-      objectName: zObjectName('视图对象名，如 ZDEMO02_CV008'),
+      packageId: zReadPackageId('视图包名，层级用 . 分隔，如 ZDEMO.ZDEMO01'),
+      objectName: zObjectName('视图对象名，如 ZDEMO11'),
       kind: VIEW_KIND.optional().describe('视图类型；省略时自动匹配三种类型'),
       channel: CHANNEL.default('derived').describe(
         '预览通道，多数场景用默认 derived 即可：derived（默认，追溯并实测上游数据源可达性）；' +

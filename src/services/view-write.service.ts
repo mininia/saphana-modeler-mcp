@@ -95,7 +95,7 @@ import {
 export interface CreateCalcViewInput {
   /** 包名（须在 HANA_WRITE_PACKAGES 配置的写边界内；示例值 ZDEMO*，留空 = 写请求被运行期闸门拒绝） */
   packageId: string;
-  /** 对象名（不含包名，如 ZDEMO_CV_TEST001） */
+  /** 对象名（不含包名，如 ZDEMO15） */
   objectName: string;
   description?: string;
   /**
@@ -1445,7 +1445,7 @@ export async function deleteCalculationView(
 
 /* ── operations 声明式补丁（修改 CV 零 XML）──────────────────
  * 由 updateCalculationView 的 operations 模式调用：读当前定义 → 逐条确定性变换 → 复用原 PUT 路径。
- * 变换规则与 BW query 视图生成器同款（范本：ZDEMOBI/COPYOFZDEMO01_CV034_1 的 join 链），
+ * 变换规则与 BW query 视图生成器同款（范本：ZDEMO/ZDEMO20 的 join 链），
  * 全部在服务端确定性完成——模型只传声明式参数，不读也不生成 XML。 */
 
 /** 视图类型 → DataSource resourceUri 的目录段名 */

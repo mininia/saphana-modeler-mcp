@@ -394,6 +394,22 @@ try {
       msg: r.msg,
     };
   };
+  /** 取一个覆盖目标能力的 contextToken（contract 回执签发；执行入口必填）。 */
+  const contractToken = async (capability, init) => {
+    const r = await callTool(TOOL_SEARCH_TOOL, { mode: 'contract', tools: [capability] }, init);
+    if (r.isError) throw new Error(`contract ${capability} 失败：${r.text.slice(0, 200)}`);
+    const env = JSON.parse(r.text.replace(/^﻿/, ''));
+    const token = env?.data?.contextToken;
+    if (typeof token !== 'string') throw new Error(`contract ${capability} 未签发 contextToken`);
+    return token;
+  };
+  const alphaDeleteToken = await contractToken('hana_view_delete');
+  const alphaProfileDeleteToken = await contractToken('hana_view_delete', {
+    authorization: `Bearer ${ALPHA_TOKEN}`,
+  });
+  const betaReadToken = await contractToken('hana_metadata_get_view', {
+    authorization: `Bearer ${BETA_TOKEN}`,
+  });
 
   // 注册面不随档案变化
   const sharedList = await rpc('tools/list');
@@ -442,7 +458,7 @@ try {
   }
   const betaInvoke = await callTool(
     INVOKE_TOOL,
-    { capability: 'hana_view_delete', args: writeArgs },
+    { capability: 'hana_view_delete', args: writeArgs, contextToken: betaReadToken },
     { authorization: `Bearer ${BETA_TOKEN}` },
   );
   if (!betaInvoke.isError || !betaInvoke.text.includes('未知能力')) {
@@ -458,19 +474,23 @@ try {
   console.log('[surface] 本体层调用不改工具面：两个平台入口恒在（按档案收窄的只是可发现/可执行集合）');
 
   // schema 校验失败也要落审计：经 hana_invoke 提交非法参数 → 目标能力的 block 记录。
-  const badSchema = await callTool(INVOKE_TOOL, { capability: 'hana_view_delete', args: {} });
+  const badSchema = await callTool(INVOKE_TOOL, {
+    capability: 'hana_view_delete',
+    args: {},
+    contextToken: alphaDeleteToken,
+  });
   if (!badSchema.isError || !/参数不符合/.test(badSchema.text)) {
     throw new Error(`经执行入口提交非法参数应被服务端拒绝，实际：${badSchema.text.slice(0, 200)}`);
   }
 
   // 路由护栏：未知能力 / 平台入口自身 / 档案外 —— 三者同一句文案。
   const guardRefs = [];
-  guardRefs.push(await callTool(INVOKE_TOOL, { capability: 'hana_does_not_exist' }));
-  guardRefs.push(await callTool(INVOKE_TOOL, { capability: TOOL_SEARCH_TOOL }));
+  guardRefs.push(await callTool(INVOKE_TOOL, { capability: 'hana_does_not_exist', contextToken: alphaDeleteToken }));
+  guardRefs.push(await callTool(INVOKE_TOOL, { capability: TOOL_SEARCH_TOOL, contextToken: alphaDeleteToken }));
   guardRefs.push(
     await callTool(
       INVOKE_TOOL,
-      { capability: 'hana_view_delete', args: writeArgs },
+      { capability: 'hana_view_delete', args: writeArgs, contextToken: betaReadToken },
       { authorization: `Bearer ${BETA_TOKEN}` },
     ),
   );
@@ -482,7 +502,7 @@ try {
   // 路由不越权：alpha（read+write）能执行 hana_view_delete，但**落回部署边界**
   const routed = await callTool(
     INVOKE_TOOL,
-    { capability: 'hana_view_delete', args: writeArgs },
+    { capability: 'hana_view_delete', args: writeArgs, contextToken: alphaProfileDeleteToken },
     { authorization: `Bearer ${ALPHA_TOKEN}` },
   );
   if (!routed.isError || !routed.text.includes('boundary_off')) {

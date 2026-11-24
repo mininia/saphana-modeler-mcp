@@ -119,7 +119,7 @@ let manifestRevCache: string | undefined;
 
 /**
  * 能力清单代际：id/title/description/routing/inputSchema 的稳定投影。
- * 清单变化 → manifestRev 变化 → 旧 disclosureId/披露上下文失效（只作一致性检查，不是授权凭证）。
+ * 清单变化 → manifestRev 变化 → 旧 contextToken/disclosureId 失效（token 才是执行凭证）。
  */
 export function manifestRev(): string {
   if (manifestRevCache !== undefined) return manifestRevCache;

@@ -27,7 +27,7 @@ export interface RuleQueryResult {
 
 /** 规则正文的调用语法提示（每条规则都按此解释简写，避免模型把能力 id 当工具名直接调） */
 const RULE_CALL_NOTE =
-  '规则里的 hana_x(...) 是能力调用简写：实际一律经 hana_invoke({capability:"hana_x", args:{...}}) 执行；' +
+  '规则里的 hana_x(...) 是能力调用简写：实际一律先 hana_tool_search({mode:"contract", tools:["hana_x"]}) 取 token，再经 hana_invoke({capability:"hana_x", args:{...}, contextToken}) 执行；' +
   '只有 hana_tool_search 与 hana_invoke 注册为工具。';
 
 /**

@@ -28,11 +28,9 @@ import {
   type ToolSearchArgs,
 } from '../capabilities/defs/tool-search.js';
 import { evaluate } from '../config/evaluate.js';
-import { registerDisclosure } from '../config/disclosure-registry.js';
 import { issueContextToken } from '../config/context-token.js';
 import { policyFromConfig } from '../config/preflight.js';
 import { approvalStateForClient, clientSupportsElicitation } from '../config/approval.js';
-import { capabilityInputSchema } from '../config/environment-policy.js';
 import { currentEnvironmentRuntime } from '../core/environment-context.js';
 import { currentIdentity } from '../core/request-context.js';
 import { logger } from '../core/logger.js';
@@ -93,12 +91,6 @@ function respond(data: DisclosureData, maxResponseBytes: number, hintOnBudget: s
 }
 
 /** 当前环境绑定（多环境才带 key/epoch；单环境返回 undefined）。 */
-function disclosureEnvironment(ctx: ToolContext): { key: string; epoch: number } | undefined {
-  const runtime = currentEnvironmentRuntime();
-  if (ctx.manager?.multiEnv !== true || !runtime) return undefined;
-  return { key: runtime.envKey, epoch: runtime.epoch };
-}
-
 function environmentField(ctx: ToolContext, ids: ReadonlySet<string>): Record<string, unknown> {
   const runtime = currentEnvironmentRuntime();
   if (ctx.manager?.multiEnv !== true || !runtime) return { multiEnv: false };
@@ -144,7 +136,6 @@ function previewPolicy(
     args: Record<string, unknown>;
     stepId?: string;
     confidence?: 'full' | 'partial' | 'deferred';
-    envAssertion?: { key?: string; epoch?: number };
     /** 资源参数仍是演示值：资源维度的结论不可用（其余维度照常预判） */
     resourceArgsUnbound?: boolean;
   }>,
@@ -165,7 +156,6 @@ function previewPolicy(
       args: item.args,
       mode: 'preview',
       ...(runtime ? { runtime } : {}),
-      ...(item.envAssertion ? { envAssertion: item.envAssertion } : {}),
     });
     // 演示资源值只能说明「这些演示包不在边界内」，不能作为该能力的结论；其余维度（能力/环境）照常。
     const relevantBlocking = item.resourceArgsUnbound
@@ -187,7 +177,7 @@ function previewPolicy(
 
 /** 把工具的完整契约放进参数卡（tool_search 自身的参数错误也可一次纠偏）。 */
 function selfContractCard(): string {
-  const { contract } = buildContract(CAP.hana_tool_search, { multiEnv: false });
+  const { contract } = buildContract(CAP.hana_tool_search, {});
   return (
     'hana_tool_search 的完整契约：\n```json\n' +
     JSON.stringify(
@@ -224,9 +214,9 @@ function resolveRequestedTools(
 }
 
 /** 配方步骤的参数键校验（只查键，不查类型：步骤引用/占位由 AI 最终替换后重新过完整 schema）。 */
-function invalidStepKeys(step: RecipeStep, cap: Capability, multiEnv: boolean): string[] {
-  const schema = capabilityInputSchema(cap, multiEnv, 'envelope') as unknown as { shape?: Record<string, unknown> };
-  const keys = new Set(Object.keys(schema.shape ?? {}));
+function invalidStepKeys(step: RecipeStep, cap: Capability): string[] {
+  const shape = (cap.inputSchema as unknown as { shape?: Record<string, unknown> }).shape;
+  const keys = new Set(Object.keys(shape ?? {}));
   return Object.keys(step.args ?? {}).filter((k) => !keys.has(k));
 }
 
@@ -265,16 +255,17 @@ export function registerToolSearchTools(server: McpServer, ctx: ToolContext): vo
     const manifest = manifestRev();
     const pRev = policyRevOf(ctx.config, toolFilterOf(ctx.config, ctx.toolFilter), profile, runtime);
     const pContext = { profileId: profile?.id ?? '(none)', policyRev: pRev };
-    const env = disclosureEnvironment(ctx);
-    // 上下文令牌：把环境/代际/策略快照打包签名，执行时只需回传这一个字段。
-    const contextToken = issueContextToken({
+    // 上下文令牌：把环境/代际/策略快照与**本次披露的能力集合**打包签名。
+    // discover 不发可执行能力（候选不等于契约）；contract/goal 的 token 才能执行集合内的能力。
+    const tokenInput = {
       profileId: profile?.id ?? '(empty)',
       ...(identity?.clientId ? { clientId: identity.clientId } : {}),
       envKey: runtime?.multiEnv ? runtime.envKey : 'DEFAULT',
       epoch: runtime?.epoch ?? 1,
       policyRev: pRev,
       manifestRev: manifest,
-    });
+    };
+    const issueToken = (toolIds: readonly string[]) => issueContextToken({ ...tokenInput, toolIds });
 
     if (mode === 'discover') {
       const candidates = discoverCapabilities(new Set(ids), {
@@ -286,14 +277,14 @@ export function registerToolSearchTools(server: McpServer, ctx: ToolContext): vo
       });
       const data: DisclosureData = {
         mode: 'discover',
-        contextToken,
+        contextToken: issueToken([]),
         total: candidates.length,
         candidates,
         approval,
-        next: 'mode=contract, tools=[候选 id] 获取完整契约',
+        next: 'mode=contract, tools=[候选 id] 获取完整契约与可执行 contextToken',
         notes: [
-          'discover 只给候选卡，不含 inputSchema；选定后一次 contract 取完整契约。',
-          '执行时把 dispatch 回执里的 contextToken 传给 hana_invoke；有效期 10 分钟，过期重新获取。',
+          'discover 只给候选卡，不含 inputSchema；其 contextToken 不包含可执行能力。',
+          '选定后一次 contract 取完整契约与 token；执行时把该 token 传给 hana_invoke。',
         ],
       };
       return respond(data, maxResponseBytes, '候选过多时请加 query/category 或降低 limit。');
@@ -322,14 +313,14 @@ export function registerToolSearchTools(server: McpServer, ctx: ToolContext): vo
       const maxSchemaBytes = args.maxSchemaBytes ?? TOOL_SEARCH_LIMITS.maxSchemaBytesDefault;
       const tools: ActionContract[] = [];
       for (const cap of resolved.caps) {
-        const built = buildContract(cap, { multiEnv, bindings, ...(env ? { environment: env } : {}) });
+        const built = buildContract(cap, { bindings });
         if (built.missingBindings.length > 0) {
           return badArgs(
             `缺少 bindings：${built.missingBindings.join(', ')}`,
             '为每个 ${bindings.x} 提供值，或改用不带占位符的工具集合。',
           );
         }
-        const schema = capabilityInputSchema(cap, multiEnv, 'envelope');
+        const schema = cap.inputSchema;
         const parsedExample = schema.safeParse(built.contract.canonicalCall.args);
         if (!parsedExample.success) {
           return badArgs(
@@ -359,25 +350,15 @@ export function registerToolSearchTools(server: McpServer, ctx: ToolContext): vo
         resolved.caps.map((cap, i) => ({
           cap,
           args: tools[i].canonicalCall.args,
-          ...(tools[i].canonicalCall.envelope?.expectedEnvironment
-            ? { envAssertion: tools[i].canonicalCall.envelope.expectedEnvironment }
-            : {}),
           // 资源参数仍是演示值 → 资源维度不可预判，其余维度照常（partial，不产出假 blocked）。
           ...(hasUnboundResourceArgs(cap, tools[i].canonicalCall.args, bindings) ? { resourceArgsUnbound: true } : {}),
         })),
       );
       const toolIds = resolved.caps.map((c) => c.id);
       const disclosureId = disclosureIdOf(manifest, pRev, runtime, toolIds);
-      registerDisclosure(disclosureId, {
-        toolIds,
-        envKey: runtime?.multiEnv ? runtime.envKey : 'DEFAULT',
-        epoch: runtime?.epoch ?? 1,
-        policyRev: pRev,
-        manifestRev: manifest,
-      });
       const data: DisclosureData = {
         mode: 'contract',
-        contextToken,
+        contextToken: issueToken(toolIds),
         disclosureId,
         manifestRev: manifest,
         environment: environmentField(ctx, new Set(ids)),
@@ -385,7 +366,8 @@ export function registerToolSearchTools(server: McpServer, ctx: ToolContext): vo
         approval,
         policy: { status: preview.status, context: pContext, blockers: preview.blockers },
         notes: [
-          '工具面未改变：回执里的 call.via 恒为 hana_invoke；执行请调 hana_invoke({capability,args,contextToken})。',
+          '工具面未改变：回执里的 call.via 恒为 hana_invoke；执行调 hana_invoke({capability,args,contextToken})（token 必填）。',
+          'contextToken 绑定本回执的 tools 集合：只能执行集合内能力；换能力请重新 contract。',
           'canonicalCall 只说明“这样调”，不代表已执行；每次 hana_invoke 仍过统一授权与预检。',
         ],
       };
@@ -420,7 +402,7 @@ export function registerToolSearchTools(server: McpServer, ctx: ToolContext): vo
         `配方 ${goal} 需要这些键；只列参数名，不要求领域数据。
 ` +
           '键名必须是配方参数名（diagnose_preview_permission 用 packageId + objectName，不是 viewName）。' +
-          '不知道 packageId 时，先 hana_invoke({capability:"hana_metadata_search_objects", args:{pattern:<objectName>, by:"name", category:"model"}}) 找到对象，或 hana_tool_search({mode:"discover", query:<objectName>}) 取契约。',
+          '不知道 packageId 时，先 hana_tool_search({mode:"contract", tools:["hana_metadata_search_objects"]}) 取契约与 token，再 hana_invoke({capability:"hana_metadata_search_objects", args:{pattern:<objectName>, by:"name", category:"model"}, contextToken}) 找到对象；或直接 contract 目标能力。',
       );
     }
 
@@ -430,7 +412,6 @@ export function registerToolSearchTools(server: McpServer, ctx: ToolContext): vo
       step: RecipeStep;
       args: Record<string, unknown>;
       confidence: 'full' | 'partial' | 'deferred';
-      envAssertion?: { key: string; epoch: number };
     }> = [];
     for (const step of substituted.value as RecipeStep[]) {
       const cap = findCapability(step.capability);
@@ -440,7 +421,7 @@ export function registerToolSearchTools(server: McpServer, ctx: ToolContext): vo
         return badArgs(UNKNOWN_CAPABILITY_TEXT); // 必需能力级不可见 → 整包拒绝、不点名
       }
       const stepArgs = (step.args ?? {}) as Record<string, unknown>;
-      const badKeys = invalidStepKeys(step, cap, multiEnv);
+      const badKeys = invalidStepKeys(step, cap);
       if (badKeys.length > 0) {
         return badArgs(
           `配方 ${goal} 的步骤 ${step.id} 参数键不合法：${badKeys.join(', ')}`,
@@ -453,7 +434,7 @@ export function registerToolSearchTools(server: McpServer, ctx: ToolContext): vo
       // 绑定/字面参数完成后，必须重新过完整 schema + preflight；引用/待补步骤留给 AI，
       // 但一旦参数齐全就不允许把类型错误/空必填带进披露包。
       if (confidence === 'full') {
-        const schema = capabilityInputSchema(cap, multiEnv, 'envelope');
+        const schema = cap.inputSchema;
         const parsedStep = schema.safeParse(stepArgs);
         if (!parsedStep.success) {
           return badArgs(
@@ -469,9 +450,8 @@ export function registerToolSearchTools(server: McpServer, ctx: ToolContext): vo
           );
         }
       }
-      const envAssertion = multiEnv && env && cap.platform !== true ? { key: env.key, epoch: env.epoch } : undefined;
-      used.push({ cap, step, args: stepArgs, confidence, ...(envAssertion ? { envAssertion } : {}) });
-      const contract = buildContract(cap, { multiEnv, ...(env ? { environment: env } : {}) });
+      used.push({ cap, step, args: stepArgs, confidence });
+      const contract = buildContract(cap, {});
       steps.push({
         id: step.id,
         capability: step.capability,
@@ -490,7 +470,7 @@ export function registerToolSearchTools(server: McpServer, ctx: ToolContext): vo
     const maxSchemaBytes = args.maxSchemaBytes ?? TOOL_SEARCH_LIMITS.maxSchemaBytesDefault;
     const tools: ActionContract[] = [];
     for (const cap of uniqueCaps) {
-      const built = buildContract(cap, { multiEnv, ...(env ? { environment: env } : {}) });
+      const built = buildContract(cap, {});
       const schemaBytes = jsonBytes(built.contract.inputSchema);
       if (schemaBytes > maxSchemaBytes) {
         return badArgs(
@@ -502,13 +482,6 @@ export function registerToolSearchTools(server: McpServer, ctx: ToolContext): vo
     }
     const toolIds = uniqueCaps.map((c) => c.id);
     const disclosureId = disclosureIdOf(manifest, pRev, runtime, toolIds, goal);
-    registerDisclosure(disclosureId, {
-      toolIds,
-      envKey: runtime?.multiEnv ? runtime.envKey : 'DEFAULT',
-      epoch: runtime?.epoch ?? 1,
-      policyRev: pRev,
-      manifestRev: manifest,
-    });
     const preview = previewPolicy(
       ctx,
       profile,
@@ -517,20 +490,13 @@ export function registerToolSearchTools(server: McpServer, ctx: ToolContext): vo
         args: u.args,
         stepId: u.step.id,
         confidence: u.confidence,
-        ...(u.envAssertion ? { envAssertion: u.envAssertion } : {}),
       })),
     );
     const data: DisclosureData = {
       mode: 'goal',
       goal,
-      contextToken,
-      disclosureId: disclosureIdOf(
-        manifest,
-        pRev,
-        runtime,
-        uniqueCaps.map((c) => c.id),
-        goal,
-      ),
+      contextToken: issueToken(toolIds),
+      disclosureId,
       manifestRev: manifest,
       environment: environmentField(ctx, new Set(ids)),
       steps,
@@ -540,7 +506,8 @@ export function registerToolSearchTools(server: McpServer, ctx: ToolContext): vo
       notes: [
         'Recipe 是 AI-managed：服务端只给建议路径与契约，不替 AI 执行整条工作流。',
         '多步变更的预检/补偿/部分失败语义仍由 Changeset/Task 负责；配方不是事务。',
-        '工具面未改变：steps[].via 恒为 hana_invoke；逐步调 hana_invoke({capability,args,contextToken})。',
+        '工具面未改变：steps[].via 恒为 hana_invoke；token 必填且绑定本回执的 tools 集合，只能执行集合内能力。',
+        '逐步调 hana_invoke({capability,args,contextToken})；需要集合外能力请重新 contract。',
       ],
     };
     logger.info(

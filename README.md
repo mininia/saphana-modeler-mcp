@@ -160,18 +160,18 @@ node scripts/smoke-stdio.mjs   # 冒烟：握手 + 工具注册（无需真实 H
 
 ```jsonc
 hana_tool_search({ "mode": "goal", "goal": "diagnose_preview_permission",
-                   "bindings": { "packageId": "ZDEMO", "objectName": "ZDEMO_CV_SDR008" } })
+                   "bindings": { "packageId": "ZDEMO", "objectName": "ZDEMO17" } })
 ```
 
 - 契约里的 `call.via` 恒为 `hana_invoke`；配方步骤的 `steps[].via` 同样如此。
 - **权限/预览失败（258/2950）**：先取 `diagnose_preview_permission` 配方（根对象 derived、上游逐个 direct），再按步骤执行；不要先猜参数或用 `hana_data_preview` 取数验证。
 - 集合内任一 id 未知/无权 → **整包拒绝**，与未知能力逐字同形。
-- 多环境下的**所有**调用需带 `contextToken`（`hana_tool_search` 回执签发；旧 `expectedEnvironment:{key,epoch}` 仍兼容一个版本）；切环境后旧 token 失效（`context_stale`）。
+- **所有** `hana_invoke` 调用必须带 `hana_tool_search`（`contract`/`goal`）签发的 `contextToken`；token 绑定签发回执的 `tools` 集合（`discover` 为空集，跳过披露直接执行 → `capability_not_disclosed`），并绑定身份/环境/epoch/策略/清单；切环境或换能力后需重新获取（`context_stale`）。
 - 预算护栏：`maxTools`（默认 12 / 硬上限 20）、`maxSchemaBytes`（默认 32KB/工具）、`maxResponseBytes`（默认 256KB）；超限给 `budget_exceeded`，不静默丢契约。
 - 契约的 `policy` 预判：`bindings` 未覆盖写包/读 schema 时状态为 `partial`（演示参数不作为资源判定依据）；补 `bindings` 后按真实目标预判。
 - **可显式关闭 goal 模式**：`HANA_TOOL_SEARCH_GOAL=off` 时只保留 `discover`/`contract`，`mode=goal` 返回可恢复错误；工具面与 `hana_invoke` 不变。
 - **审批姿态随发现回执下发**：`discover`/`contract`/`goal` 的 `data.approval` 给出 `policy`、`clientSupportsElicitation` 与 `destructiveWrites`（`confirm_via_host` / `allowed_without_confirmation` / `blocked`）；默认 `off` → `allowed_without_confirmation`；`destructive` + 无 elicitation → `blocked`（delete/import 会在派发前被拒，`dryRun=true` 预演不受影响）。
-- **调用上下文**：推荐 `hana_invoke({ capability, args, contextToken })`；`expectedEnvironment` / `disclosure` 是兼容字段。
+- **调用上下文**：`hana_invoke({ capability, args, contextToken })`；`contextToken` 必填，来自 `contract`/`goal` 回执。
 - **人工审批（默认关闭）**：`HANA_APPROVAL_POLICY=off`（默认）不逐次确认；设为 `destructive` 时，只有 `hana_view_delete`、`hana_repo_import` 与 `hana_view_update` 的 changeset delete 需要宿主 `elicitation` 确认，未声明时直接返回硬错误、不派发。`dryRun=true` 的零写入预演永不触发审批；`hana_env_switch` 自带 token/epoch/confirm，不在审批范围。
 - **SQL 访问模式**：`HANA_SQL_ACCESS=select-only`（默认）只允许 SELECT 类；`readwrite` 才允许 SQL 写；对象级 schema/对象访问由 HANA 账号权限决定。
 - 权限模型见 [CONFIG.md 的「权限参数（4 个 + SQL 模式）」](CONFIG.md#权限参数4-个--sql-模式)。

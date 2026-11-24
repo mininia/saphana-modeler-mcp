@@ -23,15 +23,15 @@ export const SERVER_INSTRUCTIONS = [
   '',
   '工具面只有两个入口：**hana_tool_search**（选择）与 **hana_invoke**（执行）；具体能力不注册为工具。',
   '选择（必须先做）：不确定用什么 → hana_tool_search({mode:"discover", query/category/...})；已知工具集或参数不确定 → ({mode:"contract", tools:[...]}) 一次拿完整 Schema/required/exampleArgs；固定流程 → ({mode:"goal", goal:"...", bindings:{...}})；bindings 的键是配方参数名（如 packageId/objectName，不是 viewName）。',
-  '执行：按回执里的 capability + args 调 hana_invoke({capability, args, contextToken})；操作级别名（如 hana_view_update#auto_layout）同样经它。多环境所有调用必须带 hana_tool_search 的 contextToken（旧 expectedEnvironment:{key,epoch} 兼容）。',
-  '**不要凭记忆猜能力 id 或参数**：没有 contract/配方就不要调用 hana_invoke；错误回执会附完整契约。',
+  '执行：按 contract/配方回执里的 capability + args 调 hana_invoke({capability, args, contextToken})；contextToken 必填，绑定该回执的 tools 集合，集合外能力会被拒绝（capability_not_disclosed），换能力先重新 contract。',
+  '**不要凭记忆猜能力 id 或参数**：没有 contract/配方就不要调用 hana_invoke；错误回执附完整契约。',
   '披露与契约不等于授权：每次 hana_invoke 仍按目标能力重新过授权、schema 与预检；不在你权限内的能力不会出现在候选/契约里。',
   '按问题选路径：权限/预览失败（258/2950）→ goal=diagnose_preview_permission（根对象 derived、上游逐个 direct）；读定义/字段/找对象 → discover "定义/字段/对象"；字段逻辑/血缘 → discover "血缘/字段逻辑"；建模写 → discover/contract 建模能力；健康/会话/存储/趋势 → discover "健康/趋势"；SQL 计划/性能 → hana_sql_analyze（高级，只读环境不可用）；直接执行 SQL → 仅当部署启用 sql 组且用户明确要求。',
   '',
   '写操作（hana_view_*）：先 validate 再 activate；改/删前先用 where_used 查依赖；改已有视图用 hana_view_update(operations)，不要 delete+重建。',
   '统一返回 envelope：{ success, data?, messages[], raw? }（HTTP 模式下额外带 clientId = 本次调用的客户端身份，见 MCP_HTTP_TOKENS）；硬错误返回 isError 并附恢复提示。',
   '',
-  '细则（SQL 方言、写边界与通道、回执与冲突、预览、分析、血缘、稳定性口径等）一律以规则库为准：先用 hana_tool_search 找到 hana_system_get_info，再 hana_invoke({capability:"hana_system_get_info", args:{rules:…}})；不传 rules 得规则目录（id+title），传 all 或规则 id（逗号分隔）得全文。',
+  '细则（SQL 方言、写边界与通道、回执与冲突、预览、分析、血缘、稳定性口径等）一律以规则库为准：先用 hana_tool_search({mode:"contract", tools:["hana_system_get_info"]}) 取契约与 token，再 hana_invoke({capability:"hana_system_get_info", args:{rules:…}, contextToken})；不传 rules 得目录（id+title），传 all 或 id 列表得全文。',
 ].join('\n');
 
 /**
@@ -47,8 +47,8 @@ export const GOAL_DISABLED_INSTRUCTIONS = [
  */
 export const MULTI_ENV_INSTRUCTIONS = [
   '多环境：每次回执带 environment（执行环境标识）与 calledFromEnvironment；以回执为准，不要假设“上次切到哪”。',
-  '查看/切换：先 hana_tool_search({mode:"discover"}) 取 contextToken，再 hana_invoke({capability:"hana_env_list", contextToken})（拿当前环境标识、from、epoch、一次性 switchToken）；切换用 hana_invoke({capability:"hana_env_switch", args:{…}})（confirm 必须等于目标环境标识，大小写不敏感）；切换只影响之后的调用，任务按提交时环境执行。',
-  '多环境所有调用必须带 hana_tool_search 的 contextToken（旧 expectedEnvironment/expectedEpoch 兼容）；只读环境（写包为空）只拒绝持久写入能力，临时对象与纯读放行，hana_sql_execute 默认只允许 SELECT 类语句。',
+  '查看/切换：先 hana_tool_search({mode:"contract", tools:["hana_env_list","hana_env_switch"]}) 取契约与 token，再 hana_invoke({capability:"hana_env_list", contextToken})（拿当前环境标识、from、epoch、一次性 switchToken）；切换用 hana_invoke({capability:"hana_env_switch", args:{…}, contextToken})（confirm 必须等于目标环境标识，大小写不敏感）；切换只影响之后的调用，任务按提交时环境执行。',
+  '多环境所有调用必须带 hana_tool_search 的 contextToken；只读环境（写包为空）只拒绝持久写入能力，临时对象与纯读放行，hana_sql_execute 默认只允许 SELECT 类语句。',
 ].join('\n');
 
 /**

@@ -76,7 +76,7 @@ function isInfraFailure(e: HanaBusinessError): boolean {
 /**
  * 校验已激活的计算视图（运行时一致性检查）：
  * - schema：运行时 schema，通常 _SYS_BIC（走白名单校验）
- * - viewName：运行时列视图名，形如 "包路径/视图名"（如 ZDEMO.ZDEMO_COF/CFZDEMO02_CV003）
+ * - viewName：运行时列视图名，形如 "包路径/视图名"（如 ZDEMO.ZDEMO04/ZDEMO21）
  * - action：默认 CHECK_CONSISTENCY（GET_CHECK_ACTIONS 查得的唯一 calculationview 动作）
  *
  * 注意：本工具校验的是「激活后的运行时视图」，不校验设计时 XML。

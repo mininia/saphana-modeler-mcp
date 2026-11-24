@@ -15,7 +15,7 @@ export const bwDialectRules: readonly RuleObject[] = [
     detail: [
       'join 输入映射重命名（BW 同款，op=add_join 据此接线）：左右列名不同时，在 join 输入映射里重命名——',
       'target=左字段、source=右字段（范本：某 16 级 join 链视图的 Join_1，target="0MATERIAL"',
-      'source="4ZDEMO01R014_TH"）；joinAttribute 用**左侧字段名**。',
+      'source="4ZDEMO18_TH"）；joinAttribute 用**左侧字段名**。',
       '目标形态与 BW query 视图生成器同款：新增 DataSource（type=CALCULATION_VIEW，resourceUri 指向源视图）→',
       '新增 Projection 把源视图字段取出来 → 新增 Join（左输入=原输出节点全字段透传，右输入=条件/带出字段映射）→',
       'logicalModel 的 id 与**全部** keyMapping/measureMapping 的 columnObjectName 重接线到新 Join 节点、',

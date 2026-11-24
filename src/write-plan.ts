@@ -127,7 +127,7 @@ function scanXmlResourceUriValues(xml: string): string[] {
  * 尽力而为：扫不到不影响判定。
  *
  * 口径：只取**首个路径段**（本服务生成的数据源 resourceUri 用点分包 id
- * `/ZDEMO.ZDEMO_MKC/calculationviews/X`，首段即完整包名）。斜杠分段的格式这里只报首段——
+ * `/ZDEMO.ZDEMO03/calculationviews/X`，首段即完整包名）。斜杠分段的格式这里只报首段——
  * readPackages 是可见性信息、不参与拦截；精确到对象的解读归 `scanXmlObjectRefs`。
  */
 export function scanXmlPackageRefs(xml: string): string[] {
@@ -150,7 +150,7 @@ const VIEW_URI_SEGMENTS = new Set(['calculationviews', 'attributeviews', 'analyt
  * （scanXmlResourceUriValues，元素/属性两种形态都收），不另写 URI 正则/表名扫描器。
  *
  * 形态：`/包路径段…/视图目录段/对象名`
- *   - 点分包路径 `/ZDEMO.ZDEMO_MKC/calculationviews/X` → `{ packageId: 'ZDEMO.ZDEMO_MKC', objectName: 'X' }`；
+ *   - 点分包路径 `/ZDEMO.ZDEMO03/calculationviews/X` → `{ packageId: 'ZDEMO.ZDEMO03', objectName: 'X' }`；
  *   - 斜杠分段包路径 `/pkg/sub/calculationviews/X` → 按 metadata.service 的「/ → .」归一口径
  *     得 `{ packageId: 'pkg.sub', objectName: 'X' }`。
  *
@@ -519,7 +519,7 @@ function startsWithSubquery(inner: string): boolean {
  *   判定**以内容为先**，不看 `(` 前的 token：`JOIN (SELECT …)`、`LATERAL (SELECT …)` 的 `(` 前是
  *   标识符字符，按"前是标识符即函数调用"判会留下子查询，别名限定列（`X.K`）被扫成 schema。
  * - **非子查询括号**（表函数、括号 join）：**不整段抹**——表函数参数里可以有表名
- *   （`APPLY_FILTER("S"."T", …)`），括号 join 的首表也没有别的锚点可见（`FROM (ZDEMO_SEC.T1 A JOIN …)`），
+ *   （`APPLY_FILTER("S"."T", …)`），括号 join 的首表也没有别的锚点可见（`FROM (ZDEMO_SCHEMA.T1 A JOIN …)`），
  *   抹掉等于整个表引用漏扫。改为**递归**：表名继续参与扫描，里面的子查询照抹；
  *   并把括号 join 的顶层 `ON …` 条件抹掉——`ON A.X=B.X` 的限定名是列不是 schema。
  */

@@ -57,7 +57,7 @@
 | `HANA_XS_PORT` | XS Classic 设计时 REST 端口（非默认实例/租户需覆盖，不按实例号推导） | 8010 | `8000` | 连接 | 生效（可选） | 忽略（不生效） | 可选 |
 | `HANA_XS_TLS` | XS 写通道走 HTTPS（默认明文 http://，须网络侧隔离） | false | `true` | 连接 | 生效（可选） | 忽略（不生效） | 可选 |
 | `HANA_XS_BASE_PATH` | XS 设计时 REST 基础路径 | /sap/hana/xs/dt/base | — | 连接 | 生效（可选） | 忽略（不生效） | 可选 |
-| `HANA_WRITE_PACKAGES` | 允许写操作的仓库包前缀；**非空 = readwrite，空 = readonly**；`_ENV_` 显式空 = 该环境只读 | 空 | `ZDEMO1,ZDEMO2.ZDEMO_SD` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
+| `HANA_WRITE_PACKAGES` | 允许写操作的仓库包前缀；**非空 = readwrite，空 = readonly**；`_ENV_` 显式空 = 该环境只读 | 空 | `ZDEMO1,ZDEMO2.ZDEMO02` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
 | `HANA_READ_SCHEMA` | 追加允许按名读取的 schema；空 = 仅系统 schema | 空 | `SAPABAP1,OTHER_SCHEMA` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
 | `HANA_SQL_TIMEOUT_MS` | SQL 语句超时（写路径 + 预览/预览诊断查询；非全局） | 60000 | `120000` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
 | `HANA_SQL_ACCESS` | `hana_sql_execute` 的访问模式：`select-only`（默认）/ `readwrite`；对象级 schema/对象访问由 HANA 账号决定 | select-only | `readwrite` | 策略/授权 | 生效（可选） | 共享（所有环境） | 可选（覆盖单个环境） |
@@ -106,20 +106,19 @@
   （`process_param_scoped`）。
 - **环境标识** = `_ENV_<XXXX>` 的 `<XXXX>`，大小写不敏感，内部规范化为大写。`HANA_ENV_START` /
   `HANA_ENV_SWITCHABLE` / `hana_env_switch` 的 `to`/`from`/`confirm` / `MCP_HTTP_CLIENT_ENVS` /
-  `expectedEnvironment` 都用它；回执与审计显示大写形式。
+  `contextToken` 中的 `envKey` 都用它；回执与审计显示大写形式。
 - **环境集合** = 所有已识别参数的 `_ENV_` 键的 `<XXXX>`；`HANA_ENV_START` 必须是其中之一（只有一个环境时可省略）；
   `HANA_ENV_SWITCHABLE` 只接受环境标识，仅大小写不同的重复项失败。
 - **只读环境**（`HANA_WRITE_PACKAGES` 为空）：只拒绝持久写入（清单 `effects.mutates='persistent'`）；临时对象（节点预览
   中间视图、`_CHKTMP`）与纯读放行。`hana_sql_execute` 有独立的 `HANA_SQL_ACCESS`：默认 `select-only` 只允许 SELECT 类
   （拒绝 `FOR UPDATE` / `FOR SHARE` / `NEXTVAL`），`readwrite` 才允许 DML/DDL/管理类（**与全局写包无关**）；
   要完全关闭 SQL，不把 `sql` 写进 `HANA_TOOL_GROUPS`。**单环境同样生效**。
-- **调用上下文（contextToken）与环境断言**：`hana_tool_search` 的 `discover` / `contract` / `goal` 回执都带
-  `contextToken`（HMAC 签名，10 分钟有效）；多环境下**所有**调用把它传给
-  `hana_invoke({ capability, args, contextToken })`。token 绑定 profile/client/env/epoch/policyRev/manifestRev，
-  切环境、改策略、换清单后失效（`context_stale`），重新调 `hana_tool_search` 即可。
-  旧写法 `expectedEnvironment:{key,epoch}`（以及放进 `args` 的 `expectedEnvironment` / `expectedEpoch`）仍兼容一个版本；
-  只有环境名挡不住 DEV 4 → PRD 5 → DEV 6 的旧披露。旧 `disclosure:{id,policyRev,manifestRev}` 只做一致性检查
-  （`disclosure_stale` / `policy_stale` / `manifest_stale`）。
+- **调用上下文（contextToken）**：`hana_tool_search` 的 `discover` / `contract` / `goal` 回执都带
+  `contextToken`（HMAC 签名，10 分钟有效）；**所有** `hana_invoke` 调用必须把它传给
+  `hana_invoke({ capability, args, contextToken })`。token 绑定 profile/client/env/epoch/policyRev/manifestRev
+  与**本次披露的能力集合**：`contract` / `goal` 的 token 才能执行集合内能力，`discover` 的 token 为空集
+  （候选不等于可执行，跳过披露直接执行会得到 `capability_not_disclosed`）。
+  切环境、改策略、换清单或换能力后 token 失效（`context_stale`），重新 contract 即可；不存在 args 级旧断言字段。
 - **切换**：`hana_env_list` 发放一次性 `switchToken`（仅 stdio 且 switch 可达）；`hana_env_switch` 是 route-only、
   HTTP 拒绝且不进发现；只影响之后的调用，已提交任务与在途调用仍绑定原环境；旧环境有运行中任务时进入
   `task-draining`，任务/调用结束后回 `idle`；切换前会预检目标连接，目标有运行中任务时需
@@ -302,9 +301,9 @@ HANA_ENV_SWITCHABLE=DEV,UAT,PROD
 `hana_tool_search` 的 `discover` / `contract` / `goal` 回执都带 `contextToken`（HMAC 签名，10 分钟有效）。
 执行时把它传给 `hana_invoke({ capability, args, contextToken })`：
 
-- 多环境**所有**调用必须带（读调用也不例外）；
-- token 绑定 profile/client/env/epoch/policyRev/manifestRev；切环境、改策略、换清单后旧 token 失效（`context_stale`），重新调 `hana_tool_search` 即可；
-- 旧字段 `expectedEnvironment` / `disclosure` / `disclosureId` 仍兼容一个版本，但新调用只需 `contextToken`；
+- **所有**调用必须带（读调用也不例外）；
+- token 绑定 profile/client/env/epoch/policyRev/manifestRev **与本次披露的能力集合**：`contract` / `goal` 的 token 只能执行回执 `tools[]` 内的能力；`discover` 的 token 为空集，跳过披露直接执行会被 `capability_not_disclosed` 拦下；
+- 切环境、改策略、换清单或换能力后旧 token 失效（`context_stale`），重新 `contract` 获取新 token；
 - token **不是授权凭证**：每次 `hana_invoke` 仍按目标能力重新授权与预检。
 
 ### 调用方档案（MCP_PROFILES）
@@ -444,14 +443,8 @@ MCP_HTTP_PORT=3000 MCP_HTTP_TOKENS='shared:your-long-random-token' node dist/ind
 | `env_start_required` | 多环境未指定启动环境 | 设置 HANA_ENV_START=<环境标识>；只有一个环境时可省略。 |
 | `env_switchable_in_single` | 单环境部署却配置了可切换列表 | 删除 HANA_ENV_SWITCHABLE，或补充 _ENV_ 变量进入多环境模式。 |
 | `env_readonly` | 只读环境拒绝了持久写入能力 | 为该环境配置非空的 HANA_WRITE_PACKAGES（或切到可写环境）；临时对象与纯读不受影响。SQL 写另由 `HANA_SQL_ACCESS` 控制。 |
-| `env_assertion_missing` | 多环境调用缺少上下文令牌/环境断言 | 传入 hana_tool_search 回执里的 contextToken（旧写法：当前环境标识 + epoch，与 hana_env_list 的 current 一致）。 |
-| `env_assertion_mismatch` | 环境断言与当前环境不一致 | 先确认是否忘了切回；用 hana_env_list 查看当前环境后重新取 contextToken。 |
-| `env_epoch_missing` | 多环境调用缺少 epoch | 重新调用 hana_tool_search 取 contextToken（旧写法：传入 hana_env_list 返回的 epoch）。 |
-| `env_epoch_stale` | 环境代际已过期（如 DEV 4 → PRD 5 → DEV 6） | 重新调用 hana_tool_search / hana_env_list 取当前代际后重试；旧披露不可复用。 |
-| `context_stale` | contextToken 已过期，或身份/环境/代际/策略/清单已变化 | 重新调用 hana_tool_search（discover/contract/goal）获取新 contextToken；切环境后必须重新获取。 |
-| `disclosure_stale` | 旧披露包已过期、不属于本次调用或属于其它工具 | 重新调用 hana_tool_search 披露，或改用 contextToken。 |
-| `policy_stale` | 调用方回传的披露 `policyRev` 与当前策略不一致 | 重新调用 hana_tool_search 披露（策略/档案/环境已变化）。 |
-| `manifest_stale` | 调用方回传的披露 `manifestRev` 与当前能力清单不一致 | 重新披露；服务端可能已升级。 |
+| `context_stale` | contextToken 已过期，或身份/环境/代际/策略/清单已变化 | 重新调用 hana_tool_search（contract/goal）获取新 contextToken；切环境后必须重新获取。 |
+| `capability_not_disclosed` | contextToken 绑定的披露集合不包含目标能力 | 先 hana_tool_search({mode:"contract", tools:[目标能力]}) 取完整契约与新的 contextToken，再调用 hana_invoke。 |
 | `env_switch_disabled` | 环境切换未启用 | 需要多环境部署且 HANA_ENV_SWITCHABLE 非空。 |
 | `env_switch_http_unsupported` | HTTP 模式不支持进程级环境切换 | 改用一进程一环境，或配置 MCP_HTTP_CLIENT_ENVS 做 Token→环境绑定。 |
 | `env_switch_target_not_allowed` | 目标环境不在 HANA_ENV_SWITCHABLE 中 | 把目标环境标识加入 HANA_ENV_SWITCHABLE 后重启。 |

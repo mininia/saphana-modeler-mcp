@@ -4,4 +4,4 @@
  * 放在叶子模块，避免任一工具模块反向 import 另一个造成注册环。
  */
 export const UNKNOWN_CAPABILITY_TEXT =
-  '未知能力：该能力不存在，或未对当前调用方开放。先 hana_tool_search({mode:"discover"}) 获取可用能力与契约，再用 hana_invoke 执行。';
+  '未知能力：该能力不存在，或未对当前调用方开放。先 hana_tool_search({mode:"discover"}) 找可用能力，再 contract 取契约与 token，最后用 hana_invoke 执行。';

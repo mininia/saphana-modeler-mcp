@@ -4,6 +4,12 @@
 >
 > 约定：每次提交前把变化补到对应版本条目下；每条 1–3 行，只写对外可见变化。
 
+## 1.5.2 - 2026-11-25
+
+- 修复 `hana_invoke` 未校验披露集合的边界问题：必须携带 `contract` / `goal` 签发的 `contextToken`，集合外能力在参数校验前返回 `capability_not_disclosed`。
+- 移除 `expectedEnvironment` / `expectedEpoch` / `disclosure` / `disclosureId` 旧入参、披露 registry 与对应错误码；环境/代际统一由 `contextToken` 校验。
+- 执行流程统一为 discover → contract/goal → invoke；示例标识统一脱敏为 ZDEMO 中性编号。
+
 ## 1.5.1 - 2026-11-23
 
 - 修复 `hana_env_switch` 在未声明 `elicitation` 的客户端上永远无法切换：控制面切换改为非破坏性（不写 HANA、可再次切回，确认由一次性 `switchToken` + epoch/from + `confirm` 完成），不再要求宿主审批。

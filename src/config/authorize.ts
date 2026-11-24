@@ -23,7 +23,7 @@
 import type { ApprovalGateResult } from './approval.js';
 import { assembleVerdict, checkDeployment, type Policy, type Verdict } from './preflight.js';
 import { evaluate, type EvaluationResult } from './evaluate.js';
-import { environmentMutationScope, type EnvironmentAssertion } from './environment-policy.js';
+import { environmentMutationScope } from './environment-policy.js';
 import type { CallerProfile } from './profiles.js';
 import { planReadless } from '../capabilities/planners.js';
 import type { Capability } from '../capabilities/types.js';
@@ -60,12 +60,6 @@ export interface AuthorizationContext {
   agentLabel?: string;
   /** 归因入口（经 `hana_invoke` 派发时 = "hana_invoke"；平台入口自身缺省）——只进审计，不参与判定 */
   via?: string;
-  /** 调用信封里的环境断言；省略时回退 args.expectedEnvironment/expectedEpoch */
-  envAssertion?: EnvironmentAssertion;
-  /** 调用信封里的披露上下文（只做一致性检查，不是授权凭证） */
-  disclosure?: { id?: string; policyRev?: string; manifestRev?: string };
-  /** rev 补充输入（readonlySql/approvalPolicy） */
-  policyRevExtras?: { readonlySql?: string; approvalPolicy?: string };
   /**
    * true = 由 dispatchAuthorized 统一记「放行后」的审计：审批确认前不记 allowed，
    * 避免被拒/待确认的破坏性调用在日志里呈现为已放行。
@@ -252,9 +246,6 @@ export function authorizeCall(
     args,
     mode: 'enforce',
     ...(runtime ? { runtime } : {}),
-    ...(ctx.envAssertion ? { envAssertion: ctx.envAssertion } : {}),
-    ...(ctx.disclosure ? { disclosure: ctx.disclosure } : {}),
-    ...(ctx.policyRevExtras ? { policyRevExtras: ctx.policyRevExtras } : {}),
   });
   const plan = evaluated.plan;
   const verdict = evaluated.verdict;

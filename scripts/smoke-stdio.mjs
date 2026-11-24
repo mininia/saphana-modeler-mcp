@@ -160,13 +160,11 @@ async function caseRegisteredSurface() {
     if (!search?.annotations?.readOnlyHint) throw new Error('hana_tool_search 应声明 readOnlyHint=true');
     if (invoke?.annotations?.readOnlyHint !== false) throw new Error('hana_invoke 应声明 readOnlyHint=false');
     const invokeProps = Object.keys(invoke.inputSchema?.properties ?? {});
-    if (JSON.stringify(invokeProps.slice(0, 2)) !== JSON.stringify(['capability', 'args'])) {
-      throw new Error(`hana_invoke 入参应以 capability/args 开头，实际：${invokeProps.join(', ')}`);
+    if (JSON.stringify(invokeProps) !== JSON.stringify(['capability', 'args', 'contextToken'])) {
+      throw new Error(`hana_invoke 入参应恰为 capability/args/contextToken，实际：${invokeProps.join(', ')}`);
     }
-    for (const p of invokeProps.slice(2)) {
-      if (!['expectedEnvironment', 'disclosure', 'disclosureId', 'contextToken'].includes(p)) {
-        throw new Error(`hana_invoke 出现未知信封字段：${p}`);
-      }
+    if (!(invoke.inputSchema?.required ?? []).includes('contextToken')) {
+      throw new Error('hana_invoke 必须把 contextToken 声明为必填');
     }
     console.log('[case A] PASS —— 工具面只有选择与执行两个平台入口');
   });
@@ -251,9 +249,18 @@ async function caseVisibilityAndGuard() {
       if (!capVisible(card.id)) throw new Error(`候选 ${card.id} 不在当前可见范围内`);
     }
 
-    // 路由护栏：未知能力 / 平台入口自身 → 同一句拒绝文案
-    const unknown = await call(INVOKE_TOOL, { capability: 'hana_does_not_exist' });
-    const toPlatform = await call(INVOKE_TOOL, { capability: TOOL_SEARCH_TOOL });
+    // 路由护栏：未知能力 / 平台入口自身 → 同一句拒绝文案（带一个有效披露 token）
+    const probeCap = discover.data.candidates[0].id;
+    const probeContract = requireEnvelope(
+      (await call(TOOL_SEARCH_TOOL, { mode: 'contract', tools: [probeCap] })).text,
+      'probe contract 回执',
+    );
+    if (probeContract.success !== true || typeof probeContract.data.contextToken !== 'string') {
+      throw new Error(`probe contract 应签发 contextToken，实际：${JSON.stringify(probeContract).slice(0, 200)}`);
+    }
+    const token = probeContract.data.contextToken;
+    const unknown = await call(INVOKE_TOOL, { capability: 'hana_does_not_exist', contextToken: token });
+    const toPlatform = await call(INVOKE_TOOL, { capability: TOOL_SEARCH_TOOL, contextToken: token });
     if (!unknown.isError || !toPlatform.isError) throw new Error('未知/平台入口目标必须是硬错误');
     assertSameUnknownRefusal([unknown.text, toPlatform.text]);
 
@@ -304,7 +311,7 @@ async function caseDisclosure() {
         await call(TOOL_SEARCH_TOOL, {
           mode: 'goal',
           goal: 'diagnose_preview_permission',
-          bindings: { packageId: 'ZDEMO.ZDEMO_MGF', objectName: 'ZDEMO02_CV008' },
+          bindings: { packageId: 'ZDEMO.ZDEMO01', objectName: 'ZDEMO11' },
         })
       ).text,
       'goal 回执',
@@ -316,10 +323,21 @@ async function caseDisclosure() {
       if (step.via !== INVOKE_TOOL) throw new Error(`配方步骤 ${step.id} 的 via 应为 ${INVOKE_TOOL}`);
     }
 
-    // invoke 的 schema 错误在派发前拒绝（不触库）
-    const bad = await call(INVOKE_TOOL, { capability: 'hana_metadata_get_view', args: {} });
+    // invoke 的 schema 错误在派发前拒绝（不触库）：token 覆盖 get_view，但参数缺必填
+    const token = contract.data.contextToken;
+    if (typeof token !== 'string') throw new Error('contract 回执必须签发 contextToken');
+    const bad = await call(INVOKE_TOOL, { capability: 'hana_metadata_get_view', args: {}, contextToken: token });
     if (!bad.isError || !/参数不符合/.test(bad.text)) {
       throw new Error(`invoke 非法参数应被拒绝，实际：${bad.text.slice(0, 200)}`);
+    }
+    // 披露集合之外的能力：在参数校验前被拒绝
+    const outside = await call(INVOKE_TOOL, {
+      capability: 'hana_metadata_list_fields',
+      args: { packageId: 'ZDEMO.ZDEMO01', objectName: 'ZDEMO11' },
+      contextToken: token,
+    });
+    if (!outside.isError || !/capability_not_disclosed/.test(outside.text)) {
+      throw new Error(`披露集合外能力应被拒绝，实际：${outside.text.slice(0, 200)}`);
     }
 
     await sleep(200);

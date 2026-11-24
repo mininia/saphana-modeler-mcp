@@ -18,7 +18,7 @@ import { manifestRev, planFor } from '../capabilities/manifest.js';
 export { manifestRev };
 import { declaredResourceRoles } from '../capabilities/resources.js';
 import { requiredParamsOf } from './surface.js';
-import { capabilityInputSchema, environmentMutationScope } from '../config/environment-policy.js';
+import { environmentMutationScope } from '../config/environment-policy.js';
 import type { HanaConfig } from '../config/config.js';
 import { policyRevFromPolicy } from '../config/policy-snapshot.js';
 import type { CallerProfile } from '../config/profiles.js';
@@ -62,8 +62,6 @@ export interface ActionContract {
     capability: string;
     operation?: string;
     args: Record<string, unknown>;
-    /** 环境断言信封（hana_invoke 顶层；args 只放业务参数） */
-    envelope?: { expectedEnvironment: { key: string; epoch: number } };
   };
 }
 
@@ -86,8 +84,8 @@ export function operationalRiskOf(cap: Capability): OperationalRisk {
   return 'low';
 }
 
-/** 静态访问画像（环境无关；`expected_environment` 需要 multiEnv 才出现） */
-export function accessProfileOf(cap: Capability, multiEnv = false): AccessProfile {
+/** 静态访问画像（环境无关）：具体能力都必须经 contextToken 执行 */
+export function accessProfileOf(cap: Capability): AccessProfile {
   const roles = new Set(declaredResourceRoles(cap.inputSchema));
   const probe = planFor(cap, { ...ACCESS_PROBE_ARGS });
   const checks: string[] = [];
@@ -95,7 +93,7 @@ export function accessProfileOf(cap: Capability, multiEnv = false): AccessProfil
   if (roles.has('readSchema') || probe.readSchemas.length > 0) checks.push('read_scope');
   const mutation = environmentMutationScope(cap);
   if (mutation === 'persistent') checks.push('environment_write');
-  if (multiEnv && cap.platform !== true) checks.push('expected_environment');
+  if (cap.platform !== true) checks.push('context_token');
   if (cap.kind === 'sql') checks.push('sql_policy');
   // 审批与风险分级解耦：只有清单显式声明 approval 的能力才出现审批检查。
   if (cap.approval === 'always') checks.push('approval');
@@ -124,22 +122,10 @@ function callOf(cap: Capability): { via: string; capability: string; operation?:
   };
 }
 
-/** 多环境下所有调用要补的断言（披露时给当前值；执行仍逐次校验） */
-export interface DisclosureEnvironment {
-  key: string;
-  epoch: number;
-}
-
 function exampleArgsOf(
   cap: Capability,
-  multiEnv: boolean,
   bindings: Record<string, unknown>,
-  environment?: DisclosureEnvironment,
-): {
-  args: Record<string, unknown>;
-  missing: string[];
-  envelope?: { expectedEnvironment: { key: string; epoch: number } };
-} {
+): { args: Record<string, unknown>; missing: string[] } {
   const { value, missing } = substituteBindings(cap.routing?.exampleArgs ?? {}, bindings);
   const args = { ...(value as Record<string, unknown>) };
   // bindings 同时作为「调用方目标」覆盖显式示例键（如 packageId/objectName）：canonicalCall 与
@@ -147,18 +133,11 @@ function exampleArgsOf(
   for (const [key, bound] of Object.entries(bindings)) {
     if (Object.hasOwn(args, key)) args[key] = bound;
   }
-  let envelope: { expectedEnvironment: { key: string; epoch: number } } | undefined;
-  if (multiEnv && cap.platform !== true && environment) {
-    // 统一走调用信封：args 只放业务参数，环境断言由 hana_invoke 顶层接收。
-    envelope = { expectedEnvironment: { key: environment.key, epoch: environment.epoch } };
-  }
-  return { args, ...(envelope ? { envelope } : {}), missing };
+  return { args, missing };
 }
 
 export interface ContractOptions {
-  multiEnv: boolean;
   bindings?: Record<string, unknown>;
-  environment?: DisclosureEnvironment;
 }
 
 /** 投影单个能力 → ActionContract；同时返回 exampleArgs 里缺失的 bindings 键。 */
@@ -166,10 +145,9 @@ export function buildContract(
   cap: Capability,
   opts: ContractOptions,
 ): { contract: ActionContract; missingBindings: string[] } {
-  const { args, missing, envelope } = exampleArgsOf(cap, opts.multiEnv, opts.bindings ?? {}, opts.environment);
+  const { args, missing } = exampleArgsOf(cap, opts.bindings ?? {});
   const call = callOf(cap);
-  // 所有能力统一走信封：args 只含业务参数；环境断言在 canonicalCall.envelope。
-  const inputSchema = z.toJSONSchema(capabilityInputSchema(cap, opts.multiEnv, 'envelope'), { io: 'input' });
+  const inputSchema = z.toJSONSchema(cap.inputSchema, { io: 'input' });
   const contract: ActionContract = {
     id: cap.id,
     title: cap.title,
@@ -182,22 +160,22 @@ export function buildContract(
     ...(cap.routing?.notFor !== undefined && cap.routing.notFor.length > 0 ? { notFor: cap.routing.notFor } : {}),
     ...(cap.routing?.priority !== undefined ? { priority: cap.routing.priority } : {}),
     inputSchema,
-    required: requiredParamsOf(cap, opts.multiEnv, 'envelope'),
+    required: requiredParamsOf(cap),
     ...(Object.keys(args).length > 0 ? { exampleArgs: args } : {}),
     ...(cap.routing?.constraints !== undefined && cap.routing.constraints.length > 0
       ? { constraints: cap.routing.constraints }
       : {}),
     ...(cap.routing?.requires !== undefined ? { requires: cap.routing.requires } : {}),
     effects: { mutates: cap.effects.mutates, destructive: cap.effects.destructive, idempotent: cap.effects.idempotent },
-    access: accessProfileOf(cap, opts.multiEnv),
+    access: accessProfileOf(cap),
     ...(cap.routing?.returns !== undefined && cap.routing.returns.length > 0 ? { returns: cap.routing.returns } : {}),
     call,
-    canonicalCall: { ...call, args, ...(envelope ? { envelope } : {}) },
+    canonicalCall: { ...call, args },
   };
   return { contract, missingBindings: missing };
 }
 
-// ── 版本与披露哈希（只做日志/缓存/过期关联，不做授权） ──────────────
+// ── 版本与披露哈希（只做日志关联，不做授权） ──────────────
 
 /** 16 位十六进制摘要（sha256 前 16 位；展示/关联足够，不作为安全边界） */
 function digest(value: unknown): string {
@@ -226,7 +204,7 @@ export function policyRevOf(
   );
 }
 
-/** 披露 id = sha256(manifestRev + policyRev + envKey/epoch + 排序后的工具 id + goal) */
+/** 披露 id（**只做日志关联**）= sha256(manifestRev + policyRev + envKey/epoch + 排序后的工具 id + goal) */
 export function disclosureIdOf(
   manifest: string,
   policyRev: string,

@@ -111,7 +111,7 @@ function text(x: unknown): string | undefined {
   }
   if (raw === undefined) return undefined;
   // 解析器 processEntities=false（保留 CDATA 原样），这里对公式/脚本等文本节点
-  // 解码 XML 实体，还原真实 SQL/表达式（ZDEMO008_CV001 的公式含 &quot; 与 &#xD;）
+  // 解码 XML 实体，还原真实 SQL/表达式（ZDEMO13 的公式含 &quot; 与 &#xD;）
   return decodeEntities(raw);
 }
 

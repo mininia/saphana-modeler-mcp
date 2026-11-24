@@ -53,9 +53,9 @@ export interface OutputFieldSpec {
 }
 
 export interface AddJoinSpec {
-  /** DataSource id（一般= 源视图对象名，如 ZDEMO01R014_Q017） */
+  /** DataSource id（一般= 源视图对象名，如 ZDEMO18） */
   sourceId: string;
-  /** 源视图仓库 URI（如 /system-local.bw.bw2hana.query.zdemo01r014/calculationviews/ZDEMO01R014_Q017） */
+  /** 源视图仓库 URI（如 /system-local.bw.bw2hana.query.zdemo18/calculationviews/ZDEMO18） */
   sourceResourceUri: string;
   joinType: 'inner' | 'leftOuter' | 'rightOuter' | 'fullOuter';
   /** join 条件（≥1；多个条件 = 复合 join） */
@@ -125,8 +125,8 @@ export function getJoinTargetAttrs(xml: string): { nodeId: string; attributes: s
 }
 
 /** 默认带出字段：源视图可见（非 hidden）输出属性 − join 条件右字段 − 已存在于左侧链的字段。
- * 例：Q017 可见属性 {4ZDEMO01R014_FLAG, ZDEMO_MAT}、条件右字段 ZDEMO_MAT、左侧已有 0MATERIAL
- * → 默认带出 [4ZDEMO01R014_FLAG]。
+ * 例：Q017 可见属性 {4ZDEMO18_FLAG, ZDEMO_FLD01}、条件右字段 ZDEMO_FLD01、左侧已有 0MATERIAL
+ * → 默认带出 [4ZDEMO18_FLAG]。
  */
 export function chooseDefaultJoinFields(
   sourceFields: Array<{ id: string; hidden?: boolean }>,
@@ -636,7 +636,7 @@ export function addAggregationToViewXml(xml: string, spec: AddAggregationSpec): 
     `    <calculationView xsi:type="Calculation:AggregationView" id="${aggregationId}">`,
     `      <descriptions/>`,
     `      <viewAttributes>`,
-    // 本环境激活方言（对齐 ZDEMO_MAT 的真实 XML）：度量在 viewAttribute 上带 aggregationType，
+    // 本环境激活方言（对齐 ZDEMO_FLD01 的真实 XML）：度量在 viewAttribute 上带 aggregationType，
     // 不再输出 aggregateBy/measureMapping（后者是读侧兼容方言，激活器会报 unknown tag）。
     ...spec.groupBy.map((f) => `        <viewAttribute id="${escapeXmlAttr(f)}"/>`),
     ...spec.measures.map(

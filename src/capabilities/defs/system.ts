@@ -73,7 +73,7 @@ export const systemCapabilities = {
     description:
       '列出本进程配置的 HANA 环境：当前 active 环境标识、每个环境的 access/state/运行任务数，' +
       '以及可切列表与一次性 switchToken。多环境部署才可见（经 hana_tool_search 发现/hana_invoke 执行）；不连 HANA，当前环境不可用时也能查看。' +
-      '切换用 hana_invoke({capability:"hana_env_switch", args:{…}})，token 由本工具发放；先经 hana_tool_search 取契约。',
+      '切换用 hana_invoke({capability:"hana_env_switch", args:{…}, contextToken})，switchToken 由本工具发放；先经 hana_tool_search({mode:"contract", tools:["hana_env_switch"]}) 取契约与 token。',
     inputSchema: z.object({}),
     annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   }),

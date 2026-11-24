@@ -42,13 +42,13 @@ export const packageCapabilities = {
       whenToUse: ['看某包有哪些对象/哪些未激活', '按对象名片段在包内过滤'],
       notFor: ['跨包按名称片段搜索用 hana_metadata_search_objects'],
       priority: 'primary',
-      exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', pattern: 'CV' },
+      exampleArgs: { packageId: 'ZDEMO.ZDEMO01', pattern: 'CV' },
     },
     title: '列出包内对象',
     description:
       '列出指定包内的仓库对象（ACTIVE_OBJECT 已激活 + INACTIVE_OBJECT 未激活合并）：对象名、类型后缀、版本号、激活状态、变更时间/人。kind 可限定视图类型；pattern 按对象名片段过滤（大小写不敏感）。结果带截断。',
     inputSchema: z.object({
-      packageId: zReadPackageId('包名（完整路径），如 ZDEMO.ZDEMO_MGF 或 ZDEMO'),
+      packageId: zReadPackageId('包名（完整路径），如 ZDEMO.ZDEMO01 或 ZDEMO'),
       pattern: z.string().optional().describe('对象名片段过滤（如 CV001），大小写不敏感；省略=全部对象'),
       kind: VIEW_KIND.optional().describe('视图类型；省略=该包全部对象类型'),
       limit: z.number().int().min(1).max(500).default(100).describe('返回条数上限，默认 100，最大 500'),
@@ -91,7 +91,7 @@ export const packageCapabilities = {
       whenToUse: ['改/导入前留档', '迁移包到另一个环境'],
       notFor: ['只读单个视图定义用 hana_metadata_get_view(format=xml)'],
       priority: 'fallback',
-      exampleArgs: { packageId: 'ZDEMO.ZDEMO_MGF', saveTo: 'backup/ZDEMO_MGF.zip' },
+      exampleArgs: { packageId: 'ZDEMO.ZDEMO01', saveTo: 'backup/ZDEMO01.zip' },
     },
     title: '导出包为 zip 备份（Transfer API）',
     description:
@@ -123,7 +123,7 @@ export const packageCapabilities = {
       notFor: ['修改已有对象用 hana_view_update，不要 delete+重建或覆盖导入'],
       priority: 'advanced',
       requires: '目标包在 HANA_WRITE_PACKAGES 可写范围内；覆盖需 overwrite=true',
-      exampleArgs: { targetPackageId: 'ZDEMO.ZDEMO_MGF', filePath: 'import/ZDEMO02_CV009.calculationview' },
+      exampleArgs: { targetPackageId: 'ZDEMO.ZDEMO01', filePath: 'import/ZDEMO12.calculationview' },
     },
     preflight: (args) => {
       const v = args as { filePath?: string; content?: unknown };
@@ -155,7 +155,7 @@ export const packageCapabilities = {
         .string()
         .max(200)
         .optional()
-        .describe('目标文件名（如 ZDEMO_CV_X.calculationview）；filePath 导入时省略=用源文件名'),
+        .describe('目标文件名（如 ZDEMO16.calculationview）；filePath 导入时省略=用源文件名'),
       overwrite: z
         .boolean()
         .default(false)

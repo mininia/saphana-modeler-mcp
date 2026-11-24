@@ -133,7 +133,7 @@ export async function getViewDefinition(
           ? '若该对象只有未激活版本，请传 version=inactive 查询；'
           : '未激活行只存在于有挂起改动的对象——若对象已全部激活，请用默认 version=active；') +
         `可先用 hana_metadata_search_objects 按名称片段搜索定位；` +
-        `包名/对象名大小写敏感（仓库内为大写存储），如 ZDEMO.ZDEMO_MGF/ZDEMO02_CV008`,
+        `包名/对象名大小写敏感（仓库内为大写存储），如 ZDEMO.ZDEMO01/ZDEMO11`,
     );
   }
   const result: ViewDefinitionResult = {
@@ -541,7 +541,7 @@ export function searchFields(
 
 /**
  * 从公式字符串中提取引用的字段
- * - 优先识别 SQL 双引号引用（"COLUMN_NAME"，ZDEMO008_CV001 的 ZDEMO_FLD_NEW 即如此）
+ * - 优先识别 SQL 双引号引用（"COLUMN_NAME"，ZDEMO13 的 ZDEMO_FLD_NEW 即如此）
  * - 剔除字符串字面量、SQL 关键字、函数调用名与 CAST 类型名后，再匹配裸标识符（兼容无引号字段名的老视图）：
  *   裸标识符与函数/类型名同形（SUM/CAST/DECIMAL…），只按有限的关键字黑名单过滤会把它们当源字段 ——
  *   实测 `SUM("AMOUNT")+CAST("QTY" AS DECIMAL)` 会被解析出 SUM/CAST/AS/DECIMAL 等假源字段。
@@ -629,7 +629,7 @@ export interface FieldLogic {
   formula?: string;
   /** SQLScript 源码（字段所在节点为 SqlScriptView 时，脚本即该字段的逻辑来源） */
   script?: string;
-  /** 公式引用的源字段（形如 "ZDEMO_FLDM__ZDEMO_TYPE"） */
+  /** 公式引用的源字段（形如 "ZDEMO_FLD02__ZDEMO_TYPE"） */
   sourceColumns: string[];
   /** 源字段溯源：公式所在节点输入映射中，各源字段来自哪个上游节点 */
   sourceTrace: FormulaSource[];

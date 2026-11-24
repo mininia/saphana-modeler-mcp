@@ -6,8 +6,8 @@
  * - 计划面：planViewOpAlias 把入参还原成父工具的一次 operations 调用，交给父规划器。
  *
  * 条目标 routeOnly: true：可发现、可授权，但永不注册为工具——调用方式：
- *   hana_invoke({ capability: "hana_view_update#auto_layout", args: { packageId, objectName, … } })
- * 与 hana_invoke({ capability: "hana_view_update", args: { …, operations: [{ op: "auto_layout", … }] } })
+ *   hana_invoke({ capability: "hana_view_update#auto_layout", args: { packageId, objectName, … }, contextToken })
+ * 与 hana_invoke({ capability: "hana_view_update", args: { …, operations: [{ op: "auto_layout", … }] }, contextToken })
  * 完全等价（同一 handler、同一闸门；审批按 op 的 destructive 声明）。
  */
 
@@ -92,10 +92,10 @@ export function buildViewOpCapabilities(parent: Capability): Record<string, Capa
       routing: {
         intent: `${decl.title}（操作级别名 op=${decl.id}）`,
         priority: 'advanced',
-        requires: `经 hana_invoke({capability:"${decl.id}", args}) 调用；不注册为工具`,
+        requires: `先 contract 本条取 token，再 hana_invoke({capability:"${decl.id}", args, contextToken})；不注册为工具`,
         exampleArgs: {
-          packageId: 'ZDEMO.ZDEMO_MGF',
-          objectName: 'ZDEMO02_CV008',
+          packageId: 'ZDEMO.ZDEMO01',
+          objectName: 'ZDEMO11',
           ...(ALIAS_EXAMPLE_PAYLOAD[decl.id] ?? {}),
         },
       },
@@ -105,9 +105,9 @@ export function buildViewOpCapabilities(parent: Capability): Record<string, Capa
         (decl.effects.destructive
           ? '此项为破坏性变更、不可自动回滚：改前用 hana_metadata_get_view(format=xml) 留档，恢复=用该 XML 重新 update。\n'
           : '') +
-        `经 hana_invoke 调用（本条目不注册为工具）：args = 父工具身份参数（packageId / objectName 必填；` +
+        `经 hana_invoke 调用（本条目不注册为工具）：先 contract 本条取 token；args = 父工具身份参数（packageId / objectName 必填；` +
         `ifMatch / dryRun / migration 可选）+ 本 op 参数。与 ` +
-        `hana_invoke({capability:"${parent.id}", args:{operations:[{op:"${decl.id}", …}]}}) 完全等价（同一 handler、同一闸门与破坏性判定；审批按本 op 的 destructive 声明）。`,
+        `hana_invoke({capability:"${parent.id}", args:{operations:[{op:"${decl.id}", …}]}, contextToken}) 完全等价（同一 handler、同一闸门与破坏性判定；审批按本 op 的 destructive 声明）。`,
       // 身份字段复用父 schema 的同名字段（保留其 .default()/.optional() 语义）；载荷字段来自 union 成员
       inputSchema: z.object({ ...identity, ...payload }),
       // 注解从本条的 effects 派生（set_description 这类非破坏 op 的 destructiveHint 必须为 false）。

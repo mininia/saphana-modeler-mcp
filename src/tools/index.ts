@@ -7,7 +7,6 @@ import { activeProfile } from '../config/profiles.js';
 import { policyFromConfig } from '../config/preflight.js';
 import { approvalGate, clientSupportsElicitation } from '../config/approval.js';
 import { blockedCallResult, dispatchAuthorized } from '../config/authorize.js';
-import { capabilityInputSchema } from '../config/environment-policy.js';
 import { registeredNameOf, type Capability } from '../capabilities/types.js';
 import { CAPABILITY_LIST, manifestRev } from '../capabilities/manifest.js';
 import { computeSurface, type CallerSurface } from './surface.js';
@@ -88,12 +87,7 @@ function registerVisibleTool(server: McpServer, ctx: ToolContext): McpServer['re
  * 能力清单条目 → SDK 的 registerTool 配置：title / inputSchema / annotations 全部取自清单。
  * 具体能力默认不注册；只有平台入口会进入工具面。
  */
-function registrationOf<S extends z.ZodType>(
-  cap: Capability<S>,
-  _surface: CallerSurface,
-  multiEnv: boolean,
-  goalEnabled = true,
-) {
+function registrationOf<S extends z.ZodType>(cap: Capability<S>, _surface: CallerSurface, goalEnabled = true) {
   const description =
     cap.id === 'hana_tool_search' && !goalEnabled
       ? `${cap.description}
@@ -102,8 +96,7 @@ function registrationOf<S extends z.ZodType>(
   return {
     title: cap.title,
     description,
-    // 多环境下所有具体能力都要求 expectedEnvironment；平台入口/单环境原样返回
-    inputSchema: capabilityInputSchema(cap, multiEnv),
+    inputSchema: cap.inputSchema,
     annotations: cap.annotations,
   };
 }
@@ -141,7 +134,7 @@ export function capabilityRegistrar(server: McpServer, ctx: ToolContext): Capabi
     // ② 只有平台入口会进面；具体能力仅登记原始 handler，供 hana_invoke 派发
     (register as (n: string, c: unknown, f: unknown) => unknown)(
       registeredNameOf(cap),
-      registrationOf(cap, surface, ctx.manager?.multiEnv === true, ctx.config.toolSearchGoalEnabled !== false),
+      registrationOf(cap, surface, ctx.config.toolSearchGoalEnabled !== false),
       gatedHandler(server, ctx, cap, handler),
     );
   } as CapabilityRegistrar;
@@ -177,10 +170,6 @@ function gatedHandler<S extends z.ZodType>(
           policy: policyFromConfig(ctx.config, toolFilterOf(ctx.config, ctx.toolFilter)),
           profile: activeProfile(ctx.config, identity),
           agentLabel: ctx.config.agentLabel,
-          policyRevExtras: {
-            readonlySql: ctx.config.readonlySql ?? 'select-only',
-            approvalPolicy: ctx.config.approvalPolicy,
-          },
         },
         () => (handler as (a: unknown, e: unknown) => unknown)(args, extra),
         (auth) => blockedCallResult(auth) as never,

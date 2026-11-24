@@ -322,7 +322,7 @@ export class EnvironmentManager {
       pools: { kept: [...new Set(kept)], closed },
       notice:
         '切换只影响本次响应之后的调用；已开始的调用仍绑定原环境。' +
-        '多环境所有调用请携带 expectedEnvironment=<当前环境标识>（或新 contextToken）；需要切回时重新调用 hana_env_list 获取新 token。',
+        '所有调用必须携带 contract/goal 回执的 contextToken；切换后旧 token 失效，需要重新获取。',
     };
   }
 

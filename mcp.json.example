@@ -14,7 +14,7 @@
         "HANA_SSL_VALIDATE": "true",
         "HANA_TIMEZONE": "Asia/Shanghai",
         "HANA_READ_SCHEMA": "",
-        "HANA_WRITE_PACKAGES": "ZDEMO1,ZDEMO2.ZDEMO_SD",
+        "HANA_WRITE_PACKAGES": "ZDEMO1,ZDEMO2.ZDEMO02",
         "HANA_XS_PORT": "8010",
         "LOG_LEVEL": "info"
       }
@@ -42,7 +42,7 @@
         "HANA_PASSWORD_ENV_PROD": "PROD_PASSWORD",
         "HANA_DB_NAME_ENV_PROD": "PRODDB",
 
-        "HANA_WRITE_PACKAGES_ENV_DEV": "ZDEMO1,ZDEMO2.ZDEMO_SD",
+        "HANA_WRITE_PACKAGES_ENV_DEV": "ZDEMO1,ZDEMO2.ZDEMO02",
         "HANA_ENV_START": "DEV",
         "HANA_ENV_SWITCHABLE": "DEV,UAT,PROD",
         "LOG_LEVEL": "info"
